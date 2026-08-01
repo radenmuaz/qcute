@@ -1,17 +1,18 @@
-"""lm.py — Phase 0 reference baseline: byte-level causal transformer LM with RoPE.
+"""qcute.lm — Phase 0 reference baseline: byte-level causal transformer LM with RoPE.
 
 Handover doc §5 Phase 0 calls for a byte-softmax LM baseline ("numbers to beat")
 before the continuous tokenizer is built. This is that baseline: plain pre-norm
 transformer, rotary position embeddings, causal self-attention, weight-tied
 output head. Reports exact bits-per-byte (softmax over 256 raw bytes -> no
-ELBO needed, unlike the FSQ/vMF bottlenecks in qcute.py).
+ELBO needed, unlike the FSQ/vMF bottleneck in qcute.tokenizer).
 
 Two power-of-2-friendly presets (see PRESETS below):
   sd  ~100M params : d_model=1024, layers=8,  heads=16, head_dim=64,  ctx=2048
   md  ~400M params : d_model=2048, layers=8,  heads=16, head_dim=128, ctx=2048
 
-Deliberately monolithic; factorize once this needs to share code with qcute.py
-beyond the enwik8 loader.
+Deliberately monolithic (one module, no internal submodules) for now;
+split further once this needs to share code with qcute.tokenizer beyond the
+enwik8 loader.
 """
 from __future__ import annotations
 

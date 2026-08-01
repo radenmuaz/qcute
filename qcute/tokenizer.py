@@ -1,6 +1,6 @@
-"""qcute — Phase 1: standalone byte-chunk autoencoder (FSQ bottleneck).
+"""qcute.tokenizer — Phase 1: standalone byte-chunk autoencoder (FSQ bottleneck).
 
-Single-file implementation, minimal, following continuous_tokenizer_handover.md
+Minimal implementation following docs/continuous_tokenizer_handover.md
 sections 1.2.2 (FSQ), 1.3 (encoder), 1.4.2/1.4.3a (Phase-1 NAT decoder).
 
 Encoder: causal recurrent body (GRU stand-in for a Mamba-style SSM) emitting one
@@ -8,7 +8,8 @@ latent every K bytes. Decoder: memoryless NAT block conditioned on z_t via FiLM,
 trained with one-shot factorized cross-entropy. No LM yet — validates the
 bottleneck alone per Phase 1's go/no-go (reconstruction > 99.5%).
 
-Deliberately monolithic for now; factorize into a package once Phase 2 needs it.
+Deliberately monolithic (one module, no internal submodules) for now;
+split further once Phase 2 needs to share pieces with qcute.lm.
 """
 from __future__ import annotations
 

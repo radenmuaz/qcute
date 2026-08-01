@@ -10,12 +10,5 @@ dependencies = [
     "torch>=2.13.0",
 ]
 
-[project.scripts]
-qcute = "qcute:main"
-
-[build-system]
-requires = ["uv_build>=0.9.30,<0.10.0"]
-build-backend = "uv_build"
-
-[tool.uv.build-backend]
-module-root = ""
+[tool.uv]
+package = false
