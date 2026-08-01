@@ -33,4 +33,6 @@ Both modules run on CUDA/MPS/CPU automatically.
 - Both modules are self-contained (no shared internal submodules yet); see
   [docs/architecture.md](docs/architecture.md) for why and when to split further.
 
-Details, gaps, and next steps: [docs/status.md](docs/status.md).
+Details, gaps, and next steps: [docs/status.md](docs/status.md). For how this
+repo itself was scaffolded (reusable for future projects):
+[docs/scaffolding_playbook.md](docs/scaffolding_playbook.md).
