@@ -1,0 +1,19 @@
+[project]
+name = "qcute"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "radenmuaz", email = "raden.m.muaz@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+qcute = "qcute:main"
+
+[build-system]
+requires = ["uv_build>=0.9.30,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
