@@ -179,3 +179,14 @@ every script with tiny `--steps`/`--n_bytes` before calling it done — this
 is how a bad default init producing nonsense loss on step 1 gets caught
 immediately instead of after a 30-minute run. Never `git commit`/`git push`
 unless explicitly asked for that specific commit/push.
+
+## 11. Claude response style — put it in `CLAUDE.md`, not just this file
+
+Session-specific conventions about *how Claude should reply* belong in
+`CLAUDE.md` under a `## Response format` heading, so they persist and apply
+automatically in future sessions rather than being re-stated each time —
+e.g. this repo's convention: prefix every reply with the current timestamp
+(`date`, never guessed). When a monitored background run is in progress,
+keep updates on new checkpoints short — one or two sentences stating the
+new value, the trend vs. the last checkpoint, and whether it changes
+anything actionable; don't re-derive or repeat prior analysis each time.
