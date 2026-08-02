@@ -139,40 +139,70 @@ Supersedes the old streaming-causal-encoder Phase 1 autoencoder, archived at
   generation finding) this project hit in practice. Computed on the LM's
   raw predicted latent (`v_pred`), not the encoder's; wired in as a
   training-loop-only term (see below), not baked into the model.
-- `ChunkEncoder`: byte-embed the K bytes, flatten, 2-layer MLP → bottleneck.
-  Deliberately non-causal within the chunk (a causal-TCN variant was tried
-  and reverted — see status.md — since the LM, not the chunk-local
+- `ChunkEncoder` / `ChunkDecoder`: per-position `byte_emb + pos_emb`
+  (decoder also broadcast-adds `z_proj(z)` to every position), then a
+  shared **`MixerBlock`** (mixer + optional post-mixer MLP, pre-norm
+  residual) before a final projection. `--mixer {attention,conv}` selects
+  the cross-K-position mixer: `FullSelfAttention` (full non-causal
+  self-attention over the K positions) or `FullConvMixer` (a single
+  non-causal 1D conv, `kernel_size=2K-1` with symmetric `padding=K-1` —
+  *not* `kernel_size=K`, which was tried first and is wrong: it gives only
+  one output position full coverage of all K inputs, the rest get an
+  inconsistent partial window; `2K-1` with symmetric padding guarantees
+  *every* output position's receptive field spans the entire real input
+  range, matching attention's actual coverage — see `FullConvMixer`'s
+  docstring). `--disable_mixer_mlp` tests the mixer alone.
+  Deliberately non-causal — a causal-TCN encoder variant was tried and
+  reverted earlier (see status.md) since the LM, not the chunk-local
   encoder/decoder, is what owns causality here; the chunk is always fully
-  observed before encoding, so hiding future bytes from earlier positions
-  bought nothing).
-  `ChunkDecoder`: **MaskGIT-style** (handover §1.4b), not one-shot
-  factorized CE — given `z` and a byte chunk with some positions replaced
-  by a MASK token (`byte_emb` table sized `vocab+1`), predicts the masked
-  positions from the unmasked ones + `z` via `byte_emb(x_masked) +
-  pos_emb + z_proj(z)` → small MLP → per-position logits. Training samples
-  a cosine mask-rate schedule per example (`maskgit_mask`, same as the
-  paper); loss is CE at the masked positions only (a heuristic training
-  loss, not a tight ELBO — the doc's own caveat, §1.4b: only the time-free-
-  masked-diffusion variant, not implemented here, gives a proper ELBO).
-  Inference uses `maskgit_decode`: `--maskgit_T` (default 4) confidence-
-  based refinement steps, cosine-paced reveal schedule, always revealing
-  everything by the final step. Replaces the old memoryless "predict all K
-  bytes independently from `z` alone" decoder, which couldn't model
-  intra-chunk byte correlations at all — directly targeting the decoder-
-  capacity bottleneck diagnosed across most of status.md's Phase 2 entries.
+  observed, so hiding future bytes from earlier positions bought nothing.
+  **`ChunkDecoder` is also MaskGIT-style** (handover §1.4b): given `z` and
+  a byte chunk with some positions replaced by a MASK token (`byte_emb`
+  table sized `vocab+1`), predicts the masked positions from the unmasked
+  ones + `z`. Training samples a cosine mask-rate schedule per example
+  (`maskgit_mask`); loss is CE at the masked positions only (a heuristic
+  training loss, not a tight ELBO — the doc's own caveat, §1.4b). Inference
+  uses `maskgit_decode`: `--maskgit_T` (default 4) confidence-based
+  refinement steps, cosine-paced reveal schedule.
+  **A real bug was found and fixed here**: an earlier `ChunkDecoder`
+  version's docstring claimed positions could condition on each other (the
+  entire point of MaskGIT), but its `forward()` applied a plain per-position
+  `Linear`/`GELU`/`Linear` MLP to `[N, K, d_byte]` — since `nn.Linear`
+  broadcasts over all but the last dimension, that was **zero** cross-
+  position mixing despite the docstring. This is now believed to be a
+  major cause of the "decoder bottleneck"/"stuck in a poor local optimum"
+  findings that recur throughout status.md's Phase 2 — a joint from-random-
+  init retest with the fixed decoder (`qcutelm_joint_bsq_noaux_fixedmix`)
+  roughly doubled `recon_acc` (13.5%→24-26%) versus the identical
+  pre-fix config, which had permanently plateaued. See status.md for the
+  full before/after comparison.
 - `LatentLM`: causal transformer over the code sequence, RoPE on Q/K
   (duplicated from `qcute/bytelm.py` rather than imported — see below).
-  Input is always a linear projection of `z_hat` (continuous) — chosen over
-  a discrete embedding-table lookup because BSQ's implicit codebook
-  (`2^dq` = 262144 at the default `dq=18`) would need a ~67M-param table,
-  dwarfing the rest of this ~3.5M-param model and inviting memorization on
-  a 500KB corpus. (A factorized/product-quantization-style embedding — e.g.
-  splitting `dq` bits into groups, each with its own small table — would
-  avoid that blowup and is a reasonable alternative; deliberately not done
-  yet, to keep the tightly-coupled rewrite below to one change at a time.)
-  Output: FSQ keeps per-dim categorical logits (unchanged); BSQ's head now
-  outputs a **raw dq-dim latent** (no `*L` reshape, no "logits" framing) —
-  see below for why.
+  Three input/output modes:
+  - **Continuous** (default): input is a linear projection of `z_hat`;
+    output is FSQ's per-dim categorical logits or BSQ's raw `dq`-dim
+    latent (no discrete embedding table — BSQ's implicit codebook, `2^dq`
+    = 262144 at the default `dq=18`, would need a ~67M-param table).
+  - **Discrete vocabulary** (`vocab_size=<int>`, used by `train_vocab_lm`
+    below): input is a plain `nn.Embedding(vocab_size, d_model)`, output is
+    a weight-tied categorical softmax over the vocab — exactly like
+    `qcute.bpelm`/`bytelm`. Only viable once a tokenizer is frozen (see
+    `build_code_vocab` below); has a real OOV/UNK problem (see status.md).
+  - **Factorized/PQ** (`--lm_factorized_input`, `FactorizedCodeEmbedding`):
+    input is a compositional embedding — one independently-learned vector
+    per `(dimension, level)` pair (`levels_per_dim`=2 for BSQ/LFQ bits,
+    `cfg.L` for FSQ), summed across the `dq` dimensions
+    (`Σᵢ table[i, value_i]`), instead of one shared linear direction per
+    dimension. Output format is unchanged from the continuous mode (still
+    per-dim logits) — this only swaps the input. Strictly more expressive
+    than the linear projection for binary dims (linear forces the two bit
+    values' contributions to be exact negations of one shared direction;
+    PQ lets them be fully independent), and — like the linear projection,
+    for the same reason: both are sums of independent per-dimension
+    terms — generalizes to any unseen *combination* of already-seen
+    per-dimension values with zero extra training, unlike the vocab-table
+    mode's OOV problem. Not yet combined with a full training run at
+    session's end; implemented and smoke-tested.
 - **FSQ path — unchanged, loosely coupled, interface Option A** (handover
   §2.1): `QCuteLM.forward()`'s FSQ branch decodes each chunk from the
   *encoder's own* code (`rec_loss`) and separately trains the LM to predict
@@ -215,9 +245,42 @@ Supersedes the old streaming-causal-encoder Phase 1 autoencoder, archived at
   the *default* (unweighted) loss — `main()`'s training loop can instead
   recombine the raw per-term losses in `forward()`'s returned `metrics`
   dict via `--uncertainty_weighting` (learned per-loss `log_var` scalars,
-  Kendall & Gal 2018) and/or `--entropy_reg_weight` (adds `bsq_entropy_reg`
-  on the LM's predicted latent). Both live in the training loop, not on
-  `QCuteLM`, since loss-combination is a training choice, not architecture.
+  Kendall & Gal 2018), `--entropy_reg_weight` (adds `bsq_entropy_reg` on the
+  LM's predicted latent), and/or `--disable_pred_loss` (drop `pred_loss`
+  entirely — `rec_loss`'s gradient still reaches the LM via `bsq_quantize`'s
+  STE, just without the explicit "match the true next code's bits"
+  constraint; `pred_loss`/`latent_acc` are still computed/logged, just
+  excluded from backward — an ablation testing whether that direct
+  code-level supervision helps or fights the reconstruction-driven
+  gradient). All three live in the training loop, not on `QCuteLM`, since
+  loss-combination is a training choice, not architecture.
+- **Optimizer**: all three of `qcutelm.py`'s `AdamW` instances (pretrain,
+  vocab-LM, main joint loop) now use `betas=(0.9, 0.95), weight_decay=0.1`,
+  matching `qcute/bytelm.py`/`qcute/bpelm.py` — previously they used plain
+  PyTorch defaults (`betas=(0.9,0.999)`, `weight_decay=0.01`), an
+  unexplained inconsistency across the three modules, now fixed.
+- **Frozen-tokenizer alternative pipeline** (`--freeze_after_pretrain`,
+  requires `--pretrain_ae`): the "dumber, simpler" alternative to joint
+  tightly-coupled training — pretrain encoder+decoder to convergence,
+  **freeze** them (the missing step vs. plain `--pretrain_ae`, which let
+  joint training erase the pretrained solution), then train a **separate,
+  plain categorical `LatentLM`** in discrete-vocabulary mode. `build_code_vocab`
+  encodes the whole corpus with the frozen encoder and collects the
+  distinct codes that actually occur (deduped on `targets`, the exact
+  discrete code — not `z_hat`, unsafe to hash as floats) into a vocabulary,
+  the same way BPE builds one from merges instead of embedding the full
+  combinatorial codebook. `encode_to_vocab_ids` maps chunks to vocab ids
+  (UNK for codes unseen in train — a real cost, e.g. ~17.6% UNK rate on
+  val for one tested tokenizer). `train_vocab_lm` trains the vocab-mode
+  `LatentLM` on the resulting id sequences, with a qualitative sample
+  logged every eval so training progress is visible as actual text, not
+  just bpb. Matches how FSQ/LFQ/BSQ papers train their downstream priors
+  in the literature (frozen tokenizer, then a separate categorical model)
+  — see status.md's literature-contrast discussion. Results so far:
+  tokenizer pretrain plateaus well short of very high fidelity (68-85%
+  `recon_acc` depending on mixer/LR/budget), and the downstream vocab-LM
+  phase overfits fast on this tiny corpus (train `bpb`→~0.05 while val
+  `bpb` climbs) — see status.md for the full trail.
 - `split_train_val()` / `eval_metrics()`: same pattern as `qcute/bytelm.py` — a
   held-out val split with periodic evaluation of all training metrics
   (recon/latent accuracy, bpb_total, bpb_lm_only, plus aux terms when
@@ -301,7 +364,8 @@ invocation whenever a run is worth being able to reproduce by name later.
 
 ## Known gaps vs. the full design (tracked in [status.md](status.md))
 
-- Encoder/decoder are non-streaming chunk-local MLPs, not the doc's
+- Encoder/decoder are non-streaming chunk-local (attention- or conv-mixed,
+  no longer plain MLPs — see the mixer-bug-fix entry above), not the doc's
   recommended causal-SSM encoder / streaming-SSM decoder (handover §1.3,
   §1.4.1) — chunk-boundary context is not shared across chunks.
 - Interface is Option A (cheapest, most drift-prone); the doc's recommended
@@ -317,3 +381,15 @@ invocation whenever a run is worth being able to reproduce by name later.
   uncertainty weighting (see status.md) — current wiring isn't right yet,
   needs a fixed small coefficient or warmup instead of free adaptive
   weighting.
+- The vocab-table LM mode (`train_vocab_lm`) has a real OOV/UNK problem
+  (codes unseen during vocab-building get no meaningful representation) —
+  `--lm_factorized_input` (`FactorizedCodeEmbedding`) is built specifically
+  to remove this, but not yet run end-to-end as a full training comparison.
+- `bpb_total`/`bpb_lm_only` aren't directly comparable across
+  `--disable_pred_loss` on vs. off: `bpb_pred` is derived straight from the
+  (possibly uncalibrated, when `pred_loss` isn't trained) raw BCE value,
+  not from actual decode quality — a `--disable_pred_loss` run can show a
+  much worse `bpb_total` than one with `pred_loss` on even when
+  `recon_acc` is actually better, since nothing calibrates `v_pred`'s
+  magnitude/probabilities without the BCE term. Compare `recon_acc`
+  directly across such runs, not `bpb_total`.

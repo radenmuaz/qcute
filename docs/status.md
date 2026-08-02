@@ -370,10 +370,58 @@ convergence either — smoke-tested only).
     baseline's ~9–11%, confirming the decoder-side fix does help on its
     own — but bpb only nudged down slightly (6.01→5.91), still short of
     the loosely-coupled baseline's 5.54 and the uncertainty-weighted
-    (pre-MaskGIT) run's 5.39. `logs/qcutelm_maskgit_lfq_aux/bpb.png`. Next:
-    combine MaskGIT with uncertainty weighting alone (no entropy_reg, given
-    that combination's demonstrated instability) to see if the two fixes
-    stack — not yet run.
+    (pre-MaskGIT) run's 5.39. `logs/qcutelm_maskgit_lfq_aux/bpb.png`.
+  - **A second, bigger decoder bug found and fixed: zero cross-position
+    mixing.** The MaskGIT decoder above still only modestly improved
+    `recon_acc` (13% vs. 9%) — investigating why turned up that
+    `ChunkDecoder.forward()` applied a plain per-position
+    `Linear`/`GELU`/`Linear` MLP to `[N, K, d_byte]`. Since `nn.Linear`
+    broadcasts over all leading dimensions, this was **literally zero**
+    mixing between the K positions — masked positions could never actually
+    see unmasked ones, despite the docstring's claim otherwise and despite
+    MaskGIT's entire premise depending on exactly that. Fixed with
+    `FullSelfAttention` (real non-causal self-attention over the K
+    positions) or `FullConvMixer` (single non-causal conv,
+    `kernel_size=2K-1`, symmetric `padding=K-1` — verified via gradient-
+    flow check that every output position now sees all K inputs; an
+    earlier `kernel_size=K` version was also tried and found wrong, same
+    class of bug, smaller scale — see architecture.md). Also added
+    `--disable_pred_loss` (drop the BCE code-supervision term entirely,
+    letting `rec_loss`'s STE gradient alone shape the LM), `--lm_factorized_input`
+    (`FactorizedCodeEmbedding`, a PQ-style compositional embedding — see
+    below), and matched `qcutelm.py`'s three `AdamW` instances to
+    `bytelm.py`/`bpelm.py`'s tuned settings (`betas=(0.9,0.95),
+    weight_decay=0.1`, previously plain PyTorch defaults).
+  - **Result, `qcutelm_joint_bsq_noaux_fixedmix`** (plain BSQ, no aux, no
+    uncertainty weighting/entropy_reg — the exact config of the original
+    `qcutelm_bsq_k4_tightlycoupled` no-aux baseline, just with the fixed
+    decoder): stabilizes at `recon_acc` **~24-26%** (a real plateau from
+    step ~5000 on, not still climbing) and val_bpb **~6.9-7.0** — vs. the
+    pre-fix baseline's permanent ceiling of 13.48% `recon_acc` and ~8.0-8.5
+    bpb that never budged. Roughly **2x** the reconstruction accuracy and
+    a real, stable (not accidental-early-dip) improvement — strong direct
+    evidence the mixing bug was a major cause of the decoder-bottleneck
+    finding that recurred across most of this section, though 24-26% is
+    still far from loosely-coupled's historical 72.76%, so it wasn't the
+    *whole* story either. `logs/qcutelm_joint_bsq_noaux_fixedmix/bpb.png`.
+  - **In progress, `qcutelm_joint_bsq_noaux_nopred_30m`**: same config
+    plus `--disable_pred_loss` (pure `rec_loss`-only training), extended to
+    a 30-minute/~46000-step budget specifically to watch for the
+    overfitting onset (previous runs used a fixed 10000-step convention
+    without checking whether that was even long enough to see convergence
+    dynamics play out). Early signal: `recon_acc` climbing *faster* than
+    with `pred_loss` on (~30-34% by step ~13000, vs. needing ~5000+ steps
+    to reach a similar level with `pred_loss`), but `latent_acc` collapsed
+    to ~50-51% (vs. ~80% with `pred_loss`) and `bpb_lm_only` is much worse
+    (~10 vs. ~2.5-2.8) — **not directly comparable to the `pred_loss`-on
+    run's bpb**, since `bpb_pred` is derived straight from the now-
+    uncalibrated raw BCE value, not from actual decode quality (see
+    architecture.md's new "Known gaps" entry). Compare `recon_acc`
+    directly instead. Full result (and overfit-onset finding) pending.
+  - **Rule added to CLAUDE.md**: only ever run one training job at a time
+    — running two concurrently on MPS was observed directly to stall one
+    of them at zero throughput (contention), not just slow both down
+    proportionally.
 - [ ] Go/no-go (BPB matches or beats BPE+MTP baseline at matched compute) —
       at the now-comparable 4-bytes/timestep numbers: bpelm (2.35) < bytelm
       (2.52) < qcutelm tightly-coupled lfq+aux+uncertainty-weighting (5.39,

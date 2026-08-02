@@ -216,14 +216,23 @@ def bsq_quantize(v: torch.Tensor, dq: int, lfq: bool = False) -> tuple[torch.Ten
     sphere step, sign the raw projection directly (hypercube corners
     {-1,+1}^dq instead of BSQ's hypersphere corners ||z_hat||=1). Sign bits
     (targets) are unaffected by normalization, so they're identical either
-    way — only z_hat's geometry/scale changes."""
+    way — only z_hat's geometry/scale changes.
+
+    `targets` is used elsewhere as a BCE/CE loss *label* (e.g. pred_loss),
+    so it must never carry gradient back into whatever produced `v`. The
+    `>` comparison already breaks the autograd graph on its own (PyTorch
+    doesn't attach a grad_fn to comparison ops), so this .detach() is
+    currently a no-op — kept explicit anyway so that stays true even if
+    this computation is ever changed to something differentiable (e.g. a
+    soft/temperature-based comparison), which would otherwise silently
+    leak a second gradient path into the encoder through the loss target."""
     if lfq:
         z_hat = v + (torch.sign(v) - v).detach()  # STE, no normalize/rescale
-        targets = (v > 0).float()
+        targets = (v > 0).float().detach()
         return z_hat, targets
     v_unit = F.normalize(v, dim=-1)
     z_hat = (v_unit + (torch.sign(v_unit) - v_unit).detach()) / math.sqrt(dq)  # STE
-    targets = (v_unit > 0).float()
+    targets = (v_unit > 0).float().detach()
     return z_hat, targets
 
 
@@ -996,7 +1005,7 @@ def pretrain_autoencoder(model: "QCuteLM", train_data: torch.Tensor, val_iter, a
     cfg = model.cfg
     device = next(model.parameters()).device
     ae_params = list(model.encoder.parameters()) + list(model.decoder.parameters())
-    opt = torch.optim.AdamW(ae_params, lr=args.pretrain_lr)
+    opt = torch.optim.AdamW(ae_params, lr=args.pretrain_lr, betas=(0.9, 0.95), weight_decay=0.1)
     train_iter = batch_iter(train_data, args.batch_size, args.seq_chunks, cfg.K, device)
 
     model.train()
@@ -1130,7 +1139,7 @@ def train_vocab_lm(
     n_params = sum(p.numel() for p in lm.parameters())
     log(f"vocab_lm: vocab_size={vocab_size} (incl. UNK) params={n_params/1e6:.2f}M K={cfg.K}")
 
-    opt = torch.optim.AdamW(lm.parameters(), lr=args.lr_peak)
+    opt = torch.optim.AdamW(lm.parameters(), lr=args.lr_peak, betas=(0.9, 0.95), weight_decay=0.1)
     context = args.seq_chunks
     train_iter = vocab_id_batch_iter(train_ids, args.batch_size, context, device)
     val_iter = vocab_id_batch_iter(val_ids, args.batch_size, context, device)
@@ -1478,7 +1487,7 @@ def main():
             log_var_entropy = nn.Parameter(torch.zeros((), device=device))
             extra_params.append(log_var_entropy)
 
-    opt = torch.optim.AdamW(list(model.parameters()) + extra_params, lr=args.lr_peak)
+    opt = torch.optim.AdamW(list(model.parameters()) + extra_params, lr=args.lr_peak, betas=(0.9, 0.95), weight_decay=0.1)
     train_iter = batch_iter(train_data, args.batch_size, args.seq_chunks, cfg.K, device)
     checkpointer = Checkpointer(args.checkpoint_dir / run_name, args.save_every_n_evals, minimize=True)
 
