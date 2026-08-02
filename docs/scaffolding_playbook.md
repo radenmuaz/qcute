@@ -67,11 +67,15 @@ losing the ability to override one flag ad hoc for a quick variant.
 Config files live in `configs/`, one per named experiment, with a docstring
 explaining what the experiment tests and the exact invocation.
 
-**b. Log-file naming falls back through three tiers**, most to least specific:
-explicit `--log_file` path → else `logs/<config_file_stem>_<timestamp>.log`
-if `--config` was given → else a formula from the CLI args themselves (e.g.
-`logs/qcute_lm_<preset>_<timestamp>.log`). Implement this as a plain
-if/elif/else in `main()`, not magic.
+**b. Run naming falls back through three tiers**, most to least specific:
+explicit `--run_name` → else the `--config` file's stem → else a formula
+from the CLI args themselves (e.g. `bytelm_<preset>_<timestamp>`).
+Implement this as a plain if/elif/else in `main()`, not magic. Give every
+run its own directory keyed by this name — `logs/<run_name>/` and
+`checkpoints/<run_name>/` — rather than flat files distinguished only by a
+long filename; it's what makes "find everything about run X" a single
+`ls`, and what lets the log and checkpoint file names themselves be boring
+(`run.log`, `best.pt`) since the directory already carries the identity.
 
 **c. Every run gets a `tqdm` progress bar *and* two logfiles**, both written
 only at `--log_every`/`--eval_every` intervals — never on every step, and
@@ -89,7 +93,20 @@ epoch timestamp, which isn't human-readable and isn't what anyone actually
 wants when reading a log back later.
 
 Implement this as a small `Logger` class, duplicated per-script like
-everything else in §3:
+everything else in §3. Two details worth calling out because they're easy
+to get wrong on a rewrite:
+
+- The `.log` file *is* "raw stdout, filtered to just the interval lines" —
+  don't reach for an OS-level `| tee | grep` pipeline to get that; tqdm's
+  bar already goes to stderr by default, and writing `line` here at the
+  same cadence as the terminal print is the filtering, done once, not
+  re-derived from a noisy captured stream after the fact.
+- In the JSON record, drop `msg` whenever `record` (the structured kwargs)
+  is non-empty — the string is just the parsed-out fields re-serialized as
+  text, so keeping both duplicates every number in the file twice. Keep
+  `msg` only for plain informational lines that carry no structured data
+  (e.g. `log(f"train_bytes={n}")` with no kwargs) — those would otherwise
+  vanish from the JSON entirely.
 
 ```python
 class Logger:
@@ -106,8 +123,8 @@ class Logger:
         line = f"[{format_hms(elapsed_s)}] {msg}"
         tqdm.write(line)
         self.text_f.write(line + "\n"); self.text_f.flush()
-        self.json_f.write(json.dumps({"elapsed_s": elapsed_s, "msg": msg, **record}) + "\n")
-        self.json_f.flush()
+        json_record = {"elapsed_s": elapsed_s, **({} if record else {"msg": msg}), **record}
+        self.json_f.write(json.dumps(json_record) + "\n"); self.json_f.flush()
 ```
 
 **d. Train/val split + periodic eval, always**, even for a quick script —

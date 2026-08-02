@@ -58,18 +58,21 @@ class Logger:
     line is prefixed with elapsed time since the Logger was created, as
     [HH:MM:SS], and the record also carries elapsed_s (int) / elapsed_hms.
 
-    Two logfiles, both written only at that same interval — tqdm's live bar
-    (constant \\r-redraws) never touches either file:
-      <path>.log   raw terminal text, exactly what's printed to stdout —
-                   `tail -f` this for a human-readable live view.
-      <path>.jsonl structured, one JSON record per line — for later plotting.
+    Writes into its own run directory (logs/<run_name>/), matching the
+    Checkpointer's checkpoints/<run_name>/ — keeps everything for one run
+    findable by run_name alone:
+      run.log   raw terminal text, exactly what's printed to stdout —
+                `tail -f` this for a human-readable live view.
+      run.jsonl structured, one JSON record per line — for later plotting.
+    Both written only at the log_every/eval_every interval — tqdm's live bar
+    (constant \\r-redraws) never touches either file.
     """
 
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.path = path
-        self.text_path = path.with_suffix(".log")
-        self.json_path = path.with_suffix(".jsonl")
+    def __init__(self, run_dir: Path):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self.run_dir = run_dir
+        self.text_path = run_dir / "run.log"
+        self.json_path = run_dir / "run.jsonl"
         self.text_f = open(self.text_path, "a")
         self.json_f = open(self.json_path, "a")
         self.start_time = time.time()
@@ -81,24 +84,25 @@ class Logger:
         tqdm.write(line)
         self.text_f.write(line + "\n")
         self.text_f.flush()
-        self.json_f.write(
-            json.dumps({"elapsed_s": elapsed_s, "elapsed_hms": elapsed_hms, "msg": msg, **record})
-            + "\n"
-        )
+        # msg is redundant once structured fields are present (they're the parsed-out
+        # version of the same text); keep it only for plain informational lines.
+        json_record = {"elapsed_s": elapsed_s, "elapsed_hms": elapsed_hms, **({} if record else {"msg": msg}), **record}
+        self.json_f.write(json.dumps(json_record) + "\n")
         self.json_f.flush()
 
 
 class Checkpointer:
-    """Saves two files under checkpoint_dir/<name>_{best,last}.pt: `best` is
-    overwritten only when the tracked val metric improves; `last` is
-    overwritten every `save_every_n_evals` eval calls (default 1, i.e. every
-    eval). Each checkpoint carries the model/optimizer state, step, cfg (as
-    a dict, to rebuild the model architecture on load), and the metric."""
+    """Saves two files in its own run directory (checkpoints/<run_name>/,
+    matching the Logger's logs/<run_name>/): `best.pt` is overwritten only
+    when the tracked val metric improves; `last.pt` is overwritten every
+    `save_every_n_evals` eval calls (default 1, i.e. every eval). Each
+    checkpoint carries the model/optimizer state, step, cfg (as a dict, to
+    rebuild the model architecture on load), and the metric."""
 
-    def __init__(self, ckpt_dir: Path, name: str, save_every_n_evals: int = 1, minimize: bool = True):
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.best_path = ckpt_dir / f"{name}_best.pt"
-        self.last_path = ckpt_dir / f"{name}_last.pt"
+    def __init__(self, run_dir: Path, save_every_n_evals: int = 1, minimize: bool = True):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self.best_path = run_dir / "best.pt"
+        self.last_path = run_dir / "last.pt"
         self.save_every_n_evals = max(1, save_every_n_evals)
         self.minimize = minimize
         self.best_metric = float("inf") if minimize else float("-inf")
@@ -118,7 +122,13 @@ class Checkpointer:
 
 @dataclass
 class Config:
-    K: int = 8                  # bytes per chunk
+    # K=4, not the handover doc's K=8 default: on this tiny 500KB corpus,
+    # qcute.bpelm (the fair comparison point) only reaches ~3-4 bytes/token
+    # before larger vocabs start memorizing phrases (see scripts/train_bpe.py)
+    # — targeting K=8 here would be a bandwidth mismatch at this corpus
+    # scale. Revisit at full-enwik8 scale, where K=8 becomes achievable
+    # (see qcute/bytelm.py's PRESETS comment for the same reasoning).
+    K: int = 4                   # bytes per chunk
     bottleneck: str = "fsq"     # "fsq" or "bsq"
     dq: int = 6                 # bottleneck dims (FSQ default; BSQ default is 18, see build_config)
     L: int = 8                  # FSQ levels per dim (unused for BSQ)
@@ -560,7 +570,7 @@ def main():
     p = argparse.ArgumentParser(description="qcute end-to-end tokenizer+LM (FSQ/BSQ, Option A)", parents=[pre])
     p.add_argument("--bottleneck", choices=["fsq", "bsq"], default="fsq")
     p.add_argument("--dq", type=int, default=None, help="defaults: 6 for fsq, 18 for bsq")
-    p.add_argument("--K", type=int, default=8)
+    p.add_argument("--K", type=int, default=4)  # see Config.K's comment for why 4, not the doc's 8
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8.gz"))
     p.add_argument("--n_bytes", type=int, default=2_000_000, help="prefix of enwik8 to load")
     p.add_argument("--val_frac", type=float, default=0.1)
@@ -573,9 +583,10 @@ def main():
     p.add_argument("--eval_every", type=int, default=200)
     p.add_argument("--eval_batches", type=int, default=10)
     p.add_argument(
-        "--log_file", type=Path, default=None,
-        help="explicit path; falls back to the --config filename, then logs/qcute_tokenizer_<bottleneck>_<timestamp>"
+        "--run_name", type=str, default=None,
+        help="run directory name under logs/ and checkpoints/; falls back to the --config filename, then qcutelm_<bottleneck>_<timestamp>"
     )
+    p.add_argument("--logs_dir", type=Path, default=Path("logs"))
     p.add_argument("--checkpoint_dir", type=Path, default=Path("checkpoints"))
     p.add_argument("--save_every_n_evals", type=int, default=1, help="write the 'last' checkpoint every N eval() calls")
     p.add_argument("--eval_only", action="store_true", help="skip training; load --checkpoint_path and just evaluate")
@@ -612,14 +623,14 @@ def main():
         start_step = 0
     n_params = sum(p_.numel() for p_ in model.parameters())
 
-    if args.log_file:
-        log_path = args.log_file
+    if args.run_name:
+        run_name = args.run_name
     elif pre_args.config:
-        log_path = Path(f"logs/{pre_args.config.stem}_{int(time.time())}.log")
+        run_name = pre_args.config.stem
     else:
-        log_path = Path(f"logs/qcute_tokenizer_{args.bottleneck}_{int(time.time())}.log")
-    log = Logger(log_path)
-    print(f"logging to {log.text_path} (raw text) / {log.json_path} (JSONL) — tail -f {log.text_path}")
+        run_name = f"qcutelm_{args.bottleneck}_{int(time.time())}"
+    log = Logger(args.logs_dir / run_name)
+    print(f"run_name={run_name}  logging to {log.text_path} (raw text) / {log.json_path} (JSONL) — tail -f {log.text_path}")
     loaded_note = f"  loaded_from={args.checkpoint_path} (step {start_step})" if args.checkpoint_path else ""
     log(f"bottleneck={cfg.bottleneck} dq={cfg.dq} params={n_params/1e6:.2f}M device={device}" + loaded_note)
 
@@ -640,8 +651,7 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr_peak)
     train_iter = batch_iter(train_data, args.batch_size, args.seq_chunks, cfg.K, device)
-    ckpt_name = log_path.stem
-    checkpointer = Checkpointer(args.checkpoint_dir, ckpt_name, args.save_every_n_evals, minimize=True)
+    checkpointer = Checkpointer(args.checkpoint_dir / run_name, args.save_every_n_evals, minimize=True)
 
     model.train()
     pbar = tqdm(range(1, args.steps + 1), desc="train", dynamic_ncols=True)
@@ -661,12 +671,12 @@ def main():
         )
         if step % args.log_every == 0:
             msg = (
-                f"step {step:5d}  lr {lr:.2e}  loss {loss.item():.4f}  rec {metrics['rec_loss'].item():.4f}"
+                f"lr {lr:.2e}  loss {loss.item():.4f}  rec {metrics['rec_loss'].item():.4f}"
                 f"  pred {metrics['pred_loss'].item():.4f}  recon_acc {metrics['recon_acc'].item()*100:.2f}%"
                 f"  latent_acc {metrics['latent_acc'].item()*100:.2f}%"
                 f"  bpb {metrics['bpb_total'].item():.4f}  bpb_lm_only {metrics['bpb_lm_only'].item():.4f}"
             )
-            log(msg, step=step, lr=lr, **{k: v.item() for k, v in metrics.items()})
+            log(f"{msg}  {pbar}", step=step, lr=lr, **{k: v.item() for k, v in metrics.items()})
         if step % args.eval_every == 0 or step == args.steps:
             val = eval_metrics(model, val_iter, args.eval_batches)
             msg = (

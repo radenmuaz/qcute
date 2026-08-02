@@ -21,15 +21,20 @@ uv run python -m qcute.bytelm --preset xs --data datasets/enwik8_tiny.gz  # quic
 # end-to-end tokenizer + latent LM (encoder + FSQ/BSQ + LM + decoder, jointly trained)
 uv run python -m qcute.qcutelm --bottleneck bsq --data datasets/enwik8_tiny.gz --qual_gen_bytes 64
 
+# BPE baseline (handover §1.6's BPE half) — train the tokenizer first
+uv run python scripts/train_bpe.py --data datasets/enwik8_tiny.gz
+uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_tiny_8192.model --data datasets/enwik8_tiny.gz
+
 # or via a named, reproducible config (CLI flags still override individual values)
 uv run python -m qcute.bytelm --config configs/bytelm_xs_tiny_longrun.py
 uv run python -m qcute.qcutelm --config configs/qcutelm_bsq_tiny.py
+uv run python -m qcute.bpelm --config configs/bpelm_tiny.py
 
 # evaluate a saved checkpoint only, no training
 uv run python -m qcute.bytelm --eval_only --checkpoint_path checkpoints/<name>_best.pt --data datasets/enwik8_tiny.gz
 ```
 
-Both modules run on CUDA/MPS/CPU automatically.
+All three modules run on CUDA/MPS/CPU automatically.
 
 ## So far
 
@@ -46,14 +51,22 @@ Both modules run on CUDA/MPS/CPU automatically.
   back directly, no re-encoding). Non-streaming chunk-local MLP encoder/
   decoder, simplified vs. the doc's causal-SSM design — see
   [docs/architecture.md](docs/architecture.md).
-- Both scripts support: a `--config <file.py>` (see `configs/`) with CLI
+- `qcute/bpelm.py`: the BPE half of handover §1.6's BPE+MTP baseline (no
+  MTP here — bytelm covers that half) — a sentencepiece-BPE-tokenized
+  causal transformer, same trunk as bytelm, with exact byte-weighted BPB
+  (not the naive mean-tokens-per-avg-token-length approximation) so it's
+  genuinely comparable to the other two. Needs `scripts/train_bpe.py` run
+  first.
+- All three scripts support: a `--config <file.py>` (see `configs/`) with CLI
   flags overriding individual config values; checkpointing (`checkpoints/`,
   gitignored) that keeps the best-so-far and most-recent model, plus
-  `--eval_only --checkpoint_path ...` to evaluate without training;
-  `--qual_gen_bytes` for qualitative generation — a prompt (from train/val
-  data or `--qual_user_text`) alongside the model's continuation, the real
-  ground-truth continuation when available, and the model's bpb on it.
-- Both modules are self-contained (no shared internal submodules); see
+  `--eval_only --checkpoint_path ...` to evaluate without training.
+  `qcute.bytelm`/`qcute.qcutelm` additionally support `--qual_gen_bytes` for
+  qualitative generation — a prompt (from train/val data or
+  `--qual_user_text`) alongside the model's continuation, the real
+  ground-truth continuation when available, and the model's bpb on it
+  (`qcute.bpelm` doesn't have this yet — narrower scope for now).
+- All three modules are self-contained (no shared internal submodules); see
   [docs/architecture.md](docs/architecture.md) for why and when to split further.
 - Superseded design (streaming-causal-encoder standalone autoencoder,
   no LM) kept for reference in `archive/`.

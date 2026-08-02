@@ -1,12 +1,13 @@
 # Architecture
 
-Two self-contained modules in the `qcute/` package: `qcute/bytelm.py` and
-`qcute/qcutelm.py`. Neither imports the other or shares a common name with
-the package itself (an earlier top-level `qcute.py` next to the `qcute/`
-package collided on `import qcute` — renamed; `qcute/bytelm.py` inlines its own
-tiny `load_enwik8` rather than importing it from `qcute/qcutelm.py`, to
-keep the two independent). Merge them once a third module needs to reuse
-encoder/decoder/LM pieces.
+Three self-contained modules in the `qcute/` package: `qcute/bytelm.py`,
+`qcute/qcutelm.py`, and `qcute/bpelm.py`. None import each other or share a
+common name with the package itself (an earlier top-level `qcute.py` next
+to the `qcute/` package collided on `import qcute` — renamed; each module
+inlines its own tiny data-loading/Logger/Checkpointer helpers rather than
+importing from the others, to keep them independent). Merge shared pieces
+into a `qcute/utils.py` once there's a fourth reason to (see each module's
+docstring for which pieces are safe-to-share candidates vs. deliberately not).
 
 See [continuous_tokenizer_handover.md](continuous_tokenizer_handover.md) for
 the full design this implements, and [status.md](status.md) for what's done.
@@ -15,22 +16,26 @@ Both scripts' `main()` follow the same (duplicated, not shared — see
 docstrings for the extraction candidates identified but not yet acted on)
 conventions:
 
+- **Run naming**: every run gets a `run_name`, resolved as `--run_name`
+  (explicit) → `--config`'s filename stem → a script-specific default
+  formula (`bytelm_<preset>_<timestamp>`, `qcutelm_<bottleneck>_<timestamp>`,
+  `bpelm_<timestamp>`). Logging and checkpointing both key off the same
+  `run_name`, so everything for one run lives under one findable name.
 - **Logging**: a `tqdm` progress bar for live terminal feedback; at
   `--log_every`/`--eval_every`, `Logger` writes the same line to *both*
-  `logs/<name>.log` (raw text, `tail -f` from another terminal) and
-  `logs/<name>.jsonl` (structured, one record per line, prefixed with
-  elapsed `[HH:MM:SS]` / `elapsed_s` rather than a raw epoch timestamp).
-  `<name>` resolves as `--log_file` (explicit) → `--config`'s filename stem
-  → a script-specific default formula. `logs/` is gitignored.
+  `logs/<run_name>/run.log` (raw text, `tail -f` from another terminal) and
+  `logs/<run_name>/run.jsonl` (structured, one record per line, prefixed
+  with elapsed `[HH:MM:SS]` / `elapsed_s` rather than a raw epoch
+  timestamp). `logs/` is gitignored.
 - **Config files**: `--config path/to/file.py` loads a plain Python module
   (see `configs/`) whose module-level variables become new argparse
   defaults (`load_config_module` + `parser.set_defaults(...)`, filtered to
   known flags) — **CLI flags still override config file values**, which
   override the script's hardcoded defaults. Two-pass parse: a small
   pre-parser reads just `--config` before the full parser is built.
-- **Checkpointing**: `Checkpointer` saves `checkpoints/<name>_best.pt`
+- **Checkpointing**: `Checkpointer` saves `checkpoints/<run_name>/best.pt`
   (overwritten only when the tracked val metric improves) and
-  `checkpoints/<name>_last.pt` (overwritten every `--save_every_n_evals`
+  `checkpoints/<run_name>/last.pt` (overwritten every `--save_every_n_evals`
   eval calls, default every eval). Each checkpoint carries model + optimizer
   state, step, and `cfg` as a dict (`dataclasses.asdict`) so `--eval_only
   --checkpoint_path ...` can rebuild the exact architecture without needing
@@ -53,9 +58,15 @@ conventions:
 The Phase 0 "number to beat" (handover §5, Phase 0) — but specifically the
 *strong* one, BPE+MTP (handover §1.6), adapted to raw bytes: a causal
 transformer with `mtp_heads` parallel output heads predicting bytes
-t+1..t+n from one trunk pass, bandwidth-matched to `qcute.qcutelm`'s
-default `K=8` (`mtp_heads` defaults to 8) so BPB and generation latency are
-comparable at matched bandwidth between the two scripts.
+t+1..t+n from one trunk pass, bandwidth-matched to `qcute.qcutelm`'s `K`
+and `qcute.bpelm`'s bytes/token so BPB and generation latency are
+comparable at matched bandwidth across all three. `mtp_heads`/`K` default
+to **4** at tiny-corpus scale (the `xs` preset), not the handover doc's
+8 — empirically, BPE (the fair comparison point) only reaches ~3-4
+bytes/token on a 450,000-byte corpus before larger vocabs start
+memorizing phrases (see `scripts/train_bpe.py`'s docstring), so targeting
+8 there would be a bandwidth mismatch specific to this corpus scale.
+`sd`/`md` keep 8, matching the doc's full-corpus-scale default.
 
 - `ByteLM`: pre-norm transformer blocks, RoPE on Q/K (`rope_cos_sin` /
   `apply_rope`), `F.scaled_dot_product_attention(is_causal=True)`,
@@ -144,21 +155,65 @@ Still independent of `qcute/bytelm.py` (no shared imports, including RoPE/attent
 code, which is duplicated rather than factored out) — see the top of this
 file for why.
 
+## `qcute/bpelm.py` — BPE baseline
+
+Handover §1.6 names BPE+MTP as the strong baseline; `qcute/bytelm.py` is
+byte+MTP, so this module is the BPE half in isolation — a plain causal
+transformer (same trunk as bytelm: pre-norm, RoPE, weight-tied head,
+GPT-2-style init) over BPE token ids, **no MTP head** (bandwidth comes
+purely from BPE merging here, by explicit choice, not stacked). Requires a
+tokenizer trained via `scripts/train_bpe.py` (sentencepiece, BPE mode)
+first — `--vocab_size` (default 8192, power-of-2) targets ~4 bytes/timestep
+to match bytelm/qcutelm's tiny-corpus-scale default, reaching ~3.3
+bytes/token on the tiny corpus (see the script's docstring: larger vocabs
+on a 450KB corpus start memorizing phrases instead of generalizing — a
+corpus-size ceiling, not a config problem; and even at full-corpus scale,
+8 bytes/token is optimistic for natural-language BPE — typical scaling
+tops out closer to 5-6, not 8).
+
+- **Lossless tokenizer, not sentencepiece's NLP-oriented defaults.**
+  `scripts/train_bpe.py` trains with `normalization_rule_name="identity"`,
+  `remove_extra_whitespaces=False`, `byte_fallback=True`, and
+  `add_dummy_prefix=False` — sentencepiece's normal defaults (NFKC
+  normalization, whitespace collapsing, a synthetic leading space) silently
+  drop information (verified empirically: encode→decode roundtrip changed
+  `\n` to `" "` and lost bytes), which would make any downstream bpb claim
+  false, not just approximate. The training script asserts a roundtrip
+  check (`sp.decode(sp.encode(text)) == text`) and hard-fails if it doesn't
+  hold — a lossy tokenizer isn't a `bpelm` config problem, it's a "don't use
+  this .model file" problem.
+- `build_byte_len_table()` / `bits_per_byte()`: BPB here isn't
+  `mean_token_nats / avg_bytes_per_token` (biased, since common tokens tend
+  to be short and rare tokens long) — it's the exact
+  `sum(token_nats) / sum(that_token's_real_utf8_byte_length)`, computed via
+  a precomputed per-token-id byte-length lookup table, **verified to sum to
+  the exact original corpus byte count** (byte-fallback pieces like
+  `<0x0A>` need special-casing to 1 byte each — their literal 6-character
+  string form would otherwise be miscounted). This is what makes bpelm's
+  bpb genuinely comparable to bytelm's and qcutelm's, not an estimate.
+- Same `--config`, `Checkpointer`, `--eval_only`, and `lr_at` schedule as
+  the other two, for a fair three-way comparison. No qualitative-generation
+  or speculative-decoding support yet (narrower scope than bytelm/qcutelm
+  — extend if needed).
+
 ## Data
 
 `scripts/prepare_data.py` downloads `datasets/enwik8.gz` (~35MB, skipped if
 present) and cuts `datasets/enwik8_tiny.gz` (a 500,000-byte prefix, gzip'd,
-`--tiny_bytes` to change the size) for fast local/smoke runs — both
-`qcute.bytelm` and `qcute.qcutelm` accept either via `--data`.
+`--tiny_bytes` to change the size) for fast local/smoke runs.
+`scripts/train_bpe.py` trains the sentencepiece tokenizer `qcute.bpelm`
+needs, from either. All three training modules accept `--data`.
 
 ## Configs
 
 `configs/` holds named, reproducible experiments as plain Python files (see
 the config-file bullet above) — e.g. `bytelm_xs_tiny_longrun.py` (the
-double-descent exploration run: `xs` preset, tiny dataset, 25000 steps) and
-`qcutelm_bsq_tiny.py` (matched-bandwidth BSQ companion). Add a new file here
-rather than a long inline CLI invocation whenever a run is worth being able
-to reproduce by name later.
+double-descent exploration run: `xs` preset, tiny dataset, 25000 steps),
+`qcutelm_bsq_tiny.py` (matched-bandwidth BSQ companion), and
+`bpelm_tiny.py` (the BPE companion — needs `datasets/bpe_enwik8_tiny_8192.model`
+from `scripts/train_bpe.py` first). Add a new file here rather than a long
+inline CLI invocation whenever a run is worth being able to reproduce by
+name later.
 
 ## Known gaps vs. the full design (tracked in [status.md](status.md))
 

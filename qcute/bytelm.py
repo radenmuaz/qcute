@@ -8,14 +8,17 @@ no VAE overhead. This is that baseline, byte-level: plain pre-norm
 transformer, rotary position embeddings, causal self-attention, `mtp_heads`
 parallel output heads (head 0 weight-tied, matching standard practice; the
 rest untied) predicting bytes t+1..t+n from the same trunk hidden state.
-`mtp_heads` defaults to 8 to match qcute.qcutelm's default K, so the two
-are comparable at matched bandwidth. Reports exact bits-per-byte from head 0
-(the standard next-byte metric) — no ELBO needed, unlike the FSQ/BSQ
+`mtp_heads` targets matched bandwidth against qcute.qcutelm's `K` and
+qcute.bpelm's bytes/token — 4 for `xs` (tiny-corpus-scale, see PRESETS
+comment for why 8 was a mismatch there), 8 for `sd`/`md` (full-corpus scale,
+matching the handover doc's §6.1 default). Reports exact bits-per-byte from
+head 0 (the standard next-byte metric) — no ELBO needed, unlike the FSQ/BSQ
 bottleneck in qcute.qcutelm.
 
-Two power-of-2-friendly presets (see PRESETS below):
-  sd  ~100M params : d_model=1024, layers=8,  heads=16, head_dim=64,  ctx=2048
-  md  ~400M params : d_model=2048, layers=8,  heads=16, head_dim=128, ctx=2048
+Three power-of-2-friendly presets (see PRESETS below):
+  xs  ~3.7M params  : d_model=256,  layers=4, heads=4,  head_dim=64,  ctx=256,  mtp_heads=4
+  sd  ~100M params  : d_model=1024, layers=8, heads=16, head_dim=64,  ctx=2048, mtp_heads=8
+  md  ~400M params  : d_model=2048, layers=8, heads=16, head_dim=128, ctx=2048, mtp_heads=8
 `--context`/`--mtp_heads` override the preset for quick experiments.
 
 Deliberately monolithic (one module, no internal submodules) for now.
@@ -60,18 +63,21 @@ class Logger:
     line is prefixed with elapsed time since the Logger was created, as
     [HH:MM:SS], and the record also carries elapsed_s (int) / elapsed_hms.
 
-    Two logfiles, both written only at that same interval — tqdm's live bar
-    (constant \\r-redraws) never touches either file:
-      <path>.log   raw terminal text, exactly what's printed to stdout —
-                   `tail -f` this for a human-readable live view.
-      <path>.jsonl structured, one JSON record per line — for later plotting.
+    Writes into its own run directory (logs/<run_name>/), not loose files in
+    logs/ — keeps everything for one run (plus its checkpoints, in the
+    matching checkpoints/<run_name>/) findable by run_name alone:
+      run.log   raw terminal text, exactly what's printed to stdout —
+                `tail -f` this for a human-readable live view.
+      run.jsonl structured, one JSON record per line — for later plotting.
+    Both written only at the log_every/eval_every interval — tqdm's live bar
+    (constant \\r-redraws) never touches either file.
     """
 
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.path = path
-        self.text_path = path.with_suffix(".log")
-        self.json_path = path.with_suffix(".jsonl")
+    def __init__(self, run_dir: Path):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self.run_dir = run_dir
+        self.text_path = run_dir / "run.log"
+        self.json_path = run_dir / "run.jsonl"
         self.text_f = open(self.text_path, "a")
         self.json_f = open(self.json_path, "a")
         self.start_time = time.time()
@@ -83,24 +89,25 @@ class Logger:
         tqdm.write(line)
         self.text_f.write(line + "\n")
         self.text_f.flush()
-        self.json_f.write(
-            json.dumps({"elapsed_s": elapsed_s, "elapsed_hms": elapsed_hms, "msg": msg, **record})
-            + "\n"
-        )
+        # msg is redundant once structured fields are present (they're the parsed-out
+        # version of the same text); keep it only for plain informational lines.
+        json_record = {"elapsed_s": elapsed_s, "elapsed_hms": elapsed_hms, **({} if record else {"msg": msg}), **record}
+        self.json_f.write(json.dumps(json_record) + "\n")
         self.json_f.flush()
 
 
 class Checkpointer:
-    """Saves two files under checkpoint_dir/<name>_{best,last}.pt: `best` is
-    overwritten only when the tracked val metric improves; `last` is
-    overwritten every `save_every_n_evals` eval calls (default 1, i.e. every
-    eval). Each checkpoint carries the model/optimizer state, step, cfg (as
-    a dict, to rebuild the model architecture on load), and the metric."""
+    """Saves two files in its own run directory (checkpoints/<run_name>/,
+    matching the Logger's logs/<run_name>/): `best.pt` is overwritten only
+    when the tracked val metric improves; `last.pt` is overwritten every
+    `save_every_n_evals` eval calls (default 1, i.e. every eval). Each
+    checkpoint carries the model/optimizer state, step, cfg (as a dict, to
+    rebuild the model architecture on load), and the metric."""
 
-    def __init__(self, ckpt_dir: Path, name: str, save_every_n_evals: int = 1, minimize: bool = True):
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.best_path = ckpt_dir / f"{name}_best.pt"
-        self.last_path = ckpt_dir / f"{name}_last.pt"
+    def __init__(self, run_dir: Path, save_every_n_evals: int = 1, minimize: bool = True):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self.best_path = run_dir / "best.pt"
+        self.last_path = run_dir / "last.pt"
         self.save_every_n_evals = max(1, save_every_n_evals)
         self.minimize = minimize
         self.best_metric = float("inf") if minimize else float("-inf")
@@ -142,7 +149,13 @@ class LMConfig:
 
 PRESETS: dict[str, LMConfig] = {
     # ~12 * d_model^2 * n_layers non-embedding params (vocab=256 is negligible)
-    "xs": LMConfig(d_model=256, n_layers=4, n_heads=4, context=256),      # ~3.7M, for quick local runs
+    # xs: mtp_heads=4, not the default 8 — on a tiny corpus, BPE (qcute.bpelm's
+    # fair comparison point) only reaches ~4 bytes/token before larger vocabs
+    # start memorizing phrases rather than generalizing (see scripts/train_bpe.py),
+    # so targeting 8 bytes/timestep here would be an unfair bandwidth mismatch.
+    # sd/md keep mtp_heads=8, matched to qcute.qcutelm's K=8 and the handover
+    # doc's full-corpus-scale default (§6.1) — 8 becomes achievable there.
+    "xs": LMConfig(d_model=256, n_layers=4, n_heads=4, context=256, mtp_heads=4),  # ~3.7M, for quick local runs
     "sd": LMConfig(d_model=1024, n_layers=8, n_heads=16, context=2048),   # ~101M
     "md": LMConfig(d_model=2048, n_layers=8, n_heads=16, context=2048),   # ~403M
 }
@@ -488,9 +501,10 @@ def main():
         help="if >0, after training benchmark plain-AR vs. self-speculative (MTP-head draft) generation latency"
     )
     p.add_argument(
-        "--log_file", type=Path, default=None,
-        help="explicit path; falls back to the --config filename, then logs/qcute_lm_<preset>_<timestamp>"
+        "--run_name", type=str, default=None,
+        help="run directory name under logs/ and checkpoints/; falls back to the --config filename, then bytelm_<preset>_<timestamp>"
     )
+    p.add_argument("--logs_dir", type=Path, default=Path("logs"))
     p.add_argument("--checkpoint_dir", type=Path, default=Path("checkpoints"))
     p.add_argument("--save_every_n_evals", type=int, default=1, help="write the 'last' checkpoint every N eval() calls")
     p.add_argument("--eval_only", action="store_true", help="skip training; load --checkpoint_path and just evaluate")
@@ -530,14 +544,14 @@ def main():
         model = ByteLM(cfg).to(device)
         start_step = 0
 
-    if args.log_file:
-        log_path = args.log_file
+    if args.run_name:
+        run_name = args.run_name
     elif pre_args.config:
-        log_path = Path(f"logs/{pre_args.config.stem}_{int(time.time())}.log")
+        run_name = pre_args.config.stem
     else:
-        log_path = Path(f"logs/qcute_lm_{args.preset}_{int(time.time())}.log")
-    log = Logger(log_path)
-    print(f"logging to {log.text_path} (raw text) / {log.json_path} (JSONL) — tail -f {log.text_path}")
+        run_name = f"bytelm_{args.preset}_{int(time.time())}"
+    log = Logger(args.logs_dir / run_name)
+    print(f"run_name={run_name}  logging to {log.text_path} (raw text) / {log.json_path} (JSONL) — tail -f {log.text_path}")
     preset_label = f"loaded_from={args.checkpoint_path} (step {start_step})" if args.checkpoint_path else f"preset={args.preset}"
     log(
         f"{preset_label}  params={count_params(model)/1e6:.1f}M  device={device}"
@@ -555,8 +569,7 @@ def main():
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(0.9, 0.95), weight_decay=0.1)
         train_iter = batch_iter(train_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
-        ckpt_name = log_path.stem
-        checkpointer = Checkpointer(args.checkpoint_dir, ckpt_name, args.save_every_n_evals, minimize=True)
+        checkpointer = Checkpointer(args.checkpoint_dir / run_name, args.save_every_n_evals, minimize=True)
 
         model.train()
         pbar = tqdm(range(1, args.steps + 1), desc="train", dynamic_ncols=True)
@@ -577,7 +590,7 @@ def main():
             pbar.set_postfix(loss=f"{loss.item():.3f}", bpb=f"{head0_bpb.item():.3f}")
             if step % args.log_every == 0:
                 log(
-                    f"step {step:5d}  lr {lr:.2e}  mtp_loss {loss.item():.4f}  bpb {head0_bpb.item():.4f}",
+                    f"lr {lr:.2e}  mtp_loss {loss.item():.4f}  bpb {head0_bpb.item():.4f}  {pbar}",
                     step=step, lr=lr, mtp_loss=loss.item(), bpb=head0_bpb.item(),
                 )
             if step % args.eval_every == 0 or step == args.steps:
