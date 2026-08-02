@@ -32,6 +32,24 @@ def load_records(jsonl_path: Path) -> list[dict]:
     return records
 
 
+def last_segment(records: list[dict]) -> list[dict]:
+    """If a run was stopped and relaunched with the same run_name, its
+    logfile is append-only (Logger opens with "a"), so it can contain
+    multiple runs' records back to back — each new attempt's elapsed_s
+    resets toward 0. Plotting all of them as one connected line zigzags
+    backward in step at each restart. Keep only the last (most recent, i.e.
+    the actual final) attempt's records, split at any point elapsed_s drops
+    below the previous record's."""
+    start = 0
+    prev_elapsed = -1
+    for i, r in enumerate(records):
+        e = r.get("elapsed_s", prev_elapsed + 1)
+        if e < prev_elapsed:
+            start = i
+        prev_elapsed = e
+    return records[start:]
+
+
 def extract_series(records: list[dict], keys: tuple[str, ...]) -> tuple[list[int], list[float]]:
     steps, values = [], []
     for r in records:
@@ -53,6 +71,7 @@ def main() -> None:
 
     jsonl_path = args.run_path / "run.jsonl" if args.run_path.is_dir() else args.run_path
     records = load_records(jsonl_path)
+    records = last_segment(records)
 
     train_steps, train_bpb = extract_series(records, TRAIN_KEYS)
     val_steps, val_bpb = extract_series(records, VAL_KEYS)

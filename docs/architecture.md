@@ -119,35 +119,112 @@ Supersedes the old streaming-causal-encoder Phase 1 autoencoder, archived at
 
 - `FSQ` / `BSQ` (handover §1.2.2 / §1.2.3): selectable via `--bottleneck`.
   FSQ default `dq=6, L=8` (codebook `8^6`); BSQ default `dq=18` (codebook
-  `2^18`). Both straight-through; `FSQ.forward` and `BSQ.forward` return
-  both the STE-quantized `z_hat` (fed to the LM/decoder) and the discrete
-  targets (levels for FSQ, bits for BSQ) the LM head is trained against.
+  `2^18`). Both straight-through. `bsq_quantize(v, dq, lfq)` is BSQ's
+  quantization math (normalize + sign STE) factored out to a module-level
+  function — reused by both the encoder's `BSQ.forward` (applied to its own
+  learned projection) and the LM's output head (applied directly to the
+  LM's raw predicted latent, no separate learned projection) — same
+  quantization boundary, two different producers. `lfq=True` (`--lfq`)
+  regresses BSQ to plain LFQ (Yu et al. 2023): skip the L2-normalize-onto-
+  hypersphere step, sign the raw projection directly (hypercube corners
+  `{-1,+1}^dq`, unscaled, vs. BSQ's hypersphere corners `||z_hat||=1`).
+  Sign bits (targets) are identical either way, only `z_hat`'s scale
+  changes — but that scale difference turned out to matter a lot in
+  practice (see status.md's gradient-norm diagnosis: LFQ's larger `z_hat`
+  magnitude produces vastly larger decoder gradients than BSQ's).
+  `bsq_entropy_reg(v)` is the LFQ/BSQ-paper entropy regularizer (Yu et al.
+  2023 §3.2) neither paper's technique actually works without — minimize
+  per-example bit entropy, maximize batch-averaged bit-usage entropy,
+  countering the code-usage collapse that (per status.md's qualitative-
+  generation finding) this project hit in practice. Computed on the LM's
+  raw predicted latent (`v_pred`), not the encoder's; wired in as a
+  training-loop-only term (see below), not baked into the model.
 - `ChunkEncoder`: byte-embed the K bytes, flatten, 2-layer MLP → bottleneck.
-  `ChunkDecoder`: mirror MLP, `z → K*vocab` logits, one-shot factorized CE
-  (handover §1.4.3a) — no MaskGIT masking.
+  Deliberately non-causal within the chunk (a causal-TCN variant was tried
+  and reverted — see status.md — since the LM, not the chunk-local
+  encoder/decoder, is what owns causality here; the chunk is always fully
+  observed before encoding, so hiding future bytes from earlier positions
+  bought nothing).
+  `ChunkDecoder`: **MaskGIT-style** (handover §1.4b), not one-shot
+  factorized CE — given `z` and a byte chunk with some positions replaced
+  by a MASK token (`byte_emb` table sized `vocab+1`), predicts the masked
+  positions from the unmasked ones + `z` via `byte_emb(x_masked) +
+  pos_emb + z_proj(z)` → small MLP → per-position logits. Training samples
+  a cosine mask-rate schedule per example (`maskgit_mask`, same as the
+  paper); loss is CE at the masked positions only (a heuristic training
+  loss, not a tight ELBO — the doc's own caveat, §1.4b: only the time-free-
+  masked-diffusion variant, not implemented here, gives a proper ELBO).
+  Inference uses `maskgit_decode`: `--maskgit_T` (default 4) confidence-
+  based refinement steps, cosine-paced reveal schedule, always revealing
+  everything by the final step. Replaces the old memoryless "predict all K
+  bytes independently from `z` alone" decoder, which couldn't model
+  intra-chunk byte correlations at all — directly targeting the decoder-
+  capacity bottleneck diagnosed across most of status.md's Phase 2 entries.
 - `LatentLM`: causal transformer over the code sequence, RoPE on Q/K
-  (duplicated from `qcute/bytelm.py` rather than imported — see below), input is
-  a linear projection of `z_hat` (continuous), output is per-dim categorical
-  logits (FSQ) or per-dim bit logits (BSQ). This is interface **Option A**,
-  pure latent autoregression (handover §2.1) — deliberately *not*
-  A-grounded: `QCuteLM.generate()` feeds the LM's sampled code straight
-  back as the next input, no re-encoding of decoded bytes. Same GPT-2-style
-  init as `qcute/bytelm.py` (load-bearing for the same reason — see below).
-- `QCuteLM.forward()` returns `rec_loss + pred_loss` (handover §7.1
-  training-step pseudocode): reconstruction CE from the decoder plus
-  next-code CE/BCE from the LM, both weight 1 (quantized bottlenecks use
-  `β=1` throughout per §1.5, no KL warmup needed).
-- `QCuteLM.generate(prompt_chunks, n_chunks)`: encodes a byte prompt,
-  then autoregressively samples the next code from the LM (categorical for
-  FSQ, Bernoulli for BSQ) and decodes it to bytes each step (handover §7.2,
-  Option-A variant — no `z_grounded = Encoder(bytes)` re-encoding step).
+  (duplicated from `qcute/bytelm.py` rather than imported — see below).
+  Input is always a linear projection of `z_hat` (continuous) — chosen over
+  a discrete embedding-table lookup because BSQ's implicit codebook
+  (`2^dq` = 262144 at the default `dq=18`) would need a ~67M-param table,
+  dwarfing the rest of this ~3.5M-param model and inviting memorization on
+  a 500KB corpus. (A factorized/product-quantization-style embedding — e.g.
+  splitting `dq` bits into groups, each with its own small table — would
+  avoid that blowup and is a reasonable alternative; deliberately not done
+  yet, to keep the tightly-coupled rewrite below to one change at a time.)
+  Output: FSQ keeps per-dim categorical logits (unchanged); BSQ's head now
+  outputs a **raw dq-dim latent** (no `*L` reshape, no "logits" framing) —
+  see below for why.
+- **FSQ path — unchanged, loosely coupled, interface Option A** (handover
+  §2.1): `QCuteLM.forward()`'s FSQ branch decodes each chunk from the
+  *encoder's own* code (`rec_loss`) and separately trains the LM to predict
+  the next code (`pred_loss`) — the two objectives never interact.
+  `QCuteLM.generate()`'s FSQ branch samples a level per dim from the LM's
+  categorical distribution and decodes it directly — no re-encoding
+  (deliberately not A-grounded).
+- **BSQ path — tightly coupled by default** (`_forward_bsq_tightly_coupled`):
+  `encoder → z_t → LM → raw latent → bsq_quantize → decoder → bytes_{t+1}`,
+  graded against the *true* `bytes_{t+1}` — the decoder's primary
+  reconstruction target is the LM's *prediction* of the next code, not the
+  encoder's own code for that chunk. `pred_loss` (BCE between the LM's raw
+  output and the true next code's sign bits) is kept alongside as a
+  code-level supervision signal, independent of whether decoding it
+  currently produces correct bytes. `cfg.aux_recon` (`--disable_aux_recon`
+  to turn off) optionally adds back the *old* loosely-coupled term —
+  `decoder(z_t)` reconstructing `bytes_t` directly, bypassing the LM — as
+  an auxiliary regularizer; excluded from the reported `bpb_total` either
+  way, since it's not part of the actual generative path (`generate()`
+  never decodes the encoder's code directly). `QCuteLM.generate()`'s BSQ
+  branch quantizes the LM's raw output the same deterministic way as
+  training (no temperature — BSQ quantization is a sign, not a
+  distribution to sample from; only FSQ's categorical sampling uses
+  `temperature`).
+  - **Results so far**: many BSQ variants tried (no-aux, plain-BSQ+aux,
+    LFQ+aux, +uncertainty weighting, +entropy regularization, +AE
+    pretraining, `dq` sweeps) — see status.md's Phase 2 for the full
+    comparison table and per-run analysis. Best so far: LFQ+aux+uncertainty
+    weighting, val_bpb 5.39 (beats the loosely-coupled architecture's 5.54,
+    though with an open caveat about whether the mechanism or run variance
+    is responsible). Consistent theme across variants: an LM-predictability
+    vs. decoder-quality tradeoff — no variant has had both a well-predicted
+    LM and a well-decoded byte output at once, until the MaskGIT decoder
+    change (see status.md), which directly targets the decoder side.
+- `QCuteLM.forward()` returns `rec_loss + pred_loss` (+ `aux_rec_loss` if
+  enabled, BSQ only) — for FSQ this matches handover §7.1's training-step
+  pseudocode (weight 1 each, quantized bottlenecks use `β=1` throughout
+  per §1.5, no KL warmup needed); BSQ's tightly-coupled version is this
+  repo's own architectural choice, not the handover doc's design. This is
+  the *default* (unweighted) loss — `main()`'s training loop can instead
+  recombine the raw per-term losses in `forward()`'s returned `metrics`
+  dict via `--uncertainty_weighting` (learned per-loss `log_var` scalars,
+  Kendall & Gal 2018) and/or `--entropy_reg_weight` (adds `bsq_entropy_reg`
+  on the LM's predicted latent). Both live in the training loop, not on
+  `QCuteLM`, since loss-combination is a training choice, not architecture.
 - `split_train_val()` / `eval_metrics()`: same pattern as `qcute/bytelm.py` — a
   held-out val split with periodic evaluation of all training metrics
-  (recon/latent accuracy, bpb_total, bpb_lm_only).
-- `score_continuation_bpb()`: unlike bytelm's single causal forward, this
-  re-runs encoder→bottleneck→LM→decoder on prompt+continuation chunks and
-  restricts both the reconstruction CE and the next-code CE/BCE to
-  continuation-region chunks — the two-term bpb decomposition from
+  (recon/latent accuracy, bpb_total, bpb_lm_only, plus aux terms when
+  `aux_recon` is on).
+- `score_continuation_bpb()`: mirrors whichever of the two `forward()`
+  branches above applies (FSQ: decode-own-code; BSQ: decode-LM-prediction),
+  restricted to the continuation-region chunks — the two-term bpb decomposition from
   `QCuteLM.forward()`, just sliced to a sub-range instead of averaged
   over the whole sequence.
 
@@ -207,13 +284,20 @@ needs, from either. All three training modules accept `--data`.
 ## Configs
 
 `configs/` holds named, reproducible experiments as plain Python files (see
-the config-file bullet above) — e.g. `bytelm_xs_tiny_longrun.py` (the
-double-descent exploration run: `xs` preset, tiny dataset, 25000 steps),
-`qcutelm_bsq_tiny.py` (matched-bandwidth BSQ companion), and
-`bpelm_tiny.py` (the BPE companion — needs `datasets/bpe_enwik8_tiny_8192.model`
-from `scripts/train_bpe.py` first). Add a new file here rather than a long
-inline CLI invocation whenever a run is worth being able to reproduce by
-name later.
+the config-file bullet above), each with a docstring documenting what it
+reproduces, the measured result, and the exact run/plot commands:
+`bytelm_xs_mtp4_converged.py` (`xs` preset, 2000 steps, best val_bpb 2.52),
+`bpelm_8192_converged.py` (vocab=8192, 2000 steps, best val_bpb 2.35),
+`qcutelm_bsq_k4_converged.py` (K=4, **loosely-coupled, historical** — BSQ's
+default training path changed to tightly-coupled after this config was
+written, so re-running it no longer reproduces its documented 5.54 number;
+kept as a historical record), `qcutelm_bsq_k4_tightlycoupled.py` (K=4,
+tightly-coupled, aux disabled, plateaus ~8.0-8.5). The many further qcutelm
+variants tried since (LFQ, uncertainty weighting, entropy regularization,
+MaskGIT decoder, `dq` sweeps, AE pretraining — see status.md's Phase 2 for
+the full list and results) were run via direct CLI invocation, not saved as
+config files yet. Add a new file here rather than a long inline CLI
+invocation whenever a run is worth being able to reproduce by name later.
 
 ## Known gaps vs. the full design (tracked in [status.md](status.md))
 
@@ -222,7 +306,14 @@ name later.
   §1.4.1) — chunk-boundary context is not shared across chunks.
 - Interface is Option A (cheapest, most drift-prone); the doc's recommended
   default is A-grounded (handover §2.4).
-- Decoder training is one-shot factorized, not the recommended time-free
-  masked diffusion (handover §1.4.3c) for a proper BPB ELBO.
+- Decoder training is MaskGIT-style masked CE (handover §1.4b, added this
+  session), not the doc's recommended time-free masked diffusion (§1.4.3c)
+  — MaskGIT gives a heuristic training loss ("strong empirically" per the
+  doc), not a proper BPB ELBO; only the diffusion variant does.
 - No geometric-state mixers (Phase 3) — both `qcute/bytelm.py` and
   `qcute/qcutelm.py`'s attention is plain softmax.
+- BSQ's entropy regularization (`bsq_entropy_reg`, a real gap vs. the LFQ/
+  BSQ papers, added this session) destabilizes training when combined with
+  uncertainty weighting (see status.md) — current wiring isn't right yet,
+  needs a fixed small coefficient or warmup instead of free adaptive
+  weighting.

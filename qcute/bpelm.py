@@ -150,7 +150,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(cfg)
         self.ln2 = nn.LayerNorm(cfg.d_model)
         self.mlp = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.mlp_mult * cfg.d_model), nn.GELU(),
+            nn.Linear(cfg.d_model, cfg.mlp_mult * cfg.d_model), nn.SiLU(),
             nn.Linear(cfg.mlp_mult * cfg.d_model, cfg.d_model),
         )
 
@@ -270,6 +270,42 @@ def lr_at(step: int, warmup: int, peak: float) -> float:
     return peak
 
 
+@torch.no_grad()
+def generate_ar(model: BpeLM, prompt_ids: torch.Tensor, n_new_tokens: int, temperature: float = 1.0) -> torch.Tensor:
+    """Naive autoregressive decode, one BPE token per forward pass. Unlike
+    qcute.bytelm this has no MTP heads to draft with, so there's no
+    speculative variant here — this is the only decode path."""
+    model.eval()
+    cfg = model.cfg
+    tokens = prompt_ids.clone()
+    for _ in range(n_new_tokens):
+        ctx = tokens[:, -cfg.context :]
+        logits = model(ctx)[:, -1]
+        probs = F.softmax(logits / temperature, dim=-1)
+        next_tok = torch.multinomial(probs, 1)
+        tokens = torch.cat([tokens, next_tok], dim=1)
+    model.train()
+    return tokens
+
+
+@torch.no_grad()
+def score_continuation_bpb(
+    model: BpeLM, full_ids: torch.Tensor, prompt_token_len: int, byte_len_table: torch.Tensor, device: str
+) -> float:
+    """Teacher-forced bpb on just the continuation tokens (full_ids[prompt_token_len:]),
+    given the real prompt as context — same idea as qcute.bytelm's function of
+    the same name, byte-weighted instead of token-averaged (see bits_per_byte)."""
+    model.eval()
+    seq = full_ids.to(device)
+    inputs, targets = seq[:, :-1], seq[:, 1:]
+    logits = model(inputs)
+    cont_logits = logits[:, prompt_token_len - 1 :]
+    cont_targets = targets[:, prompt_token_len - 1 :]
+    bpb = bits_per_byte(cont_logits, cont_targets, byte_len_table)
+    model.train()
+    return bpb.item()
+
+
 def load_config_module(path: Path) -> dict:
     import importlib.util
 
@@ -382,9 +418,9 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
 
-        pbar.set_postfix(bpb=f"{bpb.item():.3f}")
+        pbar.set_postfix(lr=f"{lr:.2e}", bpb=f"{bpb.item():.4f}")
         if step % args.log_every == 0:
-            log(f"lr {lr:.2e}  bpb {bpb.item():.4f}  {pbar}", step=step, lr=lr, bpb=bpb.item())
+            log(f"{pbar}", step=step, lr=lr, bpb=bpb.item())
         if step % args.eval_every == 0 or step == args.steps:
             val_bpb = eval_bpb(model, val_iter, byte_len_table, args.eval_batches)
             log(f"step {step:5d}  val_bpb {val_bpb:.4f}", step=step, val_bpb=val_bpb)

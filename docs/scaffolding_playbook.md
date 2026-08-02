@@ -62,7 +62,7 @@ free) and feed its module-level variables into `parser.set_defaults(...)`,
 filtered to known argument names. Then do the real `parser.parse_args()`.
 Net effect: **config file values override the script's hardcoded defaults,
 but explicit CLI flags override the config file.** This gives you
-reproducible named experiments (`configs/bytelm_xs_tiny_longrun.py`) without
+reproducible named experiments (`configs/bytelm_xs_mtp4_converged.py`) without
 losing the ability to override one flag ad hoc for a quick variant.
 Config files live in `configs/`, one per named experiment, with a docstring
 explaining what the experiment tests and the exact invocation.
@@ -180,6 +180,69 @@ artifact, not a real architectural finding.
   plan, updated as work lands — not aspirational, an honest record of
   what's actually been run vs. just implemented-but-untested.
 - This file.
+
+## 8b. Plotting: one script, reads the JSONL, PNG per run
+
+`scripts/plot_run.py logs/<run_name>` reads `run.jsonl`, auto-detects
+whichever train/val metric keys are present (different scripts may name
+theirs differently — don't force one schema across scripts that measure
+different things), and writes `<run_dir>/bpb.png`. Two things matter for
+readability, not just correctness:
+
+- **Size the val marker to its sampling rate, not a fixed default.** Val is
+  evaluated far less often than train is logged (`--eval_every >>
+  --log_every`), so a same-size marker makes val basically invisible against
+  a denser train line. A visibly bigger val marker (not just a different
+  color) is what makes "where did val bottom out, before it started rising
+  again" readable at a glance — which is usually the one plot you actually
+  need after a run, i.e. "did we overfit, and when."
+- **Detect and drop stale segments from restarted runs.** Because logging
+  (§4c) is append-only and keyed by `run_name`, stopping a run and relaunching
+  with the *same* `run_name` appends a second run's records to the same
+  file. Plotted naively as one connected line, this zigzags backward in
+  step at the restart boundary (visually "borked" — jumps forward then back
+  then forward). Detect restarts by watching `elapsed_s` for a decrease
+  from the previous record, and keep only the last segment before plotting.
+  This is a direct consequence of the append-only logging choice — expect
+  it, don't be surprised by it, and handle it in the plot script rather
+  than treating every experiment as needing a fresh `run_name`.
+
+## 8c. Verify "exact" empirically — don't just trust the theory
+
+If a metric's docstring says "exact, not an estimate," write the
+verification, don't just derive it on paper and assume the library behaves
+the way the derivation assumes. Concretely (this repo's example): a BPE
+tokenizer's bits-per-byte should be exactly `sum(token_nats) /
+sum(token_byte_lengths) / ln(2)` if — and only if — encode/decode is a true
+bijection with the original bytes. It wasn't: the tokenizer library's
+NLP-oriented defaults (Unicode normalization, whitespace collapsing, a
+synthetic leading-space prefix) silently dropped information, so the
+"exact" formula was computing something exact for a *different*, lossily-
+normalized string, not the original corpus. This surfaces as a fixable
+config problem (disable normalization, disable whitespace collapsing,
+disable the dummy prefix, add byte-fallback for full coverage) — but only
+if you actually run `sum(byte_len_table[ids]) == len(original_bytes)` and
+`decode(encode(text)) == text` as real assertions, not skip straight to
+"the math works out, ship it." Put the check in the training script itself
+(hard-fail if it doesn't hold) so a future re-run with a config that breaks
+losslessness fails loudly instead of silently producing a wrong number.
+
+## 8d. Don't hardcode a bandwidth/compute target without checking it's reachable at your data scale
+
+If your design doc specifies a target (e.g. "aim for N units of
+bandwidth/compression per step") calibrated for full-scale training, and
+you're building/debugging at a much smaller data scale for fast iteration,
+*check whether that target is even achievable* at the smaller scale before
+wiring it in as a default. Concretely: a design's full-corpus BPE
+recommendation (~8 bytes/token) turned out to require vocabulary sizes that,
+on a 500KB debug-scale corpus, just memorize phrases instead of generalizing
+— the target wasn't wrong, it was scale-mismatched. The fix was calibrating
+the small-scale presets (`xs`, tiny-corpus defaults) to a target actually
+reachable at that data size (4, not 8), documented as scale-specific
+(comments pointing at *why*, referencing the corpus-size ceiling), while
+keeping the full-scale presets (`sd`/`md`) at the doc's original number.
+One config knob serving two different scales convincingly is rare — prefer
+naming the mismatch explicitly over pretending one number fits both.
 
 ## 9. `CLAUDE.md`: lean, always
 

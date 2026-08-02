@@ -11,14 +11,19 @@ uv run python scripts/train_bpe.py --data datasets/enwik8_tiny.gz   # BPE tokeni
 uv run python -m qcute.bytelm --preset sd       # byte-level baseline LM (Phase 0), reports BPB
 uv run python -m qcute.qcutelm                  # end-to-end tokenizer + latent LM (FSQ/BSQ)
 uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_tiny_8192.model   # BPE baseline
-uv run python -m qcute.bytelm --config configs/bytelm_xs_tiny_longrun.py   # named, reproducible run
+uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_converged.py   # named, reproducible run
+uv run python scripts/plot_run.py logs/<run_name>   # train/val bpb PNG from a run's run.jsonl
 ```
 
 All three modules read `--help` for their full flag list; all support
-`--config path.py` (see `configs/`), checkpointing to `checkpoints/` (best +
-last), and `--eval_only --checkpoint_path ...`; `qcute.bytelm`/`qcute.qcutelm`
-additionally support `--qual_gen_bytes` for qualitative generation. No test
-suite, linter, or CI config exists yet.
+`--config path.py` (see `configs/`), `--run_name` (else derived from
+`--config`/preset — logs and checkpoints both key off it: `logs/<run_name>/`,
+`checkpoints/<run_name>/`), and `--eval_only --checkpoint_path ...`;
+`qcute.bytelm`/`qcute.qcutelm` additionally support `--qual_gen_bytes` for
+qualitative generation. Tiny-corpus-scale defaults (`xs` preset, `qcutelm`'s
+`K`) target ~4 bytes/timestep, not the handover doc's 8 — see
+`qcute/bytelm.py`'s `PRESETS` comment for why. No test suite, linter, or CI
+config exists yet.
 
 ## Architecture
 

@@ -209,7 +209,7 @@ class MLP(nn.Module):
         self.down = nn.Linear(hidden, cfg.d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(F.gelu(self.up(x)))
+        return self.down(F.silu(self.up(x)))
 
 
 class Block(nn.Module):
@@ -587,12 +587,9 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
 
-            pbar.set_postfix(loss=f"{loss.item():.3f}", bpb=f"{head0_bpb.item():.3f}")
+            pbar.set_postfix(lr=f"{lr:.2e}", mtp_loss=f"{loss.item():.4f}", bpb=f"{head0_bpb.item():.4f}")
             if step % args.log_every == 0:
-                log(
-                    f"lr {lr:.2e}  mtp_loss {loss.item():.4f}  bpb {head0_bpb.item():.4f}  {pbar}",
-                    step=step, lr=lr, mtp_loss=loss.item(), bpb=head0_bpb.item(),
-                )
+                log(f"{pbar}", step=step, lr=lr, mtp_loss=loss.item(), bpb=head0_bpb.item())
             if step % args.eval_every == 0 or step == args.steps:
                 val_bpb = eval_bpb(model, val_iter, cfg.context, args.eval_batches)
                 log(f"step {step:5d}  val_bpb {val_bpb:.4f}", step=step, val_bpb=val_bpb)
