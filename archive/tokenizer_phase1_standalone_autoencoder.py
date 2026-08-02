@@ -1,4 +1,8 @@
-"""qcute.tokenizer — Phase 1: standalone byte-chunk autoencoder (FSQ bottleneck).
+"""ARCHIVED 2026-08-02 — superseded by qcute/tokenizer.py's end-to-end
+encoder+bottleneck+LM+decoder (interface Option A, handover §2.1). Kept for
+reference (streaming-causal encoder design); not run or maintained.
+
+qcute.tokenizer — Phase 1: standalone byte-chunk autoencoder (FSQ bottleneck).
 
 Minimal implementation following docs/continuous_tokenizer_handover.md
 sections 1.2.2 (FSQ), 1.3 (encoder), 1.4.2/1.4.3a (Phase-1 NAT decoder).
