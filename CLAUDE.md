@@ -25,6 +25,13 @@ qualitative generation. Tiny-corpus-scale defaults (`xs` preset, `qcutelm`'s
 `qcute/bytelm.py`'s `PRESETS` comment for why. No test suite, linter, or CI
 config exists yet.
 
+**Only ever run one training job at a time.** All three modules train on
+MPS; two concurrent training processes contend for the same GPU and both
+slow down (observed directly: a second run caused an already-progressing
+job to stall with zero throughput). Kill or wait out the current run
+before launching another — never launch a second training process while
+one is still active.
+
 ## Architecture
 
 `qcute/bytelm.py`, `qcute/qcutelm.py`, and `qcute/bpelm.py` are self-contained
