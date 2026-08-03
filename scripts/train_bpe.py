@@ -1,6 +1,6 @@
-"""Train a byte-level BPE tokenizer (sentencepiece) on enwik8/enwik8_tiny.
+"""Train a byte-level BPE tokenizer (sentencepiece) on enwik8/enwik8_1M.
 
-    uv run python scripts/train_bpe.py --data datasets/enwik8_tiny.gz --vocab_size 8192
+    uv run python scripts/train_bpe.py --data datasets/enwik8_1M.gz --vocab_size 8192
 
 Produces datasets/bpe_<stem>_<vocab_size>.{model,vocab}. sentencepiece needs
 a plain-text file, so the raw byte corpus is decoded utf-8 (errors=replace
@@ -37,7 +37,7 @@ import sentencepiece as spm
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data", type=Path, default=Path("datasets/enwik8_tiny.gz"))
+    p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None, help="prefix of the corpus to train on (default: all)")
     p.add_argument("--vocab_size", type=int, default=8192)
     p.add_argument("--out_dir", type=Path, default=Path("datasets"))

@@ -320,6 +320,23 @@ def lr_at(step: int, warmup: int, peak: float) -> float:
     return peak
 
 
+def lr_at_warmup_constant_cosine(
+    step: int, warmup: int, constant_steps: int, peak: float, total_steps: int, min_lr_frac: float = 0.1,
+) -> float:
+    """Linear warmup (`warmup` steps) -> constant at peak (`constant_steps`
+    steps) -> cosine decay over the rest of training, down to `min_lr_frac
+    * peak`. Same schedule as qcute.qcutelm's --cosine_decay, for a fair
+    comparison across all three modules when enabled via --cosine_decay."""
+    if step < warmup:
+        return peak * step / max(1, warmup)
+    decay_start = warmup + constant_steps
+    if step < decay_start:
+        return peak
+    min_lr = peak * min_lr_frac
+    progress = min(1.0, (step - decay_start) / max(1, total_steps - decay_start))
+    return min_lr + 0.5 * (peak - min_lr) * (1 + math.cos(math.pi * progress))
+
+
 # ---------------------------------------------------------------------------
 # Generation — plain AR vs. self-speculative (MTP heads as draft), for a
 # latency benchmark comparable to qcute.qcutelm's K-bytes-per-LM-step decode.
@@ -485,13 +502,17 @@ def main():
     p.add_argument("--preset", choices=list(PRESETS), default="sd")
     p.add_argument("--context", type=int, default=None, help="override preset's context length")
     p.add_argument("--mtp_heads", type=int, default=None, help="override preset's MTP head count")
-    p.add_argument("--data", type=Path, default=Path("datasets/enwik8.gz"))
-    p.add_argument("--n_bytes", type=int, default=20_000_000, help="prefix of enwik8 to load")
+    p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
+    p.add_argument("--n_bytes", type=int, default=None, help="prefix of the corpus to load (default: all)")
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--steps", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr_peak", type=float, default=6e-4)
     p.add_argument("--warmup_steps", type=int, default=200)
+    p.add_argument("--cosine_decay", action="store_true",
+        help="LR: warmup -> constant (--constant_steps) -> cosine decay over the rest of --steps, "
+             "instead of warmup -> constant for the whole run (same schedule as qcute.qcutelm's --cosine_decay)")
+    p.add_argument("--constant_steps", type=int, default=1000, help="steps held at peak LR before cosine decay begins")
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--eval_every", type=int, default=200)
@@ -561,6 +582,11 @@ def main():
     data = load_enwik8(args.data, args.n_bytes)
     train_data, val_data = split_train_val(data, args.val_frac)
     log(f"train_bytes={len(train_data)}  val_bytes={len(val_data)}")
+    if not args.eval_only:
+        seq_len = cfg.context + cfg.mtp_heads
+        epochs = args.steps * args.batch_size * seq_len / len(train_data)
+        log(f"~{epochs:.1f} epochs over train_bytes (steps={args.steps} batch_size={args.batch_size} seq_len={seq_len}, "
+            f"random-with-replacement sampling — see batch_iter)")
     val_iter = batch_iter(val_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
 
     if args.eval_only:
@@ -574,7 +600,10 @@ def main():
         model.train()
         pbar = tqdm(range(1, args.steps + 1), desc="train", dynamic_ncols=True)
         for step in pbar:
-            lr = lr_at(step, args.warmup_steps, args.lr_peak)
+            if args.cosine_decay:
+                lr = lr_at_warmup_constant_cosine(step, args.warmup_steps, args.constant_steps, args.lr_peak, args.steps)
+            else:
+                lr = lr_at(step, args.warmup_steps, args.lr_peak)
             for g in opt.param_groups:
                 g["lr"] = lr
 

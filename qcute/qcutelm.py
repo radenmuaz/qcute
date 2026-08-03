@@ -154,7 +154,13 @@ class Config:
     # rescaling by 1/sqrt(dq) (hypersphere corners, ||z_hat||=1). Targets
     # (sign bits) are identical either way; only z_hat's geometry changes.
     lfq: bool = False
-    maskgit_T: int = 4  # decoder inference refinement steps, see ChunkDecoder/maskgit_decode
+    # QAT-inspired backward-only gradient rescale at BSQ's own quantization
+    # boundary (see GradScale/bsq_quantize) — 1.0 (default) is a no-op.
+    # Only applied at the encoder's own BSQ module (make_bottleneck), not
+    # the LM's separate quantization of its predicted latent — the
+    # gradient-starvation problem this addresses was found specifically on
+    # the encoder side of pretrain_ae's encoder->quantize->decoder loop.
+    quant_grad_scale: float = 1.0
     # Encoder/decoder cross-K-position mixer (see MixerBlock): "attention"
     # (full non-causal self-attention over the K positions) or "conv" (single
     # non-causal 1D conv, kernel_size=2K-1 with symmetric same-padding, so
@@ -163,11 +169,35 @@ class Config:
     # MLP block (standard transformer-style); set False to test the mixer alone.
     mixer: str = "attention"
     mixer_mlp: bool = True
+    tokenizer_layers: int = 1  # shared fallback depth for both ChunkEncoder/ChunkDecoder (was hardcoded to 1)
+    # Per-component depth/mixer overrides — None (default) falls back to
+    # tokenizer_layers/mixer for that component, so existing configs are
+    # unaffected. For testing an asymmetric shallow-encoder/deep-decoder
+    # design: the encoder mainly needs to flatten K bytes into a code (a
+    # single conv layer approximates a flatten+linear patch reasonably
+    # well, per the "math same" reasoning — not literally zero layers),
+    # while the decoder does the real reconstruction work and can afford
+    # more depth/a heavier mixer (attention).
+    encoder_layers: int | None = None
+    decoder_layers: int | None = None
+    encoder_mixer: str | None = None
+    decoder_mixer: str | None = None
     # LM input: compositional per-dim embedding (see FactorizedCodeEmbedding)
     # instead of a linear projection of the continuous z. Takes the discrete
     # `targets` as input instead of `z_hat`; output format is unchanged
     # (still the same per-dim logits used throughout this file).
     lm_factorized_input: bool = False
+    # Asymmetric left-side byte context for ChunkEncoder: 0 (default, no
+    # behavior change) means the encoder sees only its own K bytes, exactly
+    # as before. >0 (must be <=K) gives the encoder an extra context_len
+    # bytes immediately preceding the chunk (the previous chunk's tail) as
+    # additional read-only input — still causal (no future bytes), meant to
+    # soften the "naive chunk-local, no cross-chunk context" boundary-
+    # artifact gap noted in docs/architecture.md. At the very start of a
+    # sampled training window (no real preceding bytes available), the
+    # context is a zero-embedding pad, not a guess — see
+    # gather_left_context().
+    context_len: int = 0
 
     @property
     def head_dim(self) -> int:
@@ -175,6 +205,13 @@ class Config:
 
 
 def build_config(bottleneck: str, dq: int | None, **kwargs) -> Config:
+    # dq=18 for BSQ: at K=4, a chunk's raw entropy ceiling is
+    # log2(256^4)=32 bits, but English text's actual entropy is only
+    # ~4.5-5 bits/byte (~18-20 bits for 4 bytes) — dq=18 targets that real
+    # redundancy, not the uniform-byte ceiling, so the bottleneck is a
+    # tight fit against the corpus's actual information content rather
+    # than an arbitrary squeeze. (FSQ's dq=6, L=8 default: codebook 8^6,
+    # ~18 bits too, same reasoning via a different quantization scheme.)
     if dq is None:
         dq = 18 if bottleneck == "bsq" else 6
     return Config(bottleneck=bottleneck, dq=dq, **kwargs)
@@ -206,7 +243,31 @@ class FSQ(nn.Module):
         return levels.float() - (L - 1) / 2
 
 
-def bsq_quantize(v: torch.Tensor, dq: int, lfq: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+class GradScale(torch.autograd.Function):
+    """QAT-inspired backward-only gradient rescale: identity in the forward
+    pass, multiplies the incoming gradient by `alpha` in the backward pass.
+    Used at bsq_quantize's STE boundary (see Config.quant_grad_scale) to
+    counteract two compounding attenuation sources found in a side
+    gradient-norm diagnostic: the explicit 1/sqrt(dq) rescale baked into
+    BSQ's STE, and F.normalize's own contracting Jacobian — both shrink the
+    gradient reaching the encoder well below the decoder's, independent of
+    encoder depth/width (a smaller encoder concentrates the same
+    attenuated signal onto fewer params, making the imbalance *worse*, not
+    better — see docs/status.md). alpha=sqrt(dq) exactly cancels the
+    explicit rescale; tune higher to also compensate for normalize's
+    contraction."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, alpha: float) -> torch.Tensor:
+        ctx.alpha = alpha
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output * ctx.alpha, None
+
+
+def bsq_quantize(v: torch.Tensor, dq: int, lfq: bool = False, grad_scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
     """BSQ quantization math (normalize + sign STE), factored out of the
     encoder's BSQ module so the LM's own output head can reuse it directly
     on raw dq-dim vectors — same quantization boundary, two different
@@ -225,7 +286,13 @@ def bsq_quantize(v: torch.Tensor, dq: int, lfq: bool = False) -> tuple[torch.Ten
     currently a no-op — kept explicit anyway so that stays true even if
     this computation is ever changed to something differentiable (e.g. a
     soft/temperature-based comparison), which would otherwise silently
-    leak a second gradient path into the encoder through the loss target."""
+    leak a second gradient path into the encoder through the loss target.
+
+    grad_scale != 1.0 applies GradScale right at the boundary, before any
+    of the quantization math below — a backward-only rescale, changes
+    nothing about the forward value."""
+    if grad_scale != 1.0:
+        v = GradScale.apply(v, grad_scale)
     if lfq:
         z_hat = v + (torch.sign(v) - v).detach()  # STE, no normalize/rescale
         targets = (v > 0).float().detach()
@@ -289,14 +356,15 @@ def bsq_sample(out: torch.Tensor, dq: int, lfq: bool, temperature: float) -> tor
 class BSQ(nn.Module):
     """Binary spherical quantization. Targets are sign bits in {0, 1}."""
 
-    def __init__(self, d_in: int, dq: int, lfq: bool = False):
+    def __init__(self, d_in: int, dq: int, lfq: bool = False, grad_scale: float = 1.0):
         super().__init__()
         self.dq = dq
         self.lfq = lfq
+        self.grad_scale = grad_scale
         self.proj = nn.Linear(d_in, dq)
 
     def forward(self, u: torch.Tensor):
-        return bsq_quantize(self.proj(u), self.dq, self.lfq)
+        return bsq_quantize(self.proj(u), self.dq, self.lfq, self.grad_scale)
 
     @staticmethod
     def bits_to_z(bits: torch.Tensor, dq: int) -> torch.Tensor:
@@ -307,7 +375,7 @@ def make_bottleneck(cfg: Config) -> nn.Module:
     if cfg.bottleneck == "fsq":
         return FSQ(cfg.d_enc, cfg.dq, cfg.L)
     if cfg.bottleneck == "bsq":
-        return BSQ(cfg.d_enc, cfg.dq, cfg.lfq)
+        return BSQ(cfg.d_enc, cfg.dq, cfg.lfq, cfg.quant_grad_scale)
     raise ValueError(f"unknown bottleneck: {cfg.bottleneck}")
 
 
@@ -384,12 +452,16 @@ class FullConvMixer(nn.Module):
         return self.conv(x.transpose(1, 2)).transpose(1, 2)
 
 
-def make_mixer(cfg: Config, d_model: int) -> nn.Module:
-    if cfg.mixer == "attention":
+def make_mixer(cfg: Config, d_model: int, seq_len: int | None = None, mixer_type: str | None = None) -> nn.Module:
+    if seq_len is None:
+        seq_len = cfg.K
+    if mixer_type is None:
+        mixer_type = cfg.mixer
+    if mixer_type == "attention":
         return FullSelfAttention(d_model, cfg.n_heads)
-    if cfg.mixer == "conv":
-        return FullConvMixer(d_model, cfg.K)
-    raise ValueError(f"unknown mixer: {cfg.mixer}")
+    if mixer_type == "conv":
+        return FullConvMixer(d_model, seq_len)
+    raise ValueError(f"unknown mixer: {mixer_type}")
 
 
 class MixerBlock(nn.Module):
@@ -397,12 +469,13 @@ class MixerBlock(nn.Module):
     over the K positions, optionally followed by a per-position MLP block
     (standard transformer-style) — cfg.mixer_mlp=False tests the mixer
     alone. Shared by ChunkEncoder and ChunkDecoder so both use the exact
-    same cross-position-mixing machinery."""
+    same cross-position-mixing machinery; mixer_type lets each component
+    pick its own (see Config.encoder_mixer/decoder_mixer)."""
 
-    def __init__(self, cfg: Config, d_model: int, d_hidden: int):
+    def __init__(self, cfg: Config, d_model: int, d_hidden: int, seq_len: int | None = None, mixer_type: str | None = None):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.mixer = make_mixer(cfg, d_model)
+        self.mixer = make_mixer(cfg, d_model, seq_len, mixer_type)
         self.use_mlp = cfg.mixer_mlp
         if self.use_mlp:
             self.ln2 = nn.LayerNorm(d_model)
@@ -418,107 +491,101 @@ class MixerBlock(nn.Module):
 class ChunkEncoder(nn.Module):
     """byte_emb + pos_emb per position -> MixerBlock (cross-K mixing) ->
     flatten -> Linear -> bottleneck. Same block structure as ChunkDecoder
-    below, mirrored (encoder: bytes -> z; decoder: z -> bytes)."""
+    below, mirrored (encoder: bytes -> z; decoder: z -> bytes).
+
+    cfg.context_len (default 0, no behavior change): extends the encoder's
+    input window with context_len extra positions *before* the chunk's own
+    K bytes — the previous chunk's tail, still causal, never future bytes.
+    seq_len = context_len + K throughout (pos_emb, mixer, out_proj all
+    sized to it); when context_len==0 this is exactly the old K-only
+    behavior, unchanged. See forward()'s docstring for the context/mask
+    contract and gather_left_context() for how callers build them."""
 
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
+        seq_len = cfg.K + cfg.context_len
         self.byte_emb = nn.Embedding(cfg.vocab, cfg.d_byte)
-        self.pos_emb = nn.Parameter(torch.zeros(cfg.K, cfg.d_byte))
+        self.pos_emb = nn.Parameter(torch.zeros(seq_len, cfg.d_byte))
         nn.init.normal_(self.pos_emb, std=0.02)
-        self.block = MixerBlock(cfg, cfg.d_byte, cfg.d_enc)
-        self.ln_f = nn.LayerNorm(cfg.K * cfg.d_byte)
-        self.out_proj = nn.Linear(cfg.K * cfg.d_byte, cfg.d_enc)
+        n_layers = cfg.encoder_layers if cfg.encoder_layers is not None else cfg.tokenizer_layers
+        mixer_type = cfg.encoder_mixer if cfg.encoder_mixer is not None else cfg.mixer
+        self.blocks = nn.ModuleList(
+            [MixerBlock(cfg, cfg.d_byte, cfg.d_enc, seq_len=seq_len, mixer_type=mixer_type) for _ in range(n_layers)]
+        )
+        self.ln_f = nn.LayerNorm(seq_len * cfg.d_byte)
+        self.out_proj = nn.Linear(seq_len * cfg.d_byte, cfg.d_enc)
         self.bottleneck = make_bottleneck(cfg)
 
-    def forward(self, chunk: torch.Tensor):
+    def forward(self, chunk: torch.Tensor, context: torch.Tensor | None = None, context_mask: torch.Tensor | None = None):
         # chunk: [N, K] long -> z_hat: [N, dq], targets: [N, dq]
+        # context: [N, context_len] long, required iff cfg.context_len > 0 —
+        # the context_len bytes immediately preceding `chunk`.
+        # context_mask: [N, context_len] bool, True = real byte, False = no
+        # real byte available (start of a sampled window) -> that position's
+        # embedding is zeroed out instead of looking up a byte_emb row, so
+        # padding never looks like a real (if arbitrary) byte value.
         N = chunk.size(0)
-        h = self.byte_emb(chunk) + self.pos_emb.unsqueeze(0)  # [N, K, d_byte]
-        h = self.block(h)
+        if self.cfg.context_len > 0:
+            assert context is not None, "cfg.context_len > 0 requires a context tensor (see gather_left_context)"
+            ctx_emb = self.byte_emb(context)  # [N, context_len, d_byte]
+            if context_mask is not None:
+                ctx_emb = ctx_emb * context_mask.unsqueeze(-1).to(ctx_emb.dtype)
+            chunk_emb = self.byte_emb(chunk)  # [N, K, d_byte]
+            h = torch.cat([ctx_emb, chunk_emb], dim=1) + self.pos_emb.unsqueeze(0)
+        else:
+            h = self.byte_emb(chunk) + self.pos_emb.unsqueeze(0)  # [N, K, d_byte]
+        for block in self.blocks:
+            h = block(h)
         u = self.out_proj(self.ln_f(h.reshape(N, -1)))
         return self.bottleneck(u)
 
 
 class ChunkDecoder(nn.Module):
-    """MaskGIT-style (handover §1.4b): given z (context) plus a byte chunk
-    with some positions replaced by a MASK token, predict the *masked*
-    positions' real bytes from the *unmasked* ones + z — the *point* of
-    MaskGIT is exactly this cross-position conditioning, which requires the
-    K positions to actually interact (see the mixer section's docstring
-    above for why the old version didn't). Same MixerBlock as ChunkEncoder.
-
-    MASK id = cfg.vocab (256); the byte embedding table is sized vocab+1
-    to hold it. Output is always a plain [N, K, vocab] logits tensor over
-    real bytes only — MASK is never a decode target, only an input state."""
+    """Plain code -> K bytes decoder, like regular BSQ/VQ-VAE training: the
+    *only* input is z (the code) — no MaskGIT-style masked-byte-level input,
+    no iterative refinement, one forward pass reconstructs all K bytes at
+    once. Each of the K output positions is differentiated purely by
+    pos_emb (fixed) against the same broadcast z_proj(z) — the mixer's
+    cross-position interaction lets that per-position signal actually use
+    the whole chunk's worth of code together, but there is no real-byte
+    conditioning of any kind (previously there was, via a masked byte
+    input; removed — see docs/status.md for why: the decoder ended up
+    receiving no real information beyond the code, and if masking is
+    wanted at all, it belongs on the encoder's raw byte input side, not
+    the decoder's). Same MixerBlock as ChunkEncoder."""
 
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
-        self.mask_id = cfg.vocab
-        self.byte_emb = nn.Embedding(cfg.vocab + 1, cfg.d_byte)
         self.pos_emb = nn.Parameter(torch.zeros(cfg.K, cfg.d_byte))
         nn.init.normal_(self.pos_emb, std=0.02)
         self.z_proj = nn.Linear(cfg.dq, cfg.d_byte)
-        self.block = MixerBlock(cfg, cfg.d_byte, cfg.d_dec)
+        n_layers = cfg.decoder_layers if cfg.decoder_layers is not None else cfg.tokenizer_layers
+        mixer_type = cfg.decoder_mixer if cfg.decoder_mixer is not None else cfg.mixer
+        self.blocks = nn.ModuleList(
+            [MixerBlock(cfg, cfg.d_byte, cfg.d_dec, mixer_type=mixer_type) for _ in range(n_layers)]
+        )
         self.ln_f = nn.LayerNorm(cfg.d_byte)
         self.head = nn.Linear(cfg.d_byte, cfg.vocab)
 
-    def forward(self, z: torch.Tensor, x_masked: torch.Tensor) -> torch.Tensor:
-        # z: [N, dq], x_masked: [N, K] long (mask_id at masked positions) -> logits [N, K, vocab]
-        h = self.byte_emb(x_masked) + self.pos_emb.unsqueeze(0) + self.z_proj(z).unsqueeze(1)
-        h = self.block(h)
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z: [N, dq] -> logits [N, K, vocab]
+        N = z.size(0)
+        h = self.pos_emb.unsqueeze(0).expand(N, -1, -1) + self.z_proj(z).unsqueeze(1)
+        for block in self.blocks:
+            h = block(h)
         return self.head(self.ln_f(h))
 
 
-def maskgit_mask(x: torch.Tensor, mask_id: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Cosine mask-rate schedule (Chang et al. 2022, MaskGIT; handover §1.4b):
-    sample r~U(0,1) per example, mask_rate=cos(pi/2*r), independently
-    Bernoulli-mask each of the K positions at that rate. Forces at least one
-    masked position per example — K is only 4 here, so an all-unmasked draw
-    (no positions to supervise) is a real, non-negligible chance otherwise.
-    x: [N, K] real byte ids -> (x_masked: [N, K], mask: [N, K] bool)."""
-    N, K = x.shape
-    r = torch.rand(N, device=x.device)
-    mask_rate = torch.cos(math.pi / 2 * r).clamp(0, 1)  # [N]
-    mask = torch.bernoulli(mask_rate.unsqueeze(1).expand(N, K)).bool()
-    none_masked = ~mask.any(dim=1)
-    if none_masked.any():
-        force_idx = torch.randint(0, K, (int(none_masked.sum()),), device=x.device)
-        mask[none_masked, force_idx] = True
-    x_masked = torch.where(mask, torch.full_like(x, mask_id), x)
-    return x_masked, mask
-
-
 @torch.no_grad()
-def maskgit_decode(decoder: ChunkDecoder, z: torch.Tensor, T: int) -> torch.Tensor:
-    """T-step confidence-based MaskGIT inference (handover §1.4b): start
-    fully masked, each step decode logits for the still-masked positions,
-    commit the highest-confidence predictions per the cosine schedule's
-    target masked-count for that step, remask the rest, repeat. Final step
-    always reveals everything remaining (cos(pi/2*1)=0). z: [N, dq] ->
+def decode_bytes(decoder: ChunkDecoder, z: torch.Tensor) -> torch.Tensor:
+    """One-shot decode: z -> argmax bytes. Replaces the old MaskGIT-style
+    T-step iterative refinement (maskgit_decode) now that ChunkDecoder takes
+    only the code as input — there's nothing to iteratively reveal anymore,
+    since there's no masked-byte input state to refine. z: [N, dq] ->
     bytes: [N, K] long."""
-    cfg = decoder.cfg
-    N, K = z.size(0), cfg.K
-    x = torch.full((N, K), decoder.mask_id, dtype=torch.long, device=z.device)
-    masked = torch.ones((N, K), dtype=torch.bool, device=z.device)
-    for i in range(T):
-        logits = decoder(z, x)  # [N, K, vocab]
-        probs = F.softmax(logits, dim=-1)
-        conf, pred = probs.max(dim=-1)  # [N, K]
-        conf = conf.masked_fill(~masked, -1.0)  # already-revealed positions can't be re-picked
-
-        target_masked = round(K * math.cos(math.pi / 2 * (i + 1) / T)) if i < T - 1 else 0
-        n_masked_now = masked.sum(dim=1)  # [N]
-        n_reveal = (n_masked_now - target_masked).clamp(min=0)
-        for n in range(N):
-            k = int(n_reveal[n].item())
-            if k <= 0:
-                continue
-            topk = torch.topk(conf[n], k).indices
-            x[n, topk] = pred[n, topk]
-            masked[n, topk] = False
-    return x
+    return decoder(z).argmax(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +756,7 @@ class QCuteLM(nn.Module):
     def forward(self, byte_chunks: torch.Tensor):
         # byte_chunks: [B, T, K] long
         B, T, K = byte_chunks.shape
-        z_hat, targets = self.encoder(byte_chunks.reshape(B * T, K))
+        z_hat, targets = encode_chunks(self.encoder, byte_chunks)
         z_hat, targets = z_hat.reshape(B, T, -1), targets.reshape(B, T, -1)
         # LM input: discrete per-dim `targets` (FactorizedCodeEmbedding) if
         # cfg.lm_factorized_input, else the default continuous `z_hat`.
@@ -701,13 +768,12 @@ class QCuteLM(nn.Module):
         # FSQ: unchanged, loosely-coupled Option A — each chunk's own code is
         # decoded independently of the LM (see module docstring; BSQ's
         # tightly-coupled path below hasn't been extended to FSQ yet).
-        # Decoder is MaskGIT-style (see ChunkDecoder/maskgit_mask): loss is
-        # CE at the masked positions only, not all K.
+        # Decoder is a plain code-only decoder (see ChunkDecoder): one-shot
+        # CE over all K positions, no masking.
         flat_bytes = byte_chunks.reshape(B * T, K)
-        x_masked, mask = maskgit_mask(flat_bytes, self.decoder.mask_id)
-        rec_logits = self.decoder(z_hat.reshape(B * T, -1), x_masked)  # [B*T, K, vocab]
-        rec_loss = F.cross_entropy(rec_logits[mask], flat_bytes[mask])
-        recon_acc = (rec_logits.argmax(-1)[mask] == flat_bytes[mask]).float().mean()
+        rec_logits = self.decoder(z_hat.reshape(B * T, -1))  # [B*T, K, vocab]
+        rec_loss = F.cross_entropy(rec_logits.reshape(-1, self.cfg.vocab), flat_bytes.reshape(-1))
+        recon_acc = (rec_logits.argmax(-1) == flat_bytes).float().mean()
 
         pred_logits = self.lm(lm_in)[:, :-1]        # predict z_{t+1} from z_{<=t}
         pred_targets = targets[:, 1:]
@@ -716,14 +782,13 @@ class QCuteLM(nn.Module):
 
         loss = rec_loss + pred_loss
 
-        # BPB (handover §1.7 for the exact-ELBO case; no longer exact now that
-        # the decoder is MaskGIT-style — rec_loss is mean CE over only the
-        # *masked* positions sampled this batch, not all K, so bpb_rec is a
-        # heuristic proxy, not a tight ELBO. The doc calls this out directly
-        # (§1.4b): MaskGIT's masked CE is "heuristic but strong empirically";
-        # only the time-free-masked-diffusion variant (not implemented here)
-        # gives a proper ELBO -> exact bpb. pred_loss is nats/dim, so *dq
-        # gives nats/chunk before dividing by the K bytes that chunk represents.
+        # BPB (handover §1.7): rec_loss is now mean CE over *all* K positions
+        # (ChunkDecoder is code-only, one-shot — no more MaskGIT-style masked
+        # subset), so bpb_rec is a genuine per-byte bits cost under the
+        # decoder's p(bytes|z), not a heuristic proxy over a random subset
+        # the way it was when the decoder only saw a masked partial input.
+        # pred_loss is nats/dim, so *dq gives nats/chunk before dividing by
+        # the K bytes that chunk represents.
         bpb_rec = rec_loss / math.log(2)
         bpb_pred = (pred_loss * self.cfg.dq) / (K * math.log(2))
         bpb_total = bpb_rec + bpb_pred  # full ELBO
@@ -762,14 +827,13 @@ class QCuteLM(nn.Module):
         latent_acc = (pred_bits == pred_targets).float().mean()
 
         # Primary loss: decode the LM's *predicted* next latent, grade against
-        # the true next chunk's bytes. Decoder is MaskGIT-style (see
-        # ChunkDecoder/maskgit_mask): loss is CE at the masked positions only.
+        # the true next chunk's bytes. Decoder is a plain code-only decoder
+        # (see ChunkDecoder): one-shot CE over all K positions, no masking.
         true_next_bytes = byte_chunks[:, 1:]
         flat_next_bytes = true_next_bytes.reshape(-1, K)
-        x_masked, mask = maskgit_mask(flat_next_bytes, self.decoder.mask_id)
-        rec_logits = self.decoder(z_pred.reshape(-1, dq), x_masked)  # [B*(T-1), K, vocab]
-        rec_loss = F.cross_entropy(rec_logits[mask], flat_next_bytes[mask])
-        recon_acc = (rec_logits.argmax(-1)[mask] == flat_next_bytes[mask]).float().mean()
+        rec_logits = self.decoder(z_pred.reshape(-1, dq))  # [B*(T-1), K, vocab]
+        rec_loss = F.cross_entropy(rec_logits.reshape(-1, self.cfg.vocab), flat_next_bytes.reshape(-1))
+        recon_acc = (rec_logits.argmax(-1) == flat_next_bytes).float().mean()
 
         # Entropy regularization (see bsq_entropy_reg): raw value only, not
         # folded into `loss` here — like uncertainty weighting, whether/how
@@ -787,16 +851,15 @@ class QCuteLM(nn.Module):
 
         if self.cfg.aux_recon:
             flat_bytes = byte_chunks.reshape(-1, K)
-            aux_x_masked, aux_mask = maskgit_mask(flat_bytes, self.decoder.mask_id)
-            aux_logits = self.decoder(z_hat.reshape(B * T, dq), aux_x_masked)  # [B*T, K, vocab]
-            aux_rec_loss = F.cross_entropy(aux_logits[aux_mask], flat_bytes[aux_mask])
-            aux_recon_acc = (aux_logits.argmax(-1)[aux_mask] == flat_bytes[aux_mask]).float().mean()
+            aux_logits = self.decoder(z_hat.reshape(B * T, dq))  # [B*T, K, vocab]
+            aux_rec_loss = F.cross_entropy(aux_logits.reshape(-1, self.cfg.vocab), flat_bytes.reshape(-1))
+            aux_recon_acc = (aux_logits.argmax(-1) == flat_bytes).float().mean()
             loss = loss + aux_rec_loss
             metrics["aux_rec_loss"] = aux_rec_loss
             metrics["aux_recon_acc"] = aux_recon_acc
 
-        # bpb_rec is now a heuristic proxy (masked-CE, not a tight ELBO) —
-        # see the FSQ forward() path's comment above for the same caveat.
+        # bpb_rec is a genuine per-byte bits cost under the decoder's
+        # p(bytes|z) — see the FSQ forward() path's comment above for why.
         bpb_rec = rec_loss / math.log(2)
         bpb_pred = (pred_loss * dq) / (K * math.log(2))
         metrics["bpb_total"] = bpb_rec + bpb_pred
@@ -819,7 +882,7 @@ class QCuteLM(nn.Module):
         self.eval()
         cfg = self.cfg
         B, T0, K = prompt_chunks.shape
-        z_hat, targets = self.encoder(prompt_chunks.reshape(B * T0, K))
+        z_hat, targets = encode_chunks(self.encoder, prompt_chunks)
         z_history = z_hat.reshape(B, T0, -1)
         lm_history = targets.reshape(B, T0, -1) if cfg.lm_factorized_input else z_history
         out_chunks = [prompt_chunks]
@@ -838,7 +901,7 @@ class QCuteLM(nn.Module):
                 z_next, next_targets_f = bsq_quantize(out, cfg.dq, cfg.lfq)  # LM output is a latent, quantized here
                 next_targets = next_targets_f.long()
 
-            next_chunk = maskgit_decode(self.decoder, z_next, cfg.maskgit_T)   # [B, K]
+            next_chunk = decode_bytes(self.decoder, z_next)   # [B, K]
             out_chunks.append(next_chunk.unsqueeze(1))
             z_history = torch.cat([z_history, z_next.unsqueeze(1)], dim=1)
             if cfg.lm_factorized_input:
@@ -864,7 +927,7 @@ def score_continuation_bpb(model: QCuteLM, full_chunks: torch.Tensor, n_prompt_c
     model.eval()
     cfg = model.cfg
     B, T, K = full_chunks.shape
-    z_hat, targets = model.encoder(full_chunks.reshape(B * T, K))
+    z_hat, targets = encode_chunks(model.encoder, full_chunks)
     z_hat, targets = z_hat.reshape(B, T, -1), targets.reshape(B, T, -1)
     lm_in = targets if cfg.lm_factorized_input else z_hat
     start = max(0, n_prompt_chunks - 1)  # first prediction whose target is a continuation chunk
@@ -877,21 +940,16 @@ def score_continuation_bpb(model: QCuteLM, full_chunks: torch.Tensor, n_prompt_c
 
         cont_z_pred = z_pred[:, start:]
         cont_true_bytes = true_next_bytes[:, start:].reshape(-1, K)
-        cont_x_masked, cont_mask = maskgit_mask(cont_true_bytes, model.decoder.mask_id)
-        rec_logits = model.decoder(cont_z_pred.reshape(-1, cfg.dq), cont_x_masked)
-        rec_nats = F.cross_entropy(rec_logits[cont_mask], cont_true_bytes[cont_mask])
+        rec_logits = model.decoder(cont_z_pred.reshape(-1, cfg.dq))
+        rec_nats = F.cross_entropy(rec_logits.reshape(-1, cfg.vocab), cont_true_bytes.reshape(-1))
 
         cont_pred_logits, cont_pred_targets = v_pred[:, start:], pred_targets[:, start:]
         pred_nats = F.binary_cross_entropy_with_logits(cont_pred_logits, cont_pred_targets)
     else:
-        flat_bytes = full_chunks.reshape(B * T, K)
-        x_masked, mask = maskgit_mask(flat_bytes, model.decoder.mask_id)
-        rec_logits = model.decoder(z_hat.reshape(B * T, -1), x_masked).reshape(B, T, K, cfg.vocab)
-        mask = mask.reshape(B, T, K)
+        rec_logits = model.decoder(z_hat.reshape(B * T, -1)).reshape(B, T, K, cfg.vocab)
         cont_rec_logits = rec_logits[:, n_prompt_chunks:]
         cont_rec_targets = full_chunks[:, n_prompt_chunks:]
-        cont_mask = mask[:, n_prompt_chunks:]
-        rec_nats = F.cross_entropy(cont_rec_logits[cont_mask], cont_rec_targets[cont_mask])
+        rec_nats = F.cross_entropy(cont_rec_logits.reshape(-1, cfg.vocab), cont_rec_targets.reshape(-1))
 
         pred_logits = model.lm(lm_in)[:, :-1]
         pred_targets = targets[:, 1:]
@@ -947,6 +1005,51 @@ def batch_iter(data: torch.Tensor, batch_size: int, seq_chunks: int, K: int, dev
         yield batch.reshape(batch_size, seq_chunks, K).to(device)
 
 
+def gather_left_context(byte_chunks: torch.Tensor, context_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Builds ChunkEncoder's context/context_mask args from a [B, T, K]
+    (or [N, K], treated as [1, N, K]) chunk batch: chunk t's context is the
+    last context_len bytes of chunk t-1 — still causal, no future bytes,
+    and always fully contained in the immediately preceding chunk (hence
+    the context_len <= K requirement). For t==0 (start of the sampled
+    window — no real preceding chunk within this batch), context is a
+    zero pad with mask=False, per Config.context_len's docstring: no
+    guessing at bytes that came before the sampled window.
+    Returns (context: [..., context_len] long, mask: [..., context_len] bool)
+    matching byte_chunks' leading dims minus the trailing K."""
+    assert 0 < context_len <= byte_chunks.size(-1), "context_len must be in (0, K]"
+    squeeze = byte_chunks.dim() == 2
+    if squeeze:
+        byte_chunks = byte_chunks.unsqueeze(0)  # [1, N, K]
+    B, T, K = byte_chunks.shape
+    prev_tail = byte_chunks[:, :, K - context_len:]  # [B, T, context_len]
+    zeros_chunk = torch.zeros(B, 1, context_len, dtype=byte_chunks.dtype, device=byte_chunks.device)
+    context = torch.cat([zeros_chunk, prev_tail[:, :-1]], dim=1)  # shifted: chunk t gets chunk (t-1)'s tail
+    mask = torch.ones(B, T, context_len, dtype=torch.bool, device=byte_chunks.device)
+    mask[:, 0] = False
+    if squeeze:
+        context, mask = context.squeeze(0), mask.squeeze(0)
+    return context, mask
+
+
+def encode_chunks(encoder: "ChunkEncoder", byte_chunks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The single call-site wrapper every encoder invocation in this file
+    goes through: encodes a [B, T, K] chunk batch (or an already-flat
+    [N, K], treated as one [1, N, K] sequence), gathering left context via
+    gather_left_context first iff encoder.cfg.context_len > 0. Returns
+    (z_hat, targets) flattened to [B*T, dq] (or [N, dq]) — the same flat
+    shape ChunkEncoder itself returns; callers reshape back to [B, T, -1]
+    exactly as they did before this existed. When context_len==0 this is
+    byte-for-byte the old `encoder(byte_chunks.reshape(B*T, K))` call."""
+    is_flat = byte_chunks.dim() == 2
+    btk = byte_chunks.unsqueeze(0) if is_flat else byte_chunks
+    B, T, K = btk.shape
+    flat = btk.reshape(B * T, K)
+    if encoder.cfg.context_len > 0:
+        context, mask = gather_left_context(btk, encoder.cfg.context_len)
+        return encoder(flat, context.reshape(B * T, -1), mask.reshape(B * T, -1))
+    return encoder(flat)
+
+
 def split_train_val(data: torch.Tensor, val_frac: float) -> tuple[torch.Tensor, torch.Tensor]:
     n_val = max(1, int(len(data) * val_frac))
     return data[:-n_val], data[-n_val:]
@@ -968,22 +1071,101 @@ def eval_metrics(model: "QCuteLM", data_iter, n_batches: int) -> dict[str, float
 @torch.no_grad()
 def eval_ae_recon_acc(model: "QCuteLM", data_iter, n_batches: int) -> float:
     """Encoder+decoder only, bypassing the LM entirely: bytes -> encoder ->
-    z_hat -> decoder -> bytes. Used by pretrain_autoencoder's stopping
-    criterion (and its own progress logging) so it measures the actual
-    quantity the threshold is about, not a noisy single training batch."""
+    z_hat -> decoder -> bytes, one-shot over all K positions (see
+    ChunkDecoder: code-only input, no masking). Used by
+    pretrain_autoencoder's stopping criterion (and its own progress
+    logging) so it measures the actual quantity the threshold is about,
+    not a noisy single training batch."""
     model.eval()
     correct = total = 0
     for _ in range(n_batches):
         batch = next(data_iter)
         B, T, K = batch.shape
         flat_bytes = batch.reshape(B * T, K)
-        z_hat, _ = model.encoder(flat_bytes)
-        x_masked, mask = maskgit_mask(flat_bytes, model.decoder.mask_id)
-        logits = model.decoder(z_hat, x_masked)
-        correct += (logits.argmax(-1)[mask] == flat_bytes[mask]).float().sum().item()
-        total += mask.sum().item()
+        z_hat, _ = encode_chunks(model.encoder, batch)
+        logits = model.decoder(z_hat)
+        correct += (logits.argmax(-1) == flat_bytes).float().sum().item()
+        total += flat_bytes.numel()
     model.train()
     return correct / total
+
+
+def _pretrain_autoencoder_lbfgs(model: "QCuteLM", train_data: torch.Tensor, val_iter, args, log, ae_params, cfg, device) -> float:
+    """L-BFGS alternative to pretrain_autoencoder's default AdamW loop —
+    see docs/status.md's speculation on whether the plateau at full-corpus
+    scale is optimizer noise, not a real capacity ceiling. L-BFGS's line
+    search and curvature estimate assume the objective is *consistent*
+    across the multiple closure evaluations it makes per .step() call —
+    an assumption plain random-minibatch sampling (args.batch_size, a new
+    draw every step) violates badly. So unlike the AdamW path, this uses
+    one large, FIXED chunk sample for the whole run (drawn once, reused by
+    every closure call) instead of batch_iter's per-step random draws:
+    a genuinely low-noise, near-full-batch objective, which the tiny
+    (~0.3-0.5M param) encoder+decoder can afford. lr=1.0 with
+    line_search_fn='strong_wolfe' is L-BFGS's standard recommended
+    combination — the line search finds the step size itself, so
+    --pretrain_lr isn't used here (unlike the AdamW path)."""
+    n = (len(train_data) // cfg.K) * cfg.K
+    all_chunks = train_data[:n].reshape(-1, cfg.K).to(device)
+    n_sample = min(args.pretrain_lbfgs_chunks, all_chunks.size(0))
+    idx = torch.randperm(all_chunks.size(0), device=device)[:n_sample]
+    fixed_chunks = all_chunks[idx]
+    log(f"pretrain_ae_lbfgs: fixed batch of {n_sample} chunks ({n_sample*cfg.K} bytes), "
+        f"reused across every L-BFGS closure call (no per-step resampling)")
+
+    line_search_fn = None if args.pretrain_lbfgs_no_line_search else "strong_wolfe"
+    lbfgs_lr = args.pretrain_lr if args.pretrain_lbfgs_no_line_search else 1.0
+    opt = torch.optim.LBFGS(
+        ae_params, lr=lbfgs_lr, max_iter=args.pretrain_lbfgs_max_iter,
+        history_size=args.pretrain_lbfgs_history, line_search_fn=line_search_fn,
+    )
+
+    def closure():
+        opt.zero_grad()
+        z_hat, _ = encode_chunks(model.encoder, fixed_chunks)
+        logits = model.decoder(z_hat)
+        loss = F.cross_entropy(logits.reshape(-1, cfg.vocab), fixed_chunks.reshape(-1))
+        loss.backward()
+        return loss
+
+    model.train()
+    recon_acc = 0.0
+    pbar = tqdm(range(1, args.pretrain_steps + 1), desc="pretrain_ae_lbfgs", dynamic_ncols=True)
+    for step in pbar:
+        loss = opt.step(closure)
+        with torch.no_grad():
+            z_hat, _ = encode_chunks(model.encoder, fixed_chunks)
+            logits = model.decoder(z_hat)
+            train_acc = (logits.argmax(-1) == fixed_chunks).float().mean()
+        pbar.set_postfix(loss=f"{loss.item():.4f}", train_recon_acc=f"{train_acc.item()*100:.2f}%")
+        if step % args.pretrain_eval_every == 0 or step == args.pretrain_steps:
+            recon_acc = eval_ae_recon_acc(model, val_iter, args.eval_batches)
+            log(f"{pbar}  val_recon_acc {recon_acc*100:.2f}%", step=step,
+                pretrain_train_recon_acc=train_acc.item(), pretrain_recon_acc=recon_acc)
+            if recon_acc >= args.pretrain_target_acc:
+                log(f"pretrain_ae_lbfgs target reached: recon_acc {recon_acc*100:.2f}% >= "
+                    f"{args.pretrain_target_acc*100:.1f}% at step {step}", step=step, pretrain_recon_acc=recon_acc)
+                return recon_acc
+    log(f"pretrain_ae_lbfgs max steps ({args.pretrain_steps}) reached without hitting target, "
+        f"final recon_acc {recon_acc*100:.2f}%", pretrain_recon_acc=recon_acc)
+    return recon_acc
+
+
+def init_decoder_bias_to_unigram(decoder: "ChunkDecoder", data: torch.Tensor) -> None:
+    """Initializes decoder.head's bias to the training corpus's log unigram
+    byte frequency, so the decoder starts near the unigram-guessing loss
+    floor (~3.1-3.5 nats for English text) instead of the uniform-guess
+    floor (log(256)~5.5 nats) — same idea as GPT-2's embedding init, a free
+    head start requiring no architecture change. At init, the rest of the
+    decoder's output (z_proj(z), pos_emb, mixer/MLP) is small-random, so
+    the pre-bias logits are near zero and the softmax is dominated by this
+    bias term — i.e. the decoder starts out actually predicting the
+    unigram distribution, not a uniform one, before it's learned anything
+    about z at all."""
+    counts = torch.bincount(data, minlength=256).float() + 1.0  # +1 smoothing, avoid log(0)
+    log_freq = torch.log(counts / counts.sum())
+    with torch.no_grad():
+        decoder.head.bias.copy_(log_freq.to(decoder.head.bias.device))
 
 
 def pretrain_autoencoder(model: "QCuteLM", train_data: torch.Tensor, val_iter, args, log) -> float:
@@ -1005,28 +1187,41 @@ def pretrain_autoencoder(model: "QCuteLM", train_data: torch.Tensor, val_iter, a
     cfg = model.cfg
     device = next(model.parameters()).device
     ae_params = list(model.encoder.parameters()) + list(model.decoder.parameters())
-    opt = torch.optim.AdamW(ae_params, lr=args.pretrain_lr, betas=(0.9, 0.95), weight_decay=0.1)
+    init_decoder_bias_to_unigram(model.decoder, train_data)
+
+    if args.pretrain_lbfgs:
+        return _pretrain_autoencoder_lbfgs(model, train_data, val_iter, args, log, ae_params, cfg, device)
+
+    # PyTorch AdamW defaults (betas=(0.9, 0.999)), not the (0.9, 0.95) used
+    # elsewhere in this file — testing whether the shorter (0.95) second-
+    # moment window was contributing to pretrain_ae's plateau/oscillation
+    # at full-corpus scale (see docs/status.md's optimizer-side speculation).
+    opt = torch.optim.AdamW(ae_params, lr=args.pretrain_lr, weight_decay=args.pretrain_weight_decay)
     train_iter = batch_iter(train_data, args.batch_size, args.seq_chunks, cfg.K, device)
 
     model.train()
     recon_acc = 0.0
     pbar = tqdm(range(1, args.pretrain_steps + 1), desc="pretrain_ae", dynamic_ncols=True)
     for step in pbar:
-        lr = lr_at(step, args.warmup_steps, args.pretrain_lr)
+        if args.pretrain_cosine_decay:
+            lr = lr_at_warmup_constant_cosine(
+                step, args.warmup_steps, args.pretrain_constant_steps, args.pretrain_lr, args.pretrain_steps,
+            )
+        else:
+            lr = lr_at(step, args.warmup_steps, args.pretrain_lr)
         for g in opt.param_groups:
             g["lr"] = lr
         batch = next(train_iter)
         B, T, K = batch.shape
         flat_bytes = batch.reshape(B * T, K)
-        z_hat, _ = model.encoder(flat_bytes)
-        x_masked, mask = maskgit_mask(flat_bytes, model.decoder.mask_id)
-        logits = model.decoder(z_hat, x_masked)
-        loss = F.cross_entropy(logits[mask], flat_bytes[mask])
+        z_hat, _ = encode_chunks(model.encoder, batch)
+        logits = model.decoder(z_hat)
+        loss = F.cross_entropy(logits.reshape(-1, cfg.vocab), flat_bytes.reshape(-1))
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(ae_params, args.grad_clip)
         opt.step()
-        train_acc = (logits.argmax(-1)[mask] == flat_bytes[mask]).float().mean()
+        train_acc = (logits.argmax(-1) == flat_bytes).float().mean()
         pbar.set_postfix(lr=f"{lr:.2e}", loss=f"{loss.item():.4f}", train_recon_acc=f"{train_acc.item()*100:.2f}%")
         if step % args.pretrain_eval_every == 0 or step == args.pretrain_steps:
             recon_acc = eval_ae_recon_acc(model, val_iter, args.eval_batches)
@@ -1059,7 +1254,7 @@ def build_code_vocab(model: "QCuteLM", data: torch.Tensor, K: int, device: str, 
     code_to_id: dict[tuple, int] = {}
     z_rows = []
     for i in range(0, chunks.size(0), batch_size):
-        z_hat, targets = model.encoder(chunks[i : i + batch_size])
+        z_hat, targets = encode_chunks(model.encoder, chunks[i : i + batch_size])
         targets_cpu, z_cpu = targets.cpu(), z_hat.cpu()
         for j in range(targets_cpu.size(0)):
             key = tuple(targets_cpu[j].tolist())
@@ -1082,7 +1277,7 @@ def encode_to_vocab_ids(model: "QCuteLM", data: torch.Tensor, K: int, code_to_id
     chunks = data[:n].reshape(-1, K).to(device)
     ids = []
     for i in range(0, chunks.size(0), batch_size):
-        _, targets = model.encoder(chunks[i : i + batch_size])
+        _, targets = encode_chunks(model.encoder, chunks[i : i + batch_size])
         for row in targets.cpu().tolist():
             ids.append(code_to_id.get(tuple(row), unk_id))
     model.train()
@@ -1105,7 +1300,7 @@ def vocab_lm_generate(
 ) -> torch.Tensor:
     """Autoregressively sample n_new vocab ids from lm, then decode them
     back to bytes via code_table_full (row per vocab id, including the UNK
-    row) + the frozen MaskGIT decoder. prompt_ids: [B, T0] long -> bytes:
+    row) + the frozen decoder. prompt_ids: [B, T0] long -> bytes:
     [B, n_new, K] long."""
     lm.eval()
     tokens = prompt_ids.clone()
@@ -1118,7 +1313,7 @@ def vocab_lm_generate(
     new_ids = tokens[:, prompt_ids.size(1):]
     B, T = new_ids.shape
     z = code_table_full[new_ids.reshape(-1)]
-    bytes_out = maskgit_decode(decoder, z, decoder.cfg.maskgit_T)
+    bytes_out = decode_bytes(decoder, z)
     return bytes_out.reshape(B, T, -1)
 
 
@@ -1185,17 +1380,141 @@ def train_vocab_lm(
             )
             # Qualitative sample every eval — actual (readable-or-not) text,
             # not just the bpb number, so training progress is visible even
-            # while bpb is still an imperfect proxy (see MaskGIT's heuristic-
-            # loss caveat elsewhere in this file).
+            # if the tokenizer's own reconstruction quality caps how
+            # meaningful any single bpb number is on its own.
             prompt_len = min(8, vin.size(1))
             prompt_ids = vin[:1, :prompt_len]
             with torch.no_grad():
-                prompt_chunks = maskgit_decode(decoder, code_table_full[prompt_ids[0]], decoder.cfg.maskgit_T)
+                prompt_chunks = decode_bytes(decoder, code_table_full[prompt_ids[0]])
             prompt_bytes = bytes(prompt_chunks.reshape(-1).tolist())
             gen_chunks = vocab_lm_generate(lm, decoder, code_table_full, prompt_ids, n_new=16)
             gen_bytes = bytes(gen_chunks[0].reshape(-1).tolist())
             log(f"qual_prompt (decoded from val ids): {prompt_bytes!r}", step=step)
             log(f"qual_generated:                     {gen_bytes!r}", step=step)
+            lm.train()
+    return lm
+
+
+@torch.no_grad()
+def encode_to_codes(model: "QCuteLM", data: torch.Tensor, K: int, device: str, batch_size: int = 1024) -> torch.Tensor:
+    """Encode the whole corpus with the (frozen) encoder into its raw
+    per-dim codes (targets) — the PQ/factorized-embedding counterpart to
+    build_code_vocab/encode_to_vocab_ids. No vocabulary, no OOV/UNK: every
+    dq-bit combination is representable by construction
+    (FactorizedCodeEmbedding is compositional), so this just needs the
+    codes themselves, not a dedup'd id table."""
+    model.eval()
+    n = (len(data) // K) * K
+    chunks = data[:n].reshape(-1, K).to(device)
+    rows = []
+    for i in range(0, chunks.size(0), batch_size):
+        _, targets = encode_chunks(model.encoder, chunks[i : i + batch_size])
+        rows.append(targets.cpu())
+    model.train()
+    return torch.cat(rows, dim=0)
+
+
+def code_batch_iter(codes: torch.Tensor, batch_size: int, context: int, device: str):
+    seq_len = context + 1
+    n = (len(codes) - 1) // seq_len
+    while True:
+        starts = torch.randint(0, n, (batch_size,))
+        batch = torch.stack([codes[i * seq_len : (i + 1) * seq_len] for i in starts])
+        yield batch.to(device)
+
+
+@torch.no_grad()
+def factorized_lm_generate(
+    lm: LatentLM, decoder: ChunkDecoder, dq: int, lfq: bool,
+    prompt_codes: torch.Tensor, n_new: int,
+) -> torch.Tensor:
+    """Autoregressively sample n_new codes from lm (BSQ-quantized,
+    deterministic sign — matching QCuteLM.generate()'s default, non-sampling
+    BSQ path), then decode them back to bytes via the frozen decoder.
+    prompt_codes: [B, T0, dq] float (0/1) -> bytes: [B, n_new, K] long."""
+    lm.eval()
+    codes = prompt_codes.clone()
+    for _ in range(n_new):
+        out = lm(codes)[:, -1]
+        _, next_targets_f = bsq_quantize(out, dq, lfq)
+        codes = torch.cat([codes, next_targets_f.unsqueeze(1)], dim=1)
+    lm.train()
+    new_codes = codes[:, prompt_codes.size(1):]
+    B, T = new_codes.shape[0], new_codes.shape[1]
+    bytes_out = decode_bytes(decoder, new_codes.reshape(B * T, dq))
+    return bytes_out.reshape(B, T, -1)
+
+
+def train_factorized_lm(
+    cfg: Config, decoder: ChunkDecoder,
+    train_codes: torch.Tensor, val_codes: torch.Tensor, args, log, run_name: str, device: str,
+) -> LatentLM:
+    """Trains a fresh, standalone LatentLM in PQ/factorized-embedding mode
+    over the frozen tokenizer's raw per-dim codes — the symmetric
+    alternative to train_vocab_lm: input embedding mirrors the
+    encoder/decoder's own per-dim code structure (FactorizedCodeEmbedding,
+    compositional, no OOV/UNK) instead of collapsing codes into one
+    arbitrary vocab id. Loss is per-dim BCE (next-code prediction) only —
+    the decoder is frozen and never receives gradient here, matching
+    train_vocab_lm's 'no decoder loss during the LM phase' property; it's
+    only invoked (no_grad) for qualitative decode-and-inspect logging."""
+    dq = cfg.dq
+    lm = LatentLM(cfg, factorized_input=True).to(device)
+    n_params = sum(p.numel() for p in lm.parameters())
+    log(f"factorized_lm: dq={dq} params={n_params/1e6:.2f}M K={cfg.K} (no vocab/UNK)")
+
+    opt = torch.optim.AdamW(lm.parameters(), lr=args.lr_peak, betas=(0.9, 0.95), weight_decay=0.1)
+    context = args.seq_chunks
+    train_iter = code_batch_iter(train_codes, args.batch_size, context, device)
+    val_iter = code_batch_iter(val_codes, args.batch_size, context, device)
+    checkpointer = Checkpointer(args.checkpoint_dir / run_name, args.save_every_n_evals, minimize=True)
+    K = cfg.K
+
+    lm.train()
+    pbar = tqdm(range(1, args.steps + 1), desc="train_factorized_lm", dynamic_ncols=True)
+    for step in pbar:
+        lr = lr_at(step, args.warmup_steps, args.lr_peak)
+        for g in opt.param_groups:
+            g["lr"] = lr
+        batch = next(train_iter)
+        inputs, targets = batch[:, :-1], batch[:, 1:]
+        logits = lm(inputs)
+        loss = F.binary_cross_entropy_with_logits(logits, targets)
+        acc = ((logits > 0).float() == targets).float().mean()
+        bpb = (loss * dq) / (K * math.log(2))
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(lm.parameters(), args.grad_clip)
+        opt.step()
+        pbar.set_postfix(lr=f"{lr:.2e}", loss=f"{loss.item():.4f}", bit_acc=f"{acc.item()*100:.2f}%", bpb=f"{bpb.item():.4f}")
+        if step % args.log_every == 0:
+            log(f"{pbar}", step=step, lr=lr, loss=loss.item(), bit_acc=acc.item(), bpb=bpb.item())
+        if step % args.eval_every == 0 or step == args.steps:
+            lm.eval()
+            with torch.no_grad():
+                vbatch = next(val_iter)
+                vin, vtgt = vbatch[:, :-1], vbatch[:, 1:]
+                vlogits = lm(vin)
+                vloss = F.binary_cross_entropy_with_logits(vlogits, vtgt)
+                vacc = ((vlogits > 0).float() == vtgt).float().mean()
+                vbpb = (vloss * dq) / (K * math.log(2))
+            log(
+                f"step {step:5d}  val_bit_acc {vacc.item()*100:.2f}%  val_bpb {vbpb.item():.4f}",
+                step=step, val_bit_acc=vacc.item(), val_bpb=vbpb.item(),
+            )
+            checkpointer.step(
+                {"lm": lm.state_dict(), "cfg": asdict(cfg), "step": step, "val_bpb": vbpb.item()},
+                vbpb.item(),
+            )
+            prompt_len = min(8, vin.size(1))
+            prompt_codes = vin[:1, :prompt_len]
+            with torch.no_grad():
+                prompt_chunks = decode_bytes(decoder, prompt_codes[0])
+            prompt_bytes = bytes(prompt_chunks.reshape(-1).tolist())
+            gen_chunks = factorized_lm_generate(lm, decoder, dq, cfg.lfq, prompt_codes, n_new=16)
+            gen_bytes = bytes(gen_chunks[0].reshape(-1).tolist())
+            log(f"qual_prompt (decoded from val codes): {prompt_bytes!r}", step=step)
+            log(f"qual_generated:                       {gen_bytes!r}", step=step)
             lm.train()
     return lm
 
@@ -1206,6 +1525,25 @@ def lr_at(step: int, warmup: int, peak: float) -> float:
     if step < warmup:
         return peak * step / max(1, warmup)
     return peak
+
+
+def lr_at_warmup_constant_cosine(
+    step: int, warmup: int, constant_steps: int, peak: float, total_steps: int, min_lr_frac: float = 0.1,
+) -> float:
+    """Linear warmup (`warmup` steps) -> constant at peak (`constant_steps`
+    steps) -> cosine decay over the rest of training, down to `min_lr_frac
+    * peak`. Used for --pretrain_ae capacity-ceiling tests: a constant LR
+    tends to leave `recon_acc` oscillating near its ceiling instead of
+    settling into it (observed directly — noisy 89-96% instead of a clean
+    plateau); annealing down at the end should let it settle."""
+    if step < warmup:
+        return peak * step / max(1, warmup)
+    decay_start = warmup + constant_steps
+    if step < decay_start:
+        return peak
+    min_lr = peak * min_lr_frac
+    progress = min(1.0, (step - decay_start) / max(1, total_steps - decay_start))
+    return min_lr + 0.5 * (peak - min_lr) * (1 + math.cos(math.pi * progress))
 
 
 def load_config_module(path: Path) -> dict:
@@ -1261,8 +1599,26 @@ def main():
     p.add_argument("--bottleneck", choices=["fsq", "bsq"], default="fsq")
     p.add_argument("--dq", type=int, default=None, help="defaults: 6 for fsq, 18 for bsq")
     p.add_argument("--K", type=int, default=4)  # see Config.K's comment for why 4, not the doc's 8
-    p.add_argument("--data", type=Path, default=Path("datasets/enwik8.gz"))
-    p.add_argument("--n_bytes", type=int, default=2_000_000, help="prefix of enwik8 to load")
+    p.add_argument("--d_byte", type=int, default=None, help="encoder/decoder byte+pos embedding dim (Config default: 64)")
+    p.add_argument("--d_enc", type=int, default=None, help="encoder mixer/MLP width (Config default: 256)")
+    p.add_argument("--d_dec", type=int, default=None, help="decoder mixer/MLP width (Config default: 256)")
+    p.add_argument("--tokenizer_layers", type=int, default=1, help="stacked MixerBlocks in ChunkEncoder/ChunkDecoder")
+    p.add_argument("--encoder_layers", type=int, default=None, help="override tokenizer_layers for ChunkEncoder only")
+    p.add_argument("--decoder_layers", type=int, default=None, help="override tokenizer_layers for ChunkDecoder only")
+    p.add_argument("--encoder_mixer", type=str, default=None, choices=["attention", "conv"], help="override --mixer for ChunkEncoder only")
+    p.add_argument("--decoder_mixer", type=str, default=None, choices=["attention", "conv"], help="override --mixer for ChunkDecoder only")
+    p.add_argument("--context_len", type=int, default=0,
+        help="asymmetric left-side byte context for ChunkEncoder, 0-K bytes from the previous chunk's tail "
+             "(0 = no change from the old K-only encoder; see Config.context_len's docstring)")
+    p.add_argument("--pretrain_weight_decay", type=float, default=0.1, help="--pretrain_ae's AdamW weight_decay")
+    p.add_argument(
+        "--pretrain_cosine_decay", action="store_true",
+        help="--pretrain_ae's LR: warmup -> constant (--pretrain_constant_steps) -> cosine decay over the rest "
+             "of --pretrain_steps, instead of warmup -> constant for the whole run"
+    )
+    p.add_argument("--pretrain_constant_steps", type=int, default=1000, help="steps held at peak LR before cosine decay begins")
+    p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
+    p.add_argument("--n_bytes", type=int, default=None, help="prefix of the corpus to load (default: all)")
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch_size", type=int, default=32)
@@ -1270,6 +1626,10 @@ def main():
     p.add_argument("--lr_peak", type=float, default=6e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--warmup_steps", type=int, default=200)
+    p.add_argument("--cosine_decay", action="store_true",
+        help="joint-training LR: warmup -> constant (--constant_steps) -> cosine decay over the rest "
+             "of --steps, instead of warmup -> constant for the whole run")
+    p.add_argument("--constant_steps", type=int, default=1000, help="joint-training steps held at peak LR before cosine decay begins")
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--eval_every", type=int, default=200)
     p.add_argument("--eval_batches", type=int, default=10)
@@ -1290,6 +1650,17 @@ def main():
     p.add_argument("--pretrain_steps", type=int, default=3000, help="max steps for --pretrain_ae")
     p.add_argument("--pretrain_target_acc", type=float, default=0.95, help="stop --pretrain_ae early once val recon_acc clears this")
     p.add_argument("--pretrain_lr", type=float, default=1e-3, help="separate LR for the --pretrain_ae phase (its own AdamW instance)")
+    p.add_argument("--pretrain_lbfgs", action="store_true",
+        help="--pretrain_ae uses full-batch L-BFGS (see _pretrain_autoencoder_lbfgs) instead of AdamW + "
+             "random minibatches — a low-noise objective to test whether the full-corpus-scale plateau is "
+             "optimizer noise or a real capacity ceiling. Ignores --pretrain_lr/--batch_size/--pretrain_cosine_decay.")
+    p.add_argument("--pretrain_lbfgs_chunks", type=int, default=8192, help="fixed chunk-sample size for --pretrain_lbfgs")
+    p.add_argument("--pretrain_lbfgs_max_iter", type=int, default=10, help="L-BFGS's max_iter (closure calls per .step())")
+    p.add_argument("--pretrain_lbfgs_history", type=int, default=50, help="L-BFGS's history_size (curvature memory)")
+    p.add_argument("--pretrain_lbfgs_no_line_search", action="store_true",
+        help="drop line_search_fn='strong_wolfe' (default on) — BSQ's straight-through estimator makes the true "
+             "loss landscape piecewise-constant once bit-sign patterns stabilize, which can make Wolfe line search "
+             "silently fail (repeated zero-length steps) instead of erroring; this uses plain lr-scaled steps instead")
     p.add_argument("--pretrain_eval_every", type=int, default=100)
     p.add_argument(
         "--pretrain_checkpoint_path", type=Path, default=None,
@@ -1323,6 +1694,12 @@ def main():
              "instead of BSQ (L2-normalize onto the hypersphere first, then sign)"
     )
     p.add_argument(
+        "--quant_grad_scale", type=float, default=1.0,
+        help="QAT-inspired backward-only gradient rescale at the encoder's BSQ quantization boundary "
+             "(see GradScale). 1.0 (default) = no-op. sqrt(dq) exactly cancels BSQ's explicit 1/sqrt(dq) "
+             "rescale; higher also compensates for F.normalize's contracting Jacobian."
+    )
+    p.add_argument(
         "--mixer", choices=["attention", "conv"], default="attention",
         help="encoder/decoder cross-K-position mixer (see MixerBlock): full non-causal self-attention, "
              "or a single non-causal 1D conv (kernel_size=K, cheaper, no softmax)"
@@ -1335,6 +1712,14 @@ def main():
         "--lm_factorized_input", action="store_true",
         help="LM input: compositional per-dim (PQ-style) embedding on the discrete code instead of a linear "
              "projection of continuous z (see FactorizedCodeEmbedding); output format unchanged"
+    )
+    p.add_argument(
+        "--pq_groups", type=int, default=1,
+        help="--freeze_after_pretrain's LM phase only: 1 (default, special case) = a single empirical-vocab "
+             "embedding table + one softmax over it (build_code_vocab/train_vocab_lm — the whole dq-bit code is "
+             "one vocab entry); >1 = PQ/factorized per-dim embedding + per-dim BCE instead (train_factorized_lm, "
+             "no vocab/UNK). Independent of --lm_factorized_input, which governs the *unfrozen* joint-training "
+             "LM's input format, not this frozen-tokenizer recipe's choice."
     )
     p.add_argument(
         "--uncertainty_weighting", action="store_true",
@@ -1381,9 +1766,20 @@ def main():
         model.load_state_dict(ckpt["model"])
         start_step = ckpt["step"]
     else:
+        width_overrides = {}
+        if args.d_byte is not None:
+            width_overrides["d_byte"] = args.d_byte
+        if args.d_enc is not None:
+            width_overrides["d_enc"] = args.d_enc
+        if args.d_dec is not None:
+            width_overrides["d_dec"] = args.d_dec
         cfg = build_config(
             args.bottleneck, args.dq, K=args.K, aux_recon=not args.disable_aux_recon, lfq=args.lfq,
+            quant_grad_scale=args.quant_grad_scale,
             mixer=args.mixer, mixer_mlp=not args.disable_mixer_mlp, lm_factorized_input=args.lm_factorized_input,
+            tokenizer_layers=args.tokenizer_layers, context_len=args.context_len,
+            encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers,
+            encoder_mixer=args.encoder_mixer, decoder_mixer=args.decoder_mixer, **width_overrides,
         )
         model = QCuteLM(cfg).to(device)
         start_step = 0
@@ -1398,11 +1794,27 @@ def main():
     log = Logger(args.logs_dir / run_name)
     print(f"run_name={run_name}  logging to {log.text_path} (raw text) / {log.json_path} (JSONL) — tail -f {log.text_path}")
     loaded_note = f"  loaded_from={args.checkpoint_path} (step {start_step})" if args.checkpoint_path else ""
-    log(f"bottleneck={cfg.bottleneck} dq={cfg.dq} params={n_params/1e6:.2f}M device={device}" + loaded_note)
+    n_enc = sum(p_.numel() for p_ in model.encoder.parameters())
+    n_dec = sum(p_.numel() for p_ in model.decoder.parameters())
+    n_lm = sum(p_.numel() for p_ in model.lm.parameters())
+    log(
+        f"bottleneck={cfg.bottleneck} dq={cfg.dq} params={n_params/1e6:.2f}M "
+        f"(encoder={n_enc/1e6:.3f}M decoder={n_dec/1e6:.3f}M lm={n_lm/1e6:.3f}M) device={device}" + loaded_note
+    )
 
     data = load_enwik8(args.data, args.n_bytes)
     train_data, val_data = split_train_val(data, args.val_frac)
     log(f"train_bytes={len(train_data)}  val_bytes={len(val_data)}")
+    if not args.eval_only:
+        seq_len = args.seq_chunks * cfg.K
+        if args.pretrain_ae:
+            pretrain_epochs = args.pretrain_steps * args.batch_size * seq_len / len(train_data)
+            log(f"~{pretrain_epochs:.1f} epochs over train_bytes during --pretrain_ae "
+                f"(pretrain_steps={args.pretrain_steps} batch_size={args.batch_size} seq_len={seq_len})")
+        joint_epochs = args.steps * args.batch_size * seq_len / len(train_data)
+        log(f"~{joint_epochs:.1f} epochs over train_bytes during joint training "
+            f"(steps={args.steps} batch_size={args.batch_size} seq_len={seq_len}, "
+            f"random-with-replacement sampling — see batch_iter)")
     val_iter = batch_iter(val_data, args.batch_size, args.seq_chunks, cfg.K, device)
 
     if args.eval_only:
@@ -1451,15 +1863,21 @@ def main():
             p.requires_grad = False
         log("encoder+decoder frozen after pretraining")
 
-        code_table, code_to_id = build_code_vocab(model, train_data, cfg.K, device)
-        log(f"vocab built from train data: {len(code_to_id)} distinct codes "
-            f"(of {(len(train_data)//cfg.K)} chunks)")
-        train_ids = encode_to_vocab_ids(model, train_data, cfg.K, code_to_id, device)
-        val_ids = encode_to_vocab_ids(model, val_data, cfg.K, code_to_id, device)
-        unk_frac = (val_ids == len(code_to_id)).float().mean().item()
-        log(f"val UNK rate (codes unseen in train): {unk_frac*100:.2f}%")
-
-        train_vocab_lm(cfg, model.decoder, code_table, train_ids, val_ids, args, log, run_name, device)
+        if args.pq_groups != 1:
+            train_codes = encode_to_codes(model, train_data, cfg.K, device)
+            val_codes = encode_to_codes(model, val_data, cfg.K, device)
+            log(f"codes encoded: train={train_codes.size(0)} val={val_codes.size(0)} dq={cfg.dq} "
+                f"(no vocab/UNK — PQ/factorized embedding is compositional)")
+            train_factorized_lm(cfg, model.decoder, train_codes, val_codes, args, log, run_name, device)
+        else:
+            code_table, code_to_id = build_code_vocab(model, train_data, cfg.K, device)
+            log(f"vocab built from train data: {len(code_to_id)} distinct codes "
+                f"(of {(len(train_data)//cfg.K)} chunks)")
+            train_ids = encode_to_vocab_ids(model, train_data, cfg.K, code_to_id, device)
+            val_ids = encode_to_vocab_ids(model, val_data, cfg.K, code_to_id, device)
+            unk_frac = (val_ids == len(code_to_id)).float().mean().item()
+            log(f"val UNK rate (codes unseen in train): {unk_frac*100:.2f}%")
+            train_vocab_lm(cfg, model.decoder, code_table, train_ids, val_ids, args, log, run_name, device)
         return
 
     # Uncertainty weighting (Kendall & Gal 2018-style learned homoscedastic
@@ -1494,7 +1912,10 @@ def main():
     model.train()
     pbar = tqdm(range(1, args.steps + 1), desc="train", dynamic_ncols=True)
     for step in pbar:
-        lr = lr_at(step, args.warmup_steps, args.lr_peak)
+        if args.cosine_decay:
+            lr = lr_at_warmup_constant_cosine(step, args.warmup_steps, args.constant_steps, args.lr_peak, args.steps)
+        else:
+            lr = lr_at(step, args.warmup_steps, args.lr_peak)
         for g in opt.param_groups:
             g["lr"] = lr
 

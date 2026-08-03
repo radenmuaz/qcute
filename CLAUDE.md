@@ -6,12 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 uv sync                                         # install/update env from pyproject.toml + uv.lock
-uv run python scripts/prepare_data.py           # download/cut datasets/enwik8{,_tiny}.gz
-uv run python scripts/train_bpe.py --data datasets/enwik8_tiny.gz   # BPE tokenizer for qcute.bpelm
+uv run python scripts/prepare_data.py           # download/cut datasets/enwik8{,_1M}.gz
+uv run python scripts/train_bpe.py --data datasets/enwik8_1M.gz   # BPE tokenizer for qcute.bpelm
 uv run python -m qcute.bytelm --preset sd       # byte-level baseline LM (Phase 0), reports BPB
 uv run python -m qcute.qcutelm                  # end-to-end tokenizer + latent LM (FSQ/BSQ)
-uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_tiny_8192.model   # BPE baseline
-uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_converged.py   # named, reproducible run
+uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_1M_8192.model   # BPE baseline
+uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4.py   # named, reproducible run
 uv run python scripts/plot_run.py logs/<run_name>   # train/val bpb PNG from a run's run.jsonl
 ```
 
@@ -31,6 +31,27 @@ slow down (observed directly: a second run caused an already-progressing
 job to stall with zero throughput). Kill or wait out the current run
 before launching another — never launch a second training process while
 one is still active.
+
+**When launching a training run in the background, never redirect its
+stdout/stderr to `/dev/null`** — use a file instead (e.g. a scratchpad
+path, or `/tmp/<pid>.log` renamed once the PID is known post-launch),
+since `/dev/null` silently swallows uncaught-exception tracebacks and
+anything not routed through `Logger`, making crashes invisible. Pipe
+through `tr '\r' '\n'` before the redirect (`... 2>&1 | tr '\r' '\n' >
+/tmp/foo.log &`) — tqdm's progress bar uses `\r` for in-place updates,
+which lands as one giant unreadable line in a plain file otherwise; `tr`
+turns each update into its own readable line (e.g. `loss=2.1512`). Note
+`$!` after a pipe gives the last stage's PID (`tr`), not Python's — use
+`pgrep -f "python3 -m qcute.<module>"` to find the actual training
+process if you need its PID (e.g. to kill it). **After launching, give
+the user two `tail -f` commands**: one on that raw stdout/stderr file,
+and one on `logs/<run_name>/run.log` (the structured log `Logger` writes
+to at `--log_every`/`--eval_every` intervals) — so they can watch it live
+themselves rather than relying on being told the outcome later. Long runs
+have shown unpredictable throughput (observed: a
+nominal ~30-minute budget taking 2.5-3.5 hours instead) — watch actual
+elapsed time/step rate early on rather than assuming a run will finish on
+schedule.
 
 ## Architecture
 

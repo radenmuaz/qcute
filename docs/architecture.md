@@ -63,7 +63,7 @@ and `qcute.bpelm`'s bytes/token so BPB and generation latency are
 comparable at matched bandwidth across all three. `mtp_heads`/`K` default
 to **4** at tiny-corpus scale (the `xs` preset), not the handover doc's
 8 — empirically, BPE (the fair comparison point) only reaches ~3-4
-bytes/token on a 450,000-byte corpus before larger vocabs start
+bytes/token on a 900,000-byte corpus before larger vocabs start
 memorizing phrases (see `scripts/train_bpe.py`'s docstring), so targeting
 8 there would be a bandwidth mismatch specific to this corpus scale.
 `sd`/`md` keep 8, matching the doc's full-corpus-scale default.
@@ -139,43 +139,76 @@ Supersedes the old streaming-causal-encoder Phase 1 autoencoder, archived at
   generation finding) this project hit in practice. Computed on the LM's
   raw predicted latent (`v_pred`), not the encoder's; wired in as a
   training-loop-only term (see below), not baked into the model.
-- `ChunkEncoder` / `ChunkDecoder`: per-position `byte_emb + pos_emb`
-  (decoder also broadcast-adds `z_proj(z)` to every position), then a
-  shared **`MixerBlock`** (mixer + optional post-mixer MLP, pre-norm
-  residual) before a final projection. `--mixer {attention,conv}` selects
-  the cross-K-position mixer: `FullSelfAttention` (full non-causal
-  self-attention over the K positions) or `FullConvMixer` (a single
-  non-causal 1D conv, `kernel_size=2K-1` with symmetric `padding=K-1` —
-  *not* `kernel_size=K`, which was tried first and is wrong: it gives only
-  one output position full coverage of all K inputs, the rest get an
-  inconsistent partial window; `2K-1` with symmetric padding guarantees
-  *every* output position's receptive field spans the entire real input
-  range, matching attention's actual coverage — see `FullConvMixer`'s
-  docstring). `--disable_mixer_mlp` tests the mixer alone.
-  Deliberately non-causal — a causal-TCN encoder variant was tried and
-  reverted earlier (see status.md) since the LM, not the chunk-local
-  encoder/decoder, is what owns causality here; the chunk is always fully
-  observed, so hiding future bytes from earlier positions bought nothing.
-  **`ChunkDecoder` is also MaskGIT-style** (handover §1.4b): given `z` and
-  a byte chunk with some positions replaced by a MASK token (`byte_emb`
-  table sized `vocab+1`), predicts the masked positions from the unmasked
-  ones + `z`. Training samples a cosine mask-rate schedule per example
-  (`maskgit_mask`); loss is CE at the masked positions only (a heuristic
-  training loss, not a tight ELBO — the doc's own caveat, §1.4b). Inference
-  uses `maskgit_decode`: `--maskgit_T` (default 4) confidence-based
-  refinement steps, cosine-paced reveal schedule.
-  **A real bug was found and fixed here**: an earlier `ChunkDecoder`
-  version's docstring claimed positions could condition on each other (the
-  entire point of MaskGIT), but its `forward()` applied a plain per-position
-  `Linear`/`GELU`/`Linear` MLP to `[N, K, d_byte]` — since `nn.Linear`
-  broadcasts over all but the last dimension, that was **zero** cross-
-  position mixing despite the docstring. This is now believed to be a
-  major cause of the "decoder bottleneck"/"stuck in a poor local optimum"
-  findings that recur throughout status.md's Phase 2 — a joint from-random-
-  init retest with the fixed decoder (`qcutelm_joint_bsq_noaux_fixedmix`)
-  roughly doubled `recon_acc` (13.5%→24-26%) versus the identical
-  pre-fix config, which had permanently plateaued. See status.md for the
-  full before/after comparison.
+- `ChunkEncoder` / `ChunkDecoder`: per-position `byte_emb + pos_emb`, then
+  stacked **`MixerBlock`**s (mixer + optional post-mixer MLP, pre-norm
+  residual) before a final projection. Depth defaults to the shared
+  `cfg.tokenizer_layers` (`--tokenizer_layers`, default 1) for both, with
+  independent overrides `--encoder_layers`/`--decoder_layers` (each `None`
+  by default, falling back to the shared value) for asymmetric designs —
+  `encoder_layers=0` is valid, no `MixerBlock`s at all, pure flatten →
+  `Linear` → bottleneck. A tiny-subset overfit sanity check (see status.md)
+  found that 1 layer caps train `recon_acc` at ~88-97% no matter how
+  width/LR/weight-decay are tuned, while 2 layers reaches a clean 100% —
+  a real capacity ceiling at that scale, not a training-dynamics issue;
+  at full-corpus scale, though, an extensive depth/width/asymmetry sweep
+  (status.md) only reached 83% best-case, still short of 95%.
+  `--mixer {attention,conv}` selects the cross-K-position mixer (also with
+  independent `--encoder_mixer`/`--decoder_mixer` overrides):
+  `FullSelfAttention` (full non-causal self-attention over the K
+  positions) or `FullConvMixer` (a single non-causal 1D conv,
+  `kernel_size=2K-1` with symmetric `padding=K-1` — *not* `kernel_size=K`,
+  which was tried first and is wrong: it gives only one output position
+  full coverage of all K inputs, the rest get an inconsistent partial
+  window; `2K-1` with symmetric padding guarantees *every* output
+  position's receptive field spans the entire real input range, matching
+  attention's actual coverage — see `FullConvMixer`'s docstring).
+  `--disable_mixer_mlp` tests the mixer alone. Deliberately non-causal — a
+  causal-TCN encoder variant was tried and reverted earlier (see
+  status.md) since the LM, not the chunk-local encoder/decoder, is what
+  owns causality here; the chunk is always fully observed, so hiding
+  future bytes from earlier positions bought nothing.
+  `--context_len` (default 0) + `gather_left_context()`: optional
+  asymmetric left-side byte context for the encoder only — up to K extra
+  bytes from the *previous* chunk's tail, still causal.
+  **`ChunkDecoder` is now code-only** (`forward(z)`, no second argument):
+  one forward pass reconstructs all K positions from `z_proj(z)` broadcast
+  identically to every position, no masked-byte input, no iterative
+  refinement (`decode_bytes(decoder, z)` is a trivial one-shot
+  `decoder(z).argmax(-1)`, replacing the old `maskgit_decode`).
+  **History**: an earlier version was MaskGIT-style (handover §1.4b) — a
+  masked-byte-level input (`byte_emb` sized `vocab+1`, `MASK` token), with
+  training sampling a cosine mask-rate schedule (`maskgit_mask`) and
+  inference using T-step confidence-based refinement. A real bug was found
+  and fixed in *that* version first: its `forward()` had applied a plain
+  per-position `Linear`/`GELU`/`Linear` MLP to `[N, K, d_byte]`, which
+  `nn.Linear` broadcasts over all but the last dimension — **zero**
+  cross-position mixing despite the docstring claiming otherwise (the
+  entire point of MaskGIT). Fixing that (adding real `MixerBlock` mixing)
+  roughly doubled `recon_acc` (13.5%→24-26%, `qcutelm_joint_bsq_noaux_fixedmix`)
+  versus the identical pre-fix config. But even after that fix, a later
+  ablation (training with `full_mask` — always 100% masked, the "hardest
+  case") found the decoder's *only* real input under that condition was
+  `z_proj(z)` — the masked-byte channel had degenerated to contributing
+  nothing chunk-specific — meaning the two-input design had already
+  effectively become "codes only", just with dead weight (`byte_emb`,
+  `mask_id`) still attached. Removing it entirely also matches MaskGIT's
+  own two-stage assumption (Chang et al. 2022): the tokenizer trains to
+  convergence and is *frozen* before any masked-token scheme is
+  introduced — MaskGIT never masks inside tokenizer training, which is
+  what this file had drifted into. If masking is wanted at all now, it's
+  `--pretrain_encoder_mask` on the *encoder's* raw byte input
+  (`mask_bytes()`, denoising-autoencoder-style — decoder still grades
+  against true uncorrupted bytes), not the decoder.
+  `Config.quant_grad_scale` (default 1.0, no-op) + `GradScale`: QAT-style
+  backward-only gradient rescale at the encoder's BSQ quantization
+  boundary — implemented to counteract encoder/decoder gradient-norm
+  imbalance found by a side diagnostic (status.md), not yet tested at a
+  nonzero value in a real training run.
+  `init_decoder_bias_to_unigram()`: initializes `head`'s bias to the
+  training corpus's log unigram byte frequency (GPT-2-style embedding
+  init) — called unconditionally at the start of `pretrain_autoencoder()`,
+  a free head start (initial loss starts near the unigram floor instead
+  of the uniform floor).
 - `LatentLM`: causal transformer over the code sequence, RoPE on Q/K
   (duplicated from `qcute/bytelm.py` rather than imported — see below).
   Three input/output modes:
@@ -188,6 +221,12 @@ Supersedes the old streaming-causal-encoder Phase 1 autoencoder, archived at
     a weight-tied categorical softmax over the vocab — exactly like
     `qcute.bpelm`/`bytelm`. Only viable once a tokenizer is frozen (see
     `build_code_vocab` below); has a real OOV/UNK problem (see status.md).
+    `main()`'s `--freeze_after_pretrain` branch selects between this and
+    the factorized/PQ path below via `--pq_groups` (int, default 1): `1`
+    (special case) routes to this vocab-table path; any other value routes
+    to `train_factorized_lm`/`encode_to_codes` (below) instead. Independent
+    of `--lm_factorized_input`, which governs the *unfrozen* joint-training
+    LM's input format, a separate setting.
   - **Factorized/PQ** (`--lm_factorized_input`, `FactorizedCodeEmbedding`):
     input is a compositional embedding — one independently-learned vector
     per `(dimension, level)` pair (`levels_per_dim`=2 for BSQ/LFQ bits,
@@ -339,28 +378,30 @@ tops out closer to 5-6, not 8).
 ## Data
 
 `scripts/prepare_data.py` downloads `datasets/enwik8.gz` (~35MB, skipped if
-present) and cuts `datasets/enwik8_tiny.gz` (a 500,000-byte prefix, gzip'd,
-`--tiny_bytes` to change the size) for fast local/smoke runs.
-`scripts/train_bpe.py` trains the sentencepiece tokenizer `qcute.bpelm`
-needs, from either. All three training modules accept `--data`.
+present) and cuts `datasets/enwik8_1M.gz` (a 1,000,000-byte prefix, gzip'd,
+`--subset_bytes` to change the size) — the standard corpus all three
+training modules default `--data` to, so no `--n_bytes` cutoff is needed
+for normal runs. `scripts/train_bpe.py` trains the sentencepiece tokenizer
+`qcute.bpelm` needs, from either file.
 
 ## Configs
 
 `configs/` holds named, reproducible experiments as plain Python files (see
 the config-file bullet above), each with a docstring documenting what it
 reproduces, the measured result, and the exact run/plot commands:
-`bytelm_xs_mtp4_converged.py` (`xs` preset, 2000 steps, best val_bpb 2.52),
-`bpelm_8192_converged.py` (vocab=8192, 2000 steps, best val_bpb 2.35),
-`qcutelm_bsq_k4_converged.py` (K=4, **loosely-coupled, historical** — BSQ's
-default training path changed to tightly-coupled after this config was
-written, so re-running it no longer reproduces its documented 5.54 number;
-kept as a historical record), `qcutelm_bsq_k4_tightlycoupled.py` (K=4,
-tightly-coupled, aux disabled, plateaus ~8.0-8.5). The many further qcutelm
-variants tried since (LFQ, uncertainty weighting, entropy regularization,
-MaskGIT decoder, `dq` sweeps, AE pretraining — see status.md's Phase 2 for
-the full list and results) were run via direct CLI invocation, not saved as
-config files yet. Add a new file here rather than a long inline CLI
-invocation whenever a run is worth being able to reproduce by name later.
+`bytelm_xs_mtp4.py` (`xs` preset, 2000 steps, best val_bpb 2.52),
+`bpelm_8192.py` (vocab=8192, 2000 steps, best val_bpb 2.35),
+`qcutelm_bsq_k4_frozen_vocab.py` (K=4, tightly-coupled BSQ, 2-layer
+tokenizer, `--pretrain_ae` to 95% then `--freeze_after_pretrain` + plain
+vocab-LM training — the closest architectural match to `bpelm_8192.py`:
+both are a categorical softmax LM over a fixed discrete vocabulary, cross-
+entropy only, no decoder-side loss during the LM phase). The many further
+qcutelm variants tried (LFQ, uncertainty weighting, entropy regularization,
+MaskGIT decoder, `dq` sweeps, unfrozen joint training with aux recon — see
+status.md's Phase 2 for the full list and results) were run via direct CLI
+invocation, not saved as config files yet. Add a new file here rather than
+a long inline CLI invocation whenever a run is worth being able to
+reproduce by name later.
 
 ## Known gaps vs. the full design (tracked in [status.md](status.md))
 

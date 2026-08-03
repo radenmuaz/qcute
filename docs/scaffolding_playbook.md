@@ -62,7 +62,7 @@ free) and feed its module-level variables into `parser.set_defaults(...)`,
 filtered to known argument names. Then do the real `parser.parse_args()`.
 Net effect: **config file values override the script's hardcoded defaults,
 but explicit CLI flags override the config file.** This gives you
-reproducible named experiments (`configs/bytelm_xs_mtp4_converged.py`) without
+reproducible named experiments (`configs/bytelm_xs_mtp4.py`) without
 losing the ability to override one flag ad hoc for a quick variant.
 Config files live in `configs/`, one per named experiment, with a docstring
 explaining what the experiment tests and the exact invocation.

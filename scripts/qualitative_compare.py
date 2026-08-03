@@ -4,16 +4,16 @@ generated/ground-truth side by side, for a qualitative "is it garbage or
 plausible English" read — a complement to the aggregate bpb numbers, which
 say nothing about what the text actually looks like.
 
-Prompts are drawn as raw byte slices from datasets/enwik8_tiny.gz — some
+Prompts are drawn as raw byte slices from datasets/enwik8_1M.gz — some
 from the train region, some from the val region (same byte-level split as
 all three training scripts use) — so "same warmup" means literally the same
 underlying bytes fed to every model, not just the same nominal prompt
 length. Ground truth is the real corpus bytes right after the prompt.
 
     uv run python scripts/qualitative_compare.py \\
-        --bytelm_checkpoint checkpoints/bytelm_xs_mtp4_converged/best.pt \\
-        --bpelm_checkpoint checkpoints/bpelm_8192_converged/best.pt \\
-        --bpelm_sp_model datasets/bpe_enwik8_tiny_8192.model \\
+        --bytelm_checkpoint checkpoints/bytelm_xs_mtp4/best.pt \\
+        --bpelm_checkpoint checkpoints/bpelm_8192/best.pt \\
+        --bpelm_sp_model datasets/bpe_enwik8_1M_8192.model \\
         --qcutelm_checkpoint checkpoints/qcutelm_bsq_k4_lfq_aux/best.pt
 
 Writes both a human-readable .txt and a .json to --out_dir (default
@@ -109,7 +109,7 @@ def run_qcutelm(checkpoint_path: Path, prompt: bytes, gt: bytes, device: str) ->
 
 def main():
     p = argparse.ArgumentParser(description="Qualitative generation comparison: bytelm vs bpelm vs qcutelm")
-    p.add_argument("--data", type=Path, default=Path("datasets/enwik8_tiny.gz"))
+    p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=2_000_000)
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--n_prompts_train", type=int, default=3)

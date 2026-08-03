@@ -121,7 +121,7 @@ def grad_norms_per_loss(model: QCuteLM, batch: torch.Tensor) -> dict[str, float]
 def main():
     p = argparse.ArgumentParser(description="Diagnose a qcute.qcutelm BSQ checkpoint")
     p.add_argument("--checkpoint_path", type=Path, required=True)
-    p.add_argument("--data", type=Path, default=Path("datasets/enwik8_tiny.gz"))
+    p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=2_000_000)
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--batch_size", type=int, default=16)

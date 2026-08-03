@@ -10,29 +10,28 @@ design, and [docs/status.md](docs/status.md) for phase-by-phase progress.
 ```bash
 uv sync
 
-# downloads datasets/enwik8.gz (~35MB) and cuts datasets/enwik8_tiny.gz
-# (500,000-byte prefix, for fast smoke/local runs)
+# downloads datasets/enwik8.gz (~35MB) and cuts datasets/enwik8_1M.gz
+# (1,000,000-byte prefix, for fast smoke/local runs)
 uv run python scripts/prepare_data.py
 
 # byte-level baseline LM w/ MTP head (Phase 0), reports bits-per-byte
 uv run python -m qcute.bytelm --preset sd
-uv run python -m qcute.bytelm --preset xs --data datasets/enwik8_tiny.gz  # quick local run
+uv run python -m qcute.bytelm --preset xs --data datasets/enwik8_1M.gz  # quick local run
 
 # end-to-end tokenizer + latent LM (encoder + FSQ/BSQ + LM + decoder, jointly trained)
-uv run python -m qcute.qcutelm --bottleneck bsq --data datasets/enwik8_tiny.gz --qual_gen_bytes 64
+uv run python -m qcute.qcutelm --bottleneck bsq --data datasets/enwik8_1M.gz --qual_gen_bytes 64
 
 # BPE baseline (handover §1.6's BPE half) — train the tokenizer first
-uv run python scripts/train_bpe.py --data datasets/enwik8_tiny.gz
-uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_tiny_8192.model --data datasets/enwik8_tiny.gz
+uv run python scripts/train_bpe.py --data datasets/enwik8_1M.gz
+uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_1M_8192.model --data datasets/enwik8_1M.gz
 
 # or via a named, reproducible config (CLI flags still override individual values)
-uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_converged.py
-uv run python -m qcute.qcutelm --config configs/qcutelm_bsq_k4_converged.py          # loosely-coupled (FSQ default; historical for BSQ)
-uv run python -m qcute.qcutelm --config configs/qcutelm_bsq_k4_tightlycoupled.py     # tightly-coupled (BSQ default)
-uv run python -m qcute.bpelm --config configs/bpelm_8192_converged.py
+uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4.py
+uv run python -m qcute.qcutelm --config configs/qcutelm_bsq_k4_frozen_vocab.py     # tightly-coupled BSQ, K=4, 2-layer tokenizer, frozen tokenizer + vocab LM
+uv run python -m qcute.bpelm --config configs/bpelm_8192.py
 
 # evaluate a saved checkpoint only, no training
-uv run python -m qcute.bytelm --eval_only --checkpoint_path checkpoints/<run_name>/best.pt --data datasets/enwik8_tiny.gz
+uv run python -m qcute.bytelm --eval_only --checkpoint_path checkpoints/<run_name>/best.pt --data datasets/enwik8_1M.gz
 ```
 
 All three modules run on CUDA/MPS/CPU automatically.
