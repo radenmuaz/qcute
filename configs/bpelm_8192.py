@@ -1,12 +1,14 @@
 """qcute.bpelm config: reproduces the matched-bandwidth (~4 bytes/timestep)
 BPE baseline on the standard 1M-byte corpus.
 
-Prior result (500K-byte enwik8_tiny.gz, since removed and replaced by the
-1M corpus below): best val_bpb 2.35 at step 300 — the best of all three
-baselines at this scale, but also the fastest to overfit (train_bpb
-collapses to ~0.02 by step 2000; see docs/status.md's comparison table).
-Needs rerunning on the 1M corpus to get current numbers — see
-logs/bpelm_8192/bpb.png. Needs a trained tokenizer first.
+Prior result (enwik8_1M.gz, steps=2000): best val_bpb 2.3679 (best.pt),
+but last.pt badly overfit — train_bpb collapsed to 0.34-0.54 while val_bpb
+climbed 3.13->3.24->3.35 over the final 3 evals (see docs/status.md).
+steps bumped 2000->8000 here to match bytelm_xs_mtp4_ctx1024.py /
+qcutelm_vlt6 grid's budget for a fair wallclock/it-s comparison across all
+three baselines/tokenizer-LM at the same step count — best.pt still tracks
+the true optimum regardless of how far past it training continues. Needs a
+trained tokenizer first.
 
     uv run python scripts/prepare_data.py    # once, if datasets/enwik8_1M.gz missing
     uv run python scripts/train_bpe.py --data datasets/enwik8_1M.gz --vocab_size 8192
@@ -29,7 +31,7 @@ d_model = 256
 n_layers = 4
 n_heads = 4
 val_frac = 0.1
-steps = 2000
+steps = 8000
 batch_size = 16
 warmup_steps = 500
 lr_peak = 6e-4

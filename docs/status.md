@@ -37,7 +37,8 @@ Tracks progress against the phase plan in
       (see `docs/scaffolding_playbook.md` §8d). `sd`/`md` keep 8, matching
       the doc's full-corpus-scale default.
 - [x] **Matched-bandwidth comparison, all three baselines, 2000 steps each**,
-      same tiny 500KB subset, same warmup+constant LR schedule:
+      same tiny 500KB subset (superseded — see the enwik8_1M.gz rerun
+      below), same warmup+constant LR schedule:
 
   | baseline | run | best val_bpb | at step | params |
   |---|---|---|---|---|
@@ -52,6 +53,23 @@ Tracks progress against the phase plan in
   at step 300 vs. bytelm's 1300, and train bpb reaches ~0.02 by step 2000
   vs. bytelm's ~1.3), consistent with bpelm's much bigger effective
   vocabulary (8192 tokens vs. 256 bytes) memorizing a small corpus quicker.
+
+- [x] **Rerun on the standardized enwik8_1M.gz corpus** (`--config
+      configs/bytelm_xs_mtp4.py` / `configs/bpelm_8192.py`, both 2000
+      steps, both checkpoints saved to `checkpoints/{bytelm_xs_mtp4,
+      bpelm_8192}/{best,last}.pt`):
+
+  | baseline | best val_bpb | at step | end-of-run state |
+  |---|---|---|---|
+  | `bytelm_xs_mtp4` | **2.4872** | 2000 | clean — train_bpb≈1.9, no overfitting red flags, `best.pt`≈`last.pt` |
+  | `bpelm_8192` | **2.3679** | earlier (before drift) | **overfit by the end** — train_bpb collapsed to ~0.34-0.54 while val_bpb was actively *climbing* (3.13→3.24→3.35 over the final 3 evals), diverging not just plateauing |
+
+  Same qualitative pattern as the 500KB-subset run (bpelm overfits faster/
+  harder than bytelm), confirmed again on the full corpus. **Caveat for any
+  comparison against these numbers**: bpelm's `best.pt` (val_bpb 2.3679) is
+  the only trustworthy checkpoint — `last.pt` reflects a badly overfit model
+  and its train_bpb is not a meaningful generalization signal at all.
+  bytelm's full trajectory (train and val) is usable as-is.
   **bpelm currently has the best number of the three** at this scale, but
   take that with real caution: it's the highest-capacity model (5.25M vs.
   ~3.5-3.9M) and its overfitting is also the fastest, so this isn't yet a
@@ -1312,3 +1330,826 @@ uv run python -m qcute.qcutelm_vlt6 --config configs/qcutelm_vlt6_none_2xflops.p
 # qcutelm_vlt6 generation is trained-in (--gen_every, default 1000 steps) —
 # no separate script; see qualitative_gen()/generate() in qcutelm_vlt6.py
 ```
+
+## Session update — qcutelm_vlt6: composable losses, RoPE/zero-KV, shared/
+## separate encoder-decoder, 16-cell grid
+
+### New `qcutelm_vlt6.py` capabilities
+
+**Composable losses** (`Config.main_ntp_weight`/`aux_recon_weight`/
+`code_match_weight`, any combination active simultaneously, each only
+computed when its weight is nonzero — `main_ntp` additionally has a
+`force_main_ntp_metrics` escape hatch so `eval_model` can still report a
+comparable `val_bpb` even when a run doesn't train on it directly):
+- `main_ntp` (original): `decode(codepred(codelm(codes[:i])))` vs
+  `block[i+1]`, one chunk ahead.
+- `aux_recon`: `decode(code[i])` vs `block[i]` directly, zero-shift,
+  bypassing `codelm` — reuses the same `decode_block` mechanism, gives
+  the encoder/decoder a short direct gradient path. Trains the decoder
+  when `main_ntp_weight=0` (otherwise the decoder gets zero gradient —
+  `main()` warns at startup if both `main_ntp_weight` and
+  `aux_recon_weight` are 0).
+- `code_match`: factorized discrete-aware match between `codepred`'s raw
+  logits and the encoder's own **detached** true next code — BCE-per-bit
+  (BSQ/LFQ) or CE-per-dimension over `fsq_levels` (FSQ/iFSQ). No decode
+  pass needed. Empirically (single-run check, `code_match`-only + `aux_recon`
+  for decoder gradient): `code_match_loss` plateaus/degrades slightly on
+  its own while `aux_recon_acc` climbs fine — consistent with `codelm`
+  chasing a genuinely moving target (the tokenizer's own code distribution
+  keeps shifting under `aux_recon`'s training), not a dead-gradient issue.
+  Adding `main_ntp` back in stabilizes `code_match_loss`'s trend (rises
+  early, plateaus, turns slightly down) rather than fixing it outright.
+
+**RoPE / zero-KV as independent toggles** (`Config.use_rope`,
+`Config.use_zero_kv`, `Config.rope_base`) — both default to the original
+design (NoPE + zero-KV sink). `use_rope=True` applies rotary embeddings
+(`rope_cos_sin`/`apply_rope`, identical math to `qcute.bpelm`, duplicated
+per convention) to q/k in every attention call, threaded through
+`Block`/`CodeLM`/`run_blocks`/`run_decoder_blocks` (cos/sin recomputed
+fresh per call from the current sequence length — this makes `generate()`'s
+growing-sequence greedy decode correct for free, no separate handling
+needed). `use_zero_kv=False` drops the sink entirely; combined with
+`use_rope=True` this reproduces `qcute.bpelm`'s `CausalSelfAttention`
+exactly (plain `is_causal=True` SDPA, no sink) — true "bpelm parity."
+
+**Efficient windowed attention now covers the no-sink case too**
+(`_forward_chunked_no_sink`) — the original chunked `O(T·window)`
+implementation (`_forward_chunked`, from the `qcutelm_vlt5` session) only
+existed for the zero-KV branch; `use_zero_kv=False` + `window` set was
+silently falling back to an `O(T²)` dense-masked path (a boolean
+`attn_mask` doesn't reduce SDPA's actual compute — it only removes the
+fast `is_causal=True` kernel path). Confirmed via direct comparison:
+`context_len=1024`, `attn_window=64` — dense full-causal `~2.4 it/s`,
+`O(T²)` dense-windowed also `~2.4 it/s` (no better — the window wasn't
+helping at all without chunking), chunked-no-sink `~3.2 it/s`. Verified
+bit-exact (`~1e-7` max diff, gradients matching) against the dense-no-sink
+path across several `T`/`window` combinations before trusting it.
+Mechanism (same trick as the zero-KV version): split `T` into
+non-overlapping chunks of size `W`; each chunk's queries only ever need
+this chunk's + the previous chunk's K/V (a window of size `W` reaching
+back from anywhere in chunk `c` reaches at most into chunk `c-1`); fold
+the chunk index into the batch dim and call SDPA **once**, batched, on
+`[B·n_chunks, H, W, hd]` queries against `[B·n_chunks, H, 2W, hd]` K/V —
+`O(T·window)` instead of `O(T²)`, still just one SDPA call. Chunk 0's
+"previous chunk" is zero-padding with its mask columns forced `False`
+(no real previous chunk exists) — the same fix the zero-KV version needed.
+
+**`shared_encoder_decoder`** (`Config`, default `True` = original
+behavior, verified via object-identity check that `z_proj is z_proj_dec`
+and `blocks is dec_blocks` when shared — zero overhead/behavior change).
+`False`: encoder and decoder get fully independent weights
+(`byte_emb`/`blocks`/`ln_f`/`head`/`z_proj` all duplicated as
+`dec_byte_emb`/`dec_blocks`/`dec_ln_f`/`head`/`z_proj_dec`), symmetric by
+default (`dec_d_model`/`dec_n_heads`/`dec_n_layers`/`dec_mlp_mult` all
+`None` → mirror the encoder's own dims exactly — genuinely separate
+weights, not a smaller/larger split) with `dec_*` overrides available for
+an asymmetric split later. Caught a real bug while building this: `z_proj`
+was serving two different roles (feeding `CodeLM`'s input at `d_model`
+width, AND building decode's BOS) — once separated, decode's BOS needs
+`dec_d_model` width instead, so `z_proj` (→ `d_model`, always, feeds
+`CodeLM`) and `z_proj_dec` (→ `dec_d_model`, feeds decode's BOS) had to
+become genuinely separate projections.
+
+### bytelm/bpelm comparability notes (from getting `qcutelm_vlt6` runs matched)
+
+- `bytelm`'s `context=256` means 256 raw **bytes**. `bpelm`'s `context=256`
+  means 256 BPE **tokens** — per its own "matched-bandwidth (~4
+  bytes/timestep)" convention, that's ~1024 raw bytes, not 256. `vlt6`'s
+  codes are structurally bpelm's-tokens' analogue (each compresses `K`
+  bytes), not bytelm's raw-byte analogue — matching bpelm correctly means
+  `CodeLM`'s own context (in code-units) = 256 directly (`context_len=1024`
+  at `K=4`), not `context_len/K` derived from bytelm's 256-byte span
+  (`context_len=256` → 64 codes matches *bytelm* instead — a different,
+  also-valid config, not the same target).
+- Params vs. FLOPs **cannot** be matched to a baseline simultaneously at a
+  fixed `context_len`, because `vlt6` processes 3 passes/step (encoder +
+  decode + codelm) vs. bytelm/bpelm's 1 — structurally more total
+  token-positions/step regardless of `d_model`/`n_layers`. Solved the
+  general 2-unknown linear system (`X`=encoder/decoder's `d²·n` budget,
+  `Y`=CodeLM's): at `context_len=256` (bytelm-byte-matching) a valid
+  positive asymmetric split exists (~43%/57%); at `context_len=1024`
+  (bpelm-token-matching, what all the grid configs use) it degenerates to
+  requiring a zero-capacity encoder — not realizable, confirming why
+  those two targets can't both be hit at once for these specific configs.
+  `attn_window` is a useful lever here since it adds real compute with
+  **zero** added parameters (only changes how much already-computed K/V
+  each query attends to) — used to "compensate less params" when asked
+  for ~2x more FLOPs than a params-matched baseline.
+- `bytelm_xs` uses `mtp_heads=4` (structurally predicts 4 future bytes per
+  position already, though only head-0's bpb is the reported metric) — a
+  real architectural parallel to `vlt6`'s own `K=4` grouping worth keeping
+  in mind for bytelm-specific comparisons (doesn't apply to bpelm, no MTP).
+- `bpelm`/`bytelm`/`qcutelm` all use RoPE (`rope`/`rotate_half` present in
+  each). `vlt6`'s default (`use_rope=False`) is NoPE — a real architectural
+  difference from every baseline, independent of the loss/objective
+  differences, now toggleable via `use_rope=True`.
+- Tokenizer overhead is a real param cost for `vlt6` that neither baseline
+  pays (bytelm has no tokenizer at all; bpelm's BPE tokenizer is
+  non-parametric) — kept deliberately cheap (`d_model=96, n_layers=2` →
+  ~0.27-0.46M params depending on shared/separate) so most of the budget
+  goes to `CodeLM` (~2.4M, closer to the baselines' own ~3.7M).
+
+### Qualitative generation findings (across all main_ntp-trained runs so far)
+
+Greedy-decoded samples lag the underlying teacher-forced metrics badly —
+repeatedly collapse into repetition loops ("the the the...", "the and the
+and...") even as `val_next_block_acc` climbs past 35-40%; occasional
+breakouts produce topically-relevant, syntactically real fragments (valid
+`[[Article|display]]` MediaWiki link syntax, real n-grams like "Atlas
+Shrugged", country names matching the prompt's African-countries context).
+Known greedy-decoding artifact (locally-highest-probability tokens forming
+self-reinforcing loops on an undertrained model) — `val_bpb`/
+`val_next_block_acc` (teacher-forced) are the reliable signals to track,
+not the qualitative samples, at this training budget (8000 steps).
+
+### 16-cell grid (quant_type x loss_type x shared_encoder_decoder x use_zero_kv)
+
+Running unattended via a sequential bash driver
+(`run_vlt6_grid.sh`, one config after another — respects the
+one-job-at-a-time rule by construction, no orchestration needed) wrapped
+in `caffeinate -i -s` (testing whether this resolves the recurring MPS
+throughput-stall issue flagged earlier in this doc — stalls were
+hypothesized to be OS-level idle/sleep-related power management
+interfering with the MPS process). All 16 cells share: RoPE, `context_len
+=1024`, `attn_window=64`, `d_model=96/n_heads=4/n_layers=2/mlp_mult=4`
+(tokenizer), `lm_d_model=256/lm_n_heads=4/lm_n_layers=3/lm_mlp_mult=4`
+(CodeLM), `steps=8000`, `gen_every=1000`. `dq`: ifsq=5 (`8^5=32768`
+codespace), bsq=13 (`2^13=8192` — exact bpelm-vocab match, since 8192 is
+a clean power of 2 unlike ifsq's levels=8 base).
+
+| quant | loss | encdec | zerokv | config |
+|---|---|---|---|---|
+| ifsq | ntp | shared | False | `qcutelm_vlt6_rope_bpelm_parity.py` |
+| ifsq | ntp | separate | False | `qcutelm_vlt6_separate_encdec.py` |
+| ifsq | aux | shared | False | `qcutelm_vlt6_grid_ifsq_aux_shared.py` |
+| ifsq | aux | separate | False | `qcutelm_vlt6_grid_ifsq_aux_encdec.py` |
+| bsq | ntp | shared | False | `qcutelm_vlt6_grid_bsq_ntp_shared.py` |
+| bsq | ntp | separate | False | `qcutelm_vlt6_grid_bsq_ntp_encdec.py` |
+| bsq | aux | shared | False | `qcutelm_vlt6_grid_bsq_aux_shared.py` |
+| bsq | aux | separate | False | `qcutelm_vlt6_grid_bsq_aux_encdec.py` |
+| ifsq | ntp | shared | True | `qcutelm_vlt6_grid_ifsq_ntp_shared_zerokv.py` |
+| ifsq | ntp | separate | True | `qcutelm_vlt6_grid_ifsq_ntp_encdec_zerokv.py` |
+| ifsq | aux | shared | True | `qcutelm_vlt6_grid_ifsq_aux_shared_zerokv.py` |
+| ifsq | aux | separate | True | `qcutelm_vlt6_grid_ifsq_aux_encdec_zerokv.py` |
+| bsq | ntp | shared | True | `qcutelm_vlt6_grid_bsq_ntp_shared_zerokv.py` |
+| bsq | ntp | separate | True | `qcutelm_vlt6_grid_bsq_ntp_encdec_zerokv.py` |
+| bsq | aux | shared | True | `qcutelm_vlt6_grid_bsq_aux_shared_zerokv.py` |
+| bsq | aux | separate | True | `qcutelm_vlt6_grid_bsq_aux_encdec_zerokv.py` |
+
+Results TBD — this section describes the design; findings to be appended
+once the grid completes (or is stopped/checked partway through).
+
+    # driver script lives in the session's scratchpad, not checked into the
+    # repo — reconstruct from the CONFIGS array above if needed:
+    for cfg in configs/qcutelm_vlt6_{rope_bpelm_parity,separate_encdec}.py \
+               configs/qcutelm_vlt6_grid_*.py; do
+        uv run python -m qcute.qcutelm_vlt6 --config "$cfg"
+    done
+
+## Discussion — at what regime would qcute's tokenizer-as-AR-LM actually
+## beat BPE, and how does it compare to audio/video/image tokenizers?
+
+Prompted by: "at what regime and search space hypothetically this qcute
+tokenizer wins over bpe, consider llm bpe can be huge like 60k or 100k
+vocab, also vs audio video image tokenizer." Analytical discussion only —
+no new code or runs; grounded in this session's actual measurements
+(FLOP/param comparisons, quantizer instability findings) rather than
+speculation, and stated with the caveat that the 16/17-cell grid hasn't
+finished, so the bpb side of this comparison is still unproven.
+
+### The honest baseline: right now, on this corpus, BPE is winning on every axis that matters
+
+At the scale actually trained this session (enwik8_1M.gz, vocab=8192,
+d=256): bpelm_8192 best val_bpb **2.3679** vs bytelm_xs_mtp4 **2.4872** —
+BPE is *already* the best of the three baselines despite (a) zero runtime
+tokenization cost (a lookup table, trained once via a few seconds of
+frequency counting, not gradient descent) and (b) zero training
+instability (compare to this session's entire BSQ-gradient-imbalance /
+moving-target / quantizer-collapse saga — none of which BPE has any
+analogue of). qcute's own FLOPs are only ~19% below bpelm's at matched
+context (2180.86M vs 2684.35M, see the width-symmetric/FLOP-breakdown
+benchmarking above) — not a dramatic margin — and no qcute variant has yet
+matched bpelm's val_bpb. So the fair starting position for this discussion
+is: BPE is a very strong, very cheap baseline, and any claim that qcute
+wins has to identify a *specific regime* BPE is structurally bad at, not
+just assert general superiority.
+
+### Regime A — vocabulary scaling (the clearest structural edge)
+
+BPE's cost scales with vocab size roughly as `O(vocab * d_model)` for the
+embedding table plus a full `vocab`-way softmax on every output position.
+At vocab=8192 (this session's scale) that's cheap; at the 60k-100k vocab
+LLMs actually use in production, it stops being cheap:
+
+- Embedding+head params alone: `100,000 * d_model` — at d_model=256 that's
+  25.6M params just for the vocab table, before a single transformer layer.
+  At GPT-scale d_model (2048+) it's hundreds of millions, and it scales
+  *linearly* in vocab with no way to share structure across tokens.
+- Every training/inference step pays a `vocab`-way softmax — real
+  wallclock and memory cost (logits are `[B, T, vocab]`), independent of
+  how rare most of those 100k tokens actually are (Zipfian: the tail is
+  wildly undertrained per-token relative to its parameter cost).
+
+qcute's code space is *factorized*, not monolithic: `dq` independent
+per-dimension distributions (sigmoids for BSQ/LFQ, `fsq_levels`-way
+softmaxes for FSQ/iFSQ) address `fsq_levels^dq` (or `2^dq`) *combinations*
+using only `O(dq * fsq_levels)` output parameters and `dq` independent
+small softmaxes — not one huge one. Concretely, matching BPE's
+100k-token addressability needs `dq * log2(fsq_levels) >= log2(100000) ≈
+17` bits — e.g. `dq=6, fsq_levels=8` (18 bits, 262,144-code space) — via
+six independent 8-way softmaxes (48 output classes total) instead of one
+100,000-way softmax. This is the single clearest place the structural bet
+should pay off, and the gap *grows* with target vocabulary — it's an
+argument that gets stronger exactly where "just use a bigger BPE vocab"
+gets more expensive, not weaker.
+
+Caveat: this session never actually tested a vocab-matched-to-100k
+config — `dq=5/6` here targets bpelm_8192, not a 100k-vocab regime. This
+is a real, testable prediction (build a `qcutelm_vlt6` config with
+`dq=6, fsq_levels=8` or larger and compare param/FLOP counts against a
+hypothetical 100k-vocab bpelm), not a confirmed result.
+
+### Regime B — open-vocabulary / multilingual / out-of-distribution bytes
+
+BPE's merge table is a fixed lookup, frozen after training on one
+corpus/language mix. On out-of-distribution byte sequences (a script or
+language underrepresented in the merge-training corpus, binary data,
+adversarial input) it degrades to byte-level fallback — a well-documented
+failure mode where "matched bandwidth" (bytes/token) collapses exactly
+where you'd most want compression to hold up. qcute's encoder is a
+learned *function* of bytes, not a table — in principle it generalizes
+continuously to unseen byte patterns via interpolation in latent space,
+rather than falling off a cliff into single-byte tokens. This is a
+plausible advantage but **untested here**: enwik8 is a single,
+homogeneous English corpus, so this session has produced zero evidence
+either way — it would need a deliberately OOD eval split to check.
+
+### Regime C — non-stationary / continually-adapting corpora
+
+Changing BPE's vocabulary (e.g. as a model's training distribution shifts
+over time) requires retraining the merge table and, in practice,
+retraining the embedding/head from scratch — a hard discontinuity. qcute's
+tokenizer is trained jointly with (or ahead of) the downstream LM and
+could in principle keep adapting online. Also untested here (single
+static corpus, no distribution-shift setup) — a real potential advantage,
+not a demonstrated one.
+
+### Regime D — long-context, attention-bound compute (this project's actual structural bet)
+
+This is the regime `qcute` is structurally built for: CodeLM operates on
+`context_len / K` tokens, not `context_len` bytes or `context_len/~4`
+BPE tokens — a *second* compression factor stacked on top of whatever
+BPE-equivalent compression the encoder itself achieves. This only pays
+off once attention's `O(T²)` term stops being dominated by the MLP's
+`O(T)` term — which, per this session's own finding, is exactly the
+regime our own FLOP-counting tooling is blind to (`FlopCounterMode`
+reports **zero** FLOPs for `scaled_dot_product_attention` — confirmed by
+direct test — so every params/FLOPs table in this doc undercounts
+attention entirely; the real wallclock signal, ~2.4→~3.1-3.2 it/s from
+chunked windowing, is the only trustworthy proxy so far). At short
+context (256-1024 bytes, this session's whole regime) attention is a
+minor cost and this advantage barely shows up — which matches the
+observed ~19% FLOPs edge over bpelm being modest, not dramatic. At long
+context (10k+ tokens), a 4x-or-more token-count reduction compounds
+quadratically in the attention term specifically, in a way no
+BPE-vocab-size increase can replicate (BPE's compression saturates —
+merge frequency is Zipfian, diminishing returns past a few hundred
+thousand merges — while `K` is a free structural dial with no equivalent
+diminishing-returns wall, modulo reconstruction quality per block).
+
+### Where BPE wins outright, no hedging
+
+- **Zero runtime tokenization cost.** BPE is a lookup; qcute pays a
+  mandatory encoder+decoder forward pass every step, forever. This
+  session's own numbers show that tax is real: total FLOPs land close to
+  bpelm's despite a much narrower tokenizer, because CodeLM's own cost
+  plus encode/decode overhead adds back most of what K-fold compression
+  saves (see the FLOP-breakdown benchmarking above).
+- **Zero training cost/instability.** BPE trains via frequency counting in
+  seconds. qcute's entire session-long saga — BSQ's 10-28x
+  `code_proj` gradient imbalance from `F.normalize`'s Jacobian
+  contraction, the moving-target problem when training CodeLM against a
+  shifting tokenizer, code_match's decoder-starvation failure mode if
+  weighted wrong — has no BPE analogue whatsoever. The 17-cell grid this
+  session is running exists *because* qcute's design surface (quantizer
+  type, loss composition, encoder/decoder sharing, dq/fsq_levels) is
+  large and non-obvious; BPE has no equivalent hyperparameter search.
+- **Exact invertibility.** BPE's tokenize→detokenize round-trip is always
+  lossless by construction. qcute's decoder is a *learned, approximate*
+  inverse — reconstruction accuracy is never guaranteed, and this
+  session directly observed imperfect byte-match in early generations.
+- **Train/inference consistency.** BPE's merge algorithm is identical at
+  train and inference time, always. qcute's codes depend on a trained
+  network whose behavior on OOD input can degrade unpredictably, not just
+  "more fragmented" the way BPE's fallback does.
+
+### vs. audio/video/image tokenizers — a different comparison entirely
+
+Text has something audio, video, and images structurally lack: a cheap,
+lossless, zero-training discrete tokenizer already exists for it (BPE).
+Audio/image are continuous-valued and locally dense/redundant in a way
+that frequency-counting discrete merges can't exploit directly — there is
+no BPE-equivalent for raw waveforms or pixels. That's precisely why
+learned neural tokenizers (VQ-VAE, RVQ codecs like SoundStream/EnCodec,
+FSQ-based image tokenizers) are already the *standard, undisputed*
+approach in those domains, not a hypothesis to test — the alternative
+there isn't "a free 5-minute counting algorithm," it's raw floats. FSQ
+itself (Mentzer et al. 2023, the quantizer this session's `ifsq`/`fsq`
+variants are based on) originates from that image/audio-tokenizer
+literature, not from text.
+
+The implication: qcute is attempting, for text/bytes, what VQ-VAE-style
+tokenizers already do uncontested for audio/image/video — but the bar is
+categorically higher for text, because BPE is a strong free alternative
+that has no counterpart in those other domains. This reframes the whole
+project's likely payoff surface: qcute is more likely to win decisively
+on byte streams that are *not* natural-language text — compressed binary
+data, serialized sensor/log data, or other domains where bytes are really
+standing in for a continuous/dense signal the way audio samples or pixels
+do — than to beat BPE outright on English text, unless one of regimes
+A-D above is decisively in play (huge target vocabulary, OOD/multilingual
+generalization, non-stationary domains, or long-context compute-bound
+serving).
+
+### Net read
+
+Nothing here is confirmed by a run — it's a structural argument for
+*where to point the next experiments*, not a result. The regimes worth
+actually testing, roughly in order of how directly this session's tooling
+could check them: (1) a large-`dq` config compared against a
+hypothetical/real large-vocab bpelm at matched addressable-code-space —
+tests Regime A directly; (2) a long-context config (well past 1024 bytes)
+with wallclock (not FLOP-counter) timing — tests Regime D, and is the one
+this session's own tooling under-measures; (3) an OOD or multilingual
+eval split — tests Regime B, needs new data, not yet available in this
+repo.
+
+## 16-cell grid results — partial, saved before the run was stopped to
+## prioritize qcutelm_vlt7
+
+The grid (see table above) was interrupted after 8/16 non-zeroKV cells
+plus 1/8 zeroKV cells (cell 9, `ifsq_ntp_shared_zerokv`, in progress) to
+free the GPU for `qcutelm_vlt7`'s first real-data test. BSQ cells' results
+(all 4 non-zeroKV ones completed) saved here before that queue was torn
+down:
+
+| config | train_bpb (at best) | best val_bpb | notes |
+|---|---|---|---|
+| `qcutelm_vlt6_grid_bsq_ntp_shared` | 2.1728 | 2.6698 | |
+| **`qcutelm_vlt6_grid_bsq_ntp_encdec`** | 2.0262 | **2.5872** | best qcute result of the whole grid — separate (not shared) encoder/decoder weights |
+| `qcutelm_vlt6_grid_bsq_aux_shared` | 4.5680 | 4.5923 | **not comparable** — `main_ntp_weight=0`, so `val_bpb` comes from `force_main_ntp_metrics` running an untrained decode path; noise, not signal |
+| `qcutelm_vlt6_grid_bsq_aux_encdec` | 4.6250 | 4.6739 | same caveat as above |
+
+iFSQ non-zeroKV cells (`ntp_shared` 2.6993, `separate_encdec` 2.6717,
+`aux_shared`/`aux_encdec` — same aux caveat, ~4.6-4.7) are in the full
+table earlier in this doc. Both baselines still ahead of every `ntp`-loss
+cell: bytelm 2.4872, bpelm 2.3679 (old 2000-step run; an 8000-step
+rerun — `bpelm_8192` — and a context=1024-matched bytelm rerun
+(`bytelm_xs_mtp4_ctx1024`) were queued but not completed before this
+stop — rerun later if a clean baseline comparison against `qcutelm_vlt7`
+is needed).
+
+`qcutelm_vlt7` (the narrow-tokenizer/wide-codelm hybrid, see its own
+module docstring for the full design) is being tested next, first config
+`qcutelm_vlt7_bsq.py` — same bsq/dq=13/d_model=96+lm_d_model=256
+architecture as `qcutelm_vlt6_grid_bsq_ntp_encdec` above, for a direct,
+apples-to-apples comparison against its 2.5872 val_bpb.
+
+## Session update — qcutelm_vlt7/vlt8: interleaved symmetric tokenizer,
+## separate wide codelm, and a discovered window/code-value confound
+
+**Lineage.** `qcutelm_vlt7` went through three design iterations within
+the same file (see its module docstring for full detail):
+- **v1**: codes interleaved directly in the byte stream (`t1 t2 c1 t3 t4
+  c2 ...`), one shared stack playing both encoder and decoder roles, one
+  loss. Motivated by making `qcutelm_vlt6`'s encoder/decoder input
+  formats genuinely symmetric (v6's decoder uses a separate BOS-prepended
+  format even when `shared_encoder_decoder=True`).
+- **v2 (folded into v1's file)**: reserved a zero-vector slot in the
+  encoder pass too, so both modes share sequence length and RoPE
+  positions exactly — v1 had byte `t3` sitting at different positions in
+  encoder vs. decoder mode, a real bug.
+- **v3 (current `qcutelm_vlt7`)**: user caught that v1/v2 had *no
+  advantage over bytelm at all* — a single shared stack run twice over
+  ~the full byte-length sequence, at one width, is strictly worse than a
+  same-width byte LM run once. Fix: reintroduce `qcutelm_vlt6`'s
+  narrow-tokenizer/wide-`codelm` split — `codelm` is the only wide
+  component and only ever processes the short `n_blocks`-length code
+  sequence, giving `O(n_blocks²)` attention cost for the *entire* nominal
+  context span instead of `O(context_len²)` — this is where qcute's
+  compute argument actually lives, and v1/v2 had discarded it for
+  architectural symmetry.
+
+**`qcutelm_vlt7`'s current design**: Pass 1 (narrow tokenizer, "no-code"
+mode — zero vector at every reserved slot) reads out each block's TRUE
+code deterministically (no prediction, no `code_match`-style exposure
+bias — see session discussion on this). `codelm` (separate wide weights,
+short sequence only) forecasts the next code, trained via
+`code_match_loss` (same mechanism as `qcutelm_vlt6`'s `CodeLM`, no new
+loss invented). Pass 2 (same narrow tokenizer weights) decodes using
+`codelm`'s *predicted* code, not the true one — the genuine generative
+test. Ablations added: `attn_window` (ported `qcutelm_vlt6`'s verified
+`O(T·window)` chunked attention, ~1.6-1.8x measured speedup),
+`trainable_slot_embed` (learned vs. zero "no-code" marker),
+`shared_tokenizer_phases` (untied Pass 1/Pass 2 weights, mirrors v6's
+`shared_encoder_decoder=False`).
+
+**Discovered confound → `qcutelm_vlt8`.** Across the entire
+`qcutelm_vlt7_bsq` run, `code_conditioned_acc` and `no_code_acc` tracked
+within ~0.1-0.4 percentage points of each other at *every* logged
+checkpoint (e.g. step 3999/8000: 57.40% vs 57.33%) — no measurable
+advantage from having the code at all. Root cause, diagnosed in-session:
+`attn_window=64` is unrelated to the interleaved sequence's `(K+1)`
+periodicity, so a chunk boundary can split a block's own bytes from its
+own code slot (e.g. `context_len=1024, K=4`: block 12 spans positions
+`[60,64]`, and a `window=64` chunk boundary falls exactly at position 64,
+its code slot). More importantly, the chunked mechanism gives each
+position ~`2×window` raw positions of reachable history — at
+`window=64-80` that's ~16-32 *blocks* of direct raw-byte access, vastly
+more than the single-block granularity a code is supposed to compress.
+Since Pass 1 ("no-code") and Pass 2 ("forecast") share the same windowed
+stack, Pass 1 can reconstruct nearly as much as Pass 2 just by reading
+raw bytes still inside its window — the code becomes redundant with
+information already available for free. **`qcutelm_vlt6` never had this
+problem**: `decode_block` processes each block in total isolation (`[N,
+K]`, batched, zero cross-block attention) — the code is the *only*
+channel for anything beyond the current block, guaranteed by
+construction. `qcutelm_vlt7`'s single-shared-stack unification is what
+reintroduced the leak; `v6`'s asymmetric design never had a continuous
+multi-block attention mechanism for it to leak through in the first
+place. This is a second, independent mark against `v7`'s unification
+(alongside the earlier-found "no compute saving without the narrow/wide
+split") — not about efficiency this time, about whether the experiment
+even measures what it claims to.
+
+**`qcutelm_vlt8`** (forked from `v7`) fixes the alignment bug — `attn_window`
+must now be a multiple of `K+1` (enforced at `Config` construction, not
+just a config convention), so every chunk covers exactly whole blocks,
+code slot included, no more accidental splitting. `qcutelm_vlt8_bsq.py`
+uses `attn_window=80` (`16×(K+1)`, close to v7's 64) as a direct,
+window-alignment-only comparison point against `v7`'s result.
+`qcutelm_vlt8_bsq_tight_window.py` uses `attn_window=5` (`K+1`, `m=1`,
+the tightest legal value) to directly test the confound hypothesis: does
+`code_conditioned_acc` pull ahead of `no_code_acc` once the wide-window
+raw-byte shortcut is closed off? (Residual gap even at `m=1`: the chunked
+mechanism still gives one block of previous-chunk lookback, unlike
+`v6`'s decode_block's zero cross-block attention — noted as a known
+limit, not fully resolved by this ablation alone.)
+
+**Queue** (sequential, one GPU job at a time, `caffeinate`-wrapped):
+`qcutelm_vlt7_bsq` (done) → `qcutelm_vlt8_bsq` (running) →
+`qcutelm_vlt8_bsq_tight_window` → `qcutelm_vlt7_bsq_trainable_slot` →
+`qcutelm_vlt7_bsq_trainable_slot_untied` → `bytelm_xs_mtp4_ctx1024` →
+`bpelm_8192` (8000 steps).
+
+**Result — `qcutelm_vlt7_bsq`**: best val_bpb **2.4951** — beats every
+`qcutelm_vlt6` grid cell (previous best 2.5872, `bsq_ntp_encdec`) and
+lands within 0.008 of bytelm's own baseline (2.4872), the closest any
+qcute variant has come to a real baseline this session. Despite this,
+`code_conditioned_acc` vs `no_code_acc` stayed within ~0.3-0.6 percentage
+points of each other for the entire run (e.g. final eval, step 7999:
+51.92% vs 51.59%) — a small, only-recently-consistent gap in the code's
+favor, not a strong signal — consistent with the window/code-value
+confound diagnosed above (`attn_window=64` gives ~2×64=128 raw positions
+of reachable history, ~25 blocks). Free-running generation quality stayed
+poor throughout (1.56%-9.38% byte-match across gen checkpoints, no clear
+upward trend), plausibly exposure bias compounding over the block-to-block
+rollout — flagged, not yet diagnosed further. `qcutelm_vlt8_bsq` (same
+architecture, block-aligned `attn_window=80`) and especially
+`qcutelm_vlt8_bsq_tight_window` (`attn_window=5`, closes most of the
+raw-byte shortcut) are the direct next data points on whether the good
+bpb number reflects genuine code-based compression or is achieved mostly
+through the wide-window raw-byte path.
+
+Also noted in-session but not yet built: since `codelm`'s attention is
+already dense `O(n_blocks²)` over the *entire* code history (cheap
+precisely because `n_blocks = context_len/K`), predicting further than
+one block ahead (`code[i+2]`, `code[i+3]`, ...) is a natural, low-cost
+extension — an additional prediction head/shifted target on the same
+already-computed representation, not a new architectural capability.
+Flagged as a follow-up experiment, not implemented.
+
+## Session update — supervision-edge taxonomy for qcutelm_vlt7/vlt8, and
+## the actual goal: tokenizer/detokenizer-free codelm decoding
+
+**Explicit goal stated mid-session**: the point of all the loss-composition
+questions below is enabling `codelm` to run as a free autoregressive
+generator in pure code space — init from some codes, roll forward feeding
+its own predictions back as input (no re-encoding of bytes, no decoding
+to bytes at every step), only detokenize once at the very end. This
+reframes every open design question below: does a given loss help close
+the gap between `codelm`'s own predictions and the true encode-phase code
+distribution (`z_hat_enc`), since that gap is exactly what determines
+whether feeding predictions back as inputs stays stable over a long
+free-running rollout?
+
+**Current loss composition, precisely** (confirmed against
+`qcutelm_vlt8.py`'s `forward()`, `code_match_weight=1.0` active in
+`qcutelm_vlt8_bsq.py`):
+```
+loss = loss_nocode + loss_decode + code_match_weight * code_match_loss
+```
+Three losses active, not one — `codelm`'s own prediction *does* get a
+direct target (`code_match_loss`). What has **no direct target at all**
+is the *encoder's* own code (`code_pre`'s output, `z_hat_enc`) — it only
+ever receives gradient indirectly, through the long chain `z_hat → codelm
+input → forecast → z_proj → decode → NTP loss → backprop`. This is the
+real gap, not "codelm doesn't care" (it does) but "nothing directly
+shapes what the encoder's code itself should look like."
+
+**Supervision-edge grid** (source of target × who gets trained):
+
+| Source ↓ \\ Target → | Encode (`code_pre`) | Decode (bytes) | CodeLM |
+|---|---|---|---|
+| Ground truth bytes | *(indirect only)* | ✅ existing, always-on (both phases) | *(indirect only)* |
+| Encode's own code (`z_hat_enc`, detached) | — (self) | 🆕 missing — this is `qcutelm_vlt6`'s `aux_recon_weight` (same-block decode, short direct gradient path for `code_pre` — motivated by the earlier-diagnosed BSQ `code_proj` gradient weakness, 10-28x, from `F.normalize`'s Jacobian) | ✅ existing — `code_match_loss` |
+| Decode phase's code (`z_hat_dec`, doesn't exist yet — would need a new readout on Pass 2's hidden states) | 🆕 proposed | n/a | 🆕 rejected — see below |
+| CodeLM's own prediction (`pred_soft`, detached) | 🆕 proposed (`encode_match_weight`) | ✅ existing — Pass 2 "forecast" mode | — (self) |
+
+**`codelm`'s target: encode-phase, not decode-phase — decided, not just preferred.**
+Given the free-decoding goal, pointing `code_match_loss` at a hypothetical
+`z_hat_dec` (computed under decode-phase conditioning, itself dependent on
+`codelm`'s own past output) would be actively counterproductive: (1)
+`codelm`'s *input* mechanism (`in_proj`/`z_proj`) is always trained on
+`z_hat_enc`-distributed values, so a `z_hat_dec` target would train
+`codelm`'s output into a different distribution than its own input expects
+— free-rolling would get *worse*, not better; (2) `z_hat_dec` would be a
+moving target (shifts as `codelm` itself trains, since it depends on
+`codelm`'s conditioning), reintroducing the exact moving-target
+instability `qcutelm_vlt4`'s `--joint_lm` needed a `code_lm_weight`
+warmup schedule to work around. Keeping the target as `z_hat_enc` (already
+the case) is correct and not up for revision.
+
+**Two build candidates, reprioritized against the free-decoding goal**:
+- **`aux_recon_weight`** (Encode←own code, short path): sharpens
+  `z_hat_enc` itself — the canonical space `codelm` is trying to imitate.
+  Helps.
+- **`encode_match_weight`** (Encode←CodeLM's prediction, mutual
+  consistency): directly trains the gap free-rolling depends on being
+  small (`codelm`'s prediction ↔ true `z_hat_enc`). Arguably the single
+  most relevant unbuilt piece given the stated goal, not just a nice-to-have.
+- (A single-pass redesign was also discussed — collapsing Pass 1/Pass 2
+  into one causal pass, recovering real compute savings the way `v7`/`v8`'s
+  two-pass scheme doesn't. Deprioritized: it's about efficiency and
+  architectural cleanliness, orthogonal to the free-decoding goal, and
+  makes maintaining a clean condition-free `z_hat_enc` harder since encode
+  and decode would share causal hidden states instead of running as an
+  isolated pass.)
+
+**Both built.** `aux_recon_weight` added a new `decode_block_local` method
+(ported from `qcutelm_vlt6`'s `decode_block` — block-local, `[N,K]`
+batched, zero cross-block attention, reuses `dec_byte_emb`/`run_dec_blocks`/
+`dec_head`/`z_proj`; the chunked-window check in `CausalSelfAttention`
+auto-falls-back to dense SDPA for this short a sequence, so no special-
+casing needed there). `code_pre`'s output is no longer collapsed straight
+into `quantize()` — split into `pre_q` (pre-quantization) so
+`encode_match_weight` can target it directly:
+`encode_match_loss = F.mse_loss(pre_q[:, 1:, :], pred_soft.detach())`.
+Both smoke-tested (all 5 weight combinations: baseline, `aux_recon` only,
+`encode_match` only, both, `code_match_weight=0`) and overfit-verified
+(`code_acc`→100%, `aux_recon_acc`→~75%, both loss terms decreasing) before
+touching the live queue.
+
+**Queue reprioritized** (per explicit instruction — let `qcutelm_vlt8_bsq`
+finish, then an NTP-only baseline, then dense supervision, ahead of the
+previously-queued ablations): `qcutelm_vlt8_bsq` (running) →
+**`qcutelm_vlt8_bsq_ntp_only`** (`code_match_weight=0` — codelm gets *zero*
+direct supervision, only indirect gradient via Pass 2's backprop chain,
+i.e. "how a regular LM trains its last layer" with no auxiliary
+intermediate targets) → **`qcutelm_vlt8_bsq_dense_supervision`** (all four
+edges active: `code_match_weight=aux_recon_weight=encode_match_weight=1.0`)
+→ `qcutelm_vlt8_bsq_tight_window` → the two `qcutelm_vlt7` ablations →
+baseline reruns. Three-way comparison once these land: does removing
+codelm's direct target (`ntp_only`) hurt val_bpb noticeably, and does
+adding the two new edges (`dense_supervision`) help — both against
+`qcutelm_vlt8_bsq`'s own result as the middle reference point.
+
+## Session update — symmetry flaw found in qcutelm_vlt7/vlt8; qcutelm_vlt8
+## default flipped to untied; qcutelm_vlt9 built (true symmetry, slow prefill)
+
+**The flaw** ("i found a flaw in v8 for symmetry, better untie tokenizer
+detokenizer"): `qcutelm_vlt7`/`vlt8` were never actually symmetric between
+encode (Pass 1) and decode (Pass 2) despite the "symmetric" framing that
+motivated sharing their weights. Decode is a genuine CONSUMER of
+`codelm`'s output — every block's byte generation is conditioned on a
+predicted code. Encode is a pure PRODUCER — it computes `z_hat` from raw
+bytes alone and never consumes `codelm`'s output in return. That's a
+one-way pipeline (`encode -> codelm -> decode`), not a symmetric pair.
+True symmetry would require encode to ALSO consume `codelm`'s forecast as
+conditioning — which needs a genuine block-by-block AR handshake between
+encoder and `codelm` (encode's computation for block `i` needs `codelm`'s
+forecast built from block `i-1`'s TRUE code, which needs encode to have
+already finished block `i-1`) — expensive (loses full-sequence parallel
+training) and circular for no benefit `qcutelm_vlt7`/`vlt8` were actually
+using. Given encode and decode are different functions (unconditional vs.
+conditional LM), sharing weights between them was asking one set of
+weights to serve two incompatible jobs.
+
+**`qcutelm_vlt8`'s default flipped**: `shared_tokenizer_phases` now
+defaults to `False` (untied) — promoted from "one ablation among several"
+to the theoretically-motivated default. `qcutelm_vlt8_bsq_untied.py`
+(same architecture as `qcutelm_vlt8_bsq.py`, only this flag differs)
+queued as the direct comparison point. The three already-designed
+ablations (`ntp_only`, `dense_supervision`, `tight_window`) were pinned to
+`shared_tokenizer_phases=True` explicitly, preserving their original
+single-variable-isolation intent against `qcutelm_vlt8_bsq`'s own
+(pre-flip) result — the default change happened after they were written
+and queued.
+
+**`qcutelm_vlt9` built**: genuine architectural symmetry — encode and
+decode are now literally the SAME function (`SymmetricLM`, one set of
+weights), every block structured as `[code_prefix, K bytes]` where
+`code_prefix` is a bootstrap marker (block 0, nothing precedes it) or
+`codelm`'s forecast (every later block, built from the TRUE codes of all
+earlier blocks). Resolved via a genuine `n_blocks`-iteration Python loop
+— no way to vectorize away, since block `i`'s input literally cannot be
+constructed until block `i-1`'s true code is known. `codelm`'s own
+supervision (`code_match_loss`/`aux_recon_weight`/`encode_match_weight`,
+all ported unchanged) is computed via one final vectorized
+`codelm(z_hat_full)` call after the loop — `codelm`'s own attention is
+causal, so its per-position predictions from that one call are identical
+to what the in-loop incremental calls gave, avoiding the need to cache
+per-step `codelm` state.
+
+**Problem, flagged before building, not discovered after** ("problem v9
+is prefill slow"): measured directly, `n_blocks=32` already takes
+**~2.1s/train-step on CPU** (batch=4); the loop is roughly `O(n_blocks²)`
+(each iteration recomputes attention over the growing sequence), so
+`n_blocks=256` (matching `qcutelm_vlt7`/`vlt8`'s usual `context_len=1024`)
+would be ~64x slower — days for an 8000-step run, not hours. Queued
+config (`qcutelm_vlt9_bsq_small.py`) deliberately trades scale for
+tractability: `context_len=128` (`n_blocks=32`), `batch_size=8`,
+`steps=2000` — same `K`/`dq`/`quant_type`/`d_model`/`lm_d_model` as the
+other `bsq` runs (architecture held constant), not meant to be
+bpb-competitive with the full-scale runs, just enough to see whether true
+symmetry changes `code_conditioned_acc`/`within_block_acc` trends at all.
+One structural tradeoff worth noting: `qcutelm_vlt9` loses `qcutelm_vlt7`/
+`vlt8`'s free no-code-vs-code baseline ablation (no more separate
+unconditioned Pass 1) — adding one back would reintroduce a second full
+pass, undoing the point of this fork.
+
+All three new/changed pieces (`qcutelm_vlt8`'s default flip,
+`qcutelm_vlt8_bsq_untied.py`, `qcutelm_vlt9.py`) smoke-tested (forward/
+backward, all params get gradient, `generate()` runs) and overfit-verified
+(`qcutelm_vlt9`: `code_conditioned_acc`→90.6% on a tiny fixed batch,
+genuinely learning) before touching the live queue. Full updated queue:
+`qcutelm_vlt8_bsq` (running) → `qcutelm_vlt8_bsq_untied` →
+`qcutelm_vlt8_bsq_ntp_only` → `qcutelm_vlt8_bsq_dense_supervision` →
+`qcutelm_vlt8_bsq_tight_window` → the two `qcutelm_vlt7` ablations →
+`bytelm_xs_mtp4_ctx1024` → `bpelm_8192` → `qcutelm_vlt9_bsq_small`.
+
+**`qcutelm_vlt8_bsq` result**: best val_bpb **2.4771** — an improvement
+over `qcutelm_vlt7_bsq`'s 2.4951 (the block-aligned windowing fix helped,
+as hypothesized), now the closest any qcute variant has come to bytelm's
+2.4872 — actually *beating* it, the first qcute config to do so this
+session.
+
+**Two operational bugs caught and fixed immediately after `v8_bsq`
+finished:**
+1. **Queue-editing assumption was wrong.** This session's earlier
+   reasoning ("flat sequential bash scripts are read line-by-line, safe
+   to edit not-yet-reached lines without restarting the orchestrator") was
+   incorrect — when `qcutelm_vlt8_bsq` finished, the queue jumped straight
+   to `qcutelm_vlt8_bsq_tight_window`, silently skipping `untied`,
+   `ntp_only`, and `dense_supervision` (all inserted via in-place edits
+   while the script was running). Caught within seconds via the live
+   monitor output. Fix: rebuilt the queue script from scratch with all 9
+   remaining experiments verified present (`grep -c "STARTING"` = 9)
+   before relaunching — going forward, always fully restart the
+   orchestrator after any edit, no exceptions, regardless of script
+   structure.
+2. **`init_head_bias_to_unigram` didn't initialize `dec_head`'s bias when
+   untied.** With `shared_tokenizer_phases=False`, `dec_head` is a
+   separate `nn.Linear` from `head` — the unigram-frequency bias init only
+   ever touched `model.head.bias`, leaving `dec_head.bias` at its random
+   default. Caught by comparing `qcutelm_vlt8_bsq_untied`'s very early
+   `code_acc` (0.02-0.15% at step ~20) against `qcutelm_vlt8_bsq`'s
+   equivalent point (~12-14%) — too large a gap to be normal variance.
+   Fixed in both `qcutelm_vlt7.py` and `qcutelm_vlt8.py` (same bug in
+   both, `qcutelm_vlt7_bsq_trainable_slot_untied` was still queued and
+   would have hit it too): `init_head_bias_to_unigram` now also copies the
+   bias into `dec_head` when it's a distinct module. Verified via a direct
+   before/after equality check, then the untied run was killed (~30 steps
+   in, negligible loss) and relaunched with the fix — `code_acc` recovered
+   to ~12-14% by step ~30, in line with expectations.
+
+**`qcutelm_vlt8_bsq_untied` result: best val_bpb 2.4462** — better than
+`qcutelm_vlt8_bsq`'s 2.4771 (shared weights) and clearly ahead of
+bytelm's 2.4872. This is the first *quantitative* confirmation that the
+symmetry-flaw finding was correct, not just architecturally cleaner —
+untying encode/decode weights measurably improved val_bpb. Interesting
+transient during training: `no_code_acc` led `code_conditioned_acc` by as
+much as ~4.5pp in the first ~500 steps (decode's `dec_head`/`dec_blocks`
+learning from scratch without the head-start shared weights would have
+given), before `code_conditioned_acc` overtook it by ~step 1200 and
+stayed ahead for the rest of training — consistent with the untied
+decode path needing a few hundred steps to catch up, then benefiting from
+not fighting encode for representational capacity. Two full runs now
+confirm the same pattern: `qcutelm_vlt7_bsq` (2.4951) → `qcutelm_vlt8_bsq`
+(2.4771, window-alignment fix) → `qcutelm_vlt8_bsq_untied` (2.4462,
+symmetry fix) — each independent fix improved val_bpb, in the order they
+were found.
+
+**`qcutelm_vlt8_bsq_ntp_only` result: best val_bpb 2.4885** —
+`code_match_weight=0`, codelm gets zero direct supervision. Worse than
+both `qcutelm_vlt8_bsq` (2.4771) and `qcutelm_vlt8_bsq_untied` (2.4462),
+landing essentially at bytelm's own baseline (2.4872) — i.e. removing
+`code_match_loss` erases qcute's entire margin over the plain byte LM
+baseline. Confirms `code_match_loss` provides real, measurable value:
+codelm does not learn a useful forecast purely through the long indirect
+backprop chain (Pass 2's byte NTP loss → `codelm` → `z_hat`) — it needs
+the direct target.
+
+**Live finding during `qcutelm_vlt8_bsq_dense_supervision`: likely
+mutual-collapse between `code_match_loss` and `encode_match_weight`.**
+`code_match_loss` dropped to exactly 0.0000 within ~400 steps;
+`encode_match_loss` has stayed very small (~0.005-0.01) throughout —
+together suggesting `codelm`'s predictions and the encoder's own code
+(`z_hat`) have converged *toward each other*, exactly the risk flagged
+when `encode_match_weight` was first proposed ("both could converge
+toward a trivial, easily-mutually-predictable constant code that carries
+no real byte information"). With both directions active simultaneously
+at weight 1.0, nothing anchors the code to stay diverse across blocks.
+
+Diagnostic signal: `aux_recon_acc` has stalled flat around 28-30% for 7+
+consecutive evals while every other metric climbs to ~44-45%.
+`aux_recon` is the one metric that would visibly expose this — it
+reconstructs a block's bytes using *only* that block's own true code,
+zero cross-block attention, genuinely isolated (unlike Pass 1/Pass 2's
+windowed multi-block stack). If codes have collapsed toward similar
+values across blocks, `aux_recon` can't distinguish blocks from their
+codes alone. `no_code_acc`/`within_block_acc` are unaffected (never
+depend on code diversity — no-code mode always uses zero, relying on the
+raw-byte window instead). `code_conditioned_acc` climbing in lockstep
+with `no_code_acc` (not pulling ahead) suggests decode isn't actually
+leveraging the (now-degraded) code either, likely masked by the same
+wide-window raw-byte shortcut diagnosed earlier this session
+(`attn_window=80` gives ~32 blocks of direct reachable history) — an
+escape hatch `aux_recon` doesn't have. Hypothesis: the window confound
+and this mutual-collapse risk may be compounding — the wide window masks
+a code-collapse problem that `qcutelm_vlt8_bsq_tight_window` (already
+queued next) would likely expose in `code_conditioned_acc` too, the same
+way `aux_recon_acc` is exposing it here. To be confirmed once both runs
+finish.
+
+## `qcutelm_vlt10` — Clockwork-RNN-inspired multi-timescale sandwich (new fork, built)
+
+Motivated directly by the mutual-collapse finding above: `qcutelm_vlt8`'s
+`aux_recon_weight`/`encode_match_weight` reconcile `codelm` and the
+tokenizer's code only via auxiliary losses with a long backprop path —
+observed to be capable of collapsing to a trivial mutually-predictable
+solution instead of a genuinely informative code. `qcutelm_vlt9` (block-
+by-block true symmetry) is a different, still-live answer to a related
+but distinct problem (encode/decode role asymmetry) and is not touched by
+this fork.
+
+`qcutelm_vlt10`'s bet: make `codelm` a literal middle LAYER of one tiered
+stack — LOWER tokenizer layer (every byte, "fast clock") produces codes
+via strided readout every K bytes -> CODELM (sparse "slow clock", every K
+bytes) forecasts the next code -> UPPER tokenizer layer (every byte,
+"fast clock", re-synced from CODELM's forecast at every block-start byte
+position, substituted in place of the lower layer's own hidden state
+there — block 0 excepted, no forecast exists yet). Only the upper layer
+has a loss (byte NTP over the whole sequence) — the lower layer has no
+loss/head of its own (session-confirmed default: "at timesteps not
+modulo k, skip to upper layer", so a separate lower-layer loss would
+train a representation nothing downstream is forced to use consistently
+at most positions). `code_match_loss` unchanged, still the sole training
+signal for `codelm` itself.
+
+Crucially, unlike `qcutelm_vlt9`, this needs NO sequential python loop:
+the lower layer's pass depends only on raw bytes (causal, one vectorized
+call), `codelm`'s forecast at block i depends only on codes <i (already
+available from that one lower-layer pass), and the upper layer's input
+(lower's hidden states with the block-start substitution) can be built
+functionally (cat/where, no in-place mutation, autograd-safe) and run in
+one more vectorized call. Three full-sequence passes total, no
+`O(n_blocks^2)` loop — the design's actual payoff over `v9`.
+
+Windowing: both tokenizer tiers AND `codelm` now get windowed attention
+(`attn_window`/`lm_attn_window`, both default 64 per the design spec) —
+new for `codelm`, which was always dense in `v7`/`v8`/`v9` since its
+sequence was already short; here `codelm`'s window is still the largest
+in *effective* raw-byte coverage since each of its tokens already
+represents K bytes.
+
+Sanity-checked (tiny CPU forward+backward, dense and windowed variants,
+context_len=32): loss/metrics compute correctly, zero parameters with
+missing gradients, `generate()` runs for both configs (recomputes the
+full lower+codelm+upper pipeline from scratch every generated byte, no
+KV cache, consistent with this lineage's existing simplicity tradeoff;
+works for any prefix length, not just multiples of K).
+
+`configs/qcutelm_vlt10_bsq.py` created (same K/dq/quant_type/d_model/
+lm_d_model as the `v7`/`v8` bsq runs for direct comparability,
+`attn_window=lm_attn_window=64`) — not yet queued (only one training job
+at a time; current `run_vlt7_queue.sh` still has `dense_supervision`,
+`tight_window`, both `vlt7` trainable-slot ablations, both baselines, and
+`qcutelm_vlt9_bsq_small` ahead of it).
+
+Noted as a documented future extension, not built: generalizes to N
+levels by chaining — `codelm_1` (period K1) between lower and a mid
+layer, `codelm_2` (period K1*K2, operating on `codelm_1`'s own code
+stream rather than raw bytes) between mid and upper, and so on, each
+level's `code_match_loss`-style regularization targeting the level below
+it (a hierarchy of self-consistency losses).

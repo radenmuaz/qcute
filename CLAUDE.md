@@ -13,6 +13,7 @@ uv run python -m qcute.qcutelm                  # end-to-end tokenizer + latent 
 uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_1M_8192.model   # BPE baseline
 uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4.py   # named, reproducible run
 uv run python scripts/plot_run.py logs/<run_name>   # train/val bpb PNG from a run's run.jsonl
+uv run python -m qcute.qcutelm_vlt8 --config configs/qcutelm_vlt8_bsq.py   # current best qcute prototype (see below)
 ```
 
 All three modules read `--help` for their full flag list; all support
@@ -59,6 +60,19 @@ schedule.
 modules — none import each other, deliberately not factored further yet.
 Full details, including which handover-doc section each component
 implements and known gaps vs. the design: [docs/architecture.md](docs/architecture.md).
+
+`qcute/qcutelm_vlt6.py` through `qcute/qcutelm_vlt8.py` are a later,
+actively-iterated lineage of self-contained forks exploring
+tokenizer-as-AR-LM designs (narrow byte-level tokenizer + separate wide
+`codelm` operating on the short, K-fold-compressed code sequence — where
+qcute's actual compute argument lives). `qcutelm_vlt8` is the current
+best-performing/most-correct fork (fixes a windowed-attention/block-
+alignment bug present in `vlt7`); each file's own module docstring has
+the full per-version rationale. Full narrative, results, and open
+questions: [docs/status.md](docs/status.md) (session-update sections,
+newest at the bottom) — this lineage moves fast and status.md is the
+only place its current state is tracked; CLAUDE.md intentionally doesn't
+duplicate it.
 
 Design source of truth: [docs/continuous_tokenizer_handover.md](docs/continuous_tokenizer_handover.md).
 Phase-by-phase progress: [docs/status.md](docs/status.md).
