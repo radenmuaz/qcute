@@ -33,6 +33,81 @@ functions, eval_bpb) stays duplicated on purpose: it *is* the model each
 file exists to let you read and debug standalone, and qcutelm's generation
 is a structurally different shape (encode→code→decode, not byte-AR) so a
 shared abstraction there wouldn't be honest.
+
+## Session notes: strict-power-of-2 grid search (d_model x context, n_layers=3 fixed) for fair qcute_refine comparisons
+
+Companion to qcute/bpelm.py's own analogous session-notes block (same
+qcute_refine_v2 lineage targets, same FlopCounterMode methodology,
+batch=1). bytelm has no vocab-size axis to tune (byte-level, vocab=256
+fixed, embed/head table is negligible — 256*d_model is tiny next to a
+multi-million-param trunk, unlike bpelm's large BPE vocab tables) — so
+the two knobs here are d_model and context, both kept strictly
+power-of-2, n_layers pinned at 3 (configs/bytelm_xs3_ctx1024.py's own
+depth) and head_dim=64 throughout (n_heads = d_model/64, matching the xs/
+sd/md presets' own convention). NOTE: only --context/--mtp_heads/
+--n_layers are CLI-overridable on this module (see main()) — d_model/
+n_heads are NOT, only reachable by picking a different PRESETS entry or
+constructing LMConfig directly; the d_model=128/512/1024 grid points
+below aren't launchable via any existing config as-is, only d_model=256
+(the xs preset) is.
+
+**Params (context-independent, n_layers=3, mtp_heads=4, head_dim=64):**
+
+    d_model= 128  n_heads= 2  params= 0.723M
+    d_model= 256  n_heads= 4  params= 2.625M   # = configs/bytelm_xs3_ctx1024.py
+    d_model= 512  n_heads= 8  params= 9.969M
+    d_model=1024  n_heads=16  params=38.812M
+
+Coarse grid: each d_model doubling roughly quadruples params (d_model^2
+scaling dominates at fixed n_layers) — much coarser resolution than
+bpelm's vocab axis, which scales its embed table only linearly. No
+power-of-2 d_model lands close to several qcute_refine targets simply
+because there's nothing between 256 and 512 to try.
+
+**FLOPs grid (batch=1), d_model x context, both power-of-2:**
+
+    d_model= 128: ctx128=0.185G ctx256=0.369G ctx512=0.738G  ctx1024=1.476G  ctx2048=2.953G
+    d_model= 256: ctx128=0.671G ctx256=1.342G ctx512=2.684G  ctx1024=5.369G  ctx2048=10.737G
+    d_model= 512: ctx128=2.550G ctx256=5.100G ctx512=10.201G ctx1024=20.401G ctx2048=40.802G
+    d_model=1024: ctx128=9.932G ctx256=19.864G ctx512=39.728G ctx1024=79.457G ctx2048=158.914G
+
+Exactly linear in context at every d_model (doubling context exactly
+doubles FLOPs) — dense causal attention's O(context^2) term is still
+negligible next to the linear-layer terms (embed/unembed/MLP/QKV/out/MTP
+heads) even out to context=2048, same finding as bpelm's own grid.
+
+**Fair-comparison matches against the qcute_refine_v2 lineage** (params/
+FLOPs numbers from this session — see docs/status.md's own "Params/FLOPs
+comparison table"):
+
+MATCH PARAMS (context is then a free choice):
+    qcute_refine_pass_through  (2.642M) ~ d_model=256 (2.625M, -0.6% — near-exact;
+                                            this is exactly configs/bytelm_xs3_ctx1024.py)
+    qcute_refine_rope/identity (2.706M) ~ d_model=256 (2.625M, -3.0% — close)
+    qcute_refine_v1             (1.244M) ~ d_model=128 (0.723M, -41.9% — weak, coarse grid)
+    qcute_refine_rope_3level_curriculum (3.414M) ~ d_model=256 (2.625M, -23.1% — weak,
+                                            nothing between 256 and 512 to try)
+    qcute_refine_decoder_trunk (4.424M) ~ d_model=256 (2.625M, -40.7% — weak, same reason)
+
+MATCH FLOPS (single forward, batch=1):
+    qcute_refine_v1                     (2.916G) ~ d_model=128, context=2048 (2.953G, +1.3% — near-exact)
+    qcute_refine_decoder_trunk          (5.878G) ~ d_model=256, context=1024 (5.369G, -8.7% —
+                                            this is exactly configs/bytelm_xs3_ctx1024.py)
+    qcute_refine_rope_3level_curriculum (4.330G) ~ d_model=256, context=1024 (5.369G, +24.0% — weak)
+    qcute_refine_pass_through           (3.695G) ~ d_model=128, context=2048 (2.953G, -20.1% — weak)
+    qcute_refine_rope/identity          (3.862G) ~ d_model=128, context=2048 (2.953G, -23.5% — weak)
+
+Same caveat as bpelm's own notes: params-matching and FLOPs-matching
+don't generally agree (e.g. decoder_trunk: params want d_model=256 with
+some larger context, but 2.625M is already 40.7% short; FLOPs want
+d_model=256@1024 specifically, which is configs/bytelm_xs3_ctx1024.py
+almost exactly). Net: this strict-power-of-2 grid is materially coarser
+than bpelm's own (no vocab-like linear-growth knob available on bytelm),
+so most matches here are weaker than bpelm's — configs/
+bytelm_xs3_ctx1024.py (d_model=256, context=1024) remains the best
+overall single comparison point already in active use, close on params
+to pass_through/rope/identity and close on FLOPs to decoder_trunk
+simultaneously, which is why it was picked without needing a new config.
 """
 from __future__ import annotations
 
@@ -502,6 +577,7 @@ def main():
     p.add_argument("--preset", choices=list(PRESETS), default="sd")
     p.add_argument("--context", type=int, default=None, help="override preset's context length")
     p.add_argument("--mtp_heads", type=int, default=None, help="override preset's MTP head count")
+    p.add_argument("--n_layers", type=int, default=None, help="override preset's transformer layer count")
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None, help="prefix of the corpus to load (default: all)")
     p.add_argument("--val_frac", type=float, default=0.1)
@@ -562,6 +638,8 @@ def main():
             cfg.context = args.context
         if args.mtp_heads is not None:
             cfg.mtp_heads = args.mtp_heads
+        if args.n_layers is not None:
+            cfg.n_layers = args.n_layers
         model = ByteLM(cfg).to(device)
         start_step = 0
 

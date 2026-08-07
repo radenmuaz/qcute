@@ -19,6 +19,88 @@ would obscure more than it'd save.
 Requires a tokenizer trained with scripts/train_bpe.py first:
     uv run python scripts/train_bpe.py --data datasets/enwik8_1M.gz
     uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_1M_8192.model
+
+## Session notes: vocab-size tradeoffs (bytes/token, params, FLOPs) for fair qcute_refine comparisons
+
+**bytes/token vs. vocab (measured directly: 200K-char sample of
+datasets/enwik8_1M.gz, real trained sentencepiece model, sp.encode)** —
+relevant because qcute_refine's Ks=(4,...) means each emitted code
+represents 4 bytes; a BPE vocab whose average token also spans ~4 bytes
+is the fairest bandwidth-matched comparison:
+
+    vocab=4096   bytes/token=2.836  (70.9% of 4)
+    vocab=8192   bytes/token=3.220  (80.5% of 4)
+    vocab=9984   bytes/token=3.314  (82.9% of 4)   # 39*256 = 156*64, GPU-friendly but not power-of-2
+    vocab=16384  bytes/token=3.532  (88.3% of 4)
+    vocab=32768  bytes/token=3.798  (94.9% of 4)
+
+Diminishing returns: 8192->9984 is +22% vocab for only +2.9% bytes/token.
+The curve saturates hard — staying under 10,000 vocab caps you well
+short of bytes/token=4 on this corpus; reaching closer requires vocab in
+the tens-of-thousands, which brings its own cost (below).
+
+**Params, d_model=256/n_layers=3/n_heads=4 fixed, weight-tied embed/head
+(`self.head.weight = self.tok_emb.weight`, ONE table not two) — trunk is
+a FLAT 2.367M regardless of vocab or context (RoPE, no learned absolute
+position embedding); only the tied embed/head table scales with vocab:**
+
+    vocab=4096   total=3.415M  embed=1.049M (30.7%)
+    vocab=8192   total=4.464M  embed=2.097M (47.0%)
+    vocab=9984   total=4.923M  embed=2.556M (51.9%)
+    vocab=16384  total=6.561M  embed=4.194M (63.9%)
+    vocab=32768  total=10.755M embed=8.389M (78.0%)
+
+**FLOPs (single forward, batch=1, torch.utils.flop_counter.FlopCounterMode,
+same methodology as scripts/bench_forward.py) track the embed/head's
+param share almost exactly** — e.g. vocab=9984: head is 52.0% of FLOPs vs.
+51.9% of params; vocab=32768: 78.0% vs 78.0%. Not a coincidence: the head
+is a genuine dense matmul (FLOPs = 2*batch*context*d_model*vocab, exactly
+proportional to its own param count d_model*vocab, same 2*batch*context
+multiplier at every vocab) — embed lookup itself is free (a gather), but
+the head is not. So "FLOPs look fine" never rescues a params-dominated
+vocab choice here, and vice versa, unless the head mechanism itself
+changes (adaptive/hierarchical/sampled softmax — not implemented).
+
+FLOPs grid (same fixed d_model/n_layers/n_heads, batch=1), context in
+{64,128,192,256,320,384,448,512} x vocab in {4096,8192,16384,32768}:
+
+    vocab= 4096: ctx64=0.436G ctx128=0.872G ctx192=1.309G ctx256=1.745G ctx320=2.181G ctx384=2.617G ctx448=3.053G ctx512=3.490G
+    vocab= 8192: ctx64=0.570G ctx128=1.141G ctx192=1.711G ctx256=2.282G ctx320=2.852G ctx384=3.423G ctx448=3.993G ctx512=4.563G
+    vocab=16384: ctx64=0.839G ctx128=1.678G ctx192=2.517G ctx256=3.355G ctx320=4.194G ctx384=5.033G ctx448=5.872G ctx512=6.711G
+    vocab=32768: ctx64=1.376G ctx128=2.751G ctx192=4.127G ctx256=5.503G ctx320=6.879G ctx384=8.254G ctx448=9.630G ctx512=11.006G
+
+(Near-linear in context at this scale, not visibly quadratic yet — the
+linear-layer FLOPs, embed/head/MLP/QKV/out-proj, dominate over dense
+causal attention's O(context^2) term until context gets much longer than
+512.)
+
+**Fair-comparison matches found against the qcute_refine_v2 lineage
+(params/FLOPs numbers from this same session — see docs/status.md's own
+"Params/FLOPs comparison table"), power-of-2 vocab only, d_model=256/
+n_layers=3/n_heads=4 fixed:**
+
+MATCH PARAMS (context is then a free choice, e.g. for byte-equivalent span):
+    qcute_refine_rope_3level_curriculum (3.414M) ~ vocab=4096 (3.415M, +0.03% — near-exact)
+    qcute_refine_decoder_trunk          (4.424M) ~ vocab=8192 (4.464M, +0.9%)
+    qcute_refine_rope/identity/pass_through (2.64-2.71M): no good match — vocab=4096's 3.415M
+        already overshoots by 26-29%, since the flat 2.367M trunk plus even the smallest
+        power-of-2 vocab table already exceeds these targets.
+    qcute_refine_v1 (1.244M): unreachable — trunk alone (2.367M) already exceeds it.
+
+MATCH FLOPS (single forward, batch=1):
+    qcute_refine_v1                     (2.916G) ~ vocab=8192,  context=320 (2.852G, -2.2%)
+    qcute_refine_pass_through           (3.695G) ~ vocab=8192,  context=384 (3.423G, -7.4%)
+    qcute_refine_rope/identity          (3.862G) ~ vocab=8192,  context=448 (3.993G, +3.4%)
+    qcute_refine_rope_3level_curriculum (4.330G) ~ vocab=16384, context=320 (4.194G, -3.1%)
+    qcute_refine_decoder_trunk          (5.878G) ~ vocab=16384, context=448 (5.872G, -0.1% — near-exact)
+
+IMPORTANT: params-matching and FLOPs-matching pull toward DIFFERENT vocab
+choices for the same target (e.g. rope_3level_curriculum: params want
+vocab=4096, FLOPs want vocab=16384) — bpelm's dense attention + large
+tied linear head couples params and FLOPs differently than qcute_refine's
+windowed/hierarchical structure, so satisfying both simultaneously isn't
+generally possible. Pick whichever axis matters more for the specific
+comparison being made.
 """
 from __future__ import annotations
 

@@ -1011,6 +1011,20 @@ class DecoderLevel(nn.Module):
         null = self.null_kv.expand(B, 1, D)
         kv = torch.cat([null, kv], dim=1)   # [B, 1+n_blocks, D] — null slot always visible
 
+        # JAGGED STAIRCASE mask (session-verified, K=4 worked example): visible block count steps +1
+        # every K raw positions, but the step boundary lands at t=(b+1)*K-1, NOT at a K-multiple —
+        # block b's code depends on EncoderLevel's hidden state at that block's LAST position
+        # (h_blocks[:, :, K-1, :] in EncoderLevel.forward), so it isn't causally available until the
+        # byte at that position has been seen. Concretely for K=4 (decoder position t predicts byte
+        # t+1, via the h_dec[:, :-1] vs seq_repr[:, 1:] shift below): position t=2 (predicts byte 3)
+        # correctly sees NO blocks — block 0 depends on byte 3 itself, the very thing being
+        # predicted, so exposing it would leak the label. Position t=3 (predicts byte 4, unrelated
+        # to block 0) correctly sees block 0 — fully determined by already-seen bytes 0-3, no
+        # leakage. Verified empirically: visible blocks per t for K=4, n_blocks=4 are
+        # t=0,1,2->[] t=3..6->[0] t=7..10->[0,1] t=11..14->[0,1,2] t=15->[0,1,2,3] — a step of +1
+        # every K positions, offset by K-1, matching exactly when EncoderLevel actually computes
+        # each block's code (and matching cross_attn_rope's own block_pos=(b+1)*K-1 below, so the
+        # position encoding and the visibility mask agree on "when" each block conceptually exists).
         t_idx = torch.arange(L, device=device).unsqueeze(1)          # [L, 1]
         b_idx = torch.arange(n_blocks, device=device).unsqueeze(0)   # [1, n_blocks]
         n_complete = (t_idx + 1) // K                                        # exclusive upper bound: blocks
