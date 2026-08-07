@@ -2153,3 +2153,873 @@ layer, `codelm_2` (period K1*K2, operating on `codelm_1`'s own code
 stream rather than raw bytes) between mid and upper, and so on, each
 level's `code_match_loss`-style regularization targeting the level below
 it (a hierarchy of self-consistency losses).
+
+## `qcutelm_vlt11` — rebuilt as a recursive Pass1(E)/Pass2(D) sandwich
+
+`qcutelm_vlt11` went through two full architecture rewrites this session.
+The first (hierarchical pool/un-pool autoencoder, `PoolAttn`+`DecodeBlock`)
+is superseded; the current design was reached by iterating a graph-only
+("arrows, no english") check with the session until confirmed:
+
+```
+b_t ──E0──▶ h0a_t ──q──▶ c0_t
+                          │
+       c0_t ──D0──▶ h0b_t ──▶ b_(t+1)    (vs b_(t+1))
+
+c0_t ──E1──▶ h1a_t ──q──▶ c1_t
+                          │
+       c1_t ──D1──▶ h1b_t ──▶ c0_(t+1)   (vs c0_(t+1))
+```
+
+Every level is genuinely TWO LMs sharing one sequence: `E_i` (unconditional
+producer, own weights, no loss of its own) reads out a code `c_i` via
+`code_pre[i]`+quantize at block boundaries; `D_i` (conditional consumer,
+SEPARATE weights, own embedding, never reads `E_i`'s hidden states — "no
+h0") is conditioned on `c_i`'s causal forecast (`codelm[i]`, built from
+past `c_i` only) and does genuine NTP: predicts the next byte (level 0) or
+next `c_{i-1}` (level i>0), teacher-forced against real targets. Level
+`i+1`'s entire input sequence is level `i`'s code `c_i` — genuine
+sequence-length shrinkage at every level (`seq_lens` actually shrink,
+e.g. `[1024,256,64]` for `Ks=(4,4,4)`), matching `qcutelm_vlt7/vlt8`'s
+narrow/wide compute argument applied recursively, unlike `qcutelm_vlt10`
+which kept every tier at byte-length.
+
+Byte "purity" change (session ask: "make it more pure"): level 0 now
+represents a byte as its own native 8-bit BSQ-shaped code
+(`byte_to_bits`/`bits_to_byte`, deterministic, no learned embedding table)
+instead of a 256-way categorical — unifying level 0 with every coarser
+level's representation. `Config.byte_repr`: `"bits"` (default) or
+`"softmax"` (the original `nn.Embedding`+256-way CE, kept as a fallback).
+
+`BitPredictHead` (new class): predicts `dq` bits either `"independent"`
+(one `Linear(d,dq)`, no cross-bit conditioning) or `"chain"` (default) —
+a Fetch-style causal self-attention chain (ported from `qcute_fifo`/
+`qcute_bytepool`'s `FetchHead`) implementing the exact chain-rule
+factorization `p(u_0..u_{dq-1}|h) = prod_j p(u_j|h,u_{<j})` instead of an
+independence assumption. `chain_fixed_kernel=True` (default): when
+`true_bits` is available (training), builds ONE fixed-length `dq`-position
+sequence (zero vector preceding position 0, bit embeddings shifted in)
+and runs a SINGLE causally-masked self-attention call instead of a
+`dq`-step Python loop — same math, far better kernel utilization at
+training scale; falls back to the loop whenever `true_bits=None` (greedy
+generation, future bits genuinely unknown) or when the flag is off.
+
+Windowed attention is now the DEFAULT (`attn_window=64`, `lm_attn_window=
+16`; `-1` = dense is now the opt-out flag) — checked explicitly before
+setting: the chunked mechanism's effective reach is `~2*window` per layer
+(each chunk attends to itself + the previous chunk only, not a rolling
+window), not the full sequence, so these are the LARGEST values that
+still evenly divide every level's own shrinking sequence length for the
+default `Ks`/`context_len` (`gcd(1024,256,64)=64`, `gcd(256,64,16)=16`) —
+long-range signal beyond that travels through the code hierarchy, not raw
+attention.
+
+Generation: `generate_no_cache` (reference, recomputes `E_0`/`D_0` from
+scratch every byte — only level 0 ever participates in byte generation,
+since `D_i` is conditioned only on its own level's code, confirmed design,
+never coarser) and `generate_kv_cache` (append-only per-layer K/V for
+`E_0`, `D_0`, and `codelm[0]`, dense-attention only —
+`attn_window` must be -1 for this path specifically). Validated the two
+match EXACTLY across `byte_repr`x`bit_head_mode` combinations.
+
+**Two real bugs caught by that validation exercise, not by inspection:**
+1. `CodeLM.forward()`'s chain branch was zero-padding the "true bits" fed
+   to the chain for the LAST position (whose target doesn't exist yet —
+   exactly the forecast generation actually uses) instead of greedy-
+   decoding it. `generate_no_cache` (reusing `CodeLM.forward` wholesale)
+   silently computed the WRONG forecast there; `generate_kv_cache`
+   (correctly greedy at that position) diverged from it — caught by
+   `torch.equal` on full generated sequences, not visible from either
+   implementation in isolation. Fixed: split into a teacher-forced bulk
+   call (positions with real targets) + a genuinely greedy call for the
+   one position that needs it.
+2. `BitPredictHead`'s two chain implementations disagreed on whether
+   position 0 gets `gamma`-scaled or unscaled `h` — coincided only at the
+   default `gamma=1.0`, silently diverged for any other value. Caught via
+   a direct side-by-side numerical check
+   (`_forward_chain_fixed` vs `_forward_chain_loop`) after the session
+   asked to "read down the whole training and inference maths... and
+   catch any errors" — a reminder that "same math, faster kernel" claims
+   need an actual equality check, not just eyeballing.
+
+Bootstrap removed entirely (session: "wait does every D_i must has bos"):
+the block-start substitution previously used a placeholder (zero vector
+by default, `Config.trainable_bootstrap` for a learned one) at position 0
+of every `D_i`, since no codelm forecast exists there yet. Established
+this was inherited `qcutelm_vlt10` convention, not a requirement — there's
+nothing to inject at position 0 (no prior block to forecast from), so
+`D_i` now just keeps its own plain embedding of the real first element
+there, like any non-boundary position. `trainable_bootstrap`/
+`bootstrap_embed`/`bootstrap_slot` deleted (dead code once no call sites
+remained), not kept as a disabled option.
+
+**Open design question, discussed but not yet built**: `E_i` has no loss
+of its own — it's trained only indirectly (via `codelm[i]`'s
+code_match_loss, `D_i`'s own NTP loss backpropagating through the
+substituted forecast, and level i+1's losses backpropagating through
+`c_i` as raw input) — the same three paths all shape one shared hidden
+state, none of them directly constraining `c_i` to be genuinely
+informative rather than self-consistently collapsed (the same failure
+mode observed empirically in `qcutelm_vlt8_bsq_dense_supervision`, where
+`code_match_loss→0` while `aux_recon_acc` stayed low). Two concrete fixes
+discussed: (1) give `E_i` its own direct unconditioned NTP loss (mirrors
+`v7`/`v8`'s Pass-1-no-code baseline), stop-gradient-separated from the
+`code_pre` path specifically so it doesn't also reshape `c_i` (formalized
+as a block-coordinate argument: the NTP loss's fixed real-data target
+gives `θ_E` a self-contained, collapse-proof convergence point,
+independent of whatever `θ_code` is doing, and once that plateaus every
+downstream-derived quantity — including `c_i` — stabilizes into a
+non-moving target instead of a co-adapting one); (2) an `aux_recon`-style
+block-local reconstruction loss (ported from `qcutelm_vlt6`/`vlt8`,
+zero cross-block attention — no shortcut available, unlike
+`code_match_loss` or `D_i`'s own wide-attention escape hatch). Fix (1) is
+now implemented (`Config.e_ntp_weight`, default 0.0); fix (2) is not.
+
+**Fix (1) implemented and validated** (`e_ntp_weight` config flag): each
+`E_i` gets its own head (`head_e0`/`head_e_code`) and direct unconditioned
+NTP loss against real data, added to the total loss with weight
+`e_ntp_weight`. `h_a` is stop-gradiented specifically at the `code_pre[i]`
+input whenever `e_ntp_weight > 0`, so `code_match_loss`/`D_i`'s NTP loss
+(both downstream of `c_i`) can no longer also reshape `h_a` — verified
+directly via gradient-norm checks: `(total_loss - e_ntp_loss).backward()`
+gives exactly 0.0 gradient norm on `e_blocks[0]`, while
+`e_ntp_loss.backward()` alone gives nonzero (507.97) on the same
+parameters, confirming the detach fully isolates the two objective groups.
+
+400-step CPU smoke test (`Ks=(4,4)`, `quant_type=ifsq`, otherwise the same
+architecture) comparing `e_ntp_weight=0.0` vs `1.0`, tracking `level1_acc`
+(fraction of level-1 codes `D_1` predicts correctly — 100% here means the
+codes have become trivially predictable, i.e. collapsed) and
+`code_match_loss_L1` (how well `codelm[1]` forecasts `c_1` from its own
+past — near-zero alongside 100% `level1_acc` is the collapse signature
+seen live in the running `qcutelm_vlt11_k2_l3_full` job, see below):
+
+```
+e_ntp_weight=0.0 step=   1 byte_acc= 54.7% level1_acc= 13.9% cm_L1=2.0615
+e_ntp_weight=0.0 step= 100 byte_acc= 72.4% level1_acc= 99.4% cm_L1=0.5140
+e_ntp_weight=0.0 step= 200 byte_acc= 73.3% level1_acc= 87.5% cm_L1=0.1653
+e_ntp_weight=0.0 step= 300 byte_acc= 76.5% level1_acc=100.0% cm_L1=0.0250
+e_ntp_weight=0.0 step= 400 byte_acc= 75.0% level1_acc=100.0% cm_L1=0.0125
+e_ntp_weight=1.0 step=   1 byte_acc= 53.6% level1_acc= 14.3% cm_L1=2.0571
+e_ntp_weight=1.0 step= 100 byte_acc= 70.2% level1_acc= 91.5% cm_L1=0.5864
+e_ntp_weight=1.0 step= 200 byte_acc= 75.5% level1_acc= 90.9% cm_L1=0.1029
+e_ntp_weight=1.0 step= 300 byte_acc= 75.2% level1_acc= 65.3% cm_L1=0.6591
+e_ntp_weight=1.0 step= 400 byte_acc= 76.3% level1_acc= 59.2% cm_L1=0.4606
+```
+
+Without the fix, `level1_acc` climbs monotonically to 100% by step 300
+(collapse) while `code_match_loss_L1` decays to near-zero — the codes
+become trivially self-predictable. With the fix, `level1_acc` peaks at
+~91% around step 100 then *drops* to 59-65% by step 300-400, while
+`code_match_loss_L1` stays an order of magnitude higher (0.46-0.66 vs
+0.01-0.03) — i.e. the codes stay non-trivial to forecast — and `byte_acc`
+(the metric that actually matters) is comparable or slightly *better*
+with the fix (76.3% vs 75.0% at step 400). Read together with the
+zero/nonzero gradient-norm check above, this is good evidence the fix
+does what it was designed to do, not just a coincidental training-noise
+difference.
+
+The `qcutelm_vlt11_k2_l3_full` job that had been running since before this
+fix (and before the bootstrap-removal/gamma fixes too) was live-showing
+the exact predicted collapse (`val_level1_acc`/`val_level2_acc` pinned at
+100% by step ~400-1100 while `val_level0_acc` — the byte-level number that
+matters — sat at 75-81%, `val_code_match_loss_L1`/`L2` decayed to ~0.0000).
+That run has been killed and requeued with `e_ntp_weight=1.0` added to
+`configs/qcutelm_vlt11_k2_l3_full.py`, restarting from step 0 (per the
+established rule: any config edit requires a full orchestrator restart,
+not a resume). Queue after this: `qcute_fifo_w32_bw2`. The previously
+queued `qcutelm_vlt10_bsq`/`qcute_bytepool_v13`/`qcute_bytepool_v12`
+(queue4) were dropped by explicit decision — v10 is architecturally
+superseded by v11's redesign (real seq-length shrinkage, the bug fixes
+and now the collapse fix, all validated this session) so a comparison
+number added little; the bytepool v12/v13 lineage is a separate, stale
+prototype line unrelated to the active vlt11 work. All remaining compute
+now goes to iterating on the vlt11 lineage.
+
+**Update: `e_ntp_weight=1.0` run stopped — it/sec regression, plus a real
+concurrency bug caught.** Two things happened when this run was launched:
+
+1. A live orchestration bug: when the earlier stale (pre-fix)
+   `qcutelm_vlt11_k2_l3_full` process was killed, its parent
+   `run_queue3.sh` (no `set -e`) treated the killed command as "finished"
+   and immediately launched the *next* queued step (`qcute_fifo_w32_bw2`)
+   before the script itself got killed a moment later — leaving an
+   orphaned `qcute_fifo_w32_bw2` process (parent reparented to `launchd`)
+   running concurrently with the newly-launched, fixed `qcutelm_vlt11`
+   run for ~19 minutes. Caught via `ps -p <pid> -o lstart` showing two
+   `python3 -m qcute.*` processes with independent start times, one with
+   `ppid=1`. Same failure class as the earlier queue4 race this session —
+   killing a script's *child* process without also killing the script
+   itself (or killing them the instant before it advances) leaves a
+   window where `bash` moves on to the next line. Both processes killed;
+   nothing currently running.
+
+2. Separately, FLOPs/it-s analysis (below) showed the `e_ntp_weight=1.0`
+   run's it/s (~0.3-0.5 at first, later confirmed to plateau at ~0.5-0.55,
+   see rerun note below) is worse than
+   `bytelm_xs_mtp4_ctx1024`'s 1.13it/s despite `qcutelm_vlt11` doing
+   ~4-9x *fewer* FLOPs/step — i.e. it's overhead-bound (many small
+   sub-network calls: 9 stacks/step pre-fix, more with `e_ntp_weight`'s
+   extra heads), not compute-bound. Judged not worth running further at
+   worse-than-baseline it/s; stopped by explicit decision pending an
+   amortization strategy (see below) rather than continuing to eat
+   multi-hour wall-clock for a FLOP-light model.
+
+**Rerun to rule out MPS warmup as the explanation — confirmed plateau, not
+a warmup artifact.** The killed run's last few observed steps had been
+trending down (3.9s/it → 2.0s/it → 1.7-1.8s/it), raising the question of
+whether it was still warming up (MPS JIT/kernel caching) and would
+eventually reach or beat `bytelm`'s 1.13it/s given more steps. Relaunched
+standalone (bypassing `run_queue3.sh` entirely this time, to avoid any
+repeat of the orchestration race above) and watched via two checkpoints:
+step 151 at 1.86s/it, step 302 at 1.94s/it — flat, not still improving.
+Confirmed plateau at **~0.5-0.55 it/s, roughly half of `bytelm`'s
+1.13it/s**, not a transient warmup cost. Run stopped again per the
+same "cannot be worse it/s than bytelm" decision; the strategies below
+are the actual next step before another attempt.
+
+### FLOPs / it-s comparison vs. baseline (depth=4 `bytelm`/`bpelm`)
+
+Measured it/s (batch=16 throughout):
+
+| run | tokens/step | depth | it/s |
+|---|---|---|---|
+| `bytelm_xs_mtp4_ctx1024` | 1024 bytes → 16384 | n_layers=4, d=256 | 1.13 |
+| `bpelm_8192` | 256 tok → 4096 | n_layers=4, d=256 | 4.35 |
+| `bpelm_32768` | 256 tok → 4096 | n_layers=4, d=256 | 1.54 (vocab=32768 output-projection tax) |
+| `qcutelm_vlt11` pre-`e_ntp_weight` | 1024/256/64 across 3 levels | tier n_layers=2, codelm lm_n_layers=3 | 1.2-1.4 |
+| `qcutelm_vlt11` `e_ntp_weight=1.0` | same | same + 3 extra NTP heads | ~0.5-0.55 (1.86s/it @ step 151, 1.94s/it @ step 302 — plateaued, not an MPS-warmup artifact; see rerun note below) |
+
+Rough FLOPs/step (standard `6·N_sub·tokens_sub` estimate per sub-network,
+`N≈12·n_layers·d²` for mlp_mult=4 — approximate, excludes vocab-projection
+and BitPredictHead chain-attention cost, see caveat below):
+
+| run | FLOPs/step |
+|---|---|
+| `bytelm_xs` | ~334 GFLOP |
+| `bpelm_8192` | ~129 GFLOP |
+| `bpelm_32768` | ~284 GFLOP |
+| `qcutelm_vlt11` pre-`e_ntp_weight` | **~76 GFLOP** (level0 E0+D0+codelm0 ≈58G, level1 ≈14.5G, level2 ≈3.6G — dominated by level0, since sequences shrink 4x/level) |
+| `qcutelm_vlt11` `e_ntp_weight=1.0` | ~105 GFLOP (+~40%, one extra head per level reusing the already-computed `h_a`) |
+
+**Conclusion: `qcutelm_vlt11` is 4-9x lighter on FLOPs/step than either
+depth-4 baseline, but runs at similar-to-slower it/s** — i.e. it is
+overhead-bound on MPS, not compute-bound. Each step launches up to 9
+separate small transformer stacks (E+D+codelm × 3 levels) instead of
+baseline's 1 dense stack, and MPS pays real per-kernel-launch cost per
+stack. `e_ntp_weight` makes this markedly worse: FLOPs grew only ~40%
+but wall-time/step grew ~3-4x — exactly the overhead signature, not a
+compute one. The likely single biggest contributor (not yet profiled
+directly, worth confirming before trusting this as fact): `BitPredictHead`
+in `chain` mode already does real self-attention over the `dq`-bit
+dimension per token (reshaping to a `B*T`-sized batch of length-`dq`
+sequences — many small attention calls); `e_ntp_weight` adds a *second*
+independent `BitPredictHead` call per level (`head_e0`/`head_e_code`,
+alongside the existing `head0`/`head_code`), roughly doubling that
+specific many-small-ops cost, which would explain the wall-time hit far
+better than "one more full transformer pass" would.
+
+### Strategies to amortize the multi-loss cost, for a future attempt
+
+The core problem: `e_ntp_weight`'s benefit (breaking the collapse) is
+real and validated, but its wall-clock cost as implemented (compute the
+extra loss/head every step, for every level) is not affordable at this
+it/s. Options, roughly ordered from least to most invasive:
+
+1. **Periodic e_ntp** — compute `e_ntp_loss`/`head_e_*` only every `N`
+   steps (e.g. `e_ntp_every=8`), not every step. Amortizes the extra
+   head cost by `1/N` while still providing enough gradient signal to
+   prevent collapse — auxiliary losses in multi-task setups are commonly
+   scheduled this way rather than applied densely. Cheapest change
+   (one `if step % N == 0:` guard); risk is under-regularizing between
+   updates if `N` is too large, needs a sweep.
+2. **Alternating passes (bi-level / GAN-style)** — split each step's
+   optimizer update in two: one pass updates only `θ_E` via `e_ntp_loss`
+   (mirrors a "generator" step), the next updates only `θ_code`/`θ_D`
+   via `code_match_loss`+`D_i`'s NTP with `θ_E` frozen (mirrors a
+   "discriminator" step) — same total forward/backward work as computing
+   both in one pass, but each individual step is cheaper (one loss path,
+   not two), and it directly enforces the block-coordinate decomposition
+   the fix's formal argument already assumes, rather than relying on
+   `.detach()` to simulate it within a joint step.
+3. **Cheap head for the auxiliary path** — use `bit_head_mode="independent"`
+   (a single `Linear`, no chain self-attention) specifically for
+   `head_e0`/`head_e_code`, while keeping `chain` mode for `D_i`'s real
+   generation-quality path. `e_ntp_loss`'s job is only to prevent
+   collapse, not to nail exact bit-chain calibration, so a cheaper/less
+   precise head there is a reasonable quality-for-speed trade — and
+   directly targets the suspected BitPredictHead-doubling overhead
+   source above.
+4. **Batch the two BitPredictHead calls together** — concatenate `h_a`
+   (E_i's hidden state, for `e_ntp_loss`) and `h_b` (D_i's hidden state,
+   for the real NTP loss) along the batch dimension and run *one*
+   `BitPredictHead` forward instead of two separate ones. Same total
+   FLOPs, half the kernel-launch count — directly targets the
+   overhead-bound diagnosis rather than trading away loss quality.
+5. **Stochastic subsampling** — compute `e_ntp_loss` on a random subset
+   of positions per step (e.g. 25%) rather than every position. Cuts the
+   head's cost roughly proportionally; still an unbiased (if noisier)
+   gradient signal, similar to token-dropout-style auxiliary losses.
+6. **Anneal-then-drop schedule** — run `e_ntp_weight>0` only for an
+   initial window (until `level*_acc`/`code_match_loss` show the healthy
+   divergence-from-collapse pattern seen in the 400-step test), then
+   anneal `e_ntp_weight→0` for the remainder of training. Pays the extra
+   cost only during the critical early window, not for all 8000 steps —
+   cheapest in aggregate if collapse-prevention is mostly a bootstrapping
+   problem rather than a steady-state one (untested assumption).
+7. **Larger batch size, fewer steps (iso-token)** — since the diagnosis
+   is overhead-bound (fixed per-step dispatch cost, not per-token cost),
+   increasing `batch_size` while proportionally reducing `steps` amortizes
+   the fixed per-step launch overhead over more tokens per launch. Doesn't
+   reduce total FLOPs but directly attacks the per-step overhead tax;
+   cheap to try (pure config change, no code change).
+8. **Fuse the 3 levels' same-shaped sub-network calls** — `E_0/E_1/E_2`
+   (and `D_0/D_1/D_2`, `codelm[0..2]`) don't share weights or sequence
+   lengths, so they can't trivially be one call, but padding the shorter
+   levels' sequences up to a common length and running all 3 as one
+   batched call (mask out the padding) would cut 3 kernel-launch-heavy
+   calls down to 1 per group. Most invasive of these options — real
+   architectural surgery, not a flag — but addresses the *general*
+   9-stacks-per-step overhead problem, not just `e_ntp_weight`'s share
+   of it.
+
+**(1) and (3) implemented and validated — regression fixed.** New `Config`
+fields: `e_ntp_every` (default 1, off — compute every step, unchanged
+behavior; >1 computes `e_ntp_loss`/the extra `head_e_*` forward-backward
+only every N-th training step) and `e_ntp_bit_head_mode` (default `None`
+— `head_e0`/`head_e_code` inherit `bit_head_mode` as before; set to
+`"independent"` to give them a cheaper head — plain `Linear`, no per-bit
+chain self-attention — independent of what `D_i`'s real heads use).
+`forward()` takes an optional `step` param (`eval_model()`'s call site
+passes `step=None`, always computing `e_ntp_loss` — eval runs
+infrequently so its cost doesn't need amortizing); `train()`'s loop
+passes the actual step. The `h_a.detach()` before `code_pre[i]` stays
+gated on `cfg.e_ntp_weight > 0` alone (not on whether `e_ntp_loss` is
+computed *this* step) — the block-coordinate isolation guarantee
+(`code_match_loss`/`D_i` contribute exactly zero gradient to `θ_E`) must
+hold on every step, including skipped ones, or amortization would
+silently reintroduce the exact competition the fix exists to prevent.
+
+Both mechanisms verified directly: a unit test with `e_ntp_every=4`
+confirmed `e_ntp_loss` appears in `metrics` only on steps 4/8 (not 1-3/
+5-7) with `head_e0.mode="independent"` while `head0.mode` stays `"chain"`;
+a gradient-norm check on a skipped step (`step=1`) gave exactly 0.0 on
+`e_blocks[0]` (isolation intact even with `e_ntp_loss` absent from the
+graph that step), and a computed step (`step=4`) gave nonzero (4.18),
+confirming amortization doesn't weaken the guarantee.
+
+`configs/qcutelm_vlt11_k2_l3_full.py` updated with `e_ntp_every=4`,
+`e_ntp_bit_head_mode="independent"`. Relaunched standalone — **1.59-
+1.61it/s at step ~316**, beating `bytelm_xs_mtp4_ctx1024`'s 1.13it/s
+(vs. the pre-amortization plateau of ~0.5-0.55it/s — roughly 3x faster).
+Confirms the overhead diagnosis: BitPredictHead's chain self-attention
+being invoked a second time per level (once for `D_i`, once for `E_i`)
+was indeed the dominant cost, not raw FLOPs — cutting both its per-step
+frequency (4x fewer calls) and its per-call cost (independent mode, no
+chain attention) recovered — and beat — baseline throughput. (4)/(8)
+(batching the two BitPredictHead calls together, fusing the 3 levels'
+same-shaped sub-network calls) remain unimplemented; not needed for now
+given (1)+(3) already clear the baseline bar.
+
+**Amortized run stopped at step 2556/8000** (bpb=3.46, byte_acc=85.24%,
+it/s holding ~1.3, still above baseline) to pursue the convergence-speed
+question below instead of running the full 8000 steps blind — it/s was
+solved, but the separate "does it get competitive with baseline by step
+8000" question (see next section) is more informative to chase now via
+targeted ablations than by waiting out one more full run.
+
+## Did it converge slowly, and if so why? Train/val-bpb comparison vs.
+## baseline, and strategies to speed convergence
+
+Comparing `qcutelm_vlt11`'s `run.jsonl`/`run.log` against `bytelm_xs_mtp4_
+ctx1024`/`bpelm_8192`/`bpelm_32768` at matching step counts (both val_bpb,
+which is directly comparable — it's literally `val_byte_loss/log(2)`, the
+same level-0 byte-NTP cross-entropy the baselines report — and train_bpb):
+
+| step | `bytelm_xs` val_bpb | `bpelm_8192` val_bpb | `bpelm_32768` val_bpb | `qcutelm_vlt11` val_bpb |
+|---|---|---|---|---|
+| 1000 | 2.489 | 2.468-2.447 | 2.377-2.303 | 4.254 |
+| 1100 | 2.470 | 2.500-2.570 | 2.476-2.445 | 4.176 |
+| 1200 | 2.446 | 2.626-2.585 | 2.580-2.524 | 4.125 |
+
+| step | `bytelm_xs` train bpb | `bpelm_8192` train bpb | `bpelm_32768` train bpb | `qcutelm_vlt11` train bpb |
+|---|---|---|---|---|
+| ~1000 | 1.886 | 1.300 | 0.803 | 3.996 |
+| ~1100 | 1.979 | 1.284 | 0.605 | 3.951 |
+| ~1200 | 1.962 | 0.982 | 0.615 | 3.978 |
+
+**Yes, clearly slower** — v11 sits at ~4.0-4.3 bpb (train and val both)
+at the same step count where every baseline is already at ~2.3-2.6 val_bpb.
+Not new to this session's changes: the pre-fix, pre-amortization run
+showed the identical pattern (val_bpb=4.08 at step 1199), so this is an
+existing property of the architecture, not a regression from `e_ntp_
+weight`/amortization. (Caveat on the baselines' own trajectory: their
+train bpb collapsing toward ~0 by step 8000 is memorization/overfitting,
+already documented above — not a "better convergence" signal by itself,
+just faster fitting of a much smaller, more capacity-rich, single-
+objective problem.)
+
+**Likely causes**: `D_0` (the byte decoder, whose loss IS `val_bpb`) runs
+at `tier_d_models[0]=96`, under half of baseline's `d_model=256` — less
+per-token capacity for the byte-NTP task specifically. On top of that,
+`D_0` isn't optimizing byte-NTP in isolation: it shares every step with 8
+other simultaneous objectives (`code_match_loss`/`e_ntp_loss` x3 levels,
+level1/2 NTP), several of which are themselves cold-starting from
+scratch — and critically, `D_0`'s own decode input is corrupted by this:
+blocks 1+ of its input get `codelm[0]`'s forecast substituted in
+(`forecast_embed`, `qcutelm_vlt11.py`'s DECODE section), and early in
+training that forecast is close to garbage, so `D_0` is trying to learn
+clean byte statistics while also being fed noisy conditioning it didn't
+ask for.
+
+**Strategies to speed convergence** (session brainstorm, roughly cheapest
+first; queued to test in this order — cheap+diagnostic before invasive):
+
+1. **Quantization ceiling baseline (`quant_type="identity"`)** — **queued
+   first, before everything else below.** Disables discretization
+   entirely: `c_i` = `code_pre`'s raw continuous output, unbounded, no
+   rounding/STE (`configs/qcutelm_vlt11_k2_l3_identity.py`). Not a real
+   operating mode (not bounded/roundable/transmittable, generation
+   unsupported) — purpose is purely diagnostic: if removing hard
+   quantization entirely closes most of the convergence gap, that
+   isolates quantization (or its STE gradient / discretized forward
+   value) as the dominant bottleneck, pointing toward quant-specific
+   fixes (soft-to-hard annealing, blended soft/hard `code_match_loss`
+   targets). If the gap persists nearly unchanged, the bottleneck is
+   elsewhere (capacity, multi-objective competition, cold-start
+   substitution corruption) — pointing toward (2) below instead. Implemented:
+   `quantize()`, `CodeLM.__init__`/`forward()`, `_build_head_code`,
+   `code_level_loss`, `_ntp_loss_and_acc`, and the inline `cm_loss`
+   computation in `forward()` all got an `"identity"` branch (plain
+   `nn.Linear` regression head, `F.mse_loss` in place of BCE/CE; `D_i`'s
+   "accuracy" metric becomes a fraction-of-variance-explained proxy,
+   since there's no natural bit/level accuracy for unbounded regression).
+   Verified end-to-end at full config scale (3 levels, `tier_d_models=
+   (96,96,96)`, `context_len=1024`) before queuing — no crash, loss
+   decreases over a short CPU smoke test.
+2. **Byte-NTP-only warmup / curriculum staging** (original session idea)
+   — for the first `byte_warmup_steps`, backward only `level0_loss`
+   (byte NTP), and bypass `D_0`'s forecast substitution entirely (pure
+   teacher-forced real embeddings, matching `bytelm`'s well-posed dense-
+   NTP setup exactly) — giving `D_0` a clean bootstrap before the harder
+   joint optimization (with a corrupted, still-cold-starting forecast
+   signal) kicks in. Generalizes to greedy layer-wise staging (warm up
+   level 0, then 0+1, then 0+1+2) if the single-phase version helps.
+   NOT implemented yet — queued after (1), since (1)'s result determines
+   whether this is even the right lever to pull next.
+3. Soft-to-hard quantization annealing (temperature/sharpness schedule
+   on the quantizer itself, rather than hard from step 1).
+4. Soft/blended `code_match_loss` targets — interpolate hard-quantized
+   target toward the continuous `pre_q` value early in training.
+5. Residual (not hard-swap) `D_i` substitution — blend real embedding +
+   forecast rather than fully replacing blocks 1+ with the forecast.
+6. Loss-term reweighting / GradNorm-style balancing — smooth ramps for
+   `code_match_weight`/`e_ntp_weight` instead of hard on/off, to avoid
+   the loss-spike-on-activation behavior already observed with `e_ntp_
+   every`'s periodic firing (loss jumping ~10→17 on compute steps).
+7. Curriculum on `context_len` (short→1024, progressive-growing style).
+8. Differential LR for cold-start modules (`codelm`/`code_pre`/`z_proj`)
+   vs. `D_0`/`head0` (unigram-bias-initialized, less cold).
+9. Better `code_pre` init (near-typical codes from step 1, not random-
+   extreme).
+
+None of (2)-(9) implemented yet — (1)'s result should determine which of
+these is actually worth pursuing next.
+
+**Identity-quant run stopped early (step 261/8000, bpb=5.18) — went one
+level stricter first.** Before waiting out identity's full 8000 steps,
+session raised a sharper question: does the multi-level BSQ/multi-
+sandwich-LM hierarchy actually improve representation power and long-
+range capability at all, given that **only `D_0` ever decodes bytes** and
+`D_0` never reads any other level's hidden state directly (the "no h0"
+design from the cyclic-target-problem fix)? Forked a THIRD, stricter
+config first: `configs/qcutelm_vlt11_k2_l3_byteonly.py`
+(`Config.byte_only=True`) — disables the code hierarchy entirely, no
+`E_0`, no `code_pre`/`quantize`/`codelm[0]`, no forecast substitution, no
+levels 1+. `D_0` trains alone as a plain dense-ish byte LM (windowed,
+`d_model=96`) — structurally almost identical to `bytelm`, just narrower.
+Implemented as an early-return branch in `forward()` (skips straight to
+`D_0`'s embed → transformer → NTP loss) plus `_build_head0` reuse; unit-
+tested at full config scale before queuing (no crash, `metrics` dict
+correctly reduced to `{loss, byte_loss, byte_acc}` only — `train()`'s
+`pbar.set_postfix` and the `log_every` call had to be guarded for the
+missing `code_match_loss` key). Queued via `run_ablations.sh`:
+`byte_only` first, then `identity` — running now.
+
+### Does the hierarchy actually help, given only `D_0` decodes bytes?
+
+Traced the actual information path from raw bytes to `D_0`'s prediction,
+concretely, using the default config's numbers:
+
+- `D_0`'s own attention is windowed (`attn_window=64`, `n_layers=2`) —
+  effective reach ~`2*window*n_layers` ≈ **256 bytes**, not the full
+  1024-byte context.
+- Its only other input is `codelm[0]`'s forecast, substituted (not
+  blended — a hard replacement) into `D_0`'s input at every 4-byte block
+  boundary. `codelm[0]` is itself windowed (`lm_attn_window=16`, 3
+  layers) — effective reach ~96 `c_0`-positions, each summarizing 4
+  bytes → ~**384 byte-equivalent reach**. Level 1/2 extend this further
+  in principle (up to ~1536 byte-equivalents for level 1), exceeding the
+  whole context — the standard hierarchical-compression bet (same
+  argument behind H-Net/MegaByte-style designs), legitimate in principle.
+
+**Four compounding lossy stages sit between "real byte" and what `D_0`
+actually conditions on**, each capable of destroying the long-range
+signal before it arrives:
+1. **Discretization** — `c_0` has `dq=8` bits to represent a 4-byte
+   (32-bit) block, a 4x lossy compression by construction; whether the
+   surviving 8 bits capture anything *useful* depends entirely on
+   training, not on the architecture guaranteeing it.
+2. **Collapse, already observed live** — without `e_ntp_weight`, `level1_
+   acc`/`level2_acc` hit 100% while `code_match_loss`→0 (codes becoming
+   trivially self-predictable, i.e. carrying ~0 real information). The
+   fix helps, but even with it, `level1_acc` in the amortized run bounced
+   40-70%, not obviously "informative and stable" yet.
+3. **Hard substitution, not augmentation** — `D_0`'s real embedding is
+   *replaced* by `forecast_embed` at block boundaries, not blended with
+   it (strategy 5 above names this directly). A noisy forecast — which
+   it structurally must be early in training — actively corrupts `D_0`'s
+   conditioning rather than merely failing to help it.
+4. **Cascading error through 4 stages** — `E_0`'s windowed encode →
+   quantize → `codelm[0]`'s own forecast error → `z_proj`'s remap into
+   `D_0`'s residual stream. Any one stage can destroy signal that
+   survived the previous three.
+
+**The "no h0" design compounds this structurally**: the earlier cyclic-
+target-problem fix deliberately keeps every `D_i` from ever reading any
+`E_i`'s hidden state directly — the right call for making `E_i`'s own
+training well-posed (block-coordinate argument), but it also means `D_0`
+is architecturally starved to a single thin, lossy scalar-code channel;
+there is no richer path by which the hierarchy's computation could reach
+byte prediction even if the codes were perfect.
+
+**Empirical evidence so far leans toward "not yet realized, possibly
+currently net-negative at this scale"**: `bytelm` — dense attention, full
+1024-byte context, zero hierarchy — reaches 2.4 bpb by step 1200 where
+`qcutelm_vlt11` sits at 4.1 bpb (see the convergence-comparison table
+above). At `context_len=1024`, dense O(L²) attention is cheap enough that
+there's no obvious *necessity* for the hierarchy's approximate long-range
+mechanism — the real compute-savings argument (v11 pre-fix: ~76 GFLOP/
+step vs. `bytelm`'s ~334, a genuine 4-9x reduction, see the FLOPs
+comparison above) only pays off compared **per-FLOP**, not per-step, and
+that comparison hasn't been made yet; on raw per-step learning progress
+the hierarchy is currently a clear loss.
+
+**The three-way ablation queued now is designed to answer this directly**,
+not by architecture-diagram intuition:
+- `byte_only` = `D_0` alone, windowed, zero long-range signal — the
+  ceiling for "how good can `D_0`'s own local window get with nothing
+  from the hierarchy."
+- `identity` = full hierarchy, substitution active, codes unbounded (no
+  discretization loss — stage 1 above removed).
+- `full` (ifsq, already run to step 2556, bpb=3.46) = everything active,
+  all four lossy stages present.
+
+**The comparison that resolves the question**: if `full`/`identity` beat
+`byte_only` at matching steps, the hierarchy's long-range channel is
+adding real value despite the lossy stages. If `byte_only` matches or
+beats them, the long-range mechanism is currently net-neutral-to-harmful
+at this scale — pointing either toward fixing the corruption (residual
+substitution, strategy 5) before trusting the hierarchy, or toward
+concluding the compute argument only pays off at much longer contexts
+where dense attention becomes genuinely expensive (unlike at
+`context_len=1024`). Not yet resolved — `byte_only` is running now,
+`identity` queued to follow; the matching-step three-way comparison is
+the next thing to pull once both have enough steps logged.
+
+## Baseline results, final (8000 steps each) — updates the earlier "queued
+## but not completed" notes scattered through this doc (search
+## `bytelm_xs_mtp4_ctx1024`/`bpelm_8192` above for the original flags)
+
+All three baselines show the SAME overfitting shape already documented
+earlier in this file for the original 2000-step `bpelm_8192` run
+(train bpb collapsing toward ~0 while val_bpb climbs back up over the
+final ~1000 steps) — `best.pt`'s tracked optimum (not `last.pt`) is the
+comparable number, consistent with how every qcute config in this doc has
+been compared so far.
+
+| run | vocab / context | best val_bpb | last-step val_bpb (overfit) |
+|---|---|---|---|
+| `bytelm_xs_mtp4_ctx1024` | byte, context=1024 | **2.3651** | 4.4300 |
+| `bpelm_8192` | BPE vocab=8192, context=256 (~845-byte-equiv) | **2.3500** | 5.0173 |
+| `bpelm_32768` | BPE vocab=32768, context=256 (~973-byte-equiv, session-tuned closer to the 1024 target — see the vocab-tuning discussion earlier this session) | **2.1344** | 3.2582 |
+
+Wallclock, from each run's logged it/s extrapolated to the full 8000-step
+budget (`8000 / it/s`) — useful for estimating a new run's finish time from
+its early-step progress bar alone, without waiting it out:
+
+| run | observed it/s | 8000-step estimate | actual wallclock |
+|---|---|---|---|
+| `bytelm_xs_mtp4_ctx1024` | 1.13it/s | ~118 min (~2h) | ~1h49m-2h (finished within estimate) |
+| `bpelm_8192` | 4.35it/s | ~31 min | 34m22s |
+| `bpelm_32768` | 1.54it/s | ~87 min | 1h07m37s (finished faster than the it/s-implied estimate — rate improved after the sampled point) |
+
+`bpelm_32768` is now the best of the three baselines — consistent with
+the earlier reasoning for retuning the vocab: closer byte-equivalent
+context (~973 vs 8192's ~845, both short of the other configs' full 1024)
+AND a larger, more expressive token vocabulary. `bytelm_xs_mtp4_ctx1024`
+(2.3651) also improves on the old `bytelm_xs_mtp4`'s 2000-step, context=
+256 baseline (2.4872) referenced throughout the earlier parts of this
+doc — the two numbers are NOT directly comparable (different context
+length and step budget), so treat 2.3651 as bytelm's current best number
+going forward, not a direct refutation of the earlier 2.4872 comparisons
+already recorded above.
+
+## Weight-sharing-across-levels merged into `qcutelm_vlt11` (as flags, not a fork)
+
+Session idea: "what if all codes in all level in same space, and same lm
+sandwich... weight share every layer... similar idea to qcute fifo but
+uses data-driven bsq instead of byte merge rule." First implemented as a
+separate fork (`qcutelm_vlt12.py`, shared/untied E-D-codelm with v11's
+existing forecast-substitution mechanism, `Config.untie_levels`/
+`Config.code_dim` flags) — then, per explicit session direction ("merge
+current v12 into v11 as flags" / "the 3 separate e d codelm, merge to
+v11"), folded directly into `qcutelm_vlt11.py` instead of staying a
+separate module, since it changes nothing about v11's actual mechanism
+(Pass1(E)/Pass2(D)/codelm-forecast, detach-teacher-force fix, all of it
+unchanged) — only WHETHER the same weights get reused across levels.
+`qcutelm_vlt12.py` itself was freed up for a different, more radical
+redesign (next section).
+
+**`qcutelm_vlt11.py` additions**:
+- `Config.share_across_levels` (default `False`, v11's original behavior
+  completely unchanged): `False` = each level keeps its own independent
+  `E_i`/`D_i`/`codelm[i]`/`code_pre[i]`/`z_proj[i]`/`head_code[i]`/
+  `embed[i]`/`dec_embed[i]`, exactly as before. `True` = ONE shared copy
+  of each, reused at every level — requires `tier_d_models` and `dqs` to
+  each be uniform across levels (asserted in `__init__`, verified to
+  raise correctly on a non-uniform config in testing).
+- Two new index helpers, `_sel(i)` (for the zero-indexed module lists —
+  `e_blocks`/`e_ln_f`/`d_blocks`/`d_ln_f`/`code_pre`/`z_proj`/`codelm`,
+  returns `0` when sharing else `i`) and `_sel1(i)` (for the
+  None-at-index-0-plus-real-entries-from-1 lists — `embed`/`dec_embed`/
+  `head_code`/`head_e_code`, returns `1` when sharing else `i`) — every
+  forward-path index site updated to go through one of these.
+- Generation functions (`generate_no_cache`/`generate_kv_cache`) needed
+  **zero changes** — they only ever index level 0 directly (`model.
+  e_blocks[0]`, `model.d_blocks[0]`, `model.codelm[0]`, ...), which is
+  valid and correct under both sharing modes automatically.
+- **Re-verified the detach-teacher-force isolation survives sharing** in
+  this v11-native form too (same check as the retired v12 draft): `(total
+  - e_ntp_loss).backward()` gives exactly 0.0 on the shared `e_blocks[0]`;
+  `e_ntp_loss.backward()` alone gives nonzero (13.06 in the test).
+- Verified: untied (unchanged param count/behavior), shared (param count
+  drops from 632977 to 328393 in a 2-level smoke test — confirms the
+  reduction), shared+`e_ntp_weight` amortized, and the non-uniform-config
+  assertion all behave correctly.
+- Scope limitation kept from the original draft: no separate `code_dim`
+  override flag in this v11-native version (unlike the retired draft) —
+  keep `dqs` itself uniform if a different code size is wanted. That
+  richer flag lives in the new `qcutelm_vlt12.py` instead (below).
+
+## `qcutelm_vlt12` — single shared LM over a flat multi-resolution sequence (redesigned this session)
+
+The file's first draft (shared/untied E-D-codelm, described above) was
+**replaced**, not extended, after working through a real circularity in
+that design during the "merge to v11" discussion: `D_i` needs "this
+block's own code" available AT the block's own start, which can't exist
+yet (a summary of not-yet-processed content) — v11's `codelm`/forecast
+machinery exists specifically to approximate this. A literal single
+causal LM (session: "do not separate E D codelm, just single lm, like
+qcute fifo... the whole point of bsq is bsq is informative enough to give
+compressed context") hits the same wall UNLESS code computation is
+decoupled from the main attention pass entirely — which is exactly how
+`qcute_fifo` avoids it: a span's embedding there is a fixed, cheap,
+non-attentional function (`linear(concat(children))`), computable the
+instant the span's raw content is known, independent of the main LM
+having "reached" that point.
+
+**Architecture** (full derivation in `qcutelm_vlt12.py`'s module
+docstring):
+1. **Local merge** — level `i`'s code is `quantize(Linear(Ks[i]*d_model,
+   code_dim)(concat of Ks[i] consecutive child embeddings))`, then
+   re-embedded to `d_model`. Purely local (non-causal WITHIN a completed
+   block — no leakage risk, the block is entirely in the past for anyone
+   using its summary), parallel across blocks, no attention.
+2. **Flat sequence construction** — every level's embeddings are
+   scattered into ONE flat sequence, each code token placed immediately
+   after the span it summarizes (`_build_flat_layout`, pure Python,
+   precomputed once per `Config` — structural, not data-dependent). This
+   placement is what makes a PLAIN causal mask correct with zero special-
+   casing: a block's own code token always sits strictly after that
+   block in flat order.
+3. **One shared causal LM** — a single attention pass over the whole flat
+   sequence; level-0 positions gathered back out (original byte order)
+   for the ONLY loss, ordinary byte NTP. No `code_match_loss`, no
+   `e_ntp_weight`/cyclic-target-problem machinery — codes are
+   deterministic functions of already-known content, not autoregressive
+   forecasts competing for gradient.
+
+**Bugs caught and fixed during this session's own testing** (both before
+any real training run, i.e. cheaply):
+- `_build_flat_layout`'s first version grouped every `K` elements of the
+  ALREADY-interleaved (raw+lower-code) sequence when building a higher
+  level, instead of grouping only the immediately-previous level's own
+  elements — caught by a shape-mismatch crash on the first 3-level smoke
+  test (`Ks=(4,4)`: level 2 must group level 1's 64 elements into blocks
+  of 4 → 16 codes, not every-4-of-320 → 80). Fixed by walking the
+  accumulated flat sequence but counting occurrences of the previous
+  level specifically, inserting after every `K`-th one.
+- Verified the fix both structurally (hand-derived `Ks=(4,4)`, `L0=256`
+  layout: `Counter({0: 256, 1: 64, 2: 16})`, matching exactly) and via a
+  **direct numerical causal-leakage test**: perturbing byte 20 of a
+  32-byte sequence left hidden states at positions <20 EXACTLY unchanged
+  (max diff `0.00e+00`) while positions ≥20 changed (max diff `0.854`) —
+  confirms zero leakage through the flat-sequence construction, not just
+  a hand-argued correctness claim.
+
+**Verified working**: shared (`untie_levels=False`, requires uniform
+`Ks`) vs untied (`True`, `Ks` may differ per level, e.g. `(4,2)`
+tested directly), `byte_only`, `quant_type="identity"`, and the
+non-uniform-`Ks`-with-sharing assertion all construct/train/raise
+correctly. At the config-file scale (`configs/qcutelm_vlt12_shared_
+k2_l3.py`, `Ks=(4,4,4)`, `d_model=256`/`n_layers=4` matching `bytelm_xs`'s
+architecture dims exactly, `flat_len=1360`): **3.752M params** — close to
+`bytelm`'s 3.4M (unlike the retired draft's 11.6M, since there's no more
+3-role duplication, just one LM + cheap merges) — and trains without
+error.
+
+**Not yet run at real scale / not yet known**: whether this design's
+byte-bpb convergence actually beats `qcutelm_vlt11`'s (with or without
+`share_across_levels`) or `bytelm`'s — no training run has been let run
+past a few smoke-test steps yet. No generation/inference code exists for
+this file (training-only, same convention as v11's `byte_only`/`identity`
+diagnostics). `docs/vlt12_math.tex`'s masked-multi-level-pyramid-attention
+derivation is now superseded by this simpler mechanism (fixed local merge
++ single global attention achieves the same "one pass instead of `3*
+n_levels` calls" efficiency goal without needing forecasting or a custom
+attention mask at all) — kept in the repo as a record of the reasoning
+that led here, not as the current design target.
+
+## `qcute_fifo.py` retired — ported into `qcutelm_vlt12.py` as `Config.mode="fifo_v1"`
+
+Session: "make the v12 qcute_fifo_v1 and merge the current qcute_fifo
+greedy? merge algorithm as flag then delete." `qcutelm_vlt12.py` gained a
+second, fully independent code path (`Config.mode`, default `"pyramid"`
+= this file's own design above; `"fifo_v1"` = the port) — the two modes
+share only the low-level `Block`/`CausalSelfAttention`/RoPE machinery and
+`Config`, everything else (embedding construction, forward pass, batch
+sampling, loss) is separate.
+
+**Ported verbatim**: `enumerate_compositions` (non-increasing composition
+enumeration), `rope_cos_sin_explicit` (explicit-position RoPE, needed
+since a slot's position is its own raw-byte end-offset, not a sequential
+index), `FetchHead` (byte-chain MTP head — distinct from `BitPredictHead`,
+which chains over a code's *bits*; `FetchHead` chains over a slot's own
+upcoming *bytes*), `embed_span`'s recursive PQ-style merge (same formula
+`pyramid` mode's `_merge_level` uses, minus the `quantize()` step — this
+is deliberately "FIFO's own fixed merge rule, unquantized"), and
+`build_batch`'s per-composition slicing/target construction. `Config`
+gained `window`/`bandwidths`/`fetch_n_heads`/`fetch_gamma`/`tie_head`,
+consulted only in `fifo_v1` mode. `train()`/`eval_model()`/
+`init_head_bias_to_unigram()` all branch on `cfg.mode` where the two
+modes' data-sampling/loss/bias-init mechanics genuinely differ (composition
+sampling vs. fixed-context-length sampling; 256-way softmax bias vs.
+per-bit marginal bias).
+
+**Verified**: small-scale smoke test (`window=8`, `bandwidths=(1,2)`,
+9 valid compositions) trains without error; full config-file scale
+(`window=256`, `bandwidths=(1,2,4)`, `d_model=256`, `n_layers=4`,
+matching the retired `qcute_fifo_w32_bw2.py` config exactly) constructs
+(**3.748M params**, consistent with `pyramid` mode's 3.752M at the same
+architecture dims — same overall scale, different mechanism), enumerates
+33153 valid compositions, and runs a real forward/backward/opt-step
+without error. `pyramid` mode re-verified unaffected by the `__init__`
+restructuring needed to support the branch (identical loss trajectory to
+the pre-change smoke test, exact match to 3 decimal places).
+
+**Deleted**: `qcute/qcute_fifo.py`. **Renamed**: `configs/qcute_fifo_
+w32_bw2.py` → `configs/qcutelm_vlt12_fifo_v1.py` (same `window=256`/
+`bandwidths=(1,2,4)`/architecture-dims content, `mode="fifo_v1"` added,
+now invoked via `qcutelm_vlt12.py` instead of the deleted module). Historical
+mentions of `qcute_fifo`/`qcute_fifo_w32_bw2` earlier in this doc (the
+queue-race incident, `BitPredictHead`'s Fetch-mechanism attribution) are
+left as-is — they're accurate records of what was true at the time, not
+live pointers.
+
+## `qcutelm_vlt12.py` renamed to `qcutelm_pyramid.py`
+
+Session: "rename qcutelm_vlt12 to qcutelm_fifo or some descriptive
+_name." Chose `qcutelm_pyramid.py` over `qcutelm_fifo` — the module's
+default/primary mode (`Config.mode="pyramid"`) is the flat multi-
+resolution single-LM design, not the ported FIFO mechanism; `fifo_v1` is
+one mode within it (`Config.mode="fifo_v1"`), not the module's identity.
+All internal references (module docstring's `uv run` line, `run_name`
+fallback) updated to match. Configs renamed alongside it: `configs/
+qcutelm_vlt12_shared_k2_l3.py` → `configs/qcutelm_pyramid_v1.py`,
+`configs/qcutelm_vlt12_fifo_v1.py` → `configs/qcutelm_pyramid_fifo_v1.py`
+(content unchanged, just the invocation module path). Verified end-to-end
+under the new names (`load_config_module` + a real forward pass) before
+launching. All earlier mentions of `qcutelm_vlt12`/`qcutelm_vlt12_*` in
+this doc (above this section) refer to the same file/configs under their
+now-superseded names — left as historical record, not live pointers;
+**current names are `qcutelm_pyramid.py` / `qcutelm_pyramid_v1.py` /
+`qcutelm_pyramid_fifo_v1.py`**.
+
+Currently training: `qcutelm_pyramid_v1` (fresh run under the new name,
+`Ks=(4,4,4)`, `d_model=256`/`n_layers=4` matching `bytelm`, `flat_len=
+1360`, `3.752M` params), queued into `qcutelm_pyramid_fifo_v1` afterward.
+
+## `qcutelm_pyramid_v1` was catastrophically slow on MPS — three real bugs found and fixed
+
+Session: "is it taking too long" → yes, ~95-120s/step (would have taken
+~230 hours for 8000 steps). Root-caused via systematic component
+isolation (timing each piece of `forward()`/`backward()` separately —
+byte embed, merges, scatter, main attention, gather, loss — rather than
+guessing), not by inspection alone.
+
+**Bug 1 — `nn.MultiheadAttention` MPS memory pathology.** A 2nd forward
+call crashed with `MPS backend out of memory (MPS allocated: 8.82 GiB...)`,
+traced via full traceback to `BitPredictHead._forward_chain_fixed`'s
+`self.self_attn` (an `nn.MultiheadAttention` instance). Fixed: added
+`SmallSelfAttn` (manual QKV projection + `F.scaled_dot_product_attention`,
+matching this file's own `CausalSelfAttention`'s existing preference for
+manual SDPA over the `nn.MultiheadAttention` module) and swapped it in for
+both `BitPredictHead` and `FetchHead` (`fifo_v1` mode's analogous head).
+
+**Bug 2 — dense attention at `T=1360` (non-power-of-2) hit a severe MPS
+backward slowdown.** Isolated by testing the SAME 4-layer attention stack
+at `T=1024` (bytelm's own, known-fast length: 1.1s/call) vs. `T=1360`
+(this config's `flat_len`: 9s on a single call, and grew unboundedly
+across repeated calls in a training-shaped loop — not just slower, but
+non-stable). Root cause not fully isolated (suspected MPS SDPA-backward
+kernel path for odd sequence lengths). Fixed: enabled `attn_window=80`
+(divides `flat_len=1360` evenly, close to `v11`'s own default window of
+64) — confirmed both fast (~0.8-1.1s/call, stable across repeated calls)
+and *safe by construction*: windowed attention only RESTRICTS visibility
+within the flat sequence's already-verified-correct causal order (the
+causal-leakage test from this file's own construction), it can never
+violate it, only see less — no new correctness verification needed.
+
+**Bug 3 — `BitPredictHead`'s chain-mode backward, specifically when
+chained through the full upstream graph.** After bugs 1-2, the full
+model's forward+backward STILL took ~13.7s/step (all-fast components:
+embed 0.23s + merges 0.02s + scatter 0.01s + main-attn 0.54s + gather
+0.05s + byte_loss-forward 1.25s ≈ 2.1s total forward, but *backward alone*
+took 11.6s). `BitPredictHead` in chain mode tested completely in
+isolation (fresh leaf tensor, same N/dq/d_model) had a FAST backward
+(~0.5-0.6s) — the slowdown only appears once chained through this file's
+long upstream graph (main attention + merges + scatter/gather), not in
+the head alone. Session: "isolate with indp heads" — switching
+`bit_head_mode` from `"chain"` to `"independent"` (plain `Linear`, no
+per-bit chain self-attention) confirmed the fix: forward 0.97s + backward
+0.62s, matching `bytelm`'s own known-good per-step time exactly. Trades
+away chain mode's exact bit-chain-rule factorization for speed — a
+legitimate, already-designed tradeoff (`Config.bit_head_mode`'s own
+docstring), not a workaround hack. Root cause of the chain-specific
+backward pathology not isolated; noted directly in `BitPredictHead`'s
+class docstring as a known MPS issue, worth revisiting if chain mode's
+better bit-calibration turns out to matter for final quality —
+`qcutelm_vlt11.py`'s own use of the identical class (narrower `d_model`,
+shorter upstream graph) has not shown this problem, so it's specific to
+this file's scale/depth, not a defect in `BitPredictHead` generally.
+
+**Result**: `configs/qcutelm_pyramid_v1.py` updated (`attn_window=80`,
+`bit_head_mode="independent"`), verified via a real 5-step training-shaped
+loop (`init_head_bias_to_unigram` → sample → forward → backward → opt.step,
+repeated) to be fast (~0.8-1.3s/step) AND stable (flat ~62MB allocated
+across steps, no growth) before launching the real 8000-step run.
+Currently training at **~1.1it/s**, matching `bytelm_xs_mtp4_ctx1024`'s
+own rate almost exactly — a good sign for a fair head-to-head comparison,
+now that the architecture's actual per-step cost (not an MPS artifact) is
+what's being measured.
