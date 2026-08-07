@@ -1,4 +1,4 @@
-"""qcute.qcute_refine config: "pure last-layer byte NTP" ablation —
+"""qcute.qcute_refine_v1 config: "pure last-layer byte NTP" ablation —
 QUEUED, not yet launched (only one training job at a time; run this after
 qcute_refine_v1 finishes). Same tower shape as configs/qcute_refine_v1.py
 (Ks=(2,2,2), context_len=1024, same optimizer/LR/step budget as
@@ -35,7 +35,7 @@ even called. This isolates two questions at once:
      confirming once this run is underway (compare its own logged it/s
      against qcute_refine_v1's).
 
-    uv run python -m qcute.qcute_refine --config configs/qcute_refine_v2_pure_byte_ntp.py
+    uv run python -m qcute.qcute_refine_v1 --config configs/qcute_refine_v2_pure_byte_ntp.py
 
     # plot after training:
     uv run python scripts/plot_run.py logs/qcute_refine_v2_pure_byte_ntp

@@ -1,4 +1,4 @@
-"""qcute.qcute_refine — pure recursive NTP tower + joint-chain MTP
+"""qcute.qcute_refine_v1 — pure recursive NTP tower + joint-chain MTP
 detokenizer. A simplified redesign vs. qcutelm_vlt11's E_i/D_i "sandwich":
 no separate producer/consumer pair per level, no codelm forecast-
 substitution machinery. Instead:

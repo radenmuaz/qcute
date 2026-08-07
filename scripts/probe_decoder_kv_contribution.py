@@ -54,35 +54,61 @@ import torch.nn.functional as F
 from qcute.qcute_refine_v2 import Config, RefineLM, load_enwik8, sample_context, split_train_val
 
 
+def _compute_qkv(decoder, main_input: torch.Tensor, kv_input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mirrors DecoderLevel.forward's own input dispatch (own_trunk /
+    q_pass_through / kv_pass_through / default reuse) so the probe's own
+    hand-rolled attention-weight/ablation recomputation stays correct
+    regardless of which mode a given checkpoint was trained under —
+    main_input/kv_input mean whatever DecoderLevel.forward itself expects
+    for this decoder's mode (see its own docstring): h_prev/h_curr for
+    default reuse, raw seq_repr/code for pass_through, raw seq_repr/code
+    again (fed through this decoder's own private trunk copies) for
+    own_trunk."""
+    if decoder.own_trunk:
+        _, _, _, h_prev = decoder.own_main(main_input, compute_ntp=False)
+        _, _, _, h_curr = decoder.own_side(kv_input, compute_ntp=False)
+        q = decoder.q_proj(h_prev)
+        kv = decoder.kv_proj(h_curr)
+    else:
+        if decoder.q_pass_through:
+            if decoder.use_byte_softmax:
+                q = decoder.q_embed(main_input)
+            else:
+                from qcute.qcute_refine_v2 import byte_to_bits
+                q_in = byte_to_bits(main_input) if decoder.level == 0 else main_input
+                q = decoder.q_embed(q_in)
+        else:
+            q = decoder.q_proj(main_input)
+        kv = decoder.code_proj(kv_input) if decoder.kv_pass_through else decoder.kv_proj(kv_input)
+    return q, kv
+
+
 @torch.no_grad()
-def _attn_weights(decoder, h_prev: torch.Tensor, h_curr: torch.Tensor) -> torch.Tensor:
+def _attn_weights(decoder, main_input: torch.Tensor, kv_input: torch.Tensor) -> torch.Tensor:
     """Manually recomputes DecoderLevel's cross-attention softmax weights
     using its own trained sub-modules and mask — CrossBlock.forward()
     itself never exposes them (F.scaled_dot_product_attention doesn't
     return weights). Returns [B, H, L, 1+n_blocks] (index 0 = null slot,
-    1: = real code blocks)."""
-    cfg = decoder.cfg
+    1: = real code blocks). main_input/kv_input: see _compute_qkv."""
     K = decoder.K
-    B, L, _ = h_prev.shape
-    n_blocks = h_curr.size(1)
-    D = cfg.tok_d_model
+    q_in, kv_in = _compute_qkv(decoder, main_input, kv_input)
+    B, L, D = q_in.shape
+    n_blocks = kv_input.size(1)
     cb = decoder.cross_block
 
-    q_in = decoder.q_proj(h_prev)
-    kv_in = decoder.kv_proj(h_curr)
     null = decoder.null_kv.expand(B, 1, D)
-    kv_in = torch.cat([null, kv_in], dim=1)
+    kv_full = torch.cat([null, kv_in], dim=1)
 
-    q_n, kv_n = cb.ln_q(q_in), cb.ln_kv(kv_in)
+    q_n, kv_n = cb.ln_q(q_in), cb.ln_kv(kv_full)
     H, hd = cb.n_heads, cb.head_dim
     qh = cb.q_proj(q_n).reshape(B, L, H, hd).transpose(1, 2)
     kvp = cb.kv_proj(kv_n).reshape(B, 1 + n_blocks, 2, H, hd).permute(2, 0, 3, 1, 4)
     kh = kvp[0]
 
-    t_idx = torch.arange(L, device=h_prev.device).unsqueeze(1)
-    b_idx = torch.arange(n_blocks, device=h_prev.device).unsqueeze(0)
+    t_idx = torch.arange(L, device=q_in.device).unsqueeze(1)
+    b_idx = torch.arange(n_blocks, device=q_in.device).unsqueeze(0)
     visible = b_idx < ((t_idx + 1) // K)
-    null_col = torch.ones(L, 1, dtype=torch.bool, device=h_prev.device)
+    null_col = torch.ones(L, 1, dtype=torch.bool, device=q_in.device)
     visible = torch.cat([null_col, visible], dim=1)   # [L, 1+n_blocks]
 
     scores = torch.einsum("bhqd,bhkd->bhqk", qh, kh) / (hd ** 0.5)
@@ -90,22 +116,21 @@ def _attn_weights(decoder, h_prev: torch.Tensor, h_curr: torch.Tensor) -> torch.
     return F.softmax(scores, dim=-1)
 
 
-def _decode_ablated_no_kv(decoder, h_prev: torch.Tensor, h_curr: torch.Tensor, seq_repr: torch.Tensor):
+def _decode_ablated_no_kv(decoder, main_input: torch.Tensor, kv_input: torch.Tensor, seq_repr: torch.Tensor):
     """Same computation as DecoderLevel.forward, except EVERY real code
     block is masked out — only the null slot is ever visible, regardless
     of position. Duplicated here (not a flag on DecoderLevel itself) to
-    keep this ablation a probe-only concept, not a training-time option."""
+    keep this ablation a probe-only concept, not a training-time option.
+    main_input/kv_input: see _compute_qkv."""
     cfg = decoder.cfg
-    B, L, _ = h_prev.shape
-    n_blocks = h_curr.size(1)
-    D = cfg.tok_d_model
+    q, kv_in = _compute_qkv(decoder, main_input, kv_input)
+    B, L, D = q.shape
+    n_blocks = kv_input.size(1)
 
-    q = decoder.q_proj(h_prev)
-    kv = decoder.kv_proj(h_curr)
     null = decoder.null_kv.expand(B, 1, D)
-    kv = torch.cat([null, kv], dim=1)
+    kv = torch.cat([null, kv_in], dim=1)
 
-    disallow = torch.ones(L, 1 + n_blocks, dtype=torch.bool, device=h_prev.device)
+    disallow = torch.ones(L, 1 + n_blocks, dtype=torch.bool, device=q.device)
     disallow[:, 0] = False   # only the null slot (index 0) is ever visible
 
     h_dec = decoder.cross_block(q, kv, attn_mask=disallow)
@@ -137,18 +162,32 @@ def probe_pair(model: RefineLM, pair_idx: int, ctx: torch.Tensor) -> dict:
             x_list.append(seq_repr)
             seq_repr = c_i
 
-    h_prev = h_list[pair_idx].detach().clone().requires_grad_(True)
-    h_curr = h_list[pair_idx + 1].detach().clone().requires_grad_(True)
     target_seq = x_list[pair_idx]
 
-    loss, acc = decoder(h_prev, h_curr, target_seq)
-    grad_prev, grad_curr = torch.autograd.grad(loss, [h_prev, h_curr])
-    grad_prev_norm = grad_prev.norm().item()
-    grad_curr_norm = grad_curr.norm().item()
+    # main_input/kv_input must match whatever DecoderLevel.forward itself expects for THIS decoder's
+    # mode (own_trunk/q_pass_through/kv_pass_through change what "main_input"/"kv_input" mean — see
+    # _compute_qkv). Gradient-norm signal 1 only makes sense (and is only computable — byte-level raw
+    # input is a long/integer tensor, not differentiable) when that side actually reuses an encoder's
+    # own continuous hidden state; pass_through/own_trunk sides skip it (NaN), keeping signals 2/3
+    # (ablation, attention mass) which stay meaningful and CAUSAL regardless of mode.
+    main_uses_h = not decoder.own_trunk and not decoder.q_pass_through
+    kv_uses_h = not decoder.own_trunk and not decoder.kv_pass_through
+
+    main_input = h_list[pair_idx].detach().clone().requires_grad_(True) if main_uses_h else x_list[pair_idx].detach().clone()
+    kv_input = h_list[pair_idx + 1].detach().clone().requires_grad_(True) if kv_uses_h else x_list[pair_idx + 1].detach().clone()
+
+    loss, acc = decoder(main_input, kv_input, target_seq)
+    if main_uses_h and kv_uses_h:
+        grad_prev, grad_curr = torch.autograd.grad(loss, [main_input, kv_input])
+        grad_prev_norm = grad_prev.norm().item()
+        grad_curr_norm = grad_curr.norm().item()
+        grad_ratio = grad_curr_norm / max(grad_prev_norm, 1e-12)
+    else:
+        grad_prev_norm = grad_curr_norm = grad_ratio = float("nan")
 
     with torch.no_grad():
-        loss_ablated, acc_ablated = _decode_ablated_no_kv(decoder, h_prev, h_curr, target_seq)
-        weights = _attn_weights(decoder, h_prev, h_curr)
+        loss_ablated, acc_ablated = _decode_ablated_no_kv(decoder, main_input, kv_input, target_seq)
+        weights = _attn_weights(decoder, main_input, kv_input)
         null_mass = weights[..., 0].mean().item()
 
     return {
@@ -158,7 +197,7 @@ def probe_pair(model: RefineLM, pair_idx: int, ctx: torch.Tensor) -> dict:
         "delta_loss_from_kv": loss.item() - loss_ablated.item(),   # positive = KV genuinely helps
         "delta_acc_from_kv": acc.item() - acc_ablated.item(),
         "grad_norm_h_prev": grad_prev_norm, "grad_norm_h_curr": grad_curr_norm,
-        "grad_ratio_curr_over_prev": grad_curr_norm / max(grad_prev_norm, 1e-12),
+        "grad_ratio_curr_over_prev": grad_ratio,
         "null_slot_attn_mass": null_mass,   # close to 1.0 = attention barely looks at real code blocks
     }
 

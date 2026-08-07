@@ -1,6 +1,6 @@
 # `qcute_refine` — math
 
-Companion to `qcute/qcute_refine.py`'s module docstring. Notation mirrors
+Companion to `qcute/qcute_refine_v1.py`'s module docstring. Notation mirrors
 the code directly (`Config.Ks`, `Config.dqs`, etc.) so each equation below
 can be matched line-for-line against a function in the file. Written to be
 checked, not just read — flag anything that doesn't type-check.
@@ -192,3 +192,96 @@ chain draw, since both routes call the identical `_sample_next_byte`).
 byte-sequence equality — rather than re-deriving the per-step hidden-state
 equality above; a real run (`Config` at $n=2$, `context_len=32`, random
 init) confirmed `torch.equal(out_no_cache, out_kv_cache) == True`.
+
+## 7. `qcute_refine_v2` — cross-attention `DecoderLevel`, replacing §4's `Detokenizer`
+
+Encoder tower (§1–§3) is **unchanged** in v2 — same `EncoderLevel`,
+same recursion, same always-on per-level NTP loss, same BSQ hand-off.
+The only thing v2 replaces is §4's `Detokenizer` (a *self*-attention
+pass over the code sequence, decoding a whole $K$-block jointly). In its
+place: `DecoderLevel_i`, one per adjacent level pair $(i, i{+}1)$ — not
+one per level (there are $n{-}1$ of them, since there's no decoder above
+the top level), and it *reuses* $h^{(i)}$/$h^{(i+1)}$ (already computed
+by the encoder tower — zero extra trunk compute by default) instead of
+running any self-attention of its own.
+
+**Algorithm** (`DecoderLevel_i.forward`, teacher-forced training):
+
+```
+Input:  h_prev  ∈ ℝ^{B×L_i×d_i}        (EncoderLevel_i's own hidden states, DETACHED)
+        h_curr  ∈ ℝ^{B×n_{i+1}×d_{i+1}} (EncoderLevel_{i+1}'s own hidden states, DETACHED)
+        x_i     — level i's own true input sequence (decode target)
+Output: loss, acc
+
+ 1. q  ← q_proj(h_prev)                          # ℝ^{B×L_i×D}
+ 2. kv ← kv_proj(h_curr)                          # ℝ^{B×n_{i+1}×D}
+ 3. kv ← concat(null_kv, kv)                      # prepend 1 learned always-visible slot
+ 4. for t in 0..L_i-1, b in 0..n_{i+1}-1:
+        n_complete(t) ← ⌊(t+1) / K_i⌋              # blocks 0..n_complete(t)-1 are causally resolved by t
+        visible[t, b] ← n_complete(t) - W_{i+1} ≤ b < n_complete(t)   # §7.1: causal AND within KV window
+    visible[t, null] ← True  ∀t                    # null slot always visible (avoids all-masked rows)
+ 5. if cross_attn_rope:
+        rope_q[t]     ← RoPE-angles(position = t)
+        rope_k[null]  ← RoPE-angles(position = 0)
+        rope_k[b]     ← RoPE-angles(position = (b+1)·K_i - 1)     # block b's own raw-time resolve point
+        q, kv ← apply_rope(q, rope_q), apply_rope(kv, rope_k)     # (applied inside CrossBlock, per-head)
+ 6. h_dec ← CrossBlock(q, kv, mask = ¬visible)     # cross-attn sublayer + MLP sublayer, both pre-norm+residual
+ 7. (loss, acc) ← Head(h_dec[:, :-1, :], target = x_i[:, 1:])   # softmax (level 0, byte_repr="embed")
+                                                                   # or chain-BCE (bit-shaped target), else
+return (loss, acc)
+```
+
+**§7.1 KV window.** Step 4's `visible` predicate has two independent
+constraints, not one: block $b$ must be *causally resolved*
+($b < n_{\text{complete}}(t)$, same rule as v1's own past-block
+reasoning) **and** *recent enough*
+($b \ge n_{\text{complete}}(t) - W_{i+1}$), where $W_{i+1} =$
+`Config.attn_window[i+1]` (`None`/$-1$ ⇒ no second constraint, full
+unbounded causal reach — the original, pre-fix behavior). Before this
+was added, the cross-attention could reach arbitrarily far back in block-
+index terms with no cap at all, inconsistent with the encoder's own
+windowed self-attention at that same level — $W_{i+1}$ makes the two
+consistent (same units: level $i{+}1$'s own block/position scale).
+
+**§7.2 RoPE positions.** Q lives at level $i$'s raw-time resolution
+($0, \dots, L_i-1$); KV lives at level $i{+}1$'s block resolution — the
+two can't share one contiguous rotary range, so each side gets its own
+explicit position *tag*, both expressed in the same raw-byte-time units
+so relative distances are meaningful across the boundary: query
+position $t$ literally is raw-time $t$; KV block $b$ is tagged at
+$(b{+}1)\cdot K_i - 1$, the exact raw-time index at which block $b$
+*becomes* fully resolved (matches §7's own `n_complete` cutoff exactly —
+by construction, block $b$ is visible from query $t$ iff its resolve-time
+tag is $\le t$ *and* within the window). The null slot is tagged at a
+fixed reference position $0$ (arbitrary but constant — it carries no
+temporal meaning, only a well-defined fallback). `Config.cross_attn_rope`
+defaults `True`; `False` restores plain (position-blind) cross-attention.
+
+**§7.3 Two more structural options**, both defaulting to the §7
+algorithm above (`decoder_own_trunk = decoder_kv_pass_through =
+decoder_q_pass_through = False`), each swapping out exactly one line:
+
+- `decoder_own_trunk=True`: replace step 1/2's *reuse* of
+  $h^{(i)}$/$h^{(i+1)}$ with a **private, separate-weight**
+  `EncoderLevel` copy run fresh over raw $x_i$/$c_i$ — restores a real
+  self-attention trunk on both sides, at the cost the reuse design was
+  built specifically to avoid (session estimate: this level pair's own
+  params/FLOPs roughly double).
+- `decoder_kv_pass_through=True` (Q unaffected) / `decoder_q_pass_through=True`
+  (KV unaffected) — independently swap step 1 or step 2 for a **direct,
+  trunk-free projection**: $q \leftarrow \texttt{q\_embed}(x_i)$ (a
+  fresh `Embedding`/`Linear` straight to width $D$) or
+  $kv \leftarrow \texttt{code\_proj}(c_i)$ (a fresh `Linear(dq_i, D)` on
+  the raw code, bypassing $h^{(i+1)}$ entirely) — the "how much does this
+  side's own contextualization actually matter" floor probe.
+
+## 8. Loss and total (v2)
+
+Same shape as §5, renamed: $\lambda_{\text{detok}} \to
+\lambda_{\text{tok}} =$ `Config.tok_weight`, and `Detokenizer` →
+`DecoderLevel` throughout. `Config.code_ntp_weight` additionally scales
+levels $>0$'s own NTP terms (level 0's `byte_loss` is never scaled) —
+$0.0$ **skips** that level's own `ntp_head` call entirely (not just
+zero-weights it), same "skip the expensive call, don't just multiply by
+zero" principle `tok_weight=0.0` already applied to §7's `DecoderLevel`
+in v1.

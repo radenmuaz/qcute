@@ -64,38 +64,50 @@ schedule.
 
 ## Architecture
 
-`qcute/bytelm.py`, `qcute/qcutelm.py`, and `qcute/bpelm.py` are self-contained
+`qcute/bytelm.py` and `qcute/bpelm.py` are self-contained baseline
 modules — none import each other, deliberately not factored further yet.
-Full details, including which handover-doc section each component
-implements and known gaps vs. the design: [docs/architecture.md](docs/architecture.md).
+Full details: [docs/architecture.md](docs/architecture.md) (also covers
+`qcutelm.py`, now archived — see below).
 
-**`qcute/qcute_refine.py` and `qcute/qcute_refine_v2.py` are the current
+**`qcute/qcute_refine_v1.py` and `qcute/qcute_refine_v2.py` are the current
 active lineage** — considered the project's first success, as of the
-session that built them. `qcute_refine.py` ("v1"): pure recursive NTP
+session that built them. `qcute_refine_v1.py`: pure recursive NTP
 tower with BSQ code hand-off between levels, plus a block-local
-joint-chain-MTP detokenizer. `qcute_refine_v2.py`: the detokenizer
-redesigned into a `DecoderLevel` that cross-attends between adjacent
-levels' own `EncoderLevel` hidden states (reused, not recomputed) instead
-of running a separate self-attention pass — the actively-developed file,
-with a growing set of session-driven flags (`byte_repr`, `code_head_mode`,
-`bit_head_class`, `cross_attn_rope`, `decoder_own_trunk`,
-`decoder_kv_pass_through`/`decoder_q_pass_through`, `layer_warmup_steps`)
-documented in its own `Config` dataclass. Configs live under
-`configs/qcute_refine_v2_*.py` and `configs/v1_*.py`. Full narrative:
-[docs/status.md](docs/status.md) (session-update sections, newest at the
-bottom) — this lineage moves fast and status.md is the only place its
-current state is tracked; CLAUDE.md intentionally doesn't duplicate it.
+joint-chain-MTP detokenizer; math: [docs/qcute_refine_math.md](docs/qcute_refine_math.md).
+`qcute_refine_v2.py`: the detokenizer redesigned into a `DecoderLevel`
+that cross-attends between adjacent levels' own `EncoderLevel` hidden
+states (reused, not recomputed) instead of running a separate
+self-attention pass — the actively-developed file, with a growing set of
+session-driven flags (`byte_repr`, `code_head_mode`, `bit_head_class`
+with `BitPredictHeadAttn`/`Conv`/`SSM` variants, `cross_attn_rope`,
+`decoder_own_trunk`, `decoder_kv_pass_through`/`decoder_q_pass_through`,
+`layer_warmup_steps`) documented in its own `Config` dataclass. Configs
+live under `configs/qcute_refine_v2_*.py` and `configs/qcute_refine_*.py`
+(the latter — `qcute_refine_rope.py`, `_decoder_trunk.py`,
+`_pass_through.py`, `_rope_3level_curriculum.py` — renamed this session
+from an earlier `v1_*` naming). Diagnostic:
+`scripts/probe_decoder_kv_contribution.py` (gradient/ablation/attention-
+mass analysis of how much a `DecoderLevel`'s cross-attention KV actually
+contributes vs. is ignored — run against a saved checkpoint). Full
+narrative: [docs/status.md](docs/status.md) (session-update sections,
+newest at the bottom) — this lineage moves fast and status.md is the
+only place its current state is tracked; CLAUDE.md intentionally doesn't
+duplicate it.
 
 Every earlier qcute-lineage fork — `qcutelm.py`, `qcutelm_vlt*.py`
 (`vlt` through `vlt11`), `qcutelm_pyramid.py`, `qcutelm_mergetoken_v1.py`,
 `qcute_bytepool.py` — is **archived** under `qcute/archive/` (configs
-under `configs/archive/`), superseded by the `qcute_refine` lineage.
-Kept for historical reference/reproducibility, not part of active work;
+under `configs/archive/`; their own design docs —
+`continuous_tokenizer_handover.md`, `fifo_v2.md`, `vlt12_math.tex` — under
+`docs/archive/`), superseded by the `qcute_refine` lineage. Kept for
+historical reference/reproducibility, not part of active work;
 `docs/status.md`'s own history of them is untouched. `qcute/bytelm.py`
 and `qcute/bpelm.py` are the exception — still the active baseline
 comparison points, not archived.
 
-Design source of truth: [docs/continuous_tokenizer_handover.md](docs/continuous_tokenizer_handover.md).
+Original design source-of-truth for the now-archived lineage:
+[docs/archive/continuous_tokenizer_handover.md](docs/archive/continuous_tokenizer_handover.md)
+(historical — `qcute_refine`'s own design isn't specified by it).
 Phase-by-phase progress: [docs/status.md](docs/status.md).
 
 ## Response format

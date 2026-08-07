@@ -1,4 +1,4 @@
-"""qcute.qcute_refine_v2 config: CLONE of configs/v1_rope.py (itself a
+"""qcute.qcute_refine_v2 config: CLONE of configs/qcute_refine_rope.py (itself a
 clone of the "v1" baseline, configs/qcute_refine_v2_byte4_code256_simple.py),
 two changes — decoder_kv_pass_through=True AND decoder_q_pass_through=True.
 
@@ -22,10 +22,10 @@ QUEUED — do not launch until the "v1" baseline
 (qcute_refine_v2_byte4_code256_simple) finishes; do not touch that
 config or its run.
 
-    uv run python -m qcute.qcute_refine_v2 --config configs/v1_pass_through.py
+    uv run python -m qcute.qcute_refine_v2 --config configs/qcute_refine_pass_through.py
 
     # plot after training:
-    uv run python scripts/plot_run.py logs/v1_pass_through
+    uv run python scripts/plot_run.py logs/qcute_refine_pass_through
 """
 from pathlib import Path
 

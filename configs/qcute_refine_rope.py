@@ -11,10 +11,10 @@ QUEUED — do not launch until qcute_refine_v2_byte4_code256_simple (the
 currently-running "v1" baseline) finishes; do not touch that config or
 its run.
 
-    uv run python -m qcute.qcute_refine_v2 --config configs/v1_rope.py
+    uv run python -m qcute.qcute_refine_v2 --config configs/qcute_refine_rope.py
 
     # plot after training:
-    uv run python scripts/plot_run.py logs/v1_rope
+    uv run python scripts/plot_run.py logs/qcute_refine_rope
 """
 from pathlib import Path
 

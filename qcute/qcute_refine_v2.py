@@ -166,6 +166,19 @@ class Config:
     bit_conv_kernel_size: int | None = None  # None (default) = dq (full receptive field) — see
                                     # BitPredictHeadConv's own docstring for why windowing isn't obviously
                                     # the right inductive bias here. Only used when bit_head_class=="conv".
+    bit_conv_impl: str = "matmul"  # "matmul" (default, session reparam) or "conv1d" (original) — same
+                                    # op (fixed causal window, weights shared across positions), different
+                                    # dispatch; see BitPredictHeadConv's own docstring. Only used when
+                                    # bit_head_class=="conv".
+    bit_inner_downsample: int = 1  # 1 (default) = no downsampling, identical to pre-flag behavior (no
+                                    # extra op/params). >1 (2, 4, ...) projects the incoming hidden vector
+                                    # down to d_model//bit_inner_downsample once, then runs every chain op
+                                    # inside whichever BitPredictHead* class (embeds/attn/conv/ssm-state/
+                                    # head) at that smaller width instead of the full d_model — applies to
+                                    # ALL THREE bit_head_class variants uniformly. Session: "flag to
+                                    # downsample bit predict embeds or inner". Must evenly divide d_model
+                                    # (and, for bit_head_class=="attn", the resulting inner dim must be
+                                    # divisible by bit_chain_n_heads too).
     bit_ssm_d_state: int | None = None       # None (default) = d_model. Only used when bit_head_class=="ssm".
     code_ntp_weight: float = 1.0  # scales levels>0's own NTP loss (level 0's byte_loss never scaled).
                                     # ==0.0 SKIPS those levels' ntp_head forward entirely (real speed
@@ -472,24 +485,32 @@ class BitPredictHeadAttn(nn.Module):
     unconditioned NTP head (always), and optionally
     (tok_head_mode="chain") for DecoderLevel's own decode head."""
 
-    def __init__(self, d_model: int, dq: int, n_heads: int = 2, gamma: float = 1.0, fixed_kernel: bool = True):
+    def __init__(self, d_model: int, dq: int, n_heads: int = 2, gamma: float = 1.0, fixed_kernel: bool = True, downsample: int = 1):
         super().__init__()
+        assert d_model % downsample == 0, f"d_model={d_model} not divisible by downsample={downsample}"
+        d_inner = d_model // downsample
+        assert d_inner % n_heads == 0, f"inner dim={d_inner} (d_model={d_model}/downsample={downsample}) not divisible by n_heads={n_heads}"
         self.dq = dq
         self.gamma = gamma
         self.fixed_kernel = fixed_kernel
         self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.head = nn.Linear(d_model, 1)
-        self.bit_pos_emb = nn.Embedding(dq, d_model)
-        self.bit_val_emb = nn.Embedding(2, d_model)
+        self.head_dim = d_inner // n_heads
+        # downsample>1: work internally at d_inner=d_model//downsample instead of d_model — a cheap
+        # in_proj down to d_inner up front, then every chain op (embeds/qkv/out_proj/head) runs at the
+        # smaller width. downsample=1 (default): in_proj is None, identical to pre-flag behavior, no
+        # extra op/params. Session: "flag to downsample bit predict embeds or inner".
+        self.in_proj = nn.Linear(d_model, d_inner) if downsample > 1 else None
+        self.head = nn.Linear(d_inner, 1)
+        self.bit_pos_emb = nn.Embedding(dq, d_inner)
+        self.bit_val_emb = nn.Embedding(2, d_inner)
         # manual QKV + F.scaled_dot_product_attention instead of nn.MultiheadAttention — session found
         # nn.MultiheadAttention's MPS backward produces NaN gradients at d_model=256 (confirmed: identical
         # run stable on CPU, NaN only on MPS, isolated via named_parameters() to exactly this submodule's
         # out_proj.weight.grad) despite being fine at the earlier d_model=96 configs' scale. Every other
         # attention op in this codebase (CausalSelfAttention, CrossBlock) already uses manual SDPA and has
         # been stable all session — this makes BitPredictHead consistent with that, not a new mechanism.
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.qkv_proj = nn.Linear(d_inner, 3 * d_inner)
+        self.out_proj = nn.Linear(d_inner, d_inner)
         causal_mask = torch.triu(torch.full((dq, dq), float("-inf")), diagonal=1)
         self.register_buffer("causal_mask", causal_mask, persistent=False)
 
@@ -506,6 +527,8 @@ class BitPredictHeadAttn(nn.Module):
     def forward(self, h: torch.Tensor, true_bits: torch.Tensor | None = None) -> torch.Tensor:
         """h: [N, D]. true_bits: [N, dq] float in {-1,+1}-ish (teacher-forcing) or None (greedy chain
         decode at inference). -> raw_logits [N, dq]."""
+        if self.in_proj is not None:
+            h = self.in_proj(h)
         if self.fixed_kernel and true_bits is not None:
             return self._forward_fixed(h, true_bits)
         return self._forward_loop(h, true_bits)
@@ -559,31 +582,69 @@ class BitPredictHeadConv(nn.Module):
     exactly the property that makes "shared Linear read of a fixed-size
     sliding/causal window" equivalent to a real conv in the first place
     (same weights reused at every relative offset, not indexed by
-    absolute position)."""
+    absolute position).
 
-    def __init__(self, d_model: int, dq: int, kernel_size: int | None = None, gamma: float = 1.0):
+    conv_impl selects the implementation of that "shared Linear read of a
+    fixed-size window" — both are the SAME operation (same weight-sharing
+    property above), just different ops: "conv1d" (original) calls
+    nn.Conv1d directly; "matmul" (session: "reparam to use nn.linear
+    instead of conv1d") flattens the window into one [K*D] vector and
+    applies a plain nn.Linear(K*D, D) instead — mathematically the same
+    class of computation (fixed window, weights shared across positions),
+    just dispatched as a matmul instead of the conv op. Session
+    benchmark (scripts/bench_bit_heads.py) found nn.Conv1d has real
+    per-call overhead in the sequential decode loop (worst case ~3900x
+    slower than a plain independent nn.Linear head at dq=16, vs.
+    "matmul"'s expected much-flatter overhead) — kept BOTH as a flag
+    rather than replacing, matching the rest of this file's convention."""
+
+    def __init__(self, d_model: int, dq: int, kernel_size: int | None = None, gamma: float = 1.0, conv_impl: str = "matmul", downsample: int = 1):
         super().__init__()
+        assert conv_impl in ("conv1d", "matmul")
+        assert d_model % downsample == 0, f"d_model={d_model} not divisible by downsample={downsample}"
+        d_inner = d_model // downsample
         self.dq = dq
         self.gamma = gamma
+        self.conv_impl = conv_impl
         self.kernel_size = kernel_size if kernel_size is not None else dq
-        self.head = nn.Linear(d_model, 1)
-        self.bit_val_emb = nn.Embedding(2, d_model)
-        self.conv = nn.Conv1d(d_model, d_model, kernel_size=self.kernel_size, bias=True)
+        # see BitPredictHeadAttn's own in_proj comment — same downsample flag, same "identity at 1x" property
+        self.in_proj = nn.Linear(d_model, d_inner) if downsample > 1 else None
+        self.head = nn.Linear(d_inner, 1)
+        self.bit_val_emb = nn.Embedding(2, d_inner)
+        if conv_impl == "conv1d":
+            self.conv = nn.Conv1d(d_inner, d_inner, kernel_size=self.kernel_size, bias=True)
+        else:
+            self.proj = nn.Linear(self.kernel_size * d_inner, d_inner, bias=True)
 
     def forward(self, h: torch.Tensor, true_bits: torch.Tensor | None = None) -> torch.Tensor:
+        if self.in_proj is not None:
+            h = self.in_proj(h)
         if true_bits is not None:
             return self._forward_fixed(h, true_bits)
         return self._forward_loop(h, true_bits)
 
+    def _window_read(self, x_windows: torch.Tensor) -> torch.Tensor:
+        """x_windows: [N, D, dq, K] (oldest->newest along last dim) ->
+        [N, dq, D]. Dispatches on conv_impl; same op either way."""
+        if self.conv_impl == "conv1d":
+            N, D, dq, K = x_windows.shape
+            x_t = x_windows.permute(0, 2, 1, 3).reshape(N * dq, D, K)
+            return self.conv(x_t).squeeze(-1).reshape(N, dq, D)
+        N, D, dq, K = x_windows.shape
+        flat = x_windows.permute(0, 2, 3, 1).reshape(N, dq, K * D)   # [N, dq, K*D]
+        return self.proj(flat)
+
     def _forward_fixed(self, h: torch.Tensor, true_bits: torch.Tensor) -> torch.Tensor:
         N, D = h.shape
+        K = self.kernel_size
         bit_ids = (true_bits > 0).long()
         val_embeds = self.bit_val_emb(bit_ids)                          # [N, dq, D]
         zero_vec = val_embeds.new_zeros(N, 1, D)
         shifted = torch.cat([zero_vec, val_embeds[:, :-1, :]], dim=1)   # position j holds bit j-1's embed
         x_t = shifted.transpose(1, 2)                                    # [N, D, dq]
-        x_padded = F.pad(x_t, (self.kernel_size - 1, 0))                 # causal: pad LEFT only
-        conv_out = self.conv(x_padded).transpose(1, 2)                   # [N, dq, D]
+        x_padded = F.pad(x_t, (K - 1, 0))                                 # causal: pad LEFT only
+        x_windows = x_padded.unfold(2, K, 1)                              # [N, D, dq, K], oldest->newest
+        conv_out = self._window_read(x_windows)                          # [N, dq, D]
         h_scale = h.new_ones(1, self.dq, 1)
         if self.dq > 1:
             h_scale = torch.cat([h_scale[:, :1, :], h_scale[:, 1:, :] * self.gamma], dim=1)
@@ -598,8 +659,12 @@ class BitPredictHeadConv(nn.Module):
             window = past[-self.kernel_size:]
             pad_len = self.kernel_size - len(window)
             seq = [h.new_zeros(N, D)] * pad_len + window
-            x = torch.stack(seq, dim=2)             # [N, D, kernel_size]
-            conv_out = self.conv(x).squeeze(-1)      # [N, D]
+            if self.conv_impl == "conv1d":
+                x = torch.stack(seq, dim=2)              # [N, D, kernel_size]
+                conv_out = self.conv(x).squeeze(-1)      # [N, D]
+            else:
+                x = torch.cat(seq, dim=-1)                # [N, kernel_size*D], oldest->newest
+                conv_out = self.proj(x)                    # [N, D]
             h_scale_j = 1.0 if j == 0 else self.gamma
             fetched = h_scale_j * h + conv_out
             logit_j = self.head(fetched).squeeze(-1)
@@ -632,20 +697,29 @@ class BitPredictHeadSSM(nn.Module):
     sigmoid so it can approach but never algebraically equal exactly 0;
     in practice that's not a meaningful difference (sigmoid(-8) < 1e-3)."""
 
-    def __init__(self, d_model: int, dq: int, d_state: int | None = None, gamma: float = 1.0):
+    def __init__(self, d_model: int, dq: int, d_state: int | None = None, gamma: float = 1.0, downsample: int = 1):
         super().__init__()
+        assert d_model % downsample == 0, f"d_model={d_model} not divisible by downsample={downsample}"
+        d_inner = d_model // downsample
         self.dq = dq
         self.gamma = gamma
-        self.d_state = d_state if d_state is not None else d_model
-        self.head = nn.Linear(d_model, 1)
+        # d_state's own None-default now tracks d_inner, not d_model — downsampling shrinks the default
+        # recurrent state width too, consistent with the other two heads' in_proj. Still independently
+        # overridable via d_state, same as before.
+        self.d_state = d_state if d_state is not None else d_inner
+        # see BitPredictHeadAttn's own in_proj comment — same downsample flag, same "identity at 1x" property
+        self.in_proj = nn.Linear(d_model, d_inner) if downsample > 1 else None
+        self.head = nn.Linear(d_inner, 1)
         self.bit_val_emb = nn.Embedding(2, self.d_state)
-        self.state_proj = nn.Linear(self.d_state, d_model)
+        self.state_proj = nn.Linear(self.d_state, d_inner)
         self.decay_logit = nn.Parameter(torch.zeros(self.d_state))   # sigmoid(0)=0.5 init
 
     def _alpha(self) -> torch.Tensor:
         return torch.sigmoid(self.decay_logit)   # [d_state], in (0,1) — see class docstring re: alpha=0
 
     def forward(self, h: torch.Tensor, true_bits: torch.Tensor | None = None) -> torch.Tensor:
+        if self.in_proj is not None:
+            h = self.in_proj(h)
         if true_bits is not None:
             return self._forward_fixed(h, true_bits)
         return self._forward_loop(h, true_bits)
@@ -701,11 +775,11 @@ def build_bit_head(cfg: Config, d_model: int, dq: int) -> nn.Module:
     tok_head_mode=="chain" head) gets built, so switching architectures
     is one flag, not per-call-site edits."""
     if cfg.bit_head_class == "attn":
-        return BitPredictHeadAttn(d_model, dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel)
+        return BitPredictHeadAttn(d_model, dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel, downsample=cfg.bit_inner_downsample)
     elif cfg.bit_head_class == "conv":
-        return BitPredictHeadConv(d_model, dq, kernel_size=cfg.bit_conv_kernel_size, gamma=cfg.bit_chain_gamma)
+        return BitPredictHeadConv(d_model, dq, kernel_size=cfg.bit_conv_kernel_size, gamma=cfg.bit_chain_gamma, conv_impl=cfg.bit_conv_impl, downsample=cfg.bit_inner_downsample)
     elif cfg.bit_head_class == "ssm":
-        return BitPredictHeadSSM(d_model, dq, d_state=cfg.bit_ssm_d_state, gamma=cfg.bit_chain_gamma)
+        return BitPredictHeadSSM(d_model, dq, d_state=cfg.bit_ssm_d_state, gamma=cfg.bit_chain_gamma, downsample=cfg.bit_inner_downsample)
     else:
         raise ValueError(f"unknown bit_head_class {cfg.bit_head_class!r}")
 
@@ -1053,9 +1127,19 @@ class RefineLM(nn.Module):
                 break
         return n
 
-    def forward(self, byte_ids: torch.Tensor, step: int | None = None) -> tuple[torch.Tensor, dict]:
+    def forward(self, byte_ids: torch.Tensor, n_active: int | None = None) -> tuple[torch.Tensor, dict]:
+        """n_active: precomputed by the CALLER (via self.n_active_levels(step), in plain eager
+        Python, never inside a torch.compile'd region) rather than taking raw `step` here directly.
+        This is what lets --compile coexist with Config.layer_warmup_steps: dynamo would guard on
+        `step`'s exact value if it reached this function (recompiling almost every training step,
+        since step changes every call) — but n_active only takes a handful of distinct values over
+        an entire run (one per curriculum stage), so guarding on IT instead means at most
+        n_levels-1 recompiles total, each one a genuinely necessary graph change (a new level
+        activating really is a different compute graph), not a per-step cost. None (default,
+        matching every call site before Config.layer_warmup_steps existed) = all levels active."""
         cfg = self.cfg
-        n_active = self.n_active_levels(step)
+        if n_active is None:
+            n_active = self.n_levels
         seq_repr = byte_ids   # level 0's own input is now raw byte ids (long) — traditional embedding
                                 # table, not the bit-vector projection
         ntp_losses, ntp_accs = [], []
@@ -1252,10 +1336,13 @@ def load_config_module(path: Path) -> dict:
 @torch.no_grad()
 def eval_model(model: RefineLM, data: torch.Tensor, batch_size: int, n_batches: int, device: str, step: int | None = None) -> dict:
     model.eval()
+    # n_active computed HERE, once, in plain eager Python — never inside the (possibly compiled)
+    # model call itself. See RefineLM.forward's own docstring for why this matters for --compile.
+    n_active = model.n_active_levels(step)
     accum: dict[str, list[float]] = {}
     for _ in range(n_batches):
         ctx = sample_context(data, batch_size, model.cfg.context_len, device)
-        loss, metrics = model(ctx, step=step)
+        loss, metrics = model(ctx, n_active=n_active)
         for k, v in metrics.items():
             accum.setdefault(k, []).append(v.item())
     model.train()
@@ -1302,7 +1389,14 @@ def train(model: RefineLM, train_data: torch.Tensor, val_data: torch.Tensor, arg
         lr = opt.param_groups[0]["lr"]   # stage-0 lr, for logging/postfix — always active, always representative
 
         ctx = sample_context(train_data, args.batch_size, model.cfg.context_len, device)
-        loss, metrics = model(ctx, step=step)
+        # n_active computed HERE, once per step, in plain eager Python — never inside the (possibly
+        # compiled) model call itself. See RefineLM.forward's own docstring: this is what lets
+        # --compile coexist with Config.layer_warmup_steps — dynamo guards on n_active's value
+        # (stable for long stretches, changes only at curriculum stage boundaries) instead of
+        # step's (changes every single call, which is what made whole-model compile recompile
+        # almost every step before this).
+        n_active = model.n_active_levels(step)
+        loss, metrics = model(ctx, n_active=n_active)
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -1359,6 +1453,8 @@ def main():
     p.add_argument("--bit_chain_fixed_kernel", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--bit_head_class", type=str, default="attn", choices=["attn", "conv", "ssm"])
     p.add_argument("--bit_conv_kernel_size", type=int, default=None)
+    p.add_argument("--bit_conv_impl", type=str, default="matmul", choices=["conv1d", "matmul"])
+    p.add_argument("--bit_inner_downsample", type=int, default=1)
     p.add_argument("--bit_ssm_d_state", type=int, default=None)
     p.add_argument("--code_ntp_weight", type=float, default=1.0)
     p.add_argument("--quant_type", type=str, default="bsq", choices=["bsq", "identity"])
@@ -1396,6 +1492,27 @@ def main():
     p.add_argument("--checkpoint_dir", type=Path, default=Path("checkpoints"))
     p.add_argument("--save_every_n_evals", type=int, default=1)
     p.add_argument("--device", type=str, default=None, choices=["cpu", "mps", "cuda"])
+    p.add_argument("--compile", type=lambda x: x.lower() != "false", default=False,
+                    help="torch.compile() the WHOLE RefineLM (true single-graph compile, not a "
+                         "per-submodule loop). Default False. Works fine WITH Config.layer_warmup_steps "
+                         "now (no assert/restriction) — the original version of this flag made "
+                         "RefineLM.forward take the raw training-step int directly and branch on its "
+                         "exact value inside n_active_levels(); dynamo guards on that exact int and "
+                         "recompiled the whole graph almost every step (measured: net SLOWER than "
+                         "eager, confirmed via TORCH_LOGS=recompiles), EVEN for configs that never set "
+                         "layer_warmup_steps at all. Fixed properly (not worked around) by moving the "
+                         "step->n_active computation OUT of the compiled call entirely: "
+                         "train()/eval_model() now call self.n_active_levels(step) themselves, in "
+                         "plain eager Python, and pass the resulting n_active int into "
+                         "RefineLM.forward(byte_ids, n_active=...) instead of raw step — dynamo then "
+                         "guards on n_active, which only takes a handful of distinct values across an "
+                         "entire run (one per curriculum stage transition) instead of one per step, so "
+                         "at most n_levels-1 recompiles happen total, each one a genuinely necessary "
+                         "graph change (a new level activating really is a different compute graph). "
+                         "Verified via TORCH_LOGS=recompiles on a real config: 1 total recompile-related "
+                         "log line across 40 real training steps (was ~1 per step before the fix). A "
+                         "training-script-level runtime flag, not an architecture choice, so it's plain "
+                         "CLI/args, not a Config field.")
 
     if pre_args.config:
         p.set_defaults(**{k: v for k, v in load_config_module(pre_args.config).items() if k in {a.dest for a in p._actions}})
@@ -1412,7 +1529,8 @@ def main():
         context_len=args.context_len, n_heads=args.n_heads, mlp_mult=args.mlp_mult, attn_window=args.attn_window,
         rope_base=args.rope_base, bit_chain_n_heads=args.bit_chain_n_heads, bit_chain_gamma=args.bit_chain_gamma,
         bit_chain_fixed_kernel=args.bit_chain_fixed_kernel, bit_head_class=args.bit_head_class,
-        bit_conv_kernel_size=args.bit_conv_kernel_size, bit_ssm_d_state=args.bit_ssm_d_state,
+        bit_conv_kernel_size=args.bit_conv_kernel_size, bit_conv_impl=args.bit_conv_impl,
+        bit_inner_downsample=args.bit_inner_downsample, bit_ssm_d_state=args.bit_ssm_d_state,
         code_ntp_weight=args.code_ntp_weight,
         quant_type=args.quant_type, byte_repr=args.byte_repr, code_head_mode=args.code_head_mode,
         tok_d_model=args.tok_d_model, tok_n_heads=args.tok_n_heads,
@@ -1423,6 +1541,10 @@ def main():
     )
     model = RefineLM(cfg).to(device)
     n_params = sum(p_.numel() for p_ in model.parameters())
+    if args.compile:
+        # true whole-model compile, works fine WITH Config.layer_warmup_steps — see --compile's
+        # own help text above (train()/eval_model() pass n_active, not raw step, into the model).
+        model = torch.compile(model)
 
     run_name = args.run_name or (pre_args.config.stem if pre_args.config else f"qcute_refine_v2_{int(time.time())}")
     log = Logger(args.logs_dir / run_name)

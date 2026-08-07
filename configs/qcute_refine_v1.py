@@ -1,5 +1,5 @@
-"""qcute.qcute_refine config: first training run of the pure recursive
-NTP tower + joint-chain-MTP detokenizer (see qcute/qcute_refine.py's
+"""qcute.qcute_refine_v1 config: first training run of the pure recursive
+NTP tower + joint-chain-MTP detokenizer (see qcute/qcute_refine_v1.py's
 module docstring and docs/qcute_refine_math.md for the full design).
 
 Baseline being matched: configs/bytelm_xs_mtp4_ctx1024.py — context=1024,
@@ -50,7 +50,7 @@ s/step (0.864 it/s) -> ~154 min for the full 8000-step budget. Re-check
 actual logged it/s once underway — this repo's MPS throughput has been
 observed to drift over long runs (CLAUDE.md).
 
-    uv run python -m qcute.qcute_refine --config configs/qcute_refine_v1.py
+    uv run python -m qcute.qcute_refine_v1 --config configs/qcute_refine_v1.py
 
     # plot after training:
     uv run python scripts/plot_run.py logs/qcute_refine_v1

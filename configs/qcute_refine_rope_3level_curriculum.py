@@ -1,9 +1,9 @@
-"""qcute.qcute_refine_v2 config: FORK of configs/v1_rope.py — new 3-level
+"""qcute.qcute_refine_v2 config: FORK of configs/qcute_refine_rope.py — new 3-level
 architecture (replaces the removed configs/qcute_refine_v2_3level_curriculum.py),
 combining the layerwise curriculum with a fresh arch sized against bytelm.
 
 Ks=(2,2,2), context_len=1024: 3 levels, seq_lens=[1024, 512, 256] — same
-effective 1024-byte raw context as v1_rope's own Ks=(4,4), just reached
+effective 1024-byte raw context as qcute_refine_rope's own Ks=(4,4), just reached
 via 3 gentler K=2 compressions instead of 2 K=4 ones. attn_window=
 (256,128,64): each level genuinely windowed (window strictly below that
 level's own sequence length — no coincidental dense fallback, same
@@ -28,18 +28,18 @@ count). Params was the dimension chosen to match here.
 Verified this session (CPU): forward/backward clean at step=0 (n_active=1,
 level 0 alone, matching layer_warmup_steps), generate_no_cache runs
 correctly. Note generate_kv_cache is NOT usable with this config (or with
-v1_rope, or any windowed-level-0 config in this family) — its own
+qcute_refine_rope, or any windowed-level-0 config in this family) — its own
 dense-attention-only assertion is a pre-existing limitation, not
 introduced here.
 
 QUEUED — do not launch until the "v1" baseline
 (qcute_refine_v2_byte4_code256_simple) finishes; do not touch that
-config or its run, or configs/v1_rope.py.
+config or its run, or configs/qcute_refine_rope.py.
 
-    uv run python -m qcute.qcute_refine_v2 --config configs/v1_rope_3level_curriculum.py
+    uv run python -m qcute.qcute_refine_v2 --config configs/qcute_refine_rope_3level_curriculum.py
 
     # plot after training:
-    uv run python scripts/plot_run.py logs/v1_rope_3level_curriculum
+    uv run python scripts/plot_run.py logs/qcute_refine_rope_3level_curriculum
 """
 from pathlib import Path
 

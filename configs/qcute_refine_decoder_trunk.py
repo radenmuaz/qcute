@@ -1,4 +1,4 @@
-"""qcute.qcute_refine_v2 config: CLONE of configs/v1_rope.py (itself a
+"""qcute.qcute_refine_v2 config: CLONE of configs/qcute_refine_rope.py (itself a
 clone of the "v1" baseline, configs/qcute_refine_v2_byte4_code256_simple.py),
 one change — decoder_own_trunk=True.
 
@@ -21,10 +21,10 @@ QUEUED — do not launch until the "v1" baseline
 (qcute_refine_v2_byte4_code256_simple) finishes; do not touch that
 config or its run.
 
-    uv run python -m qcute.qcute_refine_v2 --config configs/v1_decoder_trunk.py
+    uv run python -m qcute.qcute_refine_v2 --config configs/qcute_refine_decoder_trunk.py
 
     # plot after training:
-    uv run python scripts/plot_run.py logs/v1_decoder_trunk
+    uv run python scripts/plot_run.py logs/qcute_refine_decoder_trunk
 """
 from pathlib import Path
 

@@ -1,9 +1,15 @@
 # qcute
 
-("Quantized Continuous Tokenizer") — continuous byte-level tokenizer + LM, per the design in
-[docs/continuous_tokenizer_handover.md](docs/continuous_tokenizer_handover.md).
-See [docs/architecture.md](docs/architecture.md) for how the code maps to that
-design, and [docs/status.md](docs/status.md) for phase-by-phase progress.
+("Quantized Continuous Tokenizer") — continuous byte-level tokenizer + LM.
+Current active design: `qcute/qcute_refine_v1.py`/`qcute/qcute_refine_v2.py`
+(math: [docs/qcute_refine_math.md](docs/qcute_refine_math.md)). The
+original design spec this project started from,
+[docs/archive/continuous_tokenizer_handover.md](docs/archive/continuous_tokenizer_handover.md),
+now describes an archived earlier lineage (`qcute/archive/`) superseded by
+`qcute_refine` — kept for historical reference. See
+[docs/architecture.md](docs/architecture.md) for how the still-active
+baselines (`bytelm`/`bpelm`) map to their own design, and
+[docs/status.md](docs/status.md) for phase-by-phase progress.
 
 ## Quickstart
 
