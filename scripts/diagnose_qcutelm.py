@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 import torch.nn.functional as F
 
-from qcute.qcutelm import (
+from qcute.archive.qcutelm import (
     Config,
     QCuteLM,
     batch_iter,

@@ -54,7 +54,7 @@ tokens_p = torch.randint(0, cfg_p.vocab, (B, cfg_p.context))
 bench("bpelm (vocab=8192, context=256)", model_p, (tokens_p,))
 
 # --- current running qcutelm_vlt6 grid config (cell 1: ifsq/ntp/shared) ---
-from qcute.qcutelm_vlt6 import ARLatentTokenizer, Config, load_config_module
+from qcute.archive.qcutelm_vlt6 import ARLatentTokenizer, Config, load_config_module
 from pathlib import Path
 cfg_kwargs = load_config_module(Path('/Users/muaz/code/qcute/configs/qcutelm_vlt6_rope_bpelm_parity.py'))
 cfg_v = Config(

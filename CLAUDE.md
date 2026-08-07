@@ -9,11 +9,19 @@ uv sync                                         # install/update env from pyproj
 uv run python scripts/prepare_data.py           # download/cut datasets/enwik8{,_1M}.gz
 uv run python scripts/train_bpe.py --data datasets/enwik8_1M.gz   # BPE tokenizer for qcute.bpelm
 uv run python -m qcute.bytelm --preset sd       # byte-level baseline LM (Phase 0), reports BPB
-uv run python -m qcute.qcutelm                  # end-to-end tokenizer + latent LM (FSQ/BSQ)
+uv run python -m qcute.archive.qcutelm          # end-to-end tokenizer + latent LM (FSQ/BSQ) — ARCHIVED,
+                                                 # superseded by qcute_refine (see Architecture below); still
+                                                 # importable/runnable via its archive path for historical reference
 uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_1M_8192.model   # BPE baseline
-uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4.py   # named, reproducible run
+uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_ctx1024.py   # named, reproducible run — the
+                                                 # standard byte-level baseline as of this session (context=1024,
+                                                 # matching qcute_refine's own context_len); the older
+                                                 # configs/bytelm_xs_mtp4.py (context=256) is superseded, kept only
+                                                 # for historical reproducibility, not a comparison target anymore
 uv run python scripts/plot_run.py logs/<run_name>   # train/val bpb PNG from a run's run.jsonl
-uv run python -m qcute.qcutelm_vlt8 --config configs/qcutelm_vlt8_bsq.py   # current best qcute prototype (see below)
+uv run python -m qcute.qcute_refine_v2 --config configs/qcute_refine_v2_byte4_code256_simple.py   # current
+                                                 # best qcute prototype — "v1" of the qcute_refine lineage's
+                                                 # own best-so-far config (see Architecture below)
 ```
 
 All three modules read `--help` for their full flag list; all support
@@ -61,18 +69,31 @@ modules — none import each other, deliberately not factored further yet.
 Full details, including which handover-doc section each component
 implements and known gaps vs. the design: [docs/architecture.md](docs/architecture.md).
 
-`qcute/qcutelm_vlt6.py` through `qcute/qcutelm_vlt8.py` are a later,
-actively-iterated lineage of self-contained forks exploring
-tokenizer-as-AR-LM designs (narrow byte-level tokenizer + separate wide
-`codelm` operating on the short, K-fold-compressed code sequence — where
-qcute's actual compute argument lives). `qcutelm_vlt8` is the current
-best-performing/most-correct fork (fixes a windowed-attention/block-
-alignment bug present in `vlt7`); each file's own module docstring has
-the full per-version rationale. Full narrative, results, and open
-questions: [docs/status.md](docs/status.md) (session-update sections,
-newest at the bottom) — this lineage moves fast and status.md is the
-only place its current state is tracked; CLAUDE.md intentionally doesn't
-duplicate it.
+**`qcute/qcute_refine.py` and `qcute/qcute_refine_v2.py` are the current
+active lineage** — considered the project's first success, as of the
+session that built them. `qcute_refine.py` ("v1"): pure recursive NTP
+tower with BSQ code hand-off between levels, plus a block-local
+joint-chain-MTP detokenizer. `qcute_refine_v2.py`: the detokenizer
+redesigned into a `DecoderLevel` that cross-attends between adjacent
+levels' own `EncoderLevel` hidden states (reused, not recomputed) instead
+of running a separate self-attention pass — the actively-developed file,
+with a growing set of session-driven flags (`byte_repr`, `code_head_mode`,
+`bit_head_class`, `cross_attn_rope`, `decoder_own_trunk`,
+`decoder_kv_pass_through`/`decoder_q_pass_through`, `layer_warmup_steps`)
+documented in its own `Config` dataclass. Configs live under
+`configs/qcute_refine_v2_*.py` and `configs/v1_*.py`. Full narrative:
+[docs/status.md](docs/status.md) (session-update sections, newest at the
+bottom) — this lineage moves fast and status.md is the only place its
+current state is tracked; CLAUDE.md intentionally doesn't duplicate it.
+
+Every earlier qcute-lineage fork — `qcutelm.py`, `qcutelm_vlt*.py`
+(`vlt` through `vlt11`), `qcutelm_pyramid.py`, `qcutelm_mergetoken_v1.py`,
+`qcute_bytepool.py` — is **archived** under `qcute/archive/` (configs
+under `configs/archive/`), superseded by the `qcute_refine` lineage.
+Kept for historical reference/reproducibility, not part of active work;
+`docs/status.md`'s own history of them is untouched. `qcute/bytelm.py`
+and `qcute/bpelm.py` are the exception — still the active baseline
+comparison points, not archived.
 
 Design source of truth: [docs/continuous_tokenizer_handover.md](docs/continuous_tokenizer_handover.md).
 Phase-by-phase progress: [docs/status.md](docs/status.md).

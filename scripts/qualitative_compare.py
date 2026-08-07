@@ -37,7 +37,7 @@ from qcute.bpelm import (
     BpeLMConfig, BpeLM, build_byte_len_table, generate_ar as bpelm_generate_ar,
     score_continuation_bpb as bpelm_bpb,
 )
-from qcute.qcutelm import Config as QCuteConfig, QCuteLM, load_enwik8, split_train_val
+from qcute.archive.qcutelm import Config as QCuteConfig, QCuteLM, load_enwik8, split_train_val
 
 
 def pick_offsets(region_len: int, n: int, prompt_len: int, gen_len: int, align: int, seed: int) -> list[int]:
@@ -89,7 +89,7 @@ def run_bpelm(checkpoint_path: Path, sp_model: Path, prompt: bytes, gt: bytes, d
 
 
 def run_qcutelm(checkpoint_path: Path, prompt: bytes, gt: bytes, device: str) -> dict:
-    from qcute.qcutelm import qualitative_generate, score_continuation_bpb as qcutelm_bpb
+    from qcute.archive.qcutelm import qualitative_generate, score_continuation_bpb as qcutelm_bpb
 
     ckpt = torch.load(checkpoint_path, map_location=device)
     cfg = QCuteConfig(**ckpt["cfg"])

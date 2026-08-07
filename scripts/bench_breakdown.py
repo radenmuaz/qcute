@@ -39,7 +39,7 @@ print(f"  total params: {n_params_p/1e6:.3f}M")
 print(f"  total flops/fwd: {flops_p_full/1e6:.2f}M")
 
 # --- vlt6 breakdown ---
-from qcute.qcutelm_vlt6 import ARLatentTokenizer, Config, load_config_module
+from qcute.archive.qcutelm_vlt6 import ARLatentTokenizer, Config, load_config_module
 cfg_kwargs = load_config_module(Path('/Users/muaz/code/qcute/configs/qcutelm_vlt6_rope_bpelm_parity.py'))
 cfg_v = Config(
     K=cfg_kwargs['K'], context_len=cfg_kwargs['context_len'], attn_window=cfg_kwargs['attn_window'],

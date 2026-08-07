@@ -155,6 +155,18 @@ class Config:
     bit_chain_n_heads: int = 2
     bit_chain_gamma: float = 1.0
     bit_chain_fixed_kernel: bool = True
+    bit_head_class: str = "attn"  # which BitPredictHead* implementation backs every "chain"-style head in
+                                    # the model (byte level's own bits-mode NTP/decode head, and any
+                                    # level's code_head_mode/tok_head_mode=="chain"): "attn" (default,
+                                    # original) = BitPredictHeadAttn, self-attention over the bit chain.
+                                    # "conv" = BitPredictHeadConv, causal Conv1d instead. "ssm" =
+                                    # BitPredictHeadSSM, linear-decay recurrence instead. All three are
+                                    # drop-in equivalent in API (verified fixed/loop-consistent) — see
+                                    # each class's own docstring for the tradeoffs.
+    bit_conv_kernel_size: int | None = None  # None (default) = dq (full receptive field) — see
+                                    # BitPredictHeadConv's own docstring for why windowing isn't obviously
+                                    # the right inductive bias here. Only used when bit_head_class=="conv".
+    bit_ssm_d_state: int | None = None       # None (default) = d_model. Only used when bit_head_class=="ssm".
     code_ntp_weight: float = 1.0  # scales levels>0's own NTP loss (level 0's byte_loss never scaled).
                                     # ==0.0 SKIPS those levels' ntp_head forward entirely (real speed
                                     # lever — see qcute_refine.py's own session diagnosis).
@@ -184,6 +196,44 @@ class Config:
                                     # measured diagnosis) — opt-in comparison, not the default.
     tok_weight: float = 1.0        # scales the summed DecoderLevel losses. ==0.0 SKIPS every
                                     # DecoderLevel's forward entirely (not just zero-weights it).
+    cross_attn_rope: bool = True   # DEFAULT ON — "decoder must be timestep aware." Applies RoPE to the
+                                    # cross-attention Q/K: Q gets its own raw-byte-time position (0..L-1);
+                                    # each K slot gets the null slot's own fixed reference position (0) or,
+                                    # for a real code block, the raw-byte-time position it becomes fully
+                                    # causally resolved at ((b+1)*K[level]-1) — gives the model actual
+                                    # relative-distance information instead of just the boolean allowed/
+                                    # blocked mask. False restores the original no-positional-info
+                                    # cross-attention (real option, not removed).
+    decoder_own_trunk: bool = False   # DEFAULT OFF — the original design keeps this off: DecoderLevel
+                                    # reuses EncoderLevel[level]/[level+1]'s own already-computed hidden
+                                    # states (h_prev/h_curr) as Q/KV sources, zero redundant trunk compute.
+                                    # True: DecoderLevel instead builds its OWN separate-weight copies of
+                                    # those two trunks (via two private EncoderLevel instances,
+                                    # compute_ntp=False, their own emitted codes discarded) and runs raw
+                                    # sequences (byte ids / codes) through them itself — the "own trunk"
+                                    # design discussed this session, ~+61% params / ~+57% FLOPs on the
+                                    # decoder side (session estimate). Mutually exclusive with
+                                    # decoder_kv_pass_through — own_trunk takes priority if both are set.
+    decoder_kv_pass_through: bool = False   # DEFAULT OFF. True: KV comes directly from a fresh
+                                    # Linear(dqs[level], tok_d_model) projection of the level's own raw
+                                    # emitted code c_i, instead of EncoderLevel[level+1]'s hidden state —
+                                    # decouples DecoderLevel[level] from needing EncoderLevel[level+1]'s
+                                    # own trunk to have finished at all (session discussion: "is it
+                                    # possible to not reuse h but direct embedding or code proj" — this is
+                                    # the KV-side version; trades away level+1's own cross-code-block
+                                    # contextualization for removing that sequential dependency). No
+                                    # effect if decoder_own_trunk is also True.
+    decoder_q_pass_through: bool = False    # DEFAULT OFF. True: Q comes directly from a fresh embedding
+                                    # of this level's own raw input seq_repr (nn.Embedding(vocab,
+                                    # tok_d_model) if use_byte_softmax, else Linear(in_dq, tok_d_model)) —
+                                    # the Q-side counterpart to decoder_kv_pass_through, session
+                                    # discussion's other half ("is it possible to not reuse h... direct
+                                    # embedding"). Combined with decoder_kv_pass_through=True, this strips
+                                    # ALL contextualization from both sides of the cross-attention — pure
+                                    # raw-token/raw-code embeddings in, nothing else — deliberately a
+                                    # worst-case/floor probe: "see limits of decoder" (how well can
+                                    # cross-attention alone do with zero causal self-attention context on
+                                    # either side?). No effect if decoder_own_trunk is also True.
     layer_warmup_steps: tuple[int, ...] = ()   # LAYERWISE CURRICULUM (queued ablation, not yet run):
                                     # length must be n_levels-1 (one entry per level-activation gap,
                                     # like `tokenizers` itself) or empty (=all-zeros, i.e. every level
@@ -217,6 +267,20 @@ def rope_cos_sin(seq_len: int, head_dim: int, base: float, device: torch.device)
 def rope_cos_sin_at(pos_id: int, head_dim: int, base: float, device: torch.device):
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     freqs = torch.tensor([[float(pos_id)]], device=device) * inv_freq
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos(), emb.sin()
+
+
+def rope_cos_sin_for_positions(position_ids: torch.Tensor, head_dim: int, base: float, device: torch.device):
+    """Same as rope_cos_sin, but for an arbitrary (non-contiguous) set of
+    position ids rather than a fixed 0..seq_len-1 range — needed for
+    DecoderLevel's cross-attention RoPE, where Q lives at raw-byte-time
+    resolution (0..L-1) and K lives at code-block resolution (each block
+    tagged with the raw-byte-time position it becomes fully causally
+    resolved at), so the two sides can't share a single contiguous
+    range. position_ids: [T] long. -> (cos, sin), each [T, head_dim]."""
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    freqs = position_ids.float().unsqueeze(-1) * inv_freq
     emb = torch.cat([freqs, freqs], dim=-1)
     return emb.cos(), emb.sin()
 
@@ -330,9 +394,18 @@ class CrossBlock(nn.Module):
     """Single cross-attention transformer block: cross-attn sublayer (Q
     from one sequence, K/V from another) + MLP sublayer, each pre-norm +
     residual — same shape as this file's own causal `Block`, with
-    self-attention swapped for cross-attention and no RoPE (Q/KV live at
-    different granularities, so a shared rotary basis doesn't apply;
-    causal safety comes entirely from the explicit boolean attn_mask)."""
+    self-attention swapped for cross-attention. RoPE is OPTIONAL (on by
+    default via Config.cross_attn_rope — "decoder must be timestep
+    aware"): Q and KV live at different granularities/lengths, so they
+    can't share one contiguous rotary range the way self-attention does,
+    but each side CAN still get its own explicit position tag —
+    DecoderLevel computes and passes those in (rope_q for Q's raw-byte-
+    time positions, rope_k for each KV slot's own raw-byte-time position:
+    the null slot at 0, each real code block at the raw position it
+    becomes fully causally resolved). Without this, the only signal the
+    cross-attention had for "how far back in real time is this code
+    block" was the boolean visibility mask (allowed/blocked, no
+    distance) — RoPE gives it the actual relative distance."""
 
     def __init__(self, d_model: int, n_heads: int, mlp_mult: int):
         super().__init__()
@@ -352,10 +425,13 @@ class CrossBlock(nn.Module):
             nn.Linear(mlp_mult * d_model, d_model),
         )
 
-    def forward(self, q: torch.Tensor, kv: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, q: torch.Tensor, kv: torch.Tensor, attn_mask: torch.Tensor,
+                rope_q: tuple[torch.Tensor, torch.Tensor] | None = None,
+                rope_k: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
         """attn_mask: bool [Lq, Lkv], True = BLOCKED (DecoderLevel's own "disallow" convention,
         matching nn.MultiheadAttention's convention) — inverted internally since
-        F.scaled_dot_product_attention's boolean convention is the opposite (True = may attend)."""
+        F.scaled_dot_product_attention's boolean convention is the opposite (True = may attend).
+        rope_q/rope_k: None (default off path) or (cos, sin) each [T, head_dim] — see class docstring."""
         qn, kvn = self.ln_q(q), self.ln_kv(kv)
         B, Lq, D = qn.shape
         Lkv = kvn.shape[1]
@@ -363,6 +439,10 @@ class CrossBlock(nn.Module):
         qh = self.q_proj(qn).reshape(B, Lq, H, hd).transpose(1, 2)
         kvp = self.kv_proj(kvn).reshape(B, Lkv, 2, H, hd).permute(2, 0, 3, 1, 4)
         kh, vh = kvp[0], kvp[1]
+        if rope_q is not None:
+            qh = apply_rope(qh, *rope_q)
+        if rope_k is not None:
+            kh = apply_rope(kh, *rope_k)
         sdpa_mask = ~attn_mask if attn_mask is not None else None
         y = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=sdpa_mask)
         attn_out = self.out_proj(y.transpose(1, 2).reshape(B, Lq, D))
@@ -384,7 +464,7 @@ def bits_to_byte(bits: torch.Tensor) -> torch.Tensor:
     return (b * powers).sum(-1)
 
 
-class BitPredictHead(nn.Module):
+class BitPredictHeadAttn(nn.Module):
     """Predicts `dq` chained bits from a hidden vector via Fetch-style causal
     self-attention over the bit sequence — the exact chain-rule
     factorization of the joint dq-bit distribution (ported from
@@ -461,10 +541,173 @@ class BitPredictHead(nn.Module):
         return torch.stack(logits_list, dim=1)
 
 
+class BitPredictHeadConv(nn.Module):
+    """Same chain-rule job as BitPredictHeadAttn, but a causal 1D
+    convolution over the bit-embedding sequence instead of self-attention
+    (session: "not use self attention but simply series of linears...").
+    kernel_size defaults to `dq` (full receptive field over the whole bit
+    chain) — cheap and lossless at this scale since dq stays small in
+    every current config (DecoderLevel predicts single tokens, not joint
+    MTP blocks), and windowing would impose a locality prior that's
+    arguably WRONG for LSB-first bit orderings specifically (bit 0 has no
+    particular reason to correlate more with bit 1 than with bit 7, unlike
+    real token sequences where nearby positions genuinely correlate more —
+    session conclusion, not an assumption).
+
+    Deliberately has NO bit_pos_emb (unlike Attn) — adding an absolute
+    position embedding would break translation-invariance, which is
+    exactly the property that makes "shared Linear read of a fixed-size
+    sliding/causal window" equivalent to a real conv in the first place
+    (same weights reused at every relative offset, not indexed by
+    absolute position)."""
+
+    def __init__(self, d_model: int, dq: int, kernel_size: int | None = None, gamma: float = 1.0):
+        super().__init__()
+        self.dq = dq
+        self.gamma = gamma
+        self.kernel_size = kernel_size if kernel_size is not None else dq
+        self.head = nn.Linear(d_model, 1)
+        self.bit_val_emb = nn.Embedding(2, d_model)
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=self.kernel_size, bias=True)
+
+    def forward(self, h: torch.Tensor, true_bits: torch.Tensor | None = None) -> torch.Tensor:
+        if true_bits is not None:
+            return self._forward_fixed(h, true_bits)
+        return self._forward_loop(h, true_bits)
+
+    def _forward_fixed(self, h: torch.Tensor, true_bits: torch.Tensor) -> torch.Tensor:
+        N, D = h.shape
+        bit_ids = (true_bits > 0).long()
+        val_embeds = self.bit_val_emb(bit_ids)                          # [N, dq, D]
+        zero_vec = val_embeds.new_zeros(N, 1, D)
+        shifted = torch.cat([zero_vec, val_embeds[:, :-1, :]], dim=1)   # position j holds bit j-1's embed
+        x_t = shifted.transpose(1, 2)                                    # [N, D, dq]
+        x_padded = F.pad(x_t, (self.kernel_size - 1, 0))                 # causal: pad LEFT only
+        conv_out = self.conv(x_padded).transpose(1, 2)                   # [N, dq, D]
+        h_scale = h.new_ones(1, self.dq, 1)
+        if self.dq > 1:
+            h_scale = torch.cat([h_scale[:, :1, :], h_scale[:, 1:, :] * self.gamma], dim=1)
+        fetched = h_scale * h.unsqueeze(1) + conv_out
+        return self.head(fetched).squeeze(-1)
+
+    def _forward_loop(self, h: torch.Tensor, true_bits: torch.Tensor | None) -> torch.Tensor:
+        N, D = h.shape
+        past: list[torch.Tensor] = []   # decided bits' embeddings so far, oldest first
+        logits_list = []
+        for j in range(self.dq):
+            window = past[-self.kernel_size:]
+            pad_len = self.kernel_size - len(window)
+            seq = [h.new_zeros(N, D)] * pad_len + window
+            x = torch.stack(seq, dim=2)             # [N, D, kernel_size]
+            conv_out = self.conv(x).squeeze(-1)      # [N, D]
+            h_scale_j = 1.0 if j == 0 else self.gamma
+            fetched = h_scale_j * h + conv_out
+            logit_j = self.head(fetched).squeeze(-1)
+            logits_list.append(logit_j)
+            if j < self.dq - 1:
+                bit_val = (true_bits[:, j] > 0).long() if true_bits is not None else (logit_j > 0).long()
+                past.append(self.bit_val_emb(bit_val))
+        return torch.stack(logits_list, dim=1)
+
+
+class BitPredictHeadSSM(nn.Module):
+    """Same chain-rule job again, via a linear-decay recurrence instead
+    of attention or convolution (session follow-up: "can ssm decay 0" —
+    yes, see below). s_j = alpha * s_{j-1} + bit_embed_{j-1}, alpha a
+    LEARNED per-channel decay. Unrolled: s_j = sum_{k<j} alpha^(j-1-k) *
+    bit_embed_k — a lower-triangular decay-weighted sum, computed as ONE
+    batched matmul (no sequential loop) during teacher-forced training —
+    this is the parallelization property a nonlinear/gated recurrence
+    (a real GRU) would NOT have; forcing the update to stay linear in
+    s_{j-1} is exactly what buys it.
+
+    alpha=0 is a fully-supported special case, not a degenerate/undefined
+    one: the k=j-1 (immediately-preceding-bit) term always has exponent 0
+    (alpha^0=1 regardless of alpha, including alpha=0 — 0**0 is 1 both
+    mathematically in this context and in torch's own float pow), while
+    every k<j-1 term (exponent>=1) vanishes. So alpha=0 means "condition
+    only on the immediately preceding bit" — exactly BitPredictHeadConv's
+    own kernel_size=1 case — cleanly, with no division/log anywhere in
+    the formula to blow up at that limit. alpha is parametrized via
+    sigmoid so it can approach but never algebraically equal exactly 0;
+    in practice that's not a meaningful difference (sigmoid(-8) < 1e-3)."""
+
+    def __init__(self, d_model: int, dq: int, d_state: int | None = None, gamma: float = 1.0):
+        super().__init__()
+        self.dq = dq
+        self.gamma = gamma
+        self.d_state = d_state if d_state is not None else d_model
+        self.head = nn.Linear(d_model, 1)
+        self.bit_val_emb = nn.Embedding(2, self.d_state)
+        self.state_proj = nn.Linear(self.d_state, d_model)
+        self.decay_logit = nn.Parameter(torch.zeros(self.d_state))   # sigmoid(0)=0.5 init
+
+    def _alpha(self) -> torch.Tensor:
+        return torch.sigmoid(self.decay_logit)   # [d_state], in (0,1) — see class docstring re: alpha=0
+
+    def forward(self, h: torch.Tensor, true_bits: torch.Tensor | None = None) -> torch.Tensor:
+        if true_bits is not None:
+            return self._forward_fixed(h, true_bits)
+        return self._forward_loop(h, true_bits)
+
+    def _forward_fixed(self, h: torch.Tensor, true_bits: torch.Tensor) -> torch.Tensor:
+        N, D = h.shape
+        dq = self.dq
+        bit_ids = (true_bits > 0).long()
+        val_embeds = self.bit_val_emb(bit_ids)                    # [N, dq, d_state]
+        alpha = self._alpha()                                      # [d_state]
+
+        idx = torch.arange(dq, device=h.device)
+        offsets = idx.unsqueeze(1) - 1 - idx.unsqueeze(0)           # [dq, dq]: j-1-k
+        valid = offsets >= 0                                        # True iff k < j
+        offsets_clamped = offsets.clamp(min=0).float()
+        decay = (alpha.view(1, 1, -1) ** offsets_clamped.unsqueeze(-1)) * valid.unsqueeze(-1).float()   # [dq,dq,d_state]
+
+        s = torch.einsum("jkc,nkc->njc", decay, val_embeds)         # [N, dq, d_state]
+        state_contrib = self.state_proj(s)                          # [N, dq, D]
+        h_scale = h.new_ones(1, dq, 1)
+        if dq > 1:
+            h_scale = torch.cat([h_scale[:, :1, :], h_scale[:, 1:, :] * self.gamma], dim=1)
+        fetched = h_scale * h.unsqueeze(1) + state_contrib
+        return self.head(fetched).squeeze(-1)
+
+    def _forward_loop(self, h: torch.Tensor, true_bits: torch.Tensor | None) -> torch.Tensor:
+        N, D = h.shape
+        alpha = self._alpha()
+        s = h.new_zeros(N, self.d_state)
+        logits_list = []
+        for j in range(self.dq):
+            state_contrib = self.state_proj(s)
+            h_scale_j = 1.0 if j == 0 else self.gamma
+            fetched = h_scale_j * h + state_contrib
+            logit_j = self.head(fetched).squeeze(-1)
+            logits_list.append(logit_j)
+            if j < self.dq - 1:
+                bit_val = (true_bits[:, j] > 0).long() if true_bits is not None else (logit_j > 0).long()
+                s = alpha * s + self.bit_val_emb(bit_val)
+        return torch.stack(logits_list, dim=1)
+
+
 def chain_bce_loss(raw_logits: torch.Tensor, true_bits: torch.Tensor) -> torch.Tensor:
     """Sum over the bit dim (nats per predicted unit), then mean over
     everything else — matches qcutelm_vlt11/qcute_refine's own convention."""
     return F.binary_cross_entropy_with_logits(raw_logits, (true_bits > 0).float(), reduction="none").sum(-1).mean()
+
+
+def build_bit_head(cfg: Config, d_model: int, dq: int) -> nn.Module:
+    """Dispatches to whichever BitPredictHead* implementation
+    Config.bit_head_class selects — the single place every "chain"-style
+    head (byte level's own bits-mode head, and any code_head_mode/
+    tok_head_mode=="chain" head) gets built, so switching architectures
+    is one flag, not per-call-site edits."""
+    if cfg.bit_head_class == "attn":
+        return BitPredictHeadAttn(d_model, dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel)
+    elif cfg.bit_head_class == "conv":
+        return BitPredictHeadConv(d_model, dq, kernel_size=cfg.bit_conv_kernel_size, gamma=cfg.bit_chain_gamma)
+    elif cfg.bit_head_class == "ssm":
+        return BitPredictHeadSSM(d_model, dq, d_state=cfg.bit_ssm_d_state, gamma=cfg.bit_chain_gamma)
+    else:
+        raise ValueError(f"unknown bit_head_class {cfg.bit_head_class!r}")
 
 
 class EncoderLevel(nn.Module):
@@ -509,14 +752,14 @@ class EncoderLevel(nn.Module):
                 self.ntp_head = nn.Linear(D, cfg.vocab)
             else:
                 self.embed = nn.Linear(in_dq, D)
-                self.ntp_head = BitPredictHead(D, in_dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel)
+                self.ntp_head = build_bit_head(cfg, D, in_dq)
         else:
             assert cfg.code_head_mode in ("chain", "independent")
             self.embed = nn.Linear(in_dq, D)
             if cfg.code_head_mode == "independent":
                 self.ntp_head = nn.Linear(D, in_dq)
             else:
-                self.ntp_head = BitPredictHead(D, in_dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel)
+                self.ntp_head = build_bit_head(cfg, D, in_dq)
         self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult, window) for _ in range(cfg.tier_n_layers[level])])
         self.ln_f = nn.LayerNorm(D)
         self.code_pre = nn.Linear(D, cfg.dqs[level])
@@ -595,19 +838,47 @@ class DecoderLevel(nn.Module):
     separate trunk is built here at all). See module docstring for the
     full causal-mask/null-KV/detach rationale."""
 
-    def __init__(self, cfg: Config, level: int, in_dq: int):
+    def __init__(self, cfg: Config, level: int, in_dq: int, kv_window: int | None = None):
         super().__init__()
         self.level = level
         self.in_dq = in_dq
         self.K = cfg.Ks[level]
         self.cfg = cfg
+        # KV visibility capped to the most recent `kv_window` completed blocks, matching
+        # EncoderLevel[level+1]'s OWN attn_window (same units: level+1's own block/position scale) — before
+        # this, the cross-attention mask only enforced causality (block b visible once complete) with no
+        # cap on how far BACK it could reach, unbounded regardless of what window the encoder itself used.
+        # None (attn_window[level+1] == -1, dense) preserves that original unbounded reach.
+        self.kv_window = kv_window
         # only level 0 with byte_repr=="embed" gets the special vocab-softmax path; level 0 with
         # byte_repr=="bits" behaves exactly like any other level (in_dq=8, tok_head_mode picks the head) —
         # matches EncoderLevel's own byte_repr flag, "do not remove that, put as flag"
         self.use_byte_softmax = level == 0 and cfg.byte_repr == "embed"
+        self.own_trunk = cfg.decoder_own_trunk
+        self.kv_pass_through = cfg.decoder_kv_pass_through and not self.own_trunk
+        self.q_pass_through = cfg.decoder_q_pass_through and not self.own_trunk
         D = cfg.tok_d_model
-        self.q_proj = nn.Linear(cfg.tier_d_models[level], D)
-        self.kv_proj = nn.Linear(cfg.tier_d_models[level + 1], D)
+
+        if self.own_trunk:
+            # own, separate-weight copies of EncoderLevel[level]/[level+1]'s own trunk shape — dense
+            # attention (window=None) for simplicity, not necessarily matching the encoder's own window
+            # choice; compute_ntp=False always (own ntp_head/code_pre exist but are never used/trained —
+            # unused byproducts of reusing the EncoderLevel class directly, same "acceptable minor waste"
+            # pattern as other unused-byproduct cases in this file).
+            self.own_main = EncoderLevel(cfg, level, in_dq, window=None)
+            self.own_side = EncoderLevel(cfg, level + 1, cfg.dqs[level], window=None)
+            self.q_proj = nn.Linear(cfg.tier_d_models[level], D)
+            self.kv_proj = nn.Linear(cfg.tier_d_models[level + 1], D)
+        else:
+            if self.q_pass_through:
+                # direct embedding straight to tok_d_model width, no h_prev/trunk involved at all
+                self.q_embed = nn.Embedding(cfg.vocab, D) if self.use_byte_softmax else nn.Linear(in_dq, D)
+            else:
+                self.q_proj = nn.Linear(cfg.tier_d_models[level], D)
+            if self.kv_pass_through:
+                self.code_proj = nn.Linear(cfg.dqs[level], D)
+            else:
+                self.kv_proj = nn.Linear(cfg.tier_d_models[level + 1], D)
         self.null_kv = nn.Parameter(torch.zeros(1, 1, D))
         nn.init.normal_(self.null_kv, std=0.02)
         self.cross_block = CrossBlock(D, cfg.tok_n_heads, cfg.tok_mlp_mult)
@@ -616,39 +887,82 @@ class DecoderLevel(nn.Module):
         elif cfg.tok_head_mode == "linear":
             self.head = nn.Linear(D, in_dq)
         elif cfg.tok_head_mode == "chain":
-            self.head = BitPredictHead(D, in_dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel)
+            self.head = build_bit_head(cfg, D, in_dq)
         else:
             raise ValueError(f"unknown tok_head_mode {cfg.tok_head_mode!r}")
 
-    def forward(self, h_prev: torch.Tensor, h_curr: torch.Tensor, seq_repr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """h_prev: [B, L, tier_d_models[level]] EncoderLevel[level]'s own
-        hidden states (caller must have already .detach()'d this).
-        h_curr: [B, n_blocks, tier_d_models[level+1]] EncoderLevel[level+1]'s
-        own hidden states (also pre-detached by caller). seq_repr: level
-        `level`'s own true input (decode target) — raw byte ids [B, L]
-        (long) at level 0, else its own continuous code [B, L, in_dq]
-        (float). Returns (loss, acc)."""
+    def forward(self, main_input: torch.Tensor, kv_input: torch.Tensor, seq_repr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """main_input/kv_input meaning depends on this decoder's own mode
+        (chosen once at construction from cfg, RefineLM.forward supplies
+        the matching arguments — see its own dispatch):
+          - default (reuse): main_input=h_prev, kv_input=h_curr — both
+            EncoderLevel's own already-computed (detached) hidden states.
+          - own_trunk: main_input=raw seq_repr for this level, kv_input=
+            raw code c_i — this decoder runs its OWN private encoder
+            copies over them to produce h_prev/h_curr itself.
+          - q_pass_through: main_input=raw seq_repr for this level
+            (embedded directly, no h_prev/trunk involved at all).
+          - kv_pass_through: main_input=h_prev (still reused unless
+            q_pass_through is ALSO set), kv_input=raw code c_i (projected
+            directly, no trunk at all on the KV side).
+        seq_repr: level `level`'s own true input (decode target) — raw
+        byte ids [B, L] (long) at level 0, else its own continuous code
+        [B, L, in_dq] (float). Returns (loss, acc)."""
         cfg = self.cfg
         K = self.K
-        B, L, _ = h_prev.shape
-        n_blocks = h_curr.size(1)
         D = cfg.tok_d_model
 
-        q = self.q_proj(h_prev)
-        kv = self.kv_proj(h_curr)
+        if self.own_trunk:
+            _, _, _, h_prev = self.own_main(main_input, compute_ntp=False)
+            _, _, _, h_curr = self.own_side(kv_input, compute_ntp=False)
+            q = self.q_proj(h_prev)
+            kv = self.kv_proj(h_curr)
+        else:
+            if self.q_pass_through:
+                # main_input is raw seq_repr here — level 0 + byte_repr=="bits" still arrives as raw byte
+                # ids (long), same convention EncoderLevel itself uses, so convert the same way it does.
+                if self.use_byte_softmax:
+                    q = self.q_embed(main_input)
+                else:
+                    q_in = byte_to_bits(main_input) if self.level == 0 else main_input
+                    q = self.q_embed(q_in)
+            else:
+                q = self.q_proj(main_input)   # main_input = h_prev (reuse mode)
+            kv = self.code_proj(kv_input) if self.kv_pass_through else self.kv_proj(kv_input)
+
+        B, L, _ = q.shape
+        n_blocks = kv_input.size(1)   # same regardless of mode: h_curr's own length == c_i's own length
+        device = q.device
+
         null = self.null_kv.expand(B, 1, D)
         kv = torch.cat([null, kv], dim=1)   # [B, 1+n_blocks, D] — null slot always visible
 
-        t_idx = torch.arange(L, device=h_prev.device).unsqueeze(1)          # [L, 1]
-        b_idx = torch.arange(n_blocks, device=h_prev.device).unsqueeze(0)   # [1, n_blocks]
-        visible = b_idx < ((t_idx + 1) // K)                                 # [L, n_blocks] bool: block b
+        t_idx = torch.arange(L, device=device).unsqueeze(1)          # [L, 1]
+        b_idx = torch.arange(n_blocks, device=device).unsqueeze(0)   # [1, n_blocks]
+        n_complete = (t_idx + 1) // K                                        # exclusive upper bound: blocks
+                                                                                # 0..n_complete-1 are complete
+        visible = b_idx < n_complete                                          # [L, n_blocks] bool: block b
                                                                                 # complete & visible at t
-        null_col = torch.ones(L, 1, dtype=torch.bool, device=h_prev.device)
+        if self.kv_window is not None:
+            visible = visible & (b_idx >= n_complete - self.kv_window)        # cap how far BACK it can reach
+                                                                                # too, not just causality
+        null_col = torch.ones(L, 1, dtype=torch.bool, device=device)
         visible = torch.cat([null_col, visible], dim=1)                      # [L, 1+n_blocks]
         disallow = ~visible                                                   # nn.MultiheadAttention bool
                                                                                 # mask convention: True=blocked
 
-        h_dec = self.cross_block(q, kv, attn_mask=disallow)                   # [B, L, D]
+        rope_q = rope_k = None
+        if cfg.cross_attn_rope:
+            head_dim = D // cfg.tok_n_heads
+            q_pos = torch.arange(L, device=device)                            # Q's own raw-byte-time positions
+            block_pos = (torch.arange(n_blocks, device=device) + 1) * K - 1   # block b resolved at
+                                                                                 # raw position (b+1)*K-1
+            null_pos = block_pos.new_zeros(1)                                 # null slot: fixed reference position 0
+            k_pos = torch.cat([null_pos, block_pos])
+            rope_q = rope_cos_sin_for_positions(q_pos, head_dim, cfg.rope_base, device)
+            rope_k = rope_cos_sin_for_positions(k_pos, head_dim, cfg.rope_base, device)
+
+        h_dec = self.cross_block(q, kv, attn_mask=disallow, rope_q=rope_q, rope_k=rope_k)   # [B, L, D]
 
         h_flat = h_dec[:, :-1, :].reshape(-1, D)
         if self.use_byte_softmax:
@@ -710,7 +1024,7 @@ class RefineLM(nn.Module):
         in_dqs = [8] + list(cfg.dqs[:-1])
         self.in_dqs = in_dqs
         self.encoders = nn.ModuleList([EncoderLevel(cfg, i, in_dqs[i], windows[i]) for i in range(self.n_levels)])
-        self.decoders = nn.ModuleList([DecoderLevel(cfg, i, in_dqs[i]) for i in range(self.n_levels - 1)])
+        self.decoders = nn.ModuleList([DecoderLevel(cfg, i, in_dqs[i], kv_window=windows[i + 1]) for i in range(self.n_levels - 1)])
 
         lw = cfg.layer_warmup_steps if cfg.layer_warmup_steps else (0,) * (self.n_levels - 1)
         assert len(lw) == self.n_levels - 1, (
@@ -763,7 +1077,15 @@ class RefineLM(nn.Module):
         tok_losses, tok_accs = [], []
         for i in range(n_active - 1):
             if compute_tok:
-                tl, ta = self.decoders[i](h_list[i].detach(), h_list[i + 1].detach(), x_list[i])
+                decoder = self.decoders[i]
+                # x_list[i+1] == c_i (level i's own emitted code — captured as x_list's NEXT entry by
+                # construction above), always detached before crossing into a decoder — same "decoder loss
+                # must not reshape encoder" principle the default h_list[...].detach() already follows.
+                need_raw_main = decoder.own_trunk or decoder.q_pass_through
+                need_raw_kv = decoder.own_trunk or decoder.kv_pass_through
+                main_arg = x_list[i].detach() if need_raw_main else h_list[i].detach()
+                kv_arg = x_list[i + 1].detach() if need_raw_kv else h_list[i + 1].detach()
+                tl, ta = decoder(main_arg, kv_arg, x_list[i])
             else:
                 tl, ta = h_list[i].new_zeros(()), h_list[i].new_zeros(())
             tok_losses.append(tl)
@@ -1035,6 +1357,9 @@ def main():
     p.add_argument("--bit_chain_n_heads", type=int, default=2)
     p.add_argument("--bit_chain_gamma", type=float, default=1.0)
     p.add_argument("--bit_chain_fixed_kernel", type=lambda x: x.lower() != "false", default=True)
+    p.add_argument("--bit_head_class", type=str, default="attn", choices=["attn", "conv", "ssm"])
+    p.add_argument("--bit_conv_kernel_size", type=int, default=None)
+    p.add_argument("--bit_ssm_d_state", type=int, default=None)
     p.add_argument("--code_ntp_weight", type=float, default=1.0)
     p.add_argument("--quant_type", type=str, default="bsq", choices=["bsq", "identity"])
     p.add_argument("--byte_repr", type=str, default="bits", choices=["bits", "embed"])
@@ -1044,6 +1369,10 @@ def main():
     p.add_argument("--tok_mlp_mult", type=int, default=4)
     p.add_argument("--tok_head_mode", type=str, default="linear", choices=["linear", "chain"])
     p.add_argument("--tok_weight", type=float, default=1.0)
+    p.add_argument("--cross_attn_rope", type=lambda x: x.lower() != "false", default=True)
+    p.add_argument("--decoder_own_trunk", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--decoder_kv_pass_through", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--decoder_q_pass_through", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--layer_warmup_steps", type=lambda s: () if s in ("", "()") else _parse_int_tuple(s), default=())
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
@@ -1082,10 +1411,14 @@ def main():
         Ks=args.Ks, dqs=args.dqs, tier_d_models=args.tier_d_models, tier_n_layers=args.tier_n_layers,
         context_len=args.context_len, n_heads=args.n_heads, mlp_mult=args.mlp_mult, attn_window=args.attn_window,
         rope_base=args.rope_base, bit_chain_n_heads=args.bit_chain_n_heads, bit_chain_gamma=args.bit_chain_gamma,
-        bit_chain_fixed_kernel=args.bit_chain_fixed_kernel, code_ntp_weight=args.code_ntp_weight,
+        bit_chain_fixed_kernel=args.bit_chain_fixed_kernel, bit_head_class=args.bit_head_class,
+        bit_conv_kernel_size=args.bit_conv_kernel_size, bit_ssm_d_state=args.bit_ssm_d_state,
+        code_ntp_weight=args.code_ntp_weight,
         quant_type=args.quant_type, byte_repr=args.byte_repr, code_head_mode=args.code_head_mode,
         tok_d_model=args.tok_d_model, tok_n_heads=args.tok_n_heads,
         tok_mlp_mult=args.tok_mlp_mult, tok_head_mode=args.tok_head_mode, tok_weight=args.tok_weight,
+        cross_attn_rope=args.cross_attn_rope, decoder_own_trunk=args.decoder_own_trunk,
+        decoder_kv_pass_through=args.decoder_kv_pass_through, decoder_q_pass_through=args.decoder_q_pass_through,
         layer_warmup_steps=args.layer_warmup_steps,
     )
     model = RefineLM(cfg).to(device)

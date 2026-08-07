@@ -3023,3 +3023,53 @@ Currently training at **~1.1it/s**, matching `bytelm_xs_mtp4_ctx1024`'s
 own rate almost exactly — a good sign for a fair head-to-head comparison,
 now that the architecture's actual per-step cost (not an MPS artifact) is
 what's being measured.
+
+## `qcute/qcute_refine.py` / `qcute/qcute_refine_v2.py` — new fork lineage (this session)
+
+A second, independent fork lineage alongside `qcutelm_vlt*`/`qcutelm_pyramid*`
+(self-contained-module convention, same as the rest of this project — full
+per-version design rationale lives in each file's own module docstring, not
+duplicated here; this entry is a pointer + one cross-cutting finding, not a
+full recap). `qcute_refine.py` ("v1" of this lineage): pure recursive NTP
+tower with BSQ code hand-off between levels, plus a block-local joint-chain-
+MTP detokenizer. `qcute_refine_v2.py`: detokenizer redesigned into a
+`DecoderLevel` that cross-attends between adjacent levels' own
+`EncoderLevel` hidden states (reused, not recomputed) instead of running a
+block-local self-attention pass; grew a number of session-driven flags
+(`byte_repr`, `code_head_mode`, `bit_head_class` with `BitPredictHeadAttn`/
+`Conv`/`SSM` variants, `cross_attn_rope`, `decoder_own_trunk`,
+`decoder_kv_pass_through`/`decoder_q_pass_through`, `layer_warmup_steps`)
+plus a real MPS-specific bug fix (`nn.MultiheadAttention`'s backward
+produced NaN gradients at `d_model=256`, resolved by switching to manual
+`F.scaled_dot_product_attention` throughout, matching every other attention
+op in the file). Configs live under `configs/qcute_refine_v2_*` and
+`configs/v1_*`.
+
+**Baseline step-budget finding, applies project-wide, not just to this
+fork**: checked `bytelm_xs_mtp4_ctx1024`'s and `bpelm_32768`'s own full
+8000-step val_bpb curves (excluding each log's earlier stale/restarted
+segment). Neither one benefits from the full 8000-step budget —
+`bytelm_xs_mtp4_ctx1024` bottoms out at **step 1700 (val_bpb 2.365)** then
+overfits almost monotonically to 4.43 by step 8000, no flat region at all;
+`bpelm_32768` bottoms out at **step 500 (val_bpb 2.134)**, overfits sharply
+through ~step 3000-4000, then genuinely plateaus (noisy, no further trend)
+through 8000. Since both baselines are already fully into their
+overfit/plateaued state by step 4000, comparison runs gain no signal from
+the second half of an 8000-step budget — **new `qcute_refine_v2` ablation
+configs default to `steps=4000`** going forward (already applied to every
+queued-not-yet-launched config as of this session: `v1_rope`,
+`v1_decoder_trunk`, `v1_pass_through`, `qcute_refine_v2_byte4_code256_identity`,
+`qcute_refine_v2_3level_curriculum`). Also worth adopting project-wide:
+report **best-checkpoint val_bpb** (`checkpoints/<run>/best.pt`, already
+tracked by `Checkpointer`), not final-step val_bpb, as the headline
+comparison number — final-step numbers on these small-corpus runs mostly
+measure how overfit a run got, not how good its best state was.
+
+Documentation note: `CLAUDE.md`'s own Commands section previously pointed
+its `bytelm` example at `configs/bytelm_xs_mtp4.py` (`context=256`) —
+updated to `configs/bytelm_xs_mtp4_ctx1024.py`, the actual standard
+baseline as of this session (`context=1024`, matching `qcute_refine`'s own
+`context_len`). The old `context=256` config is kept (historical
+reproducibility, and it's what several earlier comparison tables in this
+file itself already reference) but is no longer the comparison target for
+new work.
