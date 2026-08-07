@@ -161,6 +161,17 @@ class Config:
     quant_type: str = "bsq"       # "bsq" (default) or "identity" (ceiling-baseline diagnostic, training-
                                     # only, sound only alongside code_ntp_weight=tok_weight=0.0) — see
                                     # qcute_refine.py's Config docstring for the full rationale, unchanged.
+    byte_repr: str = "bits"       # LEVEL 0 ONLY. "bits" (default/original): byte_to_bits 8-dim
+                                    # projection + BitPredictHead chain NTP head (both EncoderLevel_0 and
+                                    # DecoderLevel_0). "embed": traditional nn.Embedding(vocab, D) lookup
+                                    # + plain nn.Linear(D, vocab) NTP head, 256-way cross-entropy — exactly
+                                    # bytelm.py's own convention. Both real, kept options — see
+                                    # EncoderLevel's own docstring.
+    code_head_mode: str = "chain"  # LEVELS>0 ONLY (encoder side). "chain" (default/original):
+                                    # BitPredictHead, exact chain-rule cross-bit conditioning.
+                                    # "independent": single plain nn.Linear(D, in_dq), independent
+                                    # per-bit logits, no BitPredictHead — every earlier BSQ fork's own
+                                    # default before the Fetch-style chain head was introduced.
     # --- DecoderLevel (cross-attention decoder) ---
     tok_d_model: int = 96          # shared cross-attention working width — h^(i)/h^(i+1) (which may have
                                     # different tier_d_models[i]/[i+1]) are each linearly projected into
@@ -457,38 +468,83 @@ def chain_bce_loss(raw_logits: torch.Tensor, true_bits: torch.Tensor) -> torch.T
 
 
 class EncoderLevel(nn.Module):
-    """Unchanged from qcute_refine.py, except forward() now genuinely uses
-    its own returned h (previously discarded by every caller) — one level
-    of the recursive NTP tower: embeds its own input sequence, runs a
-    small causal transformer, always-on direct NTP loss on its own next
-    input element (own head, own target), and every K-th position BSQ-
-    quantizes into this level's own emitted code."""
+    """One level of the recursive NTP tower: embeds its own input
+    sequence, runs a small causal transformer, always-on direct NTP loss
+    on its own next input element (own head, own target), and every K-th
+    position BSQ-quantizes into this level's own emitted code.
+
+    Two independent flags, both kept as real options (not one replacing
+    the other — "do not remove that, put as flag"):
+
+    Config.byte_repr (level 0 only): "bits" (original/default) — the
+    byte_to_bits 8-dim projection + BitPredictHead chain NTP head, same
+    as qcute_refine.py. "embed": TRADITIONAL representation instead — a
+    real nn.Embedding(vocab, D) lookup table and a plain nn.Linear(D,
+    vocab) NTP head, trained with ordinary 256-way cross-entropy, exactly
+    bytelm.py's own convention (session: "byte level use traditional
+    embedding table and 256-way softmax").
+
+    Config.code_head_mode (level>0 only): "chain" (original/default) —
+    BitPredictHead, exact chain-rule cross-bit conditioning. "independent"
+    — a single plain nn.Linear(D, in_dq), INDEPENDENT per-bit logits, no
+    BitPredictHead at all (session: "code level use independent linear
+    heads like original bsq" — every earlier BSQ fork's own default
+    before the Fetch-style chain head was introduced). Both still use the
+    same per-bit BCE loss (`chain_bce_loss` — the name is legacy; the
+    function itself is just "sum BCE over the bit dim, mean over the
+    rest," agnostic to whether the logits came from a chained or
+    independent head)."""
 
     def __init__(self, cfg: Config, level: int, in_dq: int, window: int | None):
         super().__init__()
         self.level = level
         self.in_dq = in_dq
         self.cfg = cfg
+        self.is_byte_level = level == 0
         D = cfg.tier_d_models[level]
-        self.embed = nn.Linear(in_dq, D)
+        if self.is_byte_level:
+            assert cfg.byte_repr in ("bits", "embed")
+            if cfg.byte_repr == "embed":
+                self.byte_embed = nn.Embedding(cfg.vocab, D)
+                self.ntp_head = nn.Linear(D, cfg.vocab)
+            else:
+                self.embed = nn.Linear(in_dq, D)
+                self.ntp_head = BitPredictHead(D, in_dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel)
+        else:
+            assert cfg.code_head_mode in ("chain", "independent")
+            self.embed = nn.Linear(in_dq, D)
+            if cfg.code_head_mode == "independent":
+                self.ntp_head = nn.Linear(D, in_dq)
+            else:
+                self.ntp_head = BitPredictHead(D, in_dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel)
         self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult, window) for _ in range(cfg.tier_n_layers[level])])
         self.ln_f = nn.LayerNorm(D)
-        self.ntp_head = BitPredictHead(D, in_dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel)
         self.code_pre = nn.Linear(D, cfg.dqs[level])
 
     def forward(self, seq_repr: torch.Tensor, compute_ntp: bool = True) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """seq_repr: [B, L, in_dq]. compute_ntp=False SKIPS the ntp_head
-        call entirely (real speed lever — level 0 must never pass False).
-        Returns (c_i [B, n_blocks, dqs[level]], ntp_loss, ntp_acc,
-        h [B, L, D] — now a first-class output, consumed by this level's
-        and the next level's DecoderLevel)."""
+        """seq_repr: level 0 gets raw byte ids [B, L] (long) regardless of
+        byte_repr — this class converts internally via byte_to_bits when
+        byte_repr=="bits", so RefineLM.forward stays mode-agnostic. level
+        i>0 gets its own continuous code [B, L, in_dq] (float).
+        compute_ntp=False SKIPS the ntp_head call entirely (real speed
+        lever — level 0 must never pass False). Returns (c_i [B,
+        n_blocks, dqs[level]], ntp_loss, ntp_acc, h [B, L, D])."""
         cfg = self.cfg
         K = cfg.Ks[self.level]
-        B, L, _ = seq_repr.shape
         D = cfg.tier_d_models[self.level]
+
+        if self.is_byte_level and cfg.byte_repr == "embed":
+            x = self.byte_embed(seq_repr)
+            B, L = seq_repr.shape
+        elif self.is_byte_level:
+            bits = byte_to_bits(seq_repr)
+            x = self.embed(bits)
+            B, L, _ = bits.shape
+        else:
+            x = self.embed(seq_repr)
+            B, L, _ = seq_repr.shape
         n_blocks = L // K
 
-        x = self.embed(seq_repr)
         head_dim = D // cfg.n_heads
         cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
         for block in self.blocks:
@@ -497,11 +553,24 @@ class EncoderLevel(nn.Module):
 
         if compute_ntp:
             h_flat = h[:, :-1, :].reshape(-1, D)
-            true_flat = seq_repr[:, 1:, :].reshape(-1, self.in_dq)
-            raw = self.ntp_head(h_flat, true_flat)
-            ntp_loss = chain_bce_loss(raw, true_flat)
-            with torch.no_grad():
-                ntp_acc = ((raw > 0) == (true_flat > 0)).float().mean()
+            if self.is_byte_level and cfg.byte_repr == "embed":
+                target = seq_repr[:, 1:].reshape(-1)
+                logits = self.ntp_head(h_flat)
+                ntp_loss = F.cross_entropy(logits, target)
+                with torch.no_grad():
+                    ntp_acc = (logits.argmax(-1) == target).float().mean()
+            elif self.is_byte_level:
+                true_flat = byte_to_bits(seq_repr[:, 1:]).reshape(-1, self.in_dq)
+                raw = self.ntp_head(h_flat, true_flat)
+                ntp_loss = chain_bce_loss(raw, true_flat)
+                with torch.no_grad():
+                    ntp_acc = ((raw > 0) == (true_flat > 0)).float().mean()
+            else:
+                true_flat = seq_repr[:, 1:, :].reshape(-1, self.in_dq)
+                raw = self.ntp_head(h_flat, true_flat) if cfg.code_head_mode == "chain" else self.ntp_head(h_flat)
+                ntp_loss = chain_bce_loss(raw, true_flat)
+                with torch.no_grad():
+                    ntp_acc = ((raw > 0) == (true_flat > 0)).float().mean()
         else:
             ntp_loss = h.new_zeros(())
             ntp_acc = h.new_zeros(())
@@ -532,13 +601,19 @@ class DecoderLevel(nn.Module):
         self.in_dq = in_dq
         self.K = cfg.Ks[level]
         self.cfg = cfg
+        # only level 0 with byte_repr=="embed" gets the special vocab-softmax path; level 0 with
+        # byte_repr=="bits" behaves exactly like any other level (in_dq=8, tok_head_mode picks the head) —
+        # matches EncoderLevel's own byte_repr flag, "do not remove that, put as flag"
+        self.use_byte_softmax = level == 0 and cfg.byte_repr == "embed"
         D = cfg.tok_d_model
         self.q_proj = nn.Linear(cfg.tier_d_models[level], D)
         self.kv_proj = nn.Linear(cfg.tier_d_models[level + 1], D)
         self.null_kv = nn.Parameter(torch.zeros(1, 1, D))
         nn.init.normal_(self.null_kv, std=0.02)
         self.cross_block = CrossBlock(D, cfg.tok_n_heads, cfg.tok_mlp_mult)
-        if cfg.tok_head_mode == "linear":
+        if self.use_byte_softmax:
+            self.head = nn.Linear(D, cfg.vocab)
+        elif cfg.tok_head_mode == "linear":
             self.head = nn.Linear(D, in_dq)
         elif cfg.tok_head_mode == "chain":
             self.head = BitPredictHead(D, in_dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel)
@@ -549,9 +624,10 @@ class DecoderLevel(nn.Module):
         """h_prev: [B, L, tier_d_models[level]] EncoderLevel[level]'s own
         hidden states (caller must have already .detach()'d this).
         h_curr: [B, n_blocks, tier_d_models[level+1]] EncoderLevel[level+1]'s
-        own hidden states (also pre-detached by caller). seq_repr:
-        [B, L, in_dq] level `level`'s own true input (decode target).
-        Returns (loss, acc)."""
+        own hidden states (also pre-detached by caller). seq_repr: level
+        `level`'s own true input (decode target) — raw byte ids [B, L]
+        (long) at level 0, else its own continuous code [B, L, in_dq]
+        (float). Returns (loss, acc)."""
         cfg = self.cfg
         K = self.K
         B, L, _ = h_prev.shape
@@ -575,14 +651,22 @@ class DecoderLevel(nn.Module):
         h_dec = self.cross_block(q, kv, attn_mask=disallow)                   # [B, L, D]
 
         h_flat = h_dec[:, :-1, :].reshape(-1, D)
-        true_flat = seq_repr[:, 1:, :].reshape(-1, self.in_dq)
-        if cfg.tok_head_mode == "chain":
-            raw = self.head(h_flat, true_flat)
+        if self.use_byte_softmax:
+            target = seq_repr[:, 1:].reshape(-1)
+            logits = self.head(h_flat)
+            loss = F.cross_entropy(logits, target)
+            with torch.no_grad():
+                acc = (logits.argmax(-1) == target).float().mean()
         else:
-            raw = self.head(h_flat)
-        loss = chain_bce_loss(raw, true_flat)
-        with torch.no_grad():
-            acc = ((raw > 0) == (true_flat > 0)).float().mean()
+            true_seq = byte_to_bits(seq_repr) if self.level == 0 else seq_repr   # level 0 + byte_repr=="bits"
+            true_flat = true_seq[:, 1:, :].reshape(-1, self.in_dq)
+            if cfg.tok_head_mode == "chain":
+                raw = self.head(h_flat, true_flat)
+            else:
+                raw = self.head(h_flat)
+            loss = chain_bce_loss(raw, true_flat)
+            with torch.no_grad():
+                acc = ((raw > 0) == (true_flat > 0)).float().mean()
         return loss, acc
 
 
@@ -658,7 +742,8 @@ class RefineLM(nn.Module):
     def forward(self, byte_ids: torch.Tensor, step: int | None = None) -> tuple[torch.Tensor, dict]:
         cfg = self.cfg
         n_active = self.n_active_levels(step)
-        seq_repr = byte_to_bits(byte_ids)
+        seq_repr = byte_ids   # level 0's own input is now raw byte ids (long) — traditional embedding
+                                # table, not the bit-vector projection
         ntp_losses, ntp_accs = [], []
         h_list, x_list = [], []
         byte_loss = byte_acc = None
@@ -703,7 +788,10 @@ class RefineLM(nn.Module):
 
 
 def _sample_next_byte(model: "RefineLM", h_last: torch.Tensor) -> torch.Tensor:
-    logits = model.encoders[0].ntp_head(h_last, true_bits=None)
+    if model.cfg.byte_repr == "embed":
+        logits = model.encoders[0].ntp_head(h_last)   # plain 256-way Linear — greedy argmax
+        return logits.argmax(-1)
+    logits = model.encoders[0].ntp_head(h_last, true_bits=None)   # chain mode greedy-decodes internally
     return bits_to_byte(logits)
 
 
@@ -725,7 +813,7 @@ def generate_no_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
 
     for _ in range(n_new_bytes):
         L = all_bytes.size(1)
-        x = enc0.embed(byte_to_bits(all_bytes))
+        x = enc0.byte_embed(all_bytes) if cfg.byte_repr == "embed" else enc0.embed(byte_to_bits(all_bytes))
         head_dim = D // cfg.n_heads
         cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
         for block in enc0.blocks:
@@ -760,7 +848,7 @@ def generate_kv_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
     cache_v: list[torch.Tensor | None] = [None] * n_layers
 
     def step(byte_id: torch.Tensor, pos: int) -> torch.Tensor:
-        x = enc0.embed(byte_to_bits(byte_id)).unsqueeze(1)
+        x = (enc0.byte_embed(byte_id) if cfg.byte_repr == "embed" else enc0.embed(byte_to_bits(byte_id))).unsqueeze(1)
         head_dim = D // cfg.n_heads
         cos_new, sin_new = rope_cos_sin_at(pos, head_dim, cfg.rope_base, device)
         for li, block in enumerate(enc0.blocks):
@@ -949,6 +1037,8 @@ def main():
     p.add_argument("--bit_chain_fixed_kernel", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--code_ntp_weight", type=float, default=1.0)
     p.add_argument("--quant_type", type=str, default="bsq", choices=["bsq", "identity"])
+    p.add_argument("--byte_repr", type=str, default="bits", choices=["bits", "embed"])
+    p.add_argument("--code_head_mode", type=str, default="chain", choices=["chain", "independent"])
     p.add_argument("--tok_d_model", type=int, default=96)
     p.add_argument("--tok_n_heads", type=int, default=4)
     p.add_argument("--tok_mlp_mult", type=int, default=4)
@@ -993,7 +1083,8 @@ def main():
         context_len=args.context_len, n_heads=args.n_heads, mlp_mult=args.mlp_mult, attn_window=args.attn_window,
         rope_base=args.rope_base, bit_chain_n_heads=args.bit_chain_n_heads, bit_chain_gamma=args.bit_chain_gamma,
         bit_chain_fixed_kernel=args.bit_chain_fixed_kernel, code_ntp_weight=args.code_ntp_weight,
-        quant_type=args.quant_type, tok_d_model=args.tok_d_model, tok_n_heads=args.tok_n_heads,
+        quant_type=args.quant_type, byte_repr=args.byte_repr, code_head_mode=args.code_head_mode,
+        tok_d_model=args.tok_d_model, tok_n_heads=args.tok_n_heads,
         tok_mlp_mult=args.tok_mlp_mult, tok_head_mode=args.tok_head_mode, tok_weight=args.tok_weight,
         layer_warmup_steps=args.layer_warmup_steps,
     )
