@@ -208,7 +208,7 @@ proxies: just re-evaluate the SAME trained checkpoint under different
 ablations and read `val_bpb` off directly.
 `scripts/probe_v4_fusion_contribution.py` (new this session — the old
 `probe_decoder_kv_contribution.py` targets `DecoderLevel`, which v4
-doesn't have) does exactly this, three ways, same weights throughout:
+doesn't have) does exactly this, four ways, same weights throughout:
 
 1. **normal** — fusion as trained.
 2. **null_only** — PASS 2 still runs (same `fuse_cross` module, same
@@ -216,30 +216,42 @@ doesn't have) does exactly this, three ways, same weights throughout:
    whether the model needs REAL coarser-level content, or whether just
    having a KV tensor (any tensor) to cross-attend to is most of the
    benefit.
-3. **no_fusion** — `fuse_encoder_levels=False`, full ablation, matching
+3. **big_noise** — `fuse_kv` = real content + large-magnitude (10x its
+   own std) i.i.d. Gaussian noise — a STRONGER control than null_only:
+   zeros are a degenerate, structured input a model could plausibly
+   handle specially; large additive noise keeps real variance/structure
+   partially present but swamps the actual signal, separating "needs a
+   varying signal to attend to" from "needs the SPECIFIC content."
+4. **no_fusion** — `fuse_encoder_levels=False`, full ablation, matching
    v2's own `byte_loss` computation (PASS 1 only).
 
 Run against `qcute_refine_v4_k32_narrow`'s `best.pt` (20 val batches):
 
 | mode | val_bpb | Δ from normal |
 |---|---|---|
-| normal | 2.5271 | — |
-| null_only | 2.7720 | +0.2449 |
-| no_fusion | 4.9554 | +2.4283 |
+| normal | 2.5528 | — |
+| null_only | 2.7582 | +0.2053 |
+| big_noise | 2.8437 | +0.2909 |
+| no_fusion | 4.9759 | +2.4230 |
 
-**Reading**: removing fusion ENTIRELY is catastrophic (+2.43 bpb, near
+**Reading**: removing fusion ENTIRELY is catastrophic (+2.42 bpb, near
 the ~8-bit-per-byte random-guessing ceiling) — expected for this specific
 config, since `attn_window=(32,32)` means level 0's own self-attention
 window exactly equals one code block (`K=32`); without fusion, level 0
 has essentially NO access to anything beyond its current 32-byte chunk.
-But the decomposition is the real finding: **null_only recovers 2.18 of
-that 2.43 bpb (≈90%) with ZERO real coarser-level content** — the
+But the decomposition is the real finding: **both controls recover the
+vast majority of that 2.42 bpb with NO real coarser-level content** —
+null_only recovers 2.22 (≈92%), big_noise recovers 2.13 (≈88%) — the
 `fuse_cross` module's own weights (extra cross-attention QKV/MLP
-parameters, plus the always-real, never-zeroed learned `null_kv` slot)
-apparently function as genuine extra capacity/depth for level 0's own
-forward pass, largely independent of what they're attending to. Only the
-remaining ≈10% (0.245 bpb, normal vs. null_only) is attributable to the
-coarser level's ACTUAL content.
+parameters, plus the always-real, never-corrupted learned `null_kv`
+slot) apparently function as genuine extra capacity/depth for level 0's
+own forward pass, largely independent of what they're attending to. Only
+≈8-12% (0.21-0.29 bpb) is attributable to the coarser level's ACTUAL
+content. Consistency check: big_noise scores worse than null_only
+(2.8437 vs. 2.7582) — active noise actively disrupts the computation,
+worse than a clean, predictable zero input the model can partially learn
+to route around — the two controls agree with each other, not just
+individually with the headline finding.
 
 This adds real nuance to `qcute_refine_v3_rope`'s "direct forward-value
 conditioning beats everything" reading from §6 above: for THIS

@@ -9,7 +9,7 @@ trained checkpoint under three conditions and compare val_bpb/acc
 directly — no gradient-norm proxies or attention-mass workarounds needed,
 since fusion's effect on the metric that matters is now measurable head-on.
 
-Three conditions, same weights throughout:
+Four conditions, same weights throughout:
   1. normal    — fuse_encoder_levels=True, as trained (real PASS 2).
   2. no_fusion — fuse_encoder_levels=False (PASS 1 only, matching v2's
                  own byte_loss computation) — the full ablation.
@@ -21,6 +21,18 @@ Three conditions, same weights throughout:
                  the benefit (a null/zero KV still lets Q attend to the
                  null_kv slot and to a degenerate "all zeros" set of real
                  rows, so this isolates content from structure).
+  4. big_noise — PASS 2 runs with fuse_kv = REAL content + large-magnitude
+                 i.i.d. Gaussian noise (10x h's own std) — simplest possible
+                 corruption, no separate noise tensor/shape bookkeeping,
+                 just drown out the real signal in-place. A STRONGER
+                 control than null_only: zeros are a degenerate, structured
+                 input a model could plausibly handle specially (e.g. via
+                 LayerNorm/bias terms); large additive noise keeps real
+                 variance/structure partially present but swamps the
+                 actual coarser-level signal — isolates "needs a varying
+                 signal to attend to" from "needs the SPECIFIC coarser-
+                 level content," a distinction null_only alone can't
+                 fully separate.
 
 Usage:
     uv run python scripts/probe_v4_fusion_contribution.py \\
@@ -57,6 +69,8 @@ def encode_with_ablation(model: RefineLM, byte_ids: torch.Tensor, n_active: int,
             fuse_kv = h_list[i + 1].detach()
             if mode == "null_only":
                 fuse_kv = torch.zeros_like(fuse_kv)
+            elif mode == "big_noise":
+                fuse_kv = fuse_kv + 10.0 * fuse_kv.std() * torch.randn_like(fuse_kv)
             c_i2, ntp_loss2, ntp_acc2, h_i2 = model.encoders[i](
                 x_list[i], compute_ntp=True, fuse_kv=fuse_kv
             )
@@ -98,15 +112,17 @@ def main():
     train_data, val_data = split_train_val(data, args.val_frac)
 
     results = {}
-    for mode in ["normal", "null_only", "no_fusion"]:
+    for mode in ["normal", "null_only", "big_noise", "no_fusion"]:
         loss, acc = eval_mode(model, val_data, args.batch_size, args.n_batches, cfg.context_len, mode, args.device)
         results[mode] = (loss, acc, loss / math.log(2))
-        print(f"{mode:10s}  val_byte_loss={loss:.4f}  val_byte_acc={acc:.4f}  val_bpb={loss/math.log(2):.4f}")
+        print(f"{mode:12s}  val_byte_loss={loss:.4f}  val_byte_acc={acc:.4f}  val_bpb={loss/math.log(2):.4f}")
 
     print()
-    print(f"delta_bpb (normal - null_only)  = {results['normal'][2] - results['null_only'][2]:+.4f}  (content vs. structure-only)")
-    print(f"delta_bpb (normal - no_fusion)  = {results['normal'][2] - results['no_fusion'][2]:+.4f}  (fusion's total contribution)")
+    print(f"delta_bpb (normal - null_only)    = {results['normal'][2] - results['null_only'][2]:+.4f}  (content vs. structure-only)")
+    print(f"delta_bpb (normal - big_noise)    = {results['normal'][2] - results['big_noise'][2]:+.4f}  (content vs. drowned-out-content)")
+    print(f"delta_bpb (normal - no_fusion)    = {results['normal'][2] - results['no_fusion'][2]:+.4f}  (fusion's total contribution)")
     print(f"delta_bpb (null_only - no_fusion) = {results['null_only'][2] - results['no_fusion'][2]:+.4f}  (structure-only vs. nothing)")
+    print(f"delta_bpb (big_noise - no_fusion) = {results['big_noise'][2] - results['no_fusion'][2]:+.4f}  (noisy-structure vs. nothing)")
 
 
 if __name__ == "__main__":

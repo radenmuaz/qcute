@@ -367,7 +367,19 @@ consistent with this session's broader finding that no `qcute_refine`
 variant has yet beaten a properly compute-matched dense bytelm. The
 real, distinct value of this run was methodological: it's the config
 that exposed the FLOPs-vs-memory divergence above, independent of how
-its own val_bpb landed.
+its own val_bpb landed. **Fusion-contribution probe** (new script,
+`scripts/probe_v4_fusion_contribution.py` — see
+[docs/kv_contribution.md](kv_contribution.md) §7 for the full writeup):
+removing fusion entirely costs +2.42 bpb (catastrophic, since
+`attn_window=32` exactly equals `K=32` here — level 0 has zero local
+context beyond one block without it), but ≈88-92% of that recovery comes
+from just having the `fuse_cross` module's own extra capacity/parameters
+present — confirmed by TWO independent controls (content zeroed out,
+`null_only`; content drowned in 10x-magnitude noise, `big_noise`, which
+scores even worse than zeros — consistent with each other) — only
+≈8-12% is attributable to the coarser level's actual content. Real
+nuance on "direct forward-value conditioning is the strongest lever" — at least
+for this narrow-window config, most of it was capacity, not information.
 
 `bytelm_xs3_ctx1024` (2.625M) lands almost exactly on top of most
 2-level `qcute_refine_v2` configs (2.6-2.7M) — a much closer param match
