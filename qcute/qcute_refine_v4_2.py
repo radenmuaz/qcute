@@ -1,4 +1,85 @@
-"""qcute.qcute_refine_v4 — CLONE of qcute_refine_v3.py, MINUS DecoderLevel
+"""qcute.qcute_refine_v4_2 — CLONE of qcute_refine_v4_1.py, further
+UNIFIED (see the v4.1 section below for what carries over unchanged) PLUS
+CONCAT-ONLY FUSION (session ask: "make v4.2 use by default only concat
+mode, remove any cross attn stuff"). `Config.fuse_position` and the
+separate `CrossBlock` cross-attention module it used to select between
+("pre"/"post"/"both") are GONE from this file entirely — v4.2 fuses via
+"concat" ONLY (see v4's own Config.fuse_position docstring, preserved
+below, for what "concat" originally meant as one option among several):
+the level-above's hidden state (projected via `fuse_kv_proj`, null-
+prepended if `fuse_use_null_kv`) is appended to the tail of every
+self.blocks layer's own K/V, one joint attention call per layer, no
+separate cross-attention weights at all. Unconditional whenever
+`fuse_encoder_levels=True` — no flag, matching this whole file's own
+"no flag, run that scheme by default" convention (v4.1's `share_levellm`/
+`share_code_head` before it). Generalizes to any level count unchanged
+(verified this session via 3-level `validate_generation`) — every
+non-top level fuses from the level above it, and `generate_kv_cache`
+only ever needs a fused cache for level 0 (the only level ever sampled
+from), regardless of `n_levels`.
+
+Also (session ask, same message): `dq` is a single shared scalar
+(minimum 8) and the embed/ntp_head/code_pre are the exact same objects
+across EVERY level, byte level included — no separate byte_embed/256-way
+softmax path. Independent-per-bit BCE head, not exact chain-rule
+factorization — see the `dq`/loss-cropping notes further down for the
+real "this is an upper bound, not exact cross-entropy" caveat this
+implies for `val_bpb`.
+
+---
+
+qcute.qcute_refine_v4_1 — CLONE of qcute_refine_v4.py, PLUS EXTREME
+WEIGHT SHARING (session ask: "clone v4 to v4.1 for extreme weight
+sharing, only one levellm (can adjust num layer and dim) but shared
+across byte and code levels"). New `Config.share_levellm` (default True):
+every level's `LevelLM.self.blocks`/`ln_f`/fusion modules
+(`fuse_kv_proj`/`fuse_null_kv`/fusion cross-attention, later REMOVED by
+v4.2 above) are the SAME nn.Module objects as level 0's own — genuinely
+tied weights (same Parameters, gradients from every level accumulate
+into them), not separate same-shaped copies. Requires uniform
+`tier_d_models`/`tier_n_layers` across every level (a shared trunk can't
+have a different width/depth per level).
+
+"even though shared, the k and attn window for each level can be
+different" (session ask) — `Ks`/`attn_window` STAY genuinely per-level.
+This required one real mechanical change from v4: `window` moved from a
+CausalSelfAttention CONSTRUCTOR argument (baked into the module, one
+value forever) to a FORWARD-time argument (`CausalSelfAttention.forward`/
+`Block.forward` now both take `window` as a parameter) — the only way a
+single shared module can still serve levels with different windows.
+
+"this single levellm generates for itself its own bsq code for level 1
+and above and ntp them, and in decoding phase reuse them" — unchanged
+from v4's own PASS 1/PASS 2 structure (`RefineLM._encode`): the shared
+trunk still runs once per level (its own forward pass, own NTP loss/code
+emission), fusion still cross-attends level i to level i+1's own hidden
+state — only the WEIGHTS doing this work are now shared, not the
+computational structure itself.
+
+"for first impl the levellm has both byte head and byte embed table and
+bsq head and bsq linear map, though bsq head and bsq linear map can be
+different each level by default, can be set weight sharing for ablation"
+— `Config.share_code_head` (default False, independent of
+`share_levellm`): ties every CODE level's (1..n_levels-1) own `embed`
+(CodeEmbed)/`ntp_head`/`code_pre` ("bsq linear map," the D->dq
+pre-quantization projection) to level 1's own. Off by default — each code
+level keeps its own BSQ head/embed even though the big trunk is shared.
+Byte level 0's own `byte_embed`/`ntp_head` are never affected (there's
+only one byte-typed level; "sharing" it is meaningless).
+
+First-impl scope (session: "for first impl"): `share_levellm=True`
+requires `byte_repr="embed"` and `code_head_mode="independent"` (asserted
+in `LevelLM.__init__`) — `BitPredictHead`'s chain-mode heads aren't wired
+into the shared-trunk path yet, a follow-up not this session's scope.
+
+Everything below (until noted) is v4's own original module docstring,
+unchanged — v4.1 does not alter PASS 1/PASS 2, fusion, generation, or any
+of v4's own session history; it only adds the sharing mechanism above on
+top.
+
+---
+
+qcute.qcute_refine_v4 — CLONE of qcute_refine_v3.py, MINUS DecoderLevel
 entirely. v3 added LevelLM fusion (Config.fuse_encoder_levels,
 default True — see below) on top of v2's original DecoderLevel/tok_loss
 cross-attention path; v4 removes DecoderLevel altogether, since fusion and
@@ -202,10 +283,37 @@ class Checkpointer:
 
 @dataclass
 class Config:
+    """v4.2 — CLONE of qcute_refine_v4_1.py, trimmed and made UNCONDITIONAL (session: "make that
+    4.2 and no flag, run that scheme by default"). v4.1's `share_levellm`/`share_code_head` flags
+    are GONE — v4.2 always shares everything: one trunk (self.blocks/ln_f/fuse_*) AND one head/
+    embed/code_pre, across EVERY level INCLUDING level 0 (v4.1 kept byte level 0 structurally
+    separate — its own byte_embed/256-way softmax ntp_head; v4.1's share_code_head only ever tied
+    the CODE levels to each other). Session ask: "define a single bsq dq, and share head across
+    all levels including byte". Consequences, both real simplifications:
+
+    - `dqs`/`tier_d_models`/`tier_n_layers` (per-level tuples) collapse to single `dq`/`d_model`/
+      `n_layers` values — there is only ONE shared width/depth/code-dimension now, a tuple never
+      made sense once every level is forced uniform anyway ("trim other things").
+    - `byte_repr`/`code_head_mode` are GONE — level 0 no longer gets a special nn.Embedding(vocab,
+      D)+256-way-softmax path; EVERY level (byte included) uses the exact same `CodeEmbed(dq, D)`
+      embed + `nn.Linear(D, dq)` ntp_head, trained with the same per-bit BCE loss
+      (`chain_bce_loss`) code levels already used. Byte level's own dq-bit representation is
+      produced by `byte_to_dqbits`/decoded by `dqbits_to_byte` (see their own docstrings) — dq
+      minimum 8 (session: "dq minimum 8") since a byte needs 8 bits to be representable at all;
+      `dq > 8` is allowed (more shared capacity for code levels) but byte SAMPLING only ever reads
+      the first 8 bits back out — "for sampling bytes, just crop byte 9 and more, let bits valued
+      0-255 reserved for raw bytes." At `dq==8` (the default) this is a lossless no-op identical
+      to `byte_to_bits`/`bits_to_byte`; the cropping only matters once `dq>8` is actually used.
+    - BitPredictHead ("chain" head mode) is now unreachable dead code in this file (kept, unused,
+      not deleted this session — removing ~300 lines of otherwise-correct code wasn't worth the
+      edit risk for a "first impl, trim other things" pass) — v4.2 always uses the plain
+      independent-per-bit linear head, matching v4.1's own first-impl scope requirement anyway."""
+
     Ks: tuple[int, ...] = (2, 2, 2)
-    dqs: tuple[int, ...] = (8, 8, 8)
-    tier_d_models: tuple[int, ...] = (96, 96, 96)
-    tier_n_layers: tuple[int, ...] = (1, 1, 1)
+    dq: int = 8   # SINGLE shared BSQ code width, every level (byte included) — must be >= 8 (a
+                    # byte needs 8 bits). See class docstring for the dq>8/cropping behavior.
+    d_model: int = 96    # SINGLE shared width — every level's self.blocks/embed/head operate here.
+    n_layers: int = 1    # SINGLE shared depth — every level's self.blocks has this many layers.
     context_len: int = 1024
     n_heads: int = 4
     mlp_mult: int = 4
@@ -246,6 +354,32 @@ class Config:
                                     # (and, for bit_head_class=="attn", the resulting inner dim must be
                                     # divisible by bit_chain_n_heads too).
     bit_ssm_d_state: int | None = None       # None (default) = d_model. Only used when bit_head_class=="ssm".
+    code_head_mode: str = "independent"   # RE-ENABLED (session: "later re enable flag to use
+                                    # bitpredict heads, default indp now"). "independent" (default,
+                                    # matches v4.2's whole "trim other things" direction): plain
+                                    # nn.Linear(D, dq), independent per-bit logits — no true_bits
+                                    # conditioning needed at all, cheapest. "chain": one of the
+                                    # BitPredictHead* classes (Config.bit_head_class picks Attn/
+                                    # Conv/SSM), exact autoregressive chain-rule factorization over
+                                    # the dq bits, teacher-forced at train time (_forward_fixed) —
+                                    # same shared object across every level (byte included), same as
+                                    # "independent"'s ntp_head. Unlike v4/v4.1, this is now the ONLY
+                                    # place BitPredictHead is reachable in this file.
+    byte_head_256way: bool = False   # ABLATION flag (session: "another hack is make ablation use
+                                    # regular byte 256-way head, put as flag"). False (default):
+                                    # level 0 uses the SAME shared dq-bit embed/head as every code
+                                    # level (v4.2's whole point). True: level 0 gets its OWN,
+                                    # UNSHARED nn.Embedding(vocab, D) + nn.Linear(D, vocab), trained
+                                    # with ordinary 256-way cross-entropy — exactly v4's own
+                                    # byte_repr="embed" mode, matching bytelm.py's convention. This
+                                    # opts level 0 OUT of the head-sharing pool entirely — code
+                                    # levels (1+) then share their OWN dq-bit embed/head among
+                                    # THEMSELVES (owned by level 1, not level 0) instead. self.blocks/
+                                    # ln_f/fuse_* (the TRUNK) stay shared across EVERY level
+                                    # regardless of this flag — only tests whether the exact-softmax/
+                                    # unshared byte head specifically resolves the instability
+                                    # documented in docs/kv_contribution.md §11, isolated from
+                                    # trunk-sharing (which stays on either way).
     code_ntp_weight: float = 1.0  # scales levels>0's own NTP loss (level 0's byte_loss scaled separately,
                                     # see byte_ntp_weight below). ==0.0 SKIPS those levels' ntp_head forward
                                     # entirely (real speed lever — see qcute_refine.py's own session diagnosis).
@@ -289,42 +423,21 @@ class Config:
                                     # separate graphs in v2, sharing only forward values). False: reproduces
                                     # v2's forward exactly (PASS 1 only, no fusion) — a genuine A/B control
                                     # for isolating fusion's own effect, same file/weights-shape otherwise.
-    fuse_position: str = "pre"    # WHERE _fuse's cross-attention sits relative to self.blocks, for every
-                                    # level that fuses. "pre" (default, original v3/v4 behavior): fuse THEN
-                                    # self.blocks — every raw-embedded position gets cross-level context
-                                    # BEFORE positions exchange information with each other via self-
-                                    # attention, so self-attention can then propagate one position's fused
-                                    # context to other positions during mixing. "post": self.blocks THEN
-                                    # fuse — positions first mix purely among themselves (no cross-level
-                                    # info at all yet), and only the FINAL per-position representation gets
-                                    # to look at the coarser code, with no further mixing afterward (a
-                                    # position's fused pickup stays local to it). Both are equally causally
-                                    # sound (self-attention's own mask and fuse's own jagged mask are
-                                    # independent constraints on different axes — neither's correctness
-                                    # depends on which ran first) but compute genuinely different functions,
-                                    # not equivalent ones — a real architectural variant, not a bugfix
-                                    # relationship. Session ask: "add flag ... pre or post cross attn".
-                                    # "both" (NEW): runs BOTH — a separate `fuse_cross_pre` CrossBlock before
-                                    # self.blocks AND a separate `fuse_cross_post` CrossBlock after. Two
-                                    # independent sets of cross-attention weights (real extra params, not a
-                                    # config-only toggle) — session ask: "allow levellm does decoding with
-                                    # pre and post cross attn, add more param". "concat" (NEW): no separate
-                                    # CrossBlock at ALL. Instead, the level-above's hidden state (projected
-                                    # to this level's D via the same `fuse_kv_proj`, null-prepended the same
-                                    # way if `fuse_use_null_kv`) is appended to the TAIL of every
-                                    # self.blocks layer's own K/V, and each layer does ONE joint attention
-                                    # call over [local windowed K/V ; fused tail] instead of two sequential
-                                    # attention operations — see CausalSelfAttention._fuse_kv_proj/
-                                    # LevelLM._prep_concat. Each layer derives its OWN K/V for the fused
-                                    # tail via ITS OWN qkv weights (same weights it uses for local tokens,
-                                    # applied to the fixed projected coarser state) — no new cross-attention
-                                    # parameters at all (cheaper than "pre"/"post"/"both", reuses existing
-                                    # self-attention capacity instead of adding a parallel mechanism).
-                                    # Visibility uses the same jagged_causal_mask_and_positions geometry as
-                                    # CrossBlock's own mask, just merged into self-attention's own mask
-                                    # instead of a separate SDPA call. Session ask: "if user disable both pre
-                                    # and post, a special self attn with concat higher level kv at behind".
-    fuse_use_null_kv: bool = True  # whether _fuse's cross-attention gets a learned "null" KV slot
+    # v4.2 (session: "make v4.2 use by default only concat mode, remove any cross attn stuff"):
+    # `Config.fuse_position` ("pre"/"post"/"both") and the separate `CrossBlock` cross-attention
+    # module it selected between are GONE — v4.2 fuses via "concat" ONLY, unconditionally,
+    # whenever `fuse_encoder_levels=True`. No separate cross-attention weights exist in this file
+    # at all: the level-above's hidden state (projected to this level's D via `fuse_kv_proj`,
+    # null-prepended the same way if `fuse_use_null_kv`) is appended to the TAIL of every
+    # self.blocks layer's own K/V, and each layer does ONE joint attention call over [local
+    # windowed K/V ; fused tail] — see CausalSelfAttention._fuse_kv_proj/LevelLM._prep_concat.
+    # Each layer derives its OWN K/V for the fused tail via ITS OWN qkv weights (same weights it
+    # uses for local tokens) — no new parameters beyond `fuse_kv_proj`/`fuse_null_kv`. Generalizes
+    # to any level count unchanged from v4/v4.1 (every non-top level fuses from the level above it,
+    # `RefineLM._encode`'s own PASS 2 loop; `generate_kv_cache` only ever needs a fused cache for
+    # level 0 specifically — the only level ever sampled from — regardless of `n_levels`, verified
+    # this session via 3-level `validate_generation`).
+    fuse_use_null_kv: bool = True  # whether the concat fusion tail gets a learned "null" KV slot
                                     # (self.fuse_null_kv), always visible, prepended to the real KV rows.
                                     # True (default): matches every fusion config trained so far. Exists
                                     # because CROSS-attention to a coarser, possibly-not-yet-resolved
@@ -365,16 +478,6 @@ class Config:
                                     # metric, unchanged from before) — this weight controls how much
                                     # PASS 2 across ALL fusing levels contributes to the GRADIENT,
                                     # not what gets reported/compared against baselines.
-    byte_repr: str = "bits"       # LEVEL 0 ONLY. "bits" (default/original): byte_to_bits 8-dim
-                                    # projection + BitPredictHead chain NTP head. "embed": traditional
-                                    # nn.Embedding(vocab, D) lookup + plain nn.Linear(D, vocab) NTP head,
-                                    # 256-way cross-entropy — exactly bytelm.py's own convention. Both real,
-                                    # kept options — see LevelLM's own docstring.
-    code_head_mode: str = "chain"  # LEVELS>0 ONLY (encoder side). "chain" (default/original):
-                                    # BitPredictHead, exact chain-rule cross-bit conditioning.
-                                    # "independent": single plain nn.Linear(D, in_dq), independent
-                                    # per-bit logits, no BitPredictHead — every earlier BSQ fork's own
-                                    # default before the Fetch-style chain head was introduced.
     # --- v4: NO DecoderLevel at all (see module docstring) — LevelLM fusion is the only
     # cross-attention mechanism, and it directly conditions the metric that matters (byte_loss),
     # unlike v2/v3's DecoderLevel/tok_loss which never could (detached, separate scalar). Every
@@ -406,6 +509,9 @@ class Config:
                                     # against within a single level. See RefineLM.n_active_levels/
                                     # activation_steps and train()'s per-stage param groups below.
     vocab: int = 256
+
+    def __post_init__(self):
+        assert self.dq >= 8, f"Config.dq must be >= 8 (a byte needs 8 bits to be representable), got {self.dq}"
 
 
 def bsq_quantize(v: torch.Tensor, dq: int) -> torch.Tensor:
@@ -539,8 +645,8 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 
 class CausalSelfAttention(nn.Module):
-    """`fuse_kv`/`fuse_disallow`/`fuse_rope_k` (all default None): ONLY used by LevelLM's "concat"
-    fuse_position (see Config.fuse_position's own docstring) — a fixed, already-D-dim, already
+    """`fuse_kv`/`fuse_disallow`/`fuse_rope_k` (all default None): v4.2's only fusion mechanism
+    (concat, unconditional — see module docstring) — a fixed, already-D-dim, already
     null-prepended [B, Nf, D] coarser-level KV tail, appended to this layer's OWN local K/V so one
     joint SDPA call covers both. Every layer derives its OWN K/V view of the SAME fixed fuse_kv
     tensor via `_fuse_kv_proj` (this layer's own self.qkv weights, not a separate cross-attention
@@ -548,11 +654,10 @@ class CausalSelfAttention(nn.Module):
     positions). `fuse_disallow` [T, Nf] bool (True=blocked, jagged_causal_mask_and_positions'
     convention) gates which fused rows each local query position may see."""
 
-    def __init__(self, d_model: int, n_heads: int, window: int | None = None):
+    def __init__(self, d_model: int, n_heads: int):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        self.window = window
         self._warned_dense_fallback = False
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
@@ -566,19 +671,25 @@ class CausalSelfAttention(nn.Module):
             fk = apply_rope(fk, *fuse_rope_k)
         return fk, fv
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, window: int | None,
                 fuse_kv: torch.Tensor | None = None, fuse_disallow: torch.Tensor | None = None,
                 fuse_rope_k=None) -> torch.Tensor:
+        """v4.1: `window` is now a FORWARD-time argument, not baked into the module at construction
+        — required for extreme weight sharing (Config.share_levellm): the SAME CausalSelfAttention
+        object is called at every level, and levels can have different K/attn_window (session ask:
+        "even though shared, the k and attn window for each level can be different") even though
+        they share every weight. Caller (LevelLM.forward, via RefineLM) passes each level's own
+        window in, matching v4's original per-instance `self.window` value exactly when NOT shared."""
         B, T, D = x.shape
         H, hd = self.n_heads, self.head_dim
         qkv = self.qkv(x).reshape(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        if self.window is not None and T % self.window == 0 and T > self.window:
-            y = self._forward_chunked(q, k, v, fuse_kv, fuse_disallow, fuse_rope_k)
+        if window is not None and T % window == 0 and T > window:
+            y = self._forward_chunked(q, k, v, window, fuse_kv, fuse_disallow, fuse_rope_k)
         else:
-            if self.window is not None and not self._warned_dense_fallback:
-                print(f"WARNING: CausalSelfAttention window={self.window} set but T={T} doesn't satisfy "
+            if window is not None and not self._warned_dense_fallback:
+                print(f"WARNING: CausalSelfAttention window={window} set but T={T} doesn't satisfy "
                       f"T % window == 0 and T > window — falling back to DENSE attention for this layer. "
                       f"Only warns once per layer instance.")
                 self._warned_dense_fallback = True
@@ -593,11 +704,11 @@ class CausalSelfAttention(nn.Module):
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.out(y.transpose(1, 2).reshape(B, T, D))
 
-    def _forward_chunked(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    def _forward_chunked(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int,
                           fuse_kv: torch.Tensor | None = None, fuse_disallow: torch.Tensor | None = None,
                           fuse_rope_k=None) -> torch.Tensor:
         B, H, T, hd = q.shape
-        W = self.window
+        W = window
         n_chunks = T // W
 
         def to_chunks(t):
@@ -670,10 +781,10 @@ class CausalSelfAttention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, mlp_mult: int, window: int | None = None):
+    def __init__(self, d_model: int, n_heads: int, mlp_mult: int):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, window=window)
+        self.attn = CausalSelfAttention(d_model, n_heads)
         self.ln2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, mlp_mult * d_model),
@@ -681,10 +792,10 @@ class Block(nn.Module):
             nn.Linear(mlp_mult * d_model, d_model),
         )
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, window: int | None,
                 fuse_kv: torch.Tensor | None = None, fuse_disallow: torch.Tensor | None = None,
                 fuse_rope_k=None) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), cos, sin, fuse_kv, fuse_disallow, fuse_rope_k)
+        x = x + self.attn(self.ln1(x), cos, sin, window, fuse_kv, fuse_disallow, fuse_rope_k)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -698,76 +809,31 @@ class Block(nn.Module):
         return x_new, new_k, new_v
 
 
-class CrossBlock(nn.Module):
-    """Single cross-attention transformer block: cross-attn sublayer (Q
-    from one sequence, K/V from another) + MLP sublayer, each pre-norm +
-    residual — same shape as this file's own causal `Block`, with
-    self-attention swapped for cross-attention. RoPE is OPTIONAL (on by
-    default via Config.cross_attn_rope — "decoder must be timestep
-    aware"): Q and KV live at different granularities/lengths, so they
-    can't share one contiguous rotary range the way self-attention does,
-    but each side CAN still get its own explicit position tag —
-    DecoderLevel computes and passes those in (rope_q for Q's raw-byte-
-    time positions, rope_k for each KV slot's own raw-byte-time position:
-    the null slot at 0, each real code block at the raw position it
-    becomes fully causally resolved). Without this, the only signal the
-    cross-attention had for "how far back in real time is this code
-    block" was the boolean visibility mask (allowed/blocked, no
-    distance) — RoPE gives it the actual relative distance."""
-
-    def __init__(self, d_model: int, n_heads: int, mlp_mult: int):
-        super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.ln_q = nn.LayerNorm(d_model)
-        self.ln_kv = nn.LayerNorm(d_model)
-        # manual QKV + F.scaled_dot_product_attention instead of nn.MultiheadAttention — see
-        # BitPredictHead's own comment for the MPS NaN-gradient finding this avoids.
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.kv_proj = nn.Linear(d_model, 2 * d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, mlp_mult * d_model),
-            nn.GELU(),
-            nn.Linear(mlp_mult * d_model, d_model),
-        )
-
-    def forward(self, q: torch.Tensor, kv: torch.Tensor, attn_mask: torch.Tensor,
-                rope_q: tuple[torch.Tensor, torch.Tensor] | None = None,
-                rope_k: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
-        """attn_mask: bool [Lq, Lkv], True = BLOCKED (DecoderLevel's own "disallow" convention,
-        matching nn.MultiheadAttention's convention) — inverted internally since
-        F.scaled_dot_product_attention's boolean convention is the opposite (True = may attend).
-        rope_q/rope_k: None (default off path) or (cos, sin) each [T, head_dim] — see class docstring."""
-        qn, kvn = self.ln_q(q), self.ln_kv(kv)
-        B, Lq, D = qn.shape
-        Lkv = kvn.shape[1]
-        H, hd = self.n_heads, self.head_dim
-        qh = self.q_proj(qn).reshape(B, Lq, H, hd).transpose(1, 2)
-        kvp = self.kv_proj(kvn).reshape(B, Lkv, 2, H, hd).permute(2, 0, 3, 1, 4)
-        kh, vh = kvp[0], kvp[1]
-        if rope_q is not None:
-            qh = apply_rope(qh, *rope_q)
-        if rope_k is not None:
-            kh = apply_rope(kh, *rope_k)
-        sdpa_mask = ~attn_mask if attn_mask is not None else None
-        y = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=sdpa_mask)
-        attn_out = self.out_proj(y.transpose(1, 2).reshape(B, Lq, D))
-        q = q + attn_out
-        q = q + self.mlp(self.ln2(q))
-        return q
+def byte_to_dqbits(byte_ids: torch.Tensor, dq: int) -> torch.Tensor:
+    """[*] long byte ids (0..255) -> [*, dq] float, each bit in {-1,+1}/sqrt(dq) — LSB-first,
+    deterministic, no learned parameters. v4.2: byte level shares the exact same dq-dim
+    representation every code level uses (Config.dq, single shared value, minimum 8 — see
+    Config's own docstring). dq==8 (the default): a byte losslessly IS its own 8-bit BSQ-shaped
+    code, identical to v4's own byte_to_bits. dq>8: bits 8..dq-1 are zero-padded — reserved extra
+    shared-representation capacity a byte's own identity never needs (only code levels benefit
+    from it); see dqbits_to_byte for the matching crop on the decode side."""
+    assert dq >= 8
+    bits8 = ((byte_ids.unsqueeze(-1) >> torch.arange(8, device=byte_ids.device)) & 1).float()
+    if dq > 8:
+        pad = torch.zeros(*byte_ids.shape, dq - 8, device=byte_ids.device, dtype=bits8.dtype)
+        bits = torch.cat([bits8, pad], dim=-1)
+    else:
+        bits = bits8
+    return (2 * bits - 1) / math.sqrt(dq)
 
 
-def byte_to_bits(byte_ids: torch.Tensor) -> torch.Tensor:
-    """[*] long byte ids (0..255) -> [*, 8] float, each bit in {-1,+1}/sqrt(8) — LSB-first, deterministic,
-    no learned parameters. A byte losslessly IS its own 8-bit BSQ-shaped code."""
-    bits = ((byte_ids.unsqueeze(-1) >> torch.arange(8, device=byte_ids.device)) & 1).float()
-    return (2 * bits - 1) / math.sqrt(8)
-
-
-def bits_to_byte(bits: torch.Tensor) -> torch.Tensor:
-    b = (bits > 0).long()
+def dqbits_to_byte(bits: torch.Tensor) -> torch.Tensor:
+    """[*, dq] -> [*] byte ids (0..255) — CROPS to the first 8 bits regardless of dq (session:
+    "for sampling bytes, just crop byte 9 and more, let bits valued 0-255 reserved for raw
+    bytes"). Any bits beyond the 8th are ignored for byte reconstruction — extra shared-
+    representation capacity, not part of a byte's own identity. dq==8: identical to v4's own
+    bits_to_byte (no cropping possible/needed, already exactly 8 bits)."""
+    b = (bits[..., :8] > 0).long()
     powers = (2 ** torch.arange(8, device=bits.device))
     return (b * powers).sum(-1)
 
@@ -807,6 +873,11 @@ class BitPredictHeadAttn(nn.Module):
         self.out_proj = nn.Linear(d_inner, d_inner)
         causal_mask = torch.triu(torch.full((dq, dq), float("-inf")), diagonal=1)
         self.register_buffer("causal_mask", causal_mask, persistent=False)
+        # _forward_fixed's own per-position h-scale: [1, gamma, gamma, ..., gamma] (dq values) —
+        # depends only on dq/gamma (compile-time constants), not on h/true_bits, so it was wasteful
+        # to rebuild via new_ones+cat on every single forward call. Precomputed once here instead.
+        h_scale = torch.cat([torch.ones(1), torch.full((max(dq - 1, 0),), gamma)]).view(1, dq, 1)
+        self.register_buffer("h_scale", h_scale, persistent=False)
 
     def _mha(self, x: torch.Tensor, attn_mask: torch.Tensor | None) -> torch.Tensor:
         """x: [N, T, D]. attn_mask: None, or additive float [T, T] (SDPA accepts the same -inf/0
@@ -834,10 +905,7 @@ class BitPredictHeadAttn(nn.Module):
         zero_vec = val_embeds.new_zeros(N, 1, D)
         shifted = torch.cat([zero_vec, val_embeds[:, :-1, :]], dim=1)
         pos = self.bit_pos_emb.weight.unsqueeze(0)
-        h_scale = h.new_ones(1, self.dq, 1)
-        if self.dq > 1:
-            h_scale = torch.cat([h_scale[:, :1, :], h_scale[:, 1:, :] * self.gamma], dim=1)
-        x = h_scale * h.unsqueeze(1) + shifted + pos
+        x = self.h_scale * h.unsqueeze(1) + shifted + pos
         attn_out = self._mha(x, attn_mask=self.causal_mask)
         fetched = h.unsqueeze(1) + attn_out
         return self.head(fetched).squeeze(-1)
@@ -1007,6 +1075,16 @@ class BitPredictHeadSSM(nn.Module):
         self.bit_val_emb = nn.Embedding(2, self.d_state)
         self.state_proj = nn.Linear(self.d_state, d_inner)
         self.decay_logit = nn.Parameter(torch.zeros(self.d_state))   # sigmoid(0)=0.5 init
+        # _forward_fixed's own decay-exponent grid/validity mask: pure functions of dq (unlike
+        # `decay` itself, which depends on `alpha` — a LEARNED param that changes every step, so
+        # THAT part can't be precomputed) — rebuilt via arange/outer-subtract on every single
+        # forward call before this fix, wastefully, since dq never changes after construction.
+        idx = torch.arange(dq)
+        offsets = idx.unsqueeze(1) - 1 - idx.unsqueeze(0)             # [dq, dq]: j-1-k
+        self.register_buffer("_valid", (offsets >= 0), persistent=False)
+        self.register_buffer("_offsets_clamped", offsets.clamp(min=0).float(), persistent=False)
+        h_scale = torch.cat([torch.ones(1), torch.full((max(dq - 1, 0),), gamma)]).view(1, dq, 1)
+        self.register_buffer("h_scale", h_scale, persistent=False)
 
     def _alpha(self) -> torch.Tensor:
         return torch.sigmoid(self.decay_logit)   # [d_state], in (0,1) — see class docstring re: alpha=0
@@ -1020,23 +1098,15 @@ class BitPredictHeadSSM(nn.Module):
 
     def _forward_fixed(self, h: torch.Tensor, true_bits: torch.Tensor) -> torch.Tensor:
         N, D = h.shape
-        dq = self.dq
         bit_ids = (true_bits > 0).long()
         val_embeds = self.bit_val_emb(bit_ids)                    # [N, dq, d_state]
         alpha = self._alpha()                                      # [d_state]
 
-        idx = torch.arange(dq, device=h.device)
-        offsets = idx.unsqueeze(1) - 1 - idx.unsqueeze(0)           # [dq, dq]: j-1-k
-        valid = offsets >= 0                                        # True iff k < j
-        offsets_clamped = offsets.clamp(min=0).float()
-        decay = (alpha.view(1, 1, -1) ** offsets_clamped.unsqueeze(-1)) * valid.unsqueeze(-1).float()   # [dq,dq,d_state]
+        decay = (alpha.view(1, 1, -1) ** self._offsets_clamped.unsqueeze(-1)) * self._valid.unsqueeze(-1).float()   # [dq,dq,d_state]
 
         s = torch.einsum("jkc,nkc->njc", decay, val_embeds)         # [N, dq, d_state]
         state_contrib = self.state_proj(s)                          # [N, dq, D]
-        h_scale = h.new_ones(1, dq, 1)
-        if dq > 1:
-            h_scale = torch.cat([h_scale[:, :1, :], h_scale[:, 1:, :] * self.gamma], dim=1)
-        fetched = h_scale * h.unsqueeze(1) + state_contrib
+        fetched = self.h_scale * h.unsqueeze(1) + state_contrib
         return self.head(fetched).squeeze(-1)
 
     def _forward_loop(self, h: torch.Tensor, true_bits: torch.Tensor | None) -> torch.Tensor:
@@ -1079,59 +1149,67 @@ def build_bit_head(cfg: Config, d_model: int, dq: int) -> nn.Module:
 
 
 class LevelLM(nn.Module):
-    """One level of the recursive NTP tower: embeds its own input
-    sequence, runs a small causal transformer, always-on direct NTP loss
-    on its own next input element (own head, own target), and every K-th
-    position BSQ-quantizes into this level's own emitted code.
+    """One level of the recursive NTP tower. v4.2: EVERY level — byte level 0 included — uses the
+    exact same shape of embed (`CodeEmbed(dq, D)`) + NTP head (`nn.Linear(D, dq)`, independent
+    per-bit logits, `chain_bce_loss`) + `code_pre` (D -> dq pre-quantization projection), and
+    (per `shared`, below) the literal SAME weight objects across every level, no exceptions. The
+    only thing that still distinguishes level 0 from a code level is `is_byte_level`'s use in
+    `forward`: converting raw byte ids to/from the shared dq-bit representation via
+    `byte_to_dqbits`/`dqbits_to_byte` — everything downstream of that conversion is identical
+    code for every level."""
 
-    Two independent flags, both kept as real options (not one replacing
-    the other — "do not remove that, put as flag"):
+    def __init__(self, cfg: Config, level: int, window: int | None,
+                 fuse_d_model: int | None = None, fuse_kv_window: int | None = None,
+                 shared: "LevelLM | None" = None, shared_head: "LevelLM | None" = None):
+        """`shared`: None (only for level 0, which always constructs its own TRUNK fresh — see
+        RefineLM.__init__) or level 0's own already-constructed LevelLM, whose self.blocks/ln_f/
+        fuse_* get REUSED here (same nn.Module objects — PyTorch shares the underlying Parameters
+        automatically; gradients from every level accumulate into them). The trunk is ALWAYS
+        shared across every level regardless of `Config.byte_head_256way` — that flag only affects
+        the embed/head/code_pre split below.
 
-    Config.byte_repr (level 0 only): "bits" (original/default) — the
-    byte_to_bits 8-dim projection + BitPredictHead chain NTP head, same
-    as qcute_refine.py. "embed": TRADITIONAL representation instead — a
-    real nn.Embedding(vocab, D) lookup table and a plain nn.Linear(D,
-    vocab) NTP head, trained with ordinary 256-way cross-entropy, exactly
-    bytelm.py's own convention (session: "byte level use traditional
-    embedding table and 256-way softmax").
+        `shared_head`: who owns the embed/ntp_head/code_pre this level uses. By default (`Config.
+        byte_head_256way=False`) this is level 0 for every other level (same as `shared`'s trunk-
+        ownership — one pool, byte included). Under `byte_head_256way=True`, level 0 builds its
+        OWN separate embed/head (see below) and is never anyone's `shared_head`; code levels (1+)
+        instead share a SEPARATE pool owned by level 1 — see RefineLM.__init__ for the two
+        different ownership assignments this produces.
 
-    Config.code_head_mode (level>0 only): "chain" (original/default) —
-    BitPredictHead, exact chain-rule cross-bit conditioning. "independent"
-    — a single plain nn.Linear(D, in_dq), INDEPENDENT per-bit logits, no
-    BitPredictHead at all (session: "code level use independent linear
-    heads like original bsq" — every earlier BSQ fork's own default
-    before the Fetch-style chain head was introduced). Both still use the
-    same per-bit BCE loss (`chain_bce_loss` — the name is legacy; the
-    function itself is just "sum BCE over the bit dim, mean over the
-    rest," agnostic to whether the logits came from a chained or
-    independent head)."""
-
-    def __init__(self, cfg: Config, level: int, in_dq: int, window: int | None,
-                 fuse_d_model: int | None = None, fuse_kv_window: int | None = None):
+        `window` stays genuinely per-level regardless of either sharing scheme — passed at FORWARD
+        time, never baked into construction (see CausalSelfAttention's own docstring for why)."""
         super().__init__()
         self.level = level
-        self.in_dq = in_dq
         self.cfg = cfg
+        self.window = window
         self.is_byte_level = level == 0
-        D = cfg.tier_d_models[level]
-        if self.is_byte_level:
-            assert cfg.byte_repr in ("bits", "embed")
-            if cfg.byte_repr == "embed":
-                self.byte_embed = nn.Embedding(cfg.vocab, D)
-                self.ntp_head = nn.Linear(D, cfg.vocab)
-            else:
-                self.embed = nn.Linear(in_dq, D)
-                self.ntp_head = build_bit_head(cfg, D, in_dq)
+        D = cfg.d_model
+        dq = cfg.dq
+
+        if self.is_byte_level and cfg.byte_head_256way:
+            # ABLATION (session: "make ablation use regular byte 256-way head, put as flag") —
+            # level 0 opts OUT of the shared dq-bit embed/head pool entirely: its own, unshared,
+            # exact 256-way softmax path, exactly v4's own byte_repr="embed" mode/bytelm.py's own
+            # convention. code_pre still emits a dq-dim code upward regardless (that's a separate
+            # concern from what representation level 0 uses for its OWN next-byte prediction).
+            self.byte_embed = nn.Embedding(cfg.vocab, D)
+            self.ntp_head = nn.Linear(D, cfg.vocab)
+            self.code_pre = nn.Linear(D, dq)
+        elif shared_head is not None:
+            self.embed = shared_head.embed
+            self.ntp_head = shared_head.ntp_head
+            self.code_pre = shared_head.code_pre
         else:
-            assert cfg.code_head_mode in ("chain", "independent")
-            self.embed = CodeEmbed(cfg, in_dq, D)
-            if cfg.code_head_mode == "independent":
-                self.ntp_head = nn.Linear(D, in_dq)
-            else:
-                self.ntp_head = build_bit_head(cfg, D, in_dq)
-        self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult, window) for _ in range(cfg.tier_n_layers[level])])
-        self.ln_f = nn.LayerNorm(D)
-        self.code_pre = nn.Linear(D, cfg.dqs[level])
+            assert cfg.code_head_mode in ("independent", "chain")
+            self.embed = CodeEmbed(cfg, dq, D)
+            self.ntp_head = nn.Linear(D, dq) if cfg.code_head_mode == "independent" else build_bit_head(cfg, D, dq)
+            self.code_pre = nn.Linear(D, dq)
+
+        if shared is not None:
+            self.blocks = shared.blocks
+            self.ln_f = shared.ln_f
+        else:
+            self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
+            self.ln_f = nn.LayerNorm(D)
 
         # v3 FUSION (module docstring has the full rationale): if this level has a level ABOVE it
         # (fuse_d_model is not None, i.e. level < n_levels-1), it can optionally cross-attend to that
@@ -1141,58 +1219,37 @@ class LevelLM(nn.Module):
         # DecoderLevel/tok_loss path. Q = x directly (already D-dim, this level's own embedding —
         # "encoder reads this directly, no separate embed" per the session ask), no extra q_proj
         # needed. KV = the level-above's hidden state, projected D_{level+1} -> D via fuse_kv_proj
-        # (only place a new "own" weight is learned, unavoidable when D's differ). Same jagged
-        # causal mask as DecoderLevel (see jagged_causal_mask_and_positions) — position t may only
-        # see level-above blocks that completed strictly before t, so no label leakage.
+        # (only place a new "own" weight is learned, unavoidable when D's differ — v4.2: D is
+        # uniform everywhere, so fuse_kv_proj is really D -> D, kept as a real learned layer
+        # anyway rather than an identity special-case). Same jagged causal mask as DecoderLevel
+        # (see jagged_causal_mask_and_positions) — position t may only see level-above blocks that
+        # completed strictly before t, so no label leakage.
         self.fuse_d_model = fuse_d_model
         self.fuse_kv_window = fuse_kv_window
         if fuse_d_model is not None:
-            self.fuse_kv_proj = nn.Linear(fuse_d_model, D)
-            if cfg.fuse_use_null_kv:
-                self.fuse_null_kv = nn.Parameter(torch.zeros(1, 1, D))
-                nn.init.normal_(self.fuse_null_kv, std=0.02)
-            # "pre"/"post"/"both" each need their OWN CrossBlock (a "both" level gets two —
-            # genuinely more params, see Config.fuse_position's own docstring). "concat" needs
-            # NEITHER — self.blocks' own CausalSelfAttention layers derive K/V for the fused tail
-            # directly from their own qkv weights (see _prep_concat), cheaper than the others.
-            if cfg.fuse_position in ("pre", "both"):
-                self.fuse_cross_pre = CrossBlock(D, cfg.n_heads, cfg.mlp_mult)
-            if cfg.fuse_position in ("post", "both"):
-                self.fuse_cross_post = CrossBlock(D, cfg.n_heads, cfg.mlp_mult)
-
-    def _fuse(self, x: torch.Tensor, fuse_kv: torch.Tensor, cross_block: "CrossBlock") -> torch.Tensor:
-        """x: [B, L, D] this level's own pre-self-attention embedding. fuse_kv: [B, n_blocks, D_above]
-        the level-above's own hidden state (already, by construction, "as of" the raw-time position
-        each block completes — see jagged_causal_mask_and_positions). cross_block: self.fuse_cross_pre
-        or self.fuse_cross_post — which of the (up to two, under "both") CrossBlocks to run. Returns
-        x, fused."""
-        cfg = self.cfg
-        K = cfg.Ks[self.level]
-        B, L, D = x.shape
-        n_blocks = fuse_kv.size(1)
-        device = x.device
-        kv = self.fuse_kv_proj(fuse_kv)
-        if cfg.fuse_use_null_kv:
-            null = self.fuse_null_kv.expand(B, 1, D)
-            kv = torch.cat([null, kv], dim=1)
-        disallow, k_pos = jagged_causal_mask_and_positions(L, n_blocks, K, self.fuse_kv_window, device,
-                                                              include_null=cfg.fuse_use_null_kv)
-        rope_q = rope_k = None
-        if cfg.cross_attn_rope:
-            head_dim = D // cfg.n_heads
-            q_pos = torch.arange(L, device=device)
-            rope_q = rope_cos_sin_for_positions(q_pos, head_dim, cfg.rope_base, device)
-            rope_k = rope_cos_sin_for_positions(k_pos, head_dim, cfg.rope_base, device)
-        return cross_block(x, kv, attn_mask=disallow, rope_q=rope_q, rope_k=rope_k)
+            if shared is not None and getattr(shared, "fuse_d_model", None) is not None:
+                # the fusion module is part of the shared trunk too — SAME weights regardless of
+                # which adjacent level-pair is fusing (extreme sharing extended to fusion, not
+                # just self.blocks/ln_f/embed/head).
+                self.fuse_kv_proj = shared.fuse_kv_proj
+                if cfg.fuse_use_null_kv:
+                    self.fuse_null_kv = shared.fuse_null_kv
+            else:
+                self.fuse_kv_proj = nn.Linear(fuse_d_model, D)
+                if cfg.fuse_use_null_kv:
+                    self.fuse_null_kv = nn.Parameter(torch.zeros(1, 1, D))
+                    nn.init.normal_(self.fuse_null_kv, std=0.02)
+                # concat-only (v4.2): no separate cross-attention module at all — self.blocks' own
+                # CausalSelfAttention layers derive K/V for the fused tail directly from their own
+                # qkv weights (see _prep_concat).
 
     def _prep_concat(self, x: torch.Tensor, fuse_kv: torch.Tensor):
-        """"concat" fuse_position's own prep, done ONCE and shared by every self.blocks layer
-        (unlike "pre"/"post"'s own CrossBlock, which owns its own weights per call) — projects+
-        null-prepends fuse_kv (identical to _fuse's own kv construction) and builds the jagged
-        visibility mask/rope-k positions once, since L/n_blocks/K are the same for every layer at
-        this level. Returns (kv [B, Nf, D], disallow [L, Nf] bool True=blocked, rope_k or None) —
-        passed straight into every Block.forward this level runs (see CausalSelfAttention's own
-        fuse_kv/fuse_disallow/fuse_rope_k docstring for what each layer then does with it)."""
+        """Concat fusion's own prep, done ONCE and shared by every self.blocks layer — projects+
+        null-prepends fuse_kv and builds the jagged visibility mask/rope-k positions once, since
+        L/n_blocks/K are the same for every layer at this level. Returns (kv [B, Nf, D], disallow
+        [L, Nf] bool True=blocked, rope_k or None) — passed straight into every Block.forward this
+        level runs (see CausalSelfAttention's own fuse_kv/fuse_disallow/fuse_rope_k docstring for
+        what each layer then does with it)."""
         cfg = self.cfg
         K = cfg.Ks[self.level]
         B, L, D = x.shape
@@ -1212,76 +1269,86 @@ class LevelLM(nn.Module):
 
     def forward(self, seq_repr: torch.Tensor, compute_ntp: bool = True,
                 fuse_kv: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """seq_repr: level 0 gets raw byte ids [B, L] (long) regardless of
-        byte_repr — this class converts internally via byte_to_bits when
-        byte_repr=="bits", so RefineLM.forward stays mode-agnostic. level
-        i>0 gets its own continuous code [B, L, in_dq] (float).
-        compute_ntp=False SKIPS the ntp_head call entirely (real speed
-        lever — level 0 must never pass False). fuse_kv: v3 ONLY — None
-        (default) reproduces v2's forward exactly (this is what
-        RefineLM.forward's own PASS 1 uses, bottom-up, to produce every
-        level's code); the level-above's own hidden state (PASS 2, see
-        RefineLM.forward) fuses it in via cross-attention before
-        self.blocks runs, so THIS call's ntp_loss/h genuinely depend on
-        it. Returns (c_i [B, n_blocks, dqs[level]], ntp_loss, ntp_acc,
-        h [B, L, D])."""
+        """seq_repr: level 0 gets raw byte ids [B, L] (long) — converted internally to the shared
+        dq-bit representation via `byte_to_dqbits` (v4.2: unconditional, no more byte_repr modes).
+        level i>0 gets its own continuous dq-dim code [B, L, dq] (float) directly. compute_ntp=False
+        SKIPS the ntp_head call entirely (real speed lever — level 0 must never pass False). fuse_kv:
+        None (default) reproduces PASS 1 exactly (RefineLM._encode's own bottom-up sweep, producing
+        every level's code); the level-above's own hidden state (PASS 2) fuses it in via concat
+        (v4.2's only fusion mechanism — see module docstring), so THIS call's ntp_loss/h genuinely
+        depend on it. Returns (c_i [B, n_blocks, dq], ntp_loss, ntp_acc, h [B, L, D])."""
         cfg = self.cfg
         K = cfg.Ks[self.level]
-        D = cfg.tier_d_models[self.level]
+        D = cfg.d_model
+        dq = cfg.dq
 
-        if self.is_byte_level and cfg.byte_repr == "embed":
+        if self.is_byte_level and cfg.byte_head_256way:
             x = self.byte_embed(seq_repr)
             B, L = seq_repr.shape
         elif self.is_byte_level:
-            bits = byte_to_bits(seq_repr)
-            x = self.embed(bits)
-            B, L, _ = bits.shape
+            x_in = byte_to_dqbits(seq_repr, dq)
+            B, L, _ = x_in.shape
+            x = self.embed(x_in)
         else:
-            x = self.embed(seq_repr)
-            B, L, _ = seq_repr.shape
+            x_in = seq_repr
+            B, L, _ = x_in.shape
+            x = self.embed(x_in)
         n_blocks = L // K
 
         if fuse_kv is not None:
             assert self.fuse_d_model is not None, "fuse_kv passed but this LevelLM has no fuse module (no level above it?)"
-            assert cfg.fuse_position in ("pre", "post", "both", "concat"), f"unknown fuse_position {cfg.fuse_position!r}"
-
-        if fuse_kv is not None and cfg.fuse_position in ("pre", "both"):
-            x = self._fuse(x, fuse_kv, self.fuse_cross_pre)
 
         concat_kv = concat_disallow = concat_rope_k = None
-        if fuse_kv is not None and cfg.fuse_position == "concat":
+        if fuse_kv is not None:
             concat_kv, concat_disallow, concat_rope_k = self._prep_concat(x, fuse_kv)
 
         head_dim = D // cfg.n_heads
         cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
         for block in self.blocks:
-            x = block(x, cos, sin, fuse_kv=concat_kv, fuse_disallow=concat_disallow, fuse_rope_k=concat_rope_k)
-
-        if fuse_kv is not None and cfg.fuse_position in ("post", "both"):
-            x = self._fuse(x, fuse_kv, self.fuse_cross_post)
+            x = block(x, cos, sin, self.window, fuse_kv=concat_kv, fuse_disallow=concat_disallow, fuse_rope_k=concat_rope_k)
 
         h = self.ln_f(x)
 
         if compute_ntp:
             h_flat = h[:, :-1, :].reshape(-1, D)
-            if self.is_byte_level and cfg.byte_repr == "embed":
+            if self.is_byte_level and cfg.byte_head_256way:
+                # ablation path: exact 256-way softmax, unshared — same computation v4's own
+                # byte_repr="embed" mode used, nothing dq-bit/chain related here at all.
                 target = seq_repr[:, 1:].reshape(-1)
                 logits = self.ntp_head(h_flat)
                 ntp_loss = F.cross_entropy(logits, target)
                 with torch.no_grad():
                     ntp_acc = (logits.argmax(-1) == target).float().mean()
-            elif self.is_byte_level:
-                true_flat = byte_to_bits(seq_repr[:, 1:]).reshape(-1, self.in_dq)
-                raw = self.ntp_head(h_flat, true_flat)
-                ntp_loss = chain_bce_loss(raw, true_flat)
-                with torch.no_grad():
-                    ntp_acc = ((raw > 0) == (true_flat > 0)).float().mean()
             else:
-                true_flat = seq_repr[:, 1:, :].reshape(-1, self.in_dq)
-                raw = self.ntp_head(h_flat, true_flat) if cfg.code_head_mode == "chain" else self.ntp_head(h_flat)
+                if self.is_byte_level:
+                    true_flat_full = byte_to_dqbits(seq_repr[:, 1:], dq).reshape(-1, dq)
+                else:
+                    true_flat_full = seq_repr[:, 1:, :].reshape(-1, dq)
+                # chain heads need the FULL dq-dim true_bits as teacher-forcing input (the shared head's
+                # own fixed dq output shape, needed for code levels regardless of byte-level cropping
+                # below) — crop happens AFTER the head runs, only for byte-level loss/acc, never for
+                # what conditions the chain.
+                raw = self.ntp_head(h_flat, true_flat_full) if cfg.code_head_mode == "chain" else self.ntp_head(h_flat)
+                true_flat = true_flat_full
+                if self.is_byte_level and dq > 8:
+                    # CROP to the first 8 bits for the LOSS too, not just dqbits_to_byte's own
+                    # sampling crop — bits 8..dq-1 are a constant pad (byte_to_dqbits), so without
+                    # this, byte_loss/val_bpb would include BCE terms on a trivially-learnable
+                    # constant target, inflating the "nats-over-dq-bits" value away from genuine
+                    # bits-per-BYTE once the padding is learned to near-zero cost either way, but
+                    # polluting early-training signal and the metric's own units regardless.
+                    raw, true_flat = raw[:, :8], true_flat[:, :8]
                 ntp_loss = chain_bce_loss(raw, true_flat)
                 with torch.no_grad():
-                    ntp_acc = ((raw > 0) == (true_flat > 0)).float().mean()
+                    if self.is_byte_level:
+                        # TRUE byte accuracy (crops to the first 8 bits, session: "for sampling bytes,
+                        # just crop byte 9 and more") — not per-bit accuracy, a genuinely stronger/more
+                        # interpretable metric matching what every baseline's own byte_acc measures.
+                        pred_byte = dqbits_to_byte(raw)
+                        true_byte = seq_repr[:, 1:].reshape(-1)
+                        ntp_acc = (pred_byte == true_byte).float().mean()
+                    else:
+                        ntp_acc = ((raw > 0) == (true_flat > 0)).float().mean()
         else:
             ntp_loss = h.new_zeros(())
             ntp_acc = h.new_zeros(())
@@ -1293,7 +1360,7 @@ class LevelLM(nn.Module):
         h_blocks = h[:, :n_blocks * K, :].view(B, n_blocks, K, D)
         pre_q = self.code_pre(h_blocks[:, :, K - 1, :])
         if cfg.quant_type == "bsq":
-            c_i = bsq_quantize(pre_q, cfg.dqs[self.level])
+            c_i = bsq_quantize(pre_q, dq)
         elif cfg.quant_type == "identity":
             c_i = pre_q
         else:
@@ -1311,9 +1378,7 @@ class RefineLM(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.n_levels = len(cfg.Ks)
-        assert len(cfg.dqs) == self.n_levels
-        assert len(cfg.tier_d_models) == self.n_levels
-        assert len(cfg.tier_n_layers) == self.n_levels
+        assert cfg.d_model % cfg.n_heads == 0, f"d_model ({cfg.d_model}) must be divisible by n_heads ({cfg.n_heads})"
 
         seq_lens = [cfg.context_len]
         for k in cfg.Ks[:-1]:
@@ -1322,9 +1387,6 @@ class RefineLM(nn.Module):
         assert seq_lens[-1] % cfg.Ks[-1] == 0, f"Ks={cfg.Ks} must evenly divide context_len at every level"
         self.seq_lens = seq_lens
         self.code_seq_lens = [seq_lens[i] // cfg.Ks[i] for i in range(self.n_levels)]
-
-        for i, d in enumerate(cfg.tier_d_models):
-            assert d % cfg.n_heads == 0, f"tier_d_models[{i}] ({d}) must be divisible by n_heads ({cfg.n_heads})"
 
         # resolve attn_window into one value per level — single int broadcasts (backward compatible),
         # a tuple must have length n_levels (lets e.g. the top level get its own, smaller, genuinely-
@@ -1338,18 +1400,34 @@ class RefineLM(nn.Module):
             if window is not None:
                 assert L % window == 0 or L <= window, f"attn_window[{i}] ({window}) must divide level {i}'s sequence length ({L}), or be >= it"
 
-        in_dqs = [8] + list(cfg.dqs[:-1])
-        self.in_dqs = in_dqs
-        # every level below the top gets fuse_d_model/fuse_kv_window set (the level-above's own
-        # D/kv_window) — top level gets None (nothing coarser exists to fuse from).
-        self.encoders = nn.ModuleList([
-            LevelLM(
-                cfg, i, in_dqs[i], windows[i],
-                fuse_d_model=cfg.tier_d_models[i + 1] if i < self.n_levels - 1 else None,
-                fuse_kv_window=windows[i + 1] if i < self.n_levels - 1 else None,
-            )
-            for i in range(self.n_levels)
-        ])
+        # v4.2 EXTREME WEIGHT SHARING, UNCONDITIONAL (session: "make that 4.2 and no flag, run
+        # that scheme by default"). Level 0 is built FIRST (fresh trunk always; fresh head/embed/
+        # code_pre too UNLESS byte_head_256way), every other level REUSES the trunk (see LevelLM.
+        # __init__'s own `shared` docstring) — the trunk is ALWAYS one shared pool, byte included,
+        # regardless of byte_head_256way. `window` stays genuinely per-level regardless
+        # (forward-time arg, never baked into construction).
+        #
+        # Head/embed/code_pre ownership (session: "make ablation use regular byte 256-way head,
+        # put as flag") is a SEPARATE pool assignment from the trunk's: default (byte_head_256way=
+        # False) — level 0 owns it, every level 1+ borrows, same single pool as the trunk. True —
+        # level 0 builds its own unshared 256-way head (LevelLM.__init__ handles this internally,
+        # no shared_head needed for level 0); level 1 becomes the NEW owner for the CODE levels'
+        # own separate dq-bit pool, and levels 2+ borrow from level 1 instead of level 0.
+        encoders: list[LevelLM] = []
+        for i in range(self.n_levels):
+            fuse_d_model = cfg.d_model if i < self.n_levels - 1 else None
+            fuse_kv_window = windows[i + 1] if i < self.n_levels - 1 else None
+            if cfg.byte_head_256way:
+                shared_head = encoders[1] if i > 1 else None
+            else:
+                shared_head = encoders[0] if i > 0 else None
+            encoders.append(LevelLM(
+                cfg, i, windows[i],
+                fuse_d_model=fuse_d_model, fuse_kv_window=fuse_kv_window,
+                shared=encoders[0] if i > 0 else None,
+                shared_head=shared_head,
+            ))
+        self.encoders = nn.ModuleList(encoders)
 
         lw = cfg.layer_warmup_steps if cfg.layer_warmup_steps else (0,) * (self.n_levels - 1)
         assert len(lw) == self.n_levels - 1, (
@@ -1497,11 +1575,11 @@ class RefineLM(nn.Module):
 
 
 def _sample_next_byte(model: "RefineLM", h_last: torch.Tensor) -> torch.Tensor:
-    if model.cfg.byte_repr == "embed":
-        logits = model.encoders[0].ntp_head(h_last)   # plain 256-way Linear — greedy argmax
-        return logits.argmax(-1)
-    logits = model.encoders[0].ntp_head(h_last, true_bits=None)   # chain mode greedy-decodes internally
-    return bits_to_byte(logits)
+    enc0 = model.encoders[0]
+    if model.cfg.byte_head_256way:
+        return enc0.ntp_head(h_last).argmax(-1)   # [B, vocab] exact softmax logits, unshared head
+    raw = enc0.ntp_head(h_last)   # [B, dq] independent-bit logits, shared head
+    return dqbits_to_byte(raw)   # crops to the first 8 bits — see dqbits_to_byte's own docstring
 
 
 @torch.no_grad()
@@ -1591,13 +1669,13 @@ def generate_kv_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
 
     def clean_step(level: int, token: torch.Tensor) -> torch.Tensor:
         """Advance level `level`'s CLEAN self-attention by one of its own input positions.
-        token: [B] long (level 0) or [B, in_dq] float (level>0). Returns h_new [B, D_level]."""
+        token: [B] long (level 0) or [B, dq] float (level>0). Returns h_new [B, D]."""
         enc = model.encoders[level]
-        D = cfg.tier_d_models[level]
-        if level == 0 and cfg.byte_repr == "embed":
+        D = cfg.d_model
+        if level == 0 and cfg.byte_head_256way:
             x = enc.byte_embed(token).unsqueeze(1)
         elif level == 0:
-            x = enc.embed(byte_to_bits(token)).unsqueeze(1)
+            x = enc.embed(byte_to_dqbits(token, cfg.dq)).unsqueeze(1)
         else:
             x = enc.embed(token).unsqueeze(1)
         head_dim = D // cfg.n_heads
@@ -1622,7 +1700,7 @@ def generate_kv_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
         pending[level] = 0
         enc = model.encoders[level]
         pre_q = enc.code_pre(h_new)
-        c_new = bsq_quantize(pre_q, cfg.dqs[level]) if cfg.quant_type == "bsq" else pre_q
+        c_new = bsq_quantize(pre_q, cfg.dq) if cfg.quant_type == "bsq" else pre_q
         block_idx[level] += 1
         resolved_pos = block_idx[level] * Ks[level] - 1   # matches jagged_causal_mask_and_positions'
                                                              # own block_pos=(b+1)*K-1 exactly
@@ -1633,35 +1711,19 @@ def generate_kv_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
             fuse_kv_rows = torch.cat([fuse_kv_rows, new_row], dim=1)
             fuse_k_pos = torch.cat([fuse_k_pos, torch.tensor([resolved_pos], device=device)])
 
-    def apply_fuse(x: torch.Tensor, pos: int, cross_block) -> torch.Tensor:
-        """The fuse_cross step itself, factored out so fused_step can call it before/after
-        self.blocks, and (under "both") both — matches LevelLM.forward's own pre/post/both
-        dispatch exactly. cross_block: enc0.fuse_cross_pre or enc0.fuse_cross_post."""
-        enc0 = model.encoders[0]
-        D = cfg.tier_d_models[0]
-        head_dim = D // cfg.n_heads
-        rope_q = rope_k = None
-        if cfg.cross_attn_rope:
-            rope_q = rope_cos_sin_for_positions(torch.tensor([pos], device=device), head_dim, cfg.rope_base, device)
-            rope_k = rope_cos_sin_for_positions(fuse_k_pos, head_dim, cfg.rope_base, device)
-        return cross_block(x, fuse_kv_rows, attn_mask=None, rope_q=rope_q, rope_k=rope_k)
-
     def fused_step(byte_id: torch.Tensor, pos: int) -> torch.Tensor:
-        """Advance level 0's FUSED pass by one byte — the actual sampling path."""
+        """Advance level 0's FUSED pass by one byte — the actual sampling path. v4.2: concat-only —
+        fuse_kv_rows IS already this level's own D-dim, null-prepended KV (identical to what
+        training's own _prep_concat computes each forward), fed straight into every block's
+        forward_step. No explicit visibility mask needed — see the module docstring's own
+        reasoning (every row present is, by construction, already causally valid at this step)."""
         enc0 = model.encoders[0]
-        D = cfg.tier_d_models[0]
-        x = (enc0.byte_embed(byte_id) if cfg.byte_repr == "embed" else enc0.embed(byte_to_bits(byte_id))).unsqueeze(1)
-        if fuse_on and cfg.fuse_position in ("pre", "both"):
-            x = apply_fuse(x, pos, enc0.fuse_cross_pre)
+        D = cfg.d_model
+        x = (enc0.byte_embed(byte_id) if cfg.byte_head_256way else enc0.embed(byte_to_dqbits(byte_id, cfg.dq))).unsqueeze(1)
         head_dim = D // cfg.n_heads
         cos_new, sin_new = rope_cos_sin_at(pos, head_dim, cfg.rope_base, device)
-        # "concat" mode: fuse_kv_rows IS already this level's own D-dim, null-prepended KV
-        # (identical to what training's own _prep_concat computes each forward) — no extra
-        # projection needed here, just feed it straight into every block's forward_step. No
-        # explicit visibility mask needed either — see the module docstring's own reasoning
-        # (every row present is, by construction, already causally valid at this step).
         concat_kv = concat_rope_k = None
-        if fuse_on and cfg.fuse_position == "concat":
+        if fuse_on:
             concat_kv = fuse_kv_rows
             if cfg.cross_attn_rope:
                 concat_rope_k = rope_cos_sin_for_positions(fuse_k_pos, head_dim, cfg.rope_base, device)
@@ -1670,12 +1732,10 @@ def generate_kv_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
                 x, cos_new, sin_new, fused_cache_k[li], fused_cache_v[li],
                 fuse_kv=concat_kv, fuse_rope_k=concat_rope_k,
             )
-        if fuse_on and cfg.fuse_position in ("post", "both"):
-            x = apply_fuse(x, pos, enc0.fuse_cross_post)
         return enc0.ln_f(x).squeeze(1)
 
     if fuse_on:
-        D0 = cfg.tier_d_models[0]
+        D0 = cfg.d_model
         if cfg.fuse_use_null_kv:
             fuse_kv_rows = model.encoders[0].fuse_null_kv.expand(B, 1, D0).clone()
             fuse_k_pos = torch.zeros(1, dtype=torch.long, device=device)
@@ -1799,16 +1859,32 @@ def eval_model(model: RefineLM, data: torch.Tensor, batch_size: int, n_batches: 
 
 
 def build_param_groups(model: RefineLM) -> list[dict]:
-    """One param group per activation STAGE (stage 0 = encoders[0] alone;
-    stage i>=1 = encoders[i] alone, the level that turns on once level i
-    activates — see Config.layer_warmup_steps; v4 has no DecoderLevel to
-    bundle in alongside it, unlike v2/v3) — lets train() give each stage
-    its own reset warmup schedule. With no curriculum (layer_warmup_steps
-    empty), every stage activates at step 0 and this is behaviorally
-    identical to one global param group."""
-    groups = [{"params": list(model.encoders[0].parameters()), "stage": 0}]
-    for i in range(1, model.n_levels):
-        groups.append({"params": list(model.encoders[i].parameters()), "stage": i})
+    """One param group per activation STAGE (stage 0 = encoders[0]'s own params;
+    stage i>=1 = whatever of encoders[i]'s params haven't already been claimed by an earlier
+    stage — see Config.layer_warmup_steps; v4 has no DecoderLevel to bundle in alongside it,
+    unlike v2/v3) — lets train() give each stage its own reset warmup schedule. With no
+    curriculum (layer_warmup_steps empty), every stage activates at step 0 and this is
+    behaviorally identical to one global param group.
+
+    v4.1 DEDUPLICATES by Parameter identity (`id(p)`) — under `Config.share_levellm`/
+    `share_code_head`, encoders[i>0].parameters() genuinely OVERLAPS encoders[0]'s own (same
+    nn.Module objects — see LevelLM.__init__'s shared_trunk/shared_code_head), and
+    torch.optim.Optimizer raises if the same Parameter object appears in two groups. Since
+    encoders[0] is always processed first, every SHARED weight lands in stage 0 (correct: shared
+    weights are active — and need gradient — from the very first active level onward, exactly
+    like stage 0's own params); each later stage's group then only contains whatever it did NOT
+    share (typically just that level's own embed/ntp_head/code_pre when share_code_head=False).
+    v4 (share_levellm=False) never has overlap in the first place, so this is a no-op there —
+    identical grouping to before."""
+    groups = []
+    seen: set[int] = set()
+    for i in range(model.n_levels):
+        params = []
+        for p in model.encoders[i].parameters():
+            if id(p) not in seen:
+                seen.add(id(p))
+                params.append(p)
+        groups.append({"params": params, "stage": i})
     return groups
 
 
@@ -1890,10 +1966,10 @@ def main():
     pre_args, _ = pre.parse_known_args()
 
     p = argparse.ArgumentParser(description="Recursive NTP tower + LevelLM fusion only, no DecoderLevel (qcute_refine_v4)", parents=[pre])
-    p.add_argument("--dqs", type=_parse_int_tuple, default=(8, 8, 8))
+    p.add_argument("--dq", type=int, default=8)
     p.add_argument("--Ks", default=(2, 2, 2))
-    p.add_argument("--tier_n_layers", default=(1, 1, 1))
-    p.add_argument("--tier_d_models", type=_parse_int_tuple, default=(96, 96, 96))
+    p.add_argument("--n_layers", type=int, default=1)
+    p.add_argument("--d_model", type=int, default=96)
     p.add_argument("--context_len", type=int, default=1024)
     p.add_argument("--n_heads", type=int, default=4)
     p.add_argument("--mlp_mult", type=int, default=4)
@@ -1907,16 +1983,15 @@ def main():
     p.add_argument("--bit_conv_impl", type=str, default="matmul", choices=["conv1d", "matmul"])
     p.add_argument("--bit_inner_downsample", type=int, default=1)
     p.add_argument("--bit_ssm_d_state", type=int, default=None)
+    p.add_argument("--code_head_mode", type=str, default="independent", choices=["independent", "chain"])
+    p.add_argument("--byte_head_256way", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--code_ntp_weight", type=float, default=1.0)
     p.add_argument("--byte_ntp_weight", type=float, default=1.0)
     p.add_argument("--fusion_ntp_weight", type=float, default=1.0)
     p.add_argument("--quant_type", type=str, default="bsq", choices=["bsq", "identity"])
     p.add_argument("--code_embed_mode", type=str, default="linear", choices=["linear", "mlp", "pq_table"])
     p.add_argument("--fuse_encoder_levels", type=lambda x: x.lower() != "false", default=True)
-    p.add_argument("--fuse_position", type=str, default="pre", choices=["pre", "post", "both", "concat"])
     p.add_argument("--fuse_use_null_kv", type=lambda x: x.lower() != "false", default=True)
-    p.add_argument("--byte_repr", type=str, default="bits", choices=["bits", "embed"])
-    p.add_argument("--code_head_mode", type=str, default="chain", choices=["chain", "independent"])
     p.add_argument("--cross_attn_rope", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--layer_warmup_steps", type=lambda s: () if s in ("", "()") else _parse_int_tuple(s), default=())
 
@@ -1966,25 +2041,23 @@ def main():
     if pre_args.config:
         p.set_defaults(**{k: v for k, v in load_config_module(pre_args.config).items() if k in {a.dest for a in p._actions}})
     args = p.parse_args()
-    args.dqs = _parse_int_tuple(args.dqs)
-    n_levels = len(args.dqs)
-    args.Ks = _broadcast_int_tuple(args.Ks, n_levels)
-    args.tier_n_layers = _broadcast_int_tuple(args.tier_n_layers, n_levels)
-    args.tier_d_models = _parse_int_tuple(args.tier_d_models)
+    # v4.2: n_levels inferred from Ks's own length directly (dq/d_model/n_layers are single
+    # shared scalars now, no longer a per-level tuple to infer level count from).
+    args.Ks = _parse_int_tuple(args.Ks)
 
     device = args.device or ("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     cfg = Config(
-        Ks=args.Ks, dqs=args.dqs, tier_d_models=args.tier_d_models, tier_n_layers=args.tier_n_layers,
+        Ks=args.Ks, dq=args.dq, d_model=args.d_model, n_layers=args.n_layers,
         context_len=args.context_len, n_heads=args.n_heads, mlp_mult=args.mlp_mult, attn_window=args.attn_window,
         rope_base=args.rope_base, bit_chain_n_heads=args.bit_chain_n_heads, bit_chain_gamma=args.bit_chain_gamma,
         bit_chain_fixed_kernel=args.bit_chain_fixed_kernel, bit_head_class=args.bit_head_class,
         bit_conv_kernel_size=args.bit_conv_kernel_size, bit_conv_impl=args.bit_conv_impl,
         bit_inner_downsample=args.bit_inner_downsample, bit_ssm_d_state=args.bit_ssm_d_state,
+        code_head_mode=args.code_head_mode, byte_head_256way=args.byte_head_256way,
         code_ntp_weight=args.code_ntp_weight, byte_ntp_weight=args.byte_ntp_weight,
         fusion_ntp_weight=args.fusion_ntp_weight,
         quant_type=args.quant_type, code_embed_mode=args.code_embed_mode, fuse_encoder_levels=args.fuse_encoder_levels,
-        fuse_position=args.fuse_position, fuse_use_null_kv=args.fuse_use_null_kv,
-        byte_repr=args.byte_repr, code_head_mode=args.code_head_mode,
+        fuse_use_null_kv=args.fuse_use_null_kv,
         cross_attn_rope=args.cross_attn_rope,
         layer_warmup_steps=args.layer_warmup_steps,
     )
@@ -1998,7 +2071,7 @@ def main():
     run_name = args.run_name or (pre_args.config.stem if pre_args.config else f"qcute_refine_v4_{int(time.time())}")
     log = Logger(args.logs_dir / run_name)
     print(f"run_name={run_name}  logging to {log.text_path} — tail -f {log.text_path}")
-    log(f"Ks={cfg.Ks} dqs={cfg.dqs} tier_d_models={cfg.tier_d_models} tier_n_layers={cfg.tier_n_layers} "
+    log(f"Ks={cfg.Ks} dq={cfg.dq} d_model={cfg.d_model} n_layers={cfg.n_layers} "
         f"seq_lens={model.seq_lens} context_len={cfg.context_len} fuse_encoder_levels={cfg.fuse_encoder_levels} "
         f"params={n_params/1e6:.3f}M device={device}")
 

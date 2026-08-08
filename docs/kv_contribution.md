@@ -253,6 +253,16 @@ worse than a clean, predictable zero input the model can partially learn
 to route around — the two controls agree with each other, not just
 individually with the headline finding.
 
+**Follow-up queued**: `Config.fuse_use_null_kv` (new — see
+`qcute_refine_v4.py`'s own docstring) lets the null KV slot be removed
+architecturally, not just content-ablated post-hoc. `configs/qcute_
+refine_v4_k32_narrow_postfuse_nonull.py` stacks this with `fuse_position=
+"post"` (testing whether `self.blocks` stays a cleaner, more robust
+standalone local encoder without ever seeing fused input) on the same
+K=32/narrow-window architecture — asks directly how much of the
+capacity-not-content finding above was the null slot specifically, versus
+`fuse_cross`'s other parameters. Not yet run.
+
 This adds real nuance to `qcute_refine_v3_rope`'s "direct forward-value
 conditioning beats everything" reading from §6 above: for THIS
 narrow-window config at least, most of that forward-value benefit isn't
@@ -262,3 +272,293 @@ Consistent with, and motivates, the `tier_n_layers=(2,1)`/`(2,2)` depth
 ablations queued this session (see docs/status.md) — if plain depth
 matches or beats fusion's own contribution, that would confirm capacity,
 not cross-level information, was the dominant lever all along.
+
+Note: the probe's `no_fusion` mode above was later renamed
+`unconditional_pass1` (§8's numbers use the new name; same computation,
+just a clearer label — it's PASS 1's own byte_loss, matching v2 exactly).
+
+## 8. `qcute_refine_v4_k32_narrow_postfuse` — pre vs. post, and the representational-separation hypothesis
+
+Same K=32/narrow-window architecture as §7, one change:
+`fuse_position="post"` (cross-attention runs AFTER `self.blocks`, not
+before). Trained result: best val_bpb **2.5033 @ step 3600** vs. §7's
+pre-fusion **2.4926** — post is slightly worse at matched params/FLOPs
+(identical architecture, only the fusion's position in the block
+differs), consistent with `docs/status.md`'s earlier `fuse_position`
+ablation on the K=4 pq_table config (post also lost there, 2.4678 vs.
+2.4565).
+
+Probed the same way as §7 (`scripts/probe_v4_fusion_contribution.py`,
+20 val batches, `checkpoints/qcute_refine_v4_k32_narrow_postfuse/best.pt`):
+
+| mode | pre (`k32_narrow`) val_bpb | post (`k32_narrow_postfuse`) val_bpb |
+|---|---|---|
+| normal | 2.5757 | 2.5208 |
+| null_only | 2.7895 | 2.5994 |
+| big_noise | 2.8496 | 2.5384 |
+| unconditional_pass1 (no fusion) | 4.9456 | 4.6761 |
+
+(pre-mode numbers here are a clean rerun with the renamed probe script,
+not §7's original run — same checkpoint, same config, numbers differ
+slightly from §7's 2.5528/2.7582/2.8437/4.9759 only due to eval-batch
+sampling noise; both readings support the same conclusion.)
+
+**Two separate findings, pulling in different directions:**
+
+1. **Post's standalone trunk IS more robust, as the representational-
+   separation hypothesis predicted.** `unconditional_pass1` (fusion fully
+   removed, level 0 running as a pure local encoder) scores 4.6761 for
+   post vs. 4.9456 for pre — post is 0.2695 bpb BETTER with no fusion at
+   all. This makes sense structurally: in "post" mode, `self.blocks` runs
+   first and produces a real, self-contained local representation before
+   cross-attention ever touches it; in "pre" mode, cross-attention runs
+   first and `self.blocks` learns to expect an already-fused input,
+   so stripping fusion leaves `self.blocks` operating on an
+   out-of-distribution input it never saw during training.
+
+2. **But post relies EVEN MORE heavily on the null/structural slot for
+   its OWN normal-mode performance, not less.** Of fusion's total
+   contribution (`normal` − `unconditional_pass1`), null_only alone
+   recovers 91.0% of it for pre vs. **96.4%** for post; big_noise
+   recovers 88.4% for pre vs. **99.2%** for post. In post mode, real
+   coarser-level content is responsible for essentially none of
+   `normal`'s advantage over a noised/null KV (big_noise is only 0.0176
+   bpb worse than normal for post, vs. 0.0699 for pre) — almost the
+   entire post-fusion benefit is the extra `fuse_cross` capacity/null-slot
+   itself, even more so than §7's already-capacity-dominated pre-mode
+   finding.
+
+**Reading**: these aren't contradictory — they're about two different
+counterfactuals. Removing fusion ENTIRELY (`unconditional_pass1`) hurts
+post less, because post's trunk never became dependent on fusion being
+present. But GIVEN that fusion runs, post's cross-attention branch itself
+contributes almost nothing beyond raw capacity (content barely matters),
+more so than pre's. Net: post buys a cleaner fallback/more modular trunk
+at the cost of an even less content-driven fusion mechanism, and overall
+scores slightly worse at matched compute (2.5033 vs. 2.4926) — the
+representational-separation trade doesn't pay for itself here. Still
+motivates finishing the 2x2 grid (`fuse_use_null_kv=False` in both
+positions) to isolate how much of post's null-slot dependence is the slot
+itself vs. `fuse_cross`'s other parameters.
+
+## 9. `qcute_refine_v4_k32_narrow_postfuse_nonull` (post + no null KV) — best trained result of the grid so far, and a genuine surprise
+
+Third of four 2x2 cells: `fuse_position="post"` + `fuse_use_null_kv=False`
+(no learned null slot at all — `_fuse`'s cross-attention has ONLY the
+real coarser-level KV rows to attend to, nothing else). **Trained result:
+best val_bpb 2.4799 @ step 1800** — better than BOTH `post+null`
+(2.5033) and, more surprisingly, better than `pre+null` (2.4926, the best
+of this whole K=32/narrow-window family until now). Removing the null
+slot in "post" mode isn't just neutral, it's the best config in the
+K=32 family tried this session.
+
+Probed the same way (`scripts/probe_v4_fusion_contribution.py`, 20 val
+batches, `checkpoints/qcute_refine_v4_k32_narrow_postfuse_nonull/best.pt`):
+
+| mode | pre+null | post+null | post+no-null |
+|---|---|---|---|
+| normal | 2.5757 | 2.5208 | 2.5005 |
+| null_only | 2.7895 | 2.5994 | 2.5596 |
+| big_noise | 2.8496 | 2.5384 | 2.5314 |
+| unconditional_pass1 (no fusion) | 4.9456 | 4.6761 | **5.6564** |
+| null_only/big_noise recover... | 91.0%/88.4% | 96.4%/99.2% | 98.1%/99.0% |
+| of fusion's total benefit | | | |
+
+Two findings, one confirming the trend, one genuinely unexpected:
+
+1. **Confirms the "capacity, not content" trend continues to strengthen**:
+   with no null slot to fall back on at all, `null_only`/`big_noise`
+   still recover 98-99% of fusion's benefit — essentially ALL of it, even
+   more than post+null's already-dominant 96-99%. Real coarser-level
+   content is doing almost nothing measurable in this config, with or
+   without a null slot present.
+
+2. **Unexpected: `unconditional_pass1` gets dramatically WORSE without
+   the null slot (5.6564 vs. 4.6761 — +0.98 bpb), even though the null
+   slot barely mattered for `normal`-mode performance.** The null slot's
+   real value, on this evidence, isn't what it contributes to the forward
+   pass when present — it's a TRAINING-time effect: without it,
+   `self.blocks` (PASS 1) apparently never learns to be self-sufficient,
+   because `_fuse`'s cross-attention (now real-content-only, no fallback)
+   is always "available" during training, so gradients never push PASS 1
+   toward standalone competence the way `null_only`'s own robustness
+   might. With the null slot present, evidently something about having
+   an always-visible, low-information anchor slot in the KV set makes the
+   REST of the network (particularly PASS 1's own trunk) train into a
+   more standalone-capable state — a genuine regularization effect,
+   opposite in direction from what its ~0% content-recovery share in
+   `normal`-mode would suggest on its own.
+
+**Net reading of the grid so far (3 of 4 cells)**: null_kv's role is
+almost entirely about TRAINING dynamics/robustness, not about what it
+contributes to a normal forward pass (which is consistently ~0-10%,
+across every cell). Removing it can still IMPROVE the trained result
+(post+no-null beats post+null on `normal`-mode val_bpb, 2.4799 vs.
+2.5033) even while making the model dramatically MORE fragile to full
+fusion ablation (5.6564 vs. 4.6761) — two different things, easy to
+conflate. `qcute_refine_v4_k32_narrow_nonull` (pre+no-null, the last
+cell, training as of this writing) will show whether this same pattern
+(no-null beats null, unconditional_pass1 gets much worse) holds in "pre"
+mode too, or is specific to "post."
+
+## 10. Full 2x2 grid `{pre,post} x {null,no-null}` — consolidated
+
+All four cells now trained and probed (`checkpoints/qcute_refine_v4_
+k32_narrow{,_postfuse}{,_nonull}/best.pt`, same K=32/narrow-window
+architecture, identical params/FLOPs across all four — only
+`fuse_position`/`fuse_use_null_kv` differ):
+
+| cell | trained best val_bpb | @ step | null_only recovers | big_noise recovers | unconditional_pass1 |
+|---|---|---|---|---|---|
+| pre + null (`k32_narrow`) | 2.4926 | 2800 | 91.0% | 88.4% | 4.9456 |
+| post + null (`postfuse`) | 2.5033 | 3600 | 96.4% | 99.2% | 4.6761 |
+| **post + no-null (`postfuse_nonull`)** | **2.4799 (best of grid)** | 1800 | 98.1% | 99.0% | 5.6564 (worst of grid) |
+| pre + no-null (`nonull`) | 2.4961 | 2700 | 95.9% | 97.4% | 5.0124 |
+
+Four findings, read together:
+
+1. **Content contribution shrinks monotonically toward ~0 as you move
+   away from pre+null.** null_only/big_noise recovery climbs from
+   91/88% (pre+null, the "most content-dependent" cell) up to 98/99%
+   (post+no-null, the "most capacity-dependent" cell) — real
+   coarser-level content matters least exactly where the architecture is
+   least conservative (post ordering, no fallback slot).
+
+2. **"pre" is robust to null-slot removal in BOTH directions; "post" is
+   sensitive in both.** Removing null_kv barely moves pre's trained
+   result (2.4926→2.4961, +0.0035, a wash) or its unconditional_pass1
+   floor (4.9456→5.0124, +0.067, mild) — but for post it improves the
+   trained result substantially (2.5033→2.4799, −0.023) while roughly
+   DOUBLING the unconditional_pass1 penalty (4.6761→5.6564, +0.98).
+   Structural explanation: in "pre" mode, `self.blocks` always runs on
+   fusion's OUTPUT (with or without a null slot, it's still post-
+   cross-attention data self.blocks can normalize/adapt to), so the
+   null slot's presence is a smaller perturbation to what self.blocks
+   sees. In "post" mode, `self.blocks` runs FIRST, entirely independent
+   of whatever `_fuse` does afterward — so whether `_fuse` had a null
+   fallback available during training more directly reshapes what
+   downstream layers (and `self.blocks`'s own gradients, since fusion's
+   loss still backprops through the whole model) come to rely on.
+
+3. **Best single trained result of the whole K=32 family is post+no-null
+   (2.4799)** — but it is also the LEAST robust to fusion being fully
+   ablated (worst unconditional_pass1 of all four, 5.6564). A genuine
+   score-vs-robustness trade-off, not a free win: whether "best trained
+   val_bpb" or "graceful degradation under corrupted/missing coarser
+   context" matters more for a given use case decides which cell is
+   actually "best."
+
+4. **None of these four numbers close the gap to `bytelm_xs1_ctx1024`
+   (2.4870) or `bytelm_xs3_ctx1024` (2.4080)** — post+no-null (2.4799)
+   is the only cell that beats `xs1`, and only by 0.007, well within
+   run-to-run noise, and still loses clearly to `xs3`. Consistent with
+   this session's overall finding: no `qcute_refine` lever tried,
+   including this whole null-kv/fuse-position grid, has closed the gap
+   to a properly matched dense baseline. The grid's real value was
+   mechanistic (what null_kv and fuse_position actually do), not a
+   competitive result in its own right.
+
+## 11. v4.2's fully-unified head — genuine training instability, not just an efficiency tradeoff
+
+`qcute_refine_v4_2_k32_narrow` (first real v4.2 training run — K=32/narrow-window, concat-only
+fusion, `dq=8`, single shared `embed`/`ntp_head`/`code_pre` across EVERY level including byte,
+`code_head_mode="independent"`): **best val_bpb 4.0369 @ step 3700**, full 4000-step run. This is
+dramatically worse than every other K=32 config this session (2.48-2.60 range) or even
+`bytelm_xs1_ctx1024`'s 2.4870 — a ~1.55 bpb gap far larger than the "independent-bit BCE is an
+upper bound on true bits-per-byte" caveat alone could explain (that would predict a few tenths of
+a bpb at most, not 1.5+).
+
+**Root cause, confirmed by the per-level trajectory**: `val_level1_bpb_pass1` (the code level's
+own loss, computed through the SAME shared head/embed byte level uses) never converges across the
+full 4000-step run — min 0.556, max 5.700, mean 3.705, and critically the **standard deviation
+over just the SECOND HALF of training (steps 2000-4000) is still 0.522** — no stabilization late
+in training, genuinely persistent oscillation, not a slow-to-settle transient. Meanwhile
+`val_level0_bpb_pass1` (byte level) DOES show a real if slow and noisy downward trend (6.03 →
+4.94 → 4.66 → 4.38 → 4.27 → 4.20 → 4.07) — byte level is learning something, just far worse and
+slower than every unshared config, while the code level's own loss is essentially thrashing the
+entire time. Reading: forcing ONE head/embed to serve both byte-level prediction (256-way
+discrimination over raw byte identity) and code-level prediction (a continuous BSQ code with very
+different target statistics — already >85% bit-accuracy in every other config this session, a much
+easier task) creates a genuine optimization conflict, not merely a capacity/efficiency tradeoff —
+the shared head's gradient updates from one task actively destabilize the other, and never settle
+into a shared solution good for both.
+
+**Isolating what specifically causes it — the "does concat itself train fine" baseline requested
+directly**: `qcute_refine_v4_k32_narrow_concat` (plain v4, UNSHARED weights, same K=32/narrow-window
+architecture, same additive-loss training scheme, `fuse_position="concat"`) reaches **val_bpb
+2.7150 already by step 1100** — better than v4.2's entire 4000-step best (4.0369) in barely a
+quarter of the training budget. This directly confirms concat fusion itself is not the problem;
+the instability is specific to v4.2's head/embed unification. `qcute_refine_v4_1_k32_narrow_shared`
+(trunk-shared, head/embed NOT unified — v4.1's own scheme) is queued to isolate the remaining
+question: is trunk-sharing alone (self.blocks/ln_f tied across levels) fine, with the instability
+coming specifically from ALSO tying the embed/head (v4.2's addition on top), or does trunk-sharing
+alone already show some of this pathology? Not yet resolved as of this writing.
+
+`qcute_refine_v4_2_k32_narrow_ssm` (same architecture, `code_head_mode="chain"` +
+`bit_head_class="ssm"` instead of `"independent"`) is also queued — tests whether a different
+SHARED head type (exact chain-rule factorization via `BitPredictHeadSSM`, rather than independent
+per-bit logits) reduces or reproduces the same instability, which would further localize the cause
+to "any shared head, regardless of type" vs. "specifically the independent-linear head's own
+optimization landscape."
+
+**Side finding, resolves an open question from earlier this session**: `bytelm_xs1_ctx32`
+(plain 1-layer dense bytelm, `context=32` — the genuine from-scratch single-task baseline for "how
+good can a model with only 32 bytes of context get") reaches best val_bpb **2.8664 @ step 4000**
+(still improving at the final step, not yet plateaued) — notably WORSE than the K=32 family's own
+`level0_bpb_pass1` (unconditional/standalone) values of ~2.53-2.60 seen throughout this session's
+probes. This resolves the "is qcute_refine's ~2.5-2.6 uncond bpb at window=32 normal" question
+asked earlier: **no, it's better than what a genuinely single-task 32-context model achieves**,
+confirming the earlier hedge was right to flag — `self.blocks`' good standalone performance in the
+`qcute_refine` family reflects benefit from JOINT training with the fusion task (multi-task
+regularization/shaping), not simply "32 bytes of context is already enough on its own." A plain
+model given only that same 32-byte budget and nothing else reaches 2.87, meaningfully worse.
+`bytelm_xs1_ctx8` reaches best val_bpb 3.357 @ step 2300 (and, unlike ctx32, already overfitting/
+degrading past that point rather than still improving at step 4000) — consistent with the
+session's earlier finding that 8 bytes is a harsher regime than 32.
+
+**Level 0's uncond (standalone, no-fusion) bpb, at each run's own best-fused-checkpoint step, so
+far:**
+
+| run | fused val_bpb | level0 uncond bpb | @ step |
+|---|---|---|---|
+| `qcute_refine_v4_k32_narrow_postfuse_nonull_uncond` (post+no-null) | 2.4967 | 2.5768 | 2000 |
+| `qcute_refine_v4_k32_narrow_nonull_uncond` (pre+no-null) | 2.4992 | **2.4782 (beats fused)** | 3500 |
+| `qcute_refine_v4_k32_narrow_concat` (v4, unshared, in progress) | 2.5366 so far | 2.5363 | 2500 |
+| `qcute_refine_v4_2_k32_narrow` (v4.2, shared head, unstable) | 4.0369 | 4.0563 | 3700 |
+| `bytelm_xs1_ctx32` (genuine single-task, no fusion concept at all) | 2.8664 | — (n/a, no fusion) | 4000 |
+| `bytelm_xs1_ctx8` (genuine single-task) | 3.357 | — (n/a) | 2300 |
+
+Notable: `nonull_uncond`'s (pre) own uncond value (2.4782) is actually SLIGHTLY BETTER than its
+own fused value (2.4992) at that checkpoint — level 0's standalone path briefly outperforms the
+fused prediction, a real instance of the additive-loss scheme pushing standalone competence high
+enough to occasionally beat the fused path itself, not just approach it. `k32_narrow_concat`'s own
+uncond and fused values are nearly identical (2.5363 vs 2.5366) — fusion is barely adding anything
+measurable at that checkpoint, consistent with the earlier "most of fusion's benefit is capacity,
+not content" finding (§7-10) extended to the additive-loss regime. `v4_2_k32_narrow`'s uncond
+(4.0563) tracks its own fused value (4.0369) closely too — the instability is shared-head-wide,
+not something fusion is uniquely responsible for or masking.
+
+**Is `nonull_uncond`'s fused-losing-to-uncond result (2.4992 vs. 2.4782) actually counter-
+intuitive?** On its face yes — fusion gives level 0 strictly MORE information (a coarser code
+built from a much larger receptive field), so a naive expectation is fused ≥ uncond always. Two
+things resolve it, neither undermining the architecture:
+
+1. **The gap (0.021 bpb) is small and likely just checkpoint noise, not fusion actively hurting.**
+   In `"pre"` mode, `self.blocks` is the SAME shared weights serving both the PASS 1 (raw, unfused)
+   input and the PASS 2 (fused) input — both loss terms backprop into it, so it has to generalize
+   across two different input distributions at once. That's a small multi-task tension inherent to
+   the additive-loss design itself (much milder than v4.2's full head-sharing pathology above, but
+   the same flavor) — the two paths trading places by a hair at any single snapshot, rather than one
+   strictly dominating throughout training, is expected, not alarming.
+
+2. **The "32 bytes → 2.48 bpb" number itself isn't secretly free — already checked directly.**
+   `bytelm_xs1_ctx32` (a genuinely SEPARATE model, trained ONLY on the 32-byte-window task, no
+   fusion anywhere) reaches best val_bpb **2.8664** — clearly worse than `qcute_refine`'s own
+   uncond 2.4782 at the identical 32-byte cap. So level 0's strong standalone number isn't "32
+   bytes turns out to be plenty" — it's `self.blocks` being trained JOINTLY with the fusion task
+   (even though fusion is switched OFF at this particular eval) that shapes it into a better
+   standalone 32-byte model than training on the 32-byte task in isolation ever produces. A real,
+   if slightly surprising, training-time regularization/shaping effect — "trained with X available"
+   and "evaluated with X available" are different axes, and weights carry information from how they
+   were trained even when an input channel is removed at inference time. Not a violation of "more
+   information should help," just a reminder that the two questions aren't the same question.

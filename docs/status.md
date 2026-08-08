@@ -162,6 +162,248 @@ the better real-world reference point, and the architectural reasoning
 above (not the noisy wall-clock numbers) is what the "v4 vs v2" cost
 comparison should rest on.
 
+**`qcute_refine_v4_depth22` (`tier_n_layers=(2,2)`) — closest ANY
+`qcute_refine` config has come to a matched baseline all session.** Best
+val_bpb **2.4097 @ step 1600** (mean it/s 0.834, min train bpb 0.867) —
+within **0.0017** of `bytelm_xs3_ctx1024`'s 2.4080, the strongest
+baseline result this whole investigation has been measured against.
+Beats every fusion/pq_table/`fuse_position` variant tried (`v3_rope`'s
+2.4302, `v4_rope`'s 2.4710, `v4_pq`'s 2.4565) by simply doubling depth —
+no new mechanism, no new training dynamics, the single most standard
+lever in deep learning, exactly the "test the boring thing first" plan
+from a few turns back. Strong validation of the `k32_narrow`
+fusion-contribution probe's own finding (docs/kv_contribution.md §7:
+~90% of fusion's benefit was capacity/depth, not cross-level content) —
+depth alone, with NO cross-attention tricks beyond default fusion,
+recovers essentially all of that gap on its own. **Caveat**: not a
+params/FLOPs-matched comparison — `depth22` costs 4.152M params/8.963G
+FLOPs vs. `bytelm_xs3`'s 2.625M/5.369G (58%/67% more) — so this
+specific comparison doesn't prove qcute_refine "wins" at matched
+compute, only that depth is likely the dominant lever within its OWN
+architecture family, more so than any cross-attention mechanism tried.
+A genuinely fair test would need a depth/width-matched dense bytelm
+baseline at `depth22`'s own budget — not yet run.
+
+**`qcute_refine_v4_depth21` (`tier_n_layers=(2,1)`) — beats one baseline,
+loses to the closer-matched one.** Best val_bpb **2.3957 @ step 1900**
+(held through the end — overfit after that point, train bpb collapsed to
+~1.0 while val climbed), mean it/s 0.952. Honest framing against both
+reference points (params 3.363M, FLOPs 8.561G):
+
+| vs. | params diff | FLOPs diff | val_bpb delta |
+|---|---|---|---|
+| `bytelm_xs3_ctx1024` (2.4080) | +28.1% | +59.5% | **−0.0123 (beats it)** |
+| `bytelm_xs_mtp4_ctx1024` (2.3650) | **−1.4% (closest match)** | +22.7% | +0.0307 (loses) |
+
+So: beats `xs3`, but only by spending 28% more params to do it — not a
+fair win. Against `bytelm_xs_mtp4`, the genuinely closest params match
+found for ANY config this session (−1.4%), `depth21` still loses, despite
+having fewer params (though 23% more FLOPs).
+
+**`qcute_refine_v4_k2` (`Ks=(2,2)`, finer code blocks) — loses at a
+genuinely close match.** Best val_bpb **2.4495 @ step 3100** (mean it/s
+1.391, min train bpb 1.493). This is the CLOSEST params match of any
+config this session:
+
+| vs. | params diff | FLOPs diff | val_bpb delta |
+|---|---|---|---|
+| `bytelm_xs3_ctx1024` (2.4080) | **−1.9% (closest of any config)** | +8.9% | +0.0415 (loses) |
+
+Fewer params AND a real (if modest) FLOPs premium, still loses by 0.042
+bpb — the cleanest "no, this lever alone doesn't close the gap" result
+this session. Finer code granularity (K=2 vs. the usual K=4) didn't help
+on its own.
+
+**No `qcute_refine` config has yet beaten a baseline at a comparison
+that's fair on BOTH params and FLOPs simultaneously** — `depth22` came
+closest in absolute score (0.0017 from `xs3`) but at far more compute;
+`k2` is the closest in params-matching but loses clearly; `depth21`
+beats `xs3` but only at +28% params. Depth remains the strongest lever
+found this session, but hasn't closed the gap outright at matched
+compute yet.
+
+**`qcute_refine_v4_k1` (`Ks=(1,1)`, degenerate/no compression) — no
+close baseline match, but informative anyway.** Best val_bpb **2.4232 @
+step 1500**, mean it/s 1.119, params 2.575M, FLOPs 6.866G:
+
+| vs. | params diff | FLOPs diff | val_bpb delta |
+|---|---|---|---|
+| `bytelm_xs1_ctx1024` (2.4870) | +145.2% | +219.8% | −0.0638 (beats it, unfair — 2.5x params) |
+| `bytelm_xs3_ctx1024` (2.4080) | **−1.9% (close)** | +27.9% | +0.0152 (loses) |
+
+Same story as `k2`: close params match to `xs3`, still loses, this time
+by a smaller 0.015 bpb — the least-bad "no compression at all" result,
+but still a loss at near-matched params. Removing BSQ's whole
+compression rationale (every raw position becomes its own code block)
+didn't help versus keeping it at `K=4`/`K=2`.
+
+**`qcute_refine_v4_k32_narrow_postfuse` (`fuse_position="post"` on the
+K=32/narrow-window architecture) — pre still beats post, same direction
+as the earlier `pq_postfuse` ablation.** Best val_bpb **2.5033 @ step
+3600** vs. `k32_narrow`'s (pre, default) **2.4926** — post loses by
+0.0107, identical params/FLOPs (only fusion's position in the block
+differs), consistent in direction and rough magnitude with the earlier
+`v4_pq_postfuse` finding (post lost by 0.011 there too). Probed both
+checkpoints with `scripts/probe_v4_fusion_contribution.py` — full
+writeup in [docs/kv_contribution.md](kv_contribution.md) §8. Headline:
+post's standalone trunk (fusion fully removed) IS more robust than pre's
+(4.6761 vs. 4.9456 bpb — confirms one half of the "representational
+separation" hypothesis), but post's fusion, when present, leans on real
+coarser-level CONTENT even less than pre's already content-starved
+fusion does (big_noise costs post only 0.0176 bpb vs. pre's 0.0699) — the
+trade doesn't net out to a win here. `fuse_use_null_kv=False` runs for
+both positions (`k32_narrow_nonull`, `k32_narrow_postfuse_nonull`) are
+queued to isolate how much of this is the learned null slot specifically
+vs. `fuse_cross`'s other parameters.
+
+**`qcute_refine_v4_k32_narrow_postfuse_nonull` (post + no null KV) — best
+of the K=32 family so far.** Best val_bpb **2.4799 @ step 1800** — beats
+BOTH `post+null` (2.5033) AND `pre+null` (2.4926, previously the best of
+the family). Same params/FLOPs as every other K=32/narrow-window cell
+(no null slot removes ~256 negligible params). Probe
+(`scripts/probe_v4_fusion_contribution.py`, see
+[docs/kv_contribution.md](kv_contribution.md) §9 for the full table):
+`null_only`/`big_noise` recover 98.1%/99.0% of fusion's total benefit —
+even more capacity-dominated than post+null's 96.4%/99.2%, continuing the
+trend. But `unconditional_pass1` (fusion fully removed) is dramatically
+WORSE without the null slot — 5.6564 vs. post+null's 4.6761, a +0.98 bpb
+jump despite the null slot contributing ~0% to `normal`-mode performance.
+Reading: the null slot's real value looks like a TRAINING-time
+regularizer (keeps PASS 1's own trunk more standalone-capable, evidently
+because `_fuse`'s cross-attention is never "guaranteed available" the way
+it is without a null fallback), not a forward-pass content contribution —
+those are two different effects, easy to conflate from `normal`-mode
+numbers alone.
+
+**2x2 grid complete — `qcute_refine_v4_k32_narrow_nonull` (pre + no null
+KV) is the last cell.** Best val_bpb **2.4961 @ step 2700** — essentially
+a wash vs. `pre+null`'s 2.4926 (+0.0035), unlike "post" where removing
+null improved the trained result by 0.023. Full grid (all four cells,
+identical params/FLOPs, only `fuse_position`/`fuse_use_null_kv` differ):
+
+| cell | trained best val_bpb | unconditional_pass1 (no fusion) |
+|---|---|---|
+| pre + null | 2.4926 | 4.9456 |
+| post + null | 2.5033 | 4.6761 |
+| **post + no-null** | **2.4799 (best of grid)** | 5.6564 (worst of grid) |
+| pre + no-null | 2.4961 | 5.0124 |
+
+Reading (full mechanistic writeup in
+[docs/kv_contribution.md](kv_contribution.md) §10): "pre" is robust to
+null-slot removal in both directions (trained result AND
+unconditional-ablation floor barely move); "post" is sensitive in both
+(trained result improves, but the no-fusion floor roughly doubles its
+penalty) — because in "pre" mode `self.blocks` always processes fusion's
+OUTPUT regardless of whether a null fallback existed, while in "post"
+mode `self.blocks` runs entirely independently of `_fuse`, so whatever
+fallback existed during training more directly reshapes what the rest of
+the network learns to depend on. Best single result of the whole K=32
+family is post+no-null (2.4799), narrowly beating `bytelm_xs1_ctx1024`
+(2.4870) by 0.007 — within noise, and still well short of `bytelm_
+xs3_ctx1024` (2.4080). **The grid's value was mechanistic (what
+null_kv/fuse_position actually do), not a competitive result** —
+consistent with the session's overall finding that no `qcute_refine`
+lever tried has closed the gap to a properly compute-matched dense
+baseline.
+
+**`qcute_refine_v4_bpe4_imitate` — worst result of the session relative
+to a matched baseline.** K=4/window=8 at level 0 (near-bag-of-8-bytes),
+level 1 `window=256` (dense, its own full sequence) + `tier_n_layers=
+(1,2)` — a more literal DEPTH-imitation of the 4-layer `bytelm`/`bpelm`
+baselines than any params/FLOPs-matched config tried. Best val_bpb
+**2.5073 @ step 2600**, params 3.363M, FLOPs 5.742G:
+
+| baseline | params diff | FLOPs diff | val_bpb delta |
+|---|---|---|---|
+| `bytelm_xs_mtp4_ctx1024` (2.3650) | **−1.4% (closest match)** | −17.7% | **+0.1423 (loses)** |
+| `bytelm_xs3_ctx1024` (2.4080) | +28.1% | +6.9% | +0.0993 (loses) |
+| `bytelm_xs1_ctx1024` (2.4870, 1-layer diagnostic) | +220.3% | +167.4% | +0.0203 (**loses even to this**) |
+| `bpelm_4096_paramsmatch` (2.3531) | −1.7% (close) | +119.4% | +0.1542 (loses) |
+| `bpelm_8192` (2.3500) | −36.0% | +113.9% | +0.1573 (loses) |
+| `bpelm_8192_ctx448_flopsmatch_rope` (2.3559) | −24.6% | +43.8% | +0.1514 (loses) |
+| `bpelm_16384_ctx448_flopsmatch` (2.3438) | −48.7% | −2.2% | +0.1635 (loses) |
+| `bpelm_32768` (2.1340) | −70.9% | −2.8% | +0.3733 (loses badly) |
+
+Loses to EVERY baseline, including its own closest params match
+(`bytelm_xs_mtp4_ctx1024`, −1.4%) by 0.142 bpb — a far bigger margin than
+any other closely-matched pair this session (`k2`/`k1`/`depth21` all lost
+by only 0.015–0.041 at similar match quality), and loses even to the
+trivial 1-layer `bytelm_xs1` diagnostic despite 3.2x the params and 2.7x
+the FLOPs. Reading: literal depth-imitation (narrow level-0 window +
+deep level 1) did NOT close the gap the way plain depth WITHIN
+`qcute_refine`'s own family did (`depth22` came within 0.0017 of `xs3`)
+— crippling level 0's own receptive field to force reliance on fusion
+hurt more than the added level-1 depth helped. Consistent with the
+session's broader finding: the hierarchical/windowed structure itself,
+not depth alone, is the harder constraint for `qcute_refine` to overcome
+relative to a dense baseline of equivalent depth.
+
+**This was the last queued config of the session's ablation sweep.**
+Overall verdict across everything tried (depth `(2,2)`/`(2,1)`, finer/
+degenerate K `2`/`1`, the K=32 narrow-window family and its full 2x2
+`fuse_position x fuse_use_null_kv` grid, and this depth-imitation
+config): **no `qcute_refine` lever closed the gap to a properly
+compute-matched dense `bytelm`/`bpelm` baseline.** Depth remains the
+single strongest lever found (`depth22`'s 0.0017 gap to `xs3`, at +58%
+params/+67% FLOPs — not a fair win, but the closest approach). Fusion's
+own benefit is mostly capacity, not cross-level content (§7-10 above,
+~88-99% recoverable with zeroed/noised KV). `fuse_use_null_kv`'s real
+value looks like training-time regularization (shapes how standalone-
+capable the rest of the network becomes) rather than forward-pass
+content. This session's own code change (see `qcute_refine_v4.py`'s
+`_encode`/`forward` — PASS 2 no longer overwrites PASS 1, both now
+backprop as separate terms, `Config.fusion_ntp_weight`) targets exactly
+this: pushing every `LevelLM` toward standalone competence directly
+during training, rather than relying on fusion alone and hoping
+standalone competence emerges as a side effect. Retraining under this
+new scheme is in progress as of this note.
+
+**(Not actually the last config — the session continued substantially
+further; superseded by the sections below.)** New lineage members this
+session: `qcute_refine_v4_1.py` (extreme weight sharing — one `LevelLM`
+trunk shared across every level, `Ks`/`attn_window` stay per-level) and
+`qcute_refine_v4_2.py` (further unified: single shared `dq`/embed/head
+across every level including byte, concat-only fusion, no cross-attention
+module at all). Also added to `qcute_refine_v4.py`: `fuse_position`
+gained `"both"` (two independent `CrossBlock`s) and `"concat"` (fusion
+folded directly into `self.blocks`' own windowed self-attention, no
+separate cross-attention module — see `docs/kv_contribution.md` for the
+full mechanism and correctness verification).
+
+**`qcute_refine_v4_k32_narrow_nonull_uncond` retrained under the new
+additive-loss scheme: best val_bpb 2.4992** — matches the earlier
+`postfuse_nonull_uncond` retrain (2.4967) closely; both land in the same
+range as the original (pre-additive-loss) scheme's 2.4926-2.4961, no
+regression from adding the PASS1 standalone term to the loss.
+
+**v4.2's fully-unified head shows a genuine, persistent training
+instability — not just an efficiency tradeoff.** `qcute_refine_v4_2_
+k32_narrow` (K=32/narrow-window, concat-only, single shared head/embed
+across every level): best val_bpb **4.0369 @ step 3700**, dramatically
+worse than every other K=32 config this session (2.48-2.60) and
+`bytelm_xs1_ctx1024` (2.4870) — a gap far too large to be explained by
+the independent-bit-BCE-is-an-upper-bound caveat alone. Root cause: the
+code level's own loss (`val_level1_bpb_pass1`, computed through the SAME
+shared head byte level uses) never stabilizes across the full run —
+std over just the second half of training (steps 2000-4000) is still
+0.522, no late-training convergence. Full trajectory/isolation analysis
+(confirming concat itself trains fine at 2.7150 by step 1100 when
+weights are unshared, and testing whether a different shared head type
+helps) in [docs/kv_contribution.md](kv_contribution.md) §11.
+
+**Resolves an earlier open question**: `bytelm_xs1_ctx32` (genuine
+from-scratch 1-layer bytelm, `context=32`) reaches best val_bpb **2.8664
+@ step 4000** — worse than the K=32 family's own standalone/unconditional
+`level0_bpb_pass1` values (~2.53-2.60) seen throughout this session.
+Confirms that `qcute_refine`'s good standalone byte-level performance at
+window=32 reflects a genuine benefit from JOINT training with the fusion
+task (multi-task shaping), not simply "32 bytes of raw context is already
+enough on its own" — a plain single-task model given the same budget
+does meaningfully worse. `bytelm_xs1_ctx8`: best val_bpb 3.357 @ step
+2300, already overfitting past that point (unlike ctx32, which was still
+improving at the final step) — 8 bytes is a harsher regime than 32,
+consistent with earlier findings.
+
 **Housekeeping (this session)**: `EncoderLevel` renamed to `LevelLM`
 throughout `qcute_refine_v4.py` — the class does both the "encode"
 (PASS 1, produce the code) and "decode" (PASS 2, fused/conditioned

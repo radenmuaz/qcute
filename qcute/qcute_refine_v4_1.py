@@ -1,4 +1,55 @@
-"""qcute.qcute_refine_v4 — CLONE of qcute_refine_v3.py, MINUS DecoderLevel
+"""qcute.qcute_refine_v4_1 — CLONE of qcute_refine_v4.py, PLUS EXTREME
+WEIGHT SHARING (session ask: "clone v4 to v4.1 for extreme weight
+sharing, only one levellm (can adjust num layer and dim) but shared
+across byte and code levels"). New `Config.share_levellm` (default True):
+every level's `LevelLM.self.blocks`/`ln_f`/fusion modules
+(`fuse_kv_proj`/`fuse_null_kv`/`fuse_cross_pre`/`fuse_cross_post`) are the
+SAME nn.Module objects as level 0's own — genuinely tied weights (same
+Parameters, gradients from every level accumulate into them), not
+separate same-shaped copies. Requires uniform `tier_d_models`/
+`tier_n_layers` across every level (a shared trunk can't have a different
+width/depth per level).
+
+"even though shared, the k and attn window for each level can be
+different" (session ask) — `Ks`/`attn_window` STAY genuinely per-level.
+This required one real mechanical change from v4: `window` moved from a
+CausalSelfAttention CONSTRUCTOR argument (baked into the module, one
+value forever) to a FORWARD-time argument (`CausalSelfAttention.forward`/
+`Block.forward` now both take `window` as a parameter) — the only way a
+single shared module can still serve levels with different windows.
+
+"this single levellm generates for itself its own bsq code for level 1
+and above and ntp them, and in decoding phase reuse them" — unchanged
+from v4's own PASS 1/PASS 2 structure (`RefineLM._encode`): the shared
+trunk still runs once per level (its own forward pass, own NTP loss/code
+emission), fusion still cross-attends level i to level i+1's own hidden
+state — only the WEIGHTS doing this work are now shared, not the
+computational structure itself.
+
+"for first impl the levellm has both byte head and byte embed table and
+bsq head and bsq linear map, though bsq head and bsq linear map can be
+different each level by default, can be set weight sharing for ablation"
+— `Config.share_code_head` (default False, independent of
+`share_levellm`): ties every CODE level's (1..n_levels-1) own `embed`
+(CodeEmbed)/`ntp_head`/`code_pre` ("bsq linear map," the D->dq
+pre-quantization projection) to level 1's own. Off by default — each code
+level keeps its own BSQ head/embed even though the big trunk is shared.
+Byte level 0's own `byte_embed`/`ntp_head` are never affected (there's
+only one byte-typed level; "sharing" it is meaningless).
+
+First-impl scope (session: "for first impl"): `share_levellm=True`
+requires `byte_repr="embed"` and `code_head_mode="independent"` (asserted
+in `LevelLM.__init__`) — `BitPredictHead`'s chain-mode heads aren't wired
+into the shared-trunk path yet, a follow-up not this session's scope.
+
+Everything below (until noted) is v4's own original module docstring,
+unchanged — v4.1 does not alter PASS 1/PASS 2, fusion, generation, or any
+of v4's own session history; it only adds the sharing mechanism above on
+top.
+
+---
+
+qcute.qcute_refine_v4 — CLONE of qcute_refine_v3.py, MINUS DecoderLevel
 entirely. v3 added LevelLM fusion (Config.fuse_encoder_levels,
 default True — see below) on top of v2's original DecoderLevel/tok_loss
 cross-attention path; v4 removes DecoderLevel altogether, since fusion and
@@ -209,6 +260,36 @@ class Config:
     context_len: int = 1024
     n_heads: int = 4
     mlp_mult: int = 4
+    share_levellm: bool = True    # v4.1's own reason to exist (session ask: "extreme weight
+                                    # sharing, only one levellm... shared across byte and code
+                                    # levels"). True (default): every level's self.blocks/ln_f/
+                                    # fuse_* (fuse_kv_proj/fuse_null_kv/fuse_cross_pre/
+                                    # fuse_cross_post) are the SAME nn.Module objects as level 0's
+                                    # own — genuinely tied weights, not just same-shaped separate
+                                    # copies (see LevelLM.__init__'s own shared_trunk docstring).
+                                    # Requires uniform tier_d_models AND tier_n_layers across every
+                                    # level (asserted in RefineLM.__init__) — a shared trunk can't
+                                    # have a different width/depth per level by construction. `Ks`/
+                                    # `attn_window` stay genuinely per-level regardless (session:
+                                    # "even though shared, the k and attn window for each level can
+                                    # be different") — window became a FORWARD-time argument to
+                                    # CausalSelfAttention this file (v4 baked it into the module at
+                                    # construction; that's incompatible with one shared module
+                                    # serving levels with different windows). False: reproduces
+                                    # qcute_refine_v4.py's own per-level-independent-weights
+                                    # behavior exactly (this file's own version of "no sharing").
+    share_code_head: bool = False  # ablation, off by default ("bsq head and bsq linear map...
+                                    # different each level by default... can be set weight sharing
+                                    # for ablation" — session ask). Only affects CODE levels
+                                    # (1..n_levels-1) — byte level 0's own byte_embed/ntp_head are
+                                    # never shared (there's only one byte-typed level). True: every
+                                    # code level's own `embed` (CodeEmbed)/`ntp_head`/`code_pre`
+                                    # (the "bsq linear map", D -> dq pre-quantization projection)
+                                    # get tied to level 1's own (the first code level) — requires
+                                    # uniform dqs across every code level (asserted). Independent of
+                                    # share_levellm — the shared TRUNK (self.blocks) and the
+                                    # per-level BSQ head/embed are two separate sharing questions,
+                                    # by design (session: kept them as two distinct knobs).
     attn_window: int | tuple[int, ...] = 128   # single int: broadcast to every level (backward-
                                     # compatible default). Per-level tuple (length n_levels): lets the
                                     # TOP level get its OWN, genuinely-sub-full window instead of always
@@ -548,11 +629,10 @@ class CausalSelfAttention(nn.Module):
     positions). `fuse_disallow` [T, Nf] bool (True=blocked, jagged_causal_mask_and_positions'
     convention) gates which fused rows each local query position may see."""
 
-    def __init__(self, d_model: int, n_heads: int, window: int | None = None):
+    def __init__(self, d_model: int, n_heads: int):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        self.window = window
         self._warned_dense_fallback = False
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
@@ -566,19 +646,25 @@ class CausalSelfAttention(nn.Module):
             fk = apply_rope(fk, *fuse_rope_k)
         return fk, fv
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, window: int | None,
                 fuse_kv: torch.Tensor | None = None, fuse_disallow: torch.Tensor | None = None,
                 fuse_rope_k=None) -> torch.Tensor:
+        """v4.1: `window` is now a FORWARD-time argument, not baked into the module at construction
+        — required for extreme weight sharing (Config.share_levellm): the SAME CausalSelfAttention
+        object is called at every level, and levels can have different K/attn_window (session ask:
+        "even though shared, the k and attn window for each level can be different") even though
+        they share every weight. Caller (LevelLM.forward, via RefineLM) passes each level's own
+        window in, matching v4's original per-instance `self.window` value exactly when NOT shared."""
         B, T, D = x.shape
         H, hd = self.n_heads, self.head_dim
         qkv = self.qkv(x).reshape(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        if self.window is not None and T % self.window == 0 and T > self.window:
-            y = self._forward_chunked(q, k, v, fuse_kv, fuse_disallow, fuse_rope_k)
+        if window is not None and T % window == 0 and T > window:
+            y = self._forward_chunked(q, k, v, window, fuse_kv, fuse_disallow, fuse_rope_k)
         else:
-            if self.window is not None and not self._warned_dense_fallback:
-                print(f"WARNING: CausalSelfAttention window={self.window} set but T={T} doesn't satisfy "
+            if window is not None and not self._warned_dense_fallback:
+                print(f"WARNING: CausalSelfAttention window={window} set but T={T} doesn't satisfy "
                       f"T % window == 0 and T > window — falling back to DENSE attention for this layer. "
                       f"Only warns once per layer instance.")
                 self._warned_dense_fallback = True
@@ -593,11 +679,11 @@ class CausalSelfAttention(nn.Module):
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.out(y.transpose(1, 2).reshape(B, T, D))
 
-    def _forward_chunked(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    def _forward_chunked(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int,
                           fuse_kv: torch.Tensor | None = None, fuse_disallow: torch.Tensor | None = None,
                           fuse_rope_k=None) -> torch.Tensor:
         B, H, T, hd = q.shape
-        W = self.window
+        W = window
         n_chunks = T // W
 
         def to_chunks(t):
@@ -670,10 +756,10 @@ class CausalSelfAttention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, mlp_mult: int, window: int | None = None):
+    def __init__(self, d_model: int, n_heads: int, mlp_mult: int):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, window=window)
+        self.attn = CausalSelfAttention(d_model, n_heads)
         self.ln2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, mlp_mult * d_model),
@@ -681,10 +767,10 @@ class Block(nn.Module):
             nn.Linear(mlp_mult * d_model, d_model),
         )
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, window: int | None,
                 fuse_kv: torch.Tensor | None = None, fuse_disallow: torch.Tensor | None = None,
                 fuse_rope_k=None) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), cos, sin, fuse_kv, fuse_disallow, fuse_rope_k)
+        x = x + self.attn(self.ln1(x), cos, sin, window, fuse_kv, fuse_disallow, fuse_rope_k)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -1107,13 +1193,43 @@ class LevelLM(nn.Module):
     independent head)."""
 
     def __init__(self, cfg: Config, level: int, in_dq: int, window: int | None,
-                 fuse_d_model: int | None = None, fuse_kv_window: int | None = None):
+                 fuse_d_model: int | None = None, fuse_kv_window: int | None = None,
+                 shared_trunk: "LevelLM | None" = None, shared_code_head: "LevelLM | None" = None):
+        """v4.1 EXTREME WEIGHT SHARING (session ask: "only one levellm... shared across byte and
+        code levels... even though shared, the k and attn window for each level can be different"):
+
+        `shared_trunk`: None (default — v4-identical, this level gets its OWN self.blocks/ln_f/
+        fuse_* weights) or another already-constructed LevelLM (always level 0's own, by
+        convention — see RefineLM.__init__) whose self.blocks/ln_f/fuse_kv_proj/fuse_null_kv/
+        fuse_cross_pre/fuse_cross_post get REUSED (same nn.Module objects assigned here, not
+        copied — PyTorch shares the underlying Parameters automatically, gradients from every
+        level accumulate into the same weights). Requires uniform tier_d_models/tier_n_layers
+        across every level (asserted) — `window` stays genuinely per-level regardless (passed at
+        FORWARD time now, not baked into CausalSelfAttention's own construction — see that
+        class's own docstring).
+
+        `shared_code_head`: None (default — "bsq head and bsq linear map... different each level
+        by default") or another code-level LevelLM whose embed/ntp_head/code_pre get reused the
+        same way — Config.share_code_head's ablation, requires uniform in_dq/dqs across the code
+        levels that share (asserted). Byte level (level 0) is never affected — there's only one
+        byte-typed level, "sharing" it is meaningless.
+
+        First-impl scope (session: "for first impl"): byte_repr="embed" and code_head_mode=
+        "independent" only when share_levellm is on — BitPredictHead's chain-mode heads aren't
+        wired into the shared-trunk path yet (asserted below), richer combinations are a
+        follow-up, not this session's scope."""
         super().__init__()
         self.level = level
         self.in_dq = in_dq
         self.cfg = cfg
+        self.window = window
         self.is_byte_level = level == 0
         D = cfg.tier_d_models[level]
+        if shared_trunk is not None:
+            assert cfg.byte_repr == "embed" and cfg.code_head_mode == "independent", (
+                "v4.1 share_levellm's first impl only supports byte_repr='embed'/code_head_mode="
+                "'independent' — BitPredictHead chain-mode heads aren't wired into the shared path yet"
+            )
         if self.is_byte_level:
             assert cfg.byte_repr in ("bits", "embed")
             if cfg.byte_repr == "embed":
@@ -1122,6 +1238,14 @@ class LevelLM(nn.Module):
             else:
                 self.embed = nn.Linear(in_dq, D)
                 self.ntp_head = build_bit_head(cfg, D, in_dq)
+        elif shared_code_head is not None:
+            # Config.share_code_head=True ablation: reuse ANOTHER code level's own embed/head/
+            # code_pre weights outright — same objects, genuinely tied, not just same-shaped.
+            assert in_dq == shared_code_head.in_dq and cfg.dqs[level] == cfg.dqs[shared_code_head.level], (
+                "share_code_head requires uniform in_dq/dqs across every code level that shares"
+            )
+            self.embed = shared_code_head.embed
+            self.ntp_head = shared_code_head.ntp_head
         else:
             assert cfg.code_head_mode in ("chain", "independent")
             self.embed = CodeEmbed(cfg, in_dq, D)
@@ -1129,9 +1253,19 @@ class LevelLM(nn.Module):
                 self.ntp_head = nn.Linear(D, in_dq)
             else:
                 self.ntp_head = build_bit_head(cfg, D, in_dq)
-        self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult, window) for _ in range(cfg.tier_n_layers[level])])
-        self.ln_f = nn.LayerNorm(D)
-        self.code_pre = nn.Linear(D, cfg.dqs[level])
+
+        if shared_trunk is not None:
+            assert D == cfg.tier_d_models[shared_trunk.level], "share_levellm requires uniform tier_d_models"
+            self.blocks = shared_trunk.blocks
+            self.ln_f = shared_trunk.ln_f
+        else:
+            self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.tier_n_layers[level])])
+            self.ln_f = nn.LayerNorm(D)
+
+        if shared_code_head is not None:
+            self.code_pre = shared_code_head.code_pre
+        else:
+            self.code_pre = nn.Linear(D, cfg.dqs[level])
 
         # v3 FUSION (module docstring has the full rationale): if this level has a level ABOVE it
         # (fuse_d_model is not None, i.e. level < n_levels-1), it can optionally cross-attend to that
@@ -1147,18 +1281,32 @@ class LevelLM(nn.Module):
         self.fuse_d_model = fuse_d_model
         self.fuse_kv_window = fuse_kv_window
         if fuse_d_model is not None:
-            self.fuse_kv_proj = nn.Linear(fuse_d_model, D)
-            if cfg.fuse_use_null_kv:
-                self.fuse_null_kv = nn.Parameter(torch.zeros(1, 1, D))
-                nn.init.normal_(self.fuse_null_kv, std=0.02)
-            # "pre"/"post"/"both" each need their OWN CrossBlock (a "both" level gets two —
-            # genuinely more params, see Config.fuse_position's own docstring). "concat" needs
-            # NEITHER — self.blocks' own CausalSelfAttention layers derive K/V for the fused tail
-            # directly from their own qkv weights (see _prep_concat), cheaper than the others.
-            if cfg.fuse_position in ("pre", "both"):
-                self.fuse_cross_pre = CrossBlock(D, cfg.n_heads, cfg.mlp_mult)
-            if cfg.fuse_position in ("post", "both"):
-                self.fuse_cross_post = CrossBlock(D, cfg.n_heads, cfg.mlp_mult)
+            if shared_trunk is not None and getattr(shared_trunk, "fuse_d_model", None) is not None:
+                # v4.1: the fusion module is part of the shared trunk too — SAME weights regardless
+                # of which adjacent level-pair is fusing (extreme sharing's own logic extended to
+                # fusion, not just self.blocks/ln_f). Requires shared_trunk's own fuse_d_model to
+                # match (asserted implicitly by tier_d_models uniformity already required above,
+                # since fuse_d_model IS the level-above's D, itself uniform under share_levellm).
+                self.fuse_kv_proj = shared_trunk.fuse_kv_proj
+                if cfg.fuse_use_null_kv:
+                    self.fuse_null_kv = shared_trunk.fuse_null_kv
+                if cfg.fuse_position in ("pre", "both"):
+                    self.fuse_cross_pre = shared_trunk.fuse_cross_pre
+                if cfg.fuse_position in ("post", "both"):
+                    self.fuse_cross_post = shared_trunk.fuse_cross_post
+            else:
+                self.fuse_kv_proj = nn.Linear(fuse_d_model, D)
+                if cfg.fuse_use_null_kv:
+                    self.fuse_null_kv = nn.Parameter(torch.zeros(1, 1, D))
+                    nn.init.normal_(self.fuse_null_kv, std=0.02)
+                # "pre"/"post"/"both" each need their OWN CrossBlock (a "both" level gets two —
+                # genuinely more params, see Config.fuse_position's own docstring). "concat" needs
+                # NEITHER — self.blocks' own CausalSelfAttention layers derive K/V for the fused tail
+                # directly from their own qkv weights (see _prep_concat), cheaper than the others.
+                if cfg.fuse_position in ("pre", "both"):
+                    self.fuse_cross_pre = CrossBlock(D, cfg.n_heads, cfg.mlp_mult)
+                if cfg.fuse_position in ("post", "both"):
+                    self.fuse_cross_post = CrossBlock(D, cfg.n_heads, cfg.mlp_mult)
 
     def _fuse(self, x: torch.Tensor, fuse_kv: torch.Tensor, cross_block: "CrossBlock") -> torch.Tensor:
         """x: [B, L, D] this level's own pre-self-attention embedding. fuse_kv: [B, n_blocks, D_above]
@@ -1255,7 +1403,7 @@ class LevelLM(nn.Module):
         head_dim = D // cfg.n_heads
         cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
         for block in self.blocks:
-            x = block(x, cos, sin, fuse_kv=concat_kv, fuse_disallow=concat_disallow, fuse_rope_k=concat_rope_k)
+            x = block(x, cos, sin, self.window, fuse_kv=concat_kv, fuse_disallow=concat_disallow, fuse_rope_k=concat_rope_k)
 
         if fuse_kv is not None and cfg.fuse_position in ("post", "both"):
             x = self._fuse(x, fuse_kv, self.fuse_cross_post)
@@ -1340,16 +1488,34 @@ class RefineLM(nn.Module):
 
         in_dqs = [8] + list(cfg.dqs[:-1])
         self.in_dqs = in_dqs
-        # every level below the top gets fuse_d_model/fuse_kv_window set (the level-above's own
-        # D/kv_window) — top level gets None (nothing coarser exists to fuse from).
-        self.encoders = nn.ModuleList([
-            LevelLM(
+
+        if cfg.share_levellm:
+            assert len(set(cfg.tier_d_models)) == 1, "share_levellm requires uniform tier_d_models across every level"
+            assert len(set(cfg.tier_n_layers)) == 1, "share_levellm requires uniform tier_n_layers across every level"
+        if cfg.share_code_head and self.n_levels > 2:
+            assert len(set(cfg.dqs[1:])) == 1, "share_code_head requires uniform dqs across every code level (levels 1+)"
+
+        # v4.1 EXTREME WEIGHT SHARING (Config.share_levellm, default True — this file's whole
+        # point): level 0 is built FIRST and, when sharing is on, every other level's self.blocks/
+        # ln_f/fuse_* get REUSED from it (see LevelLM.__init__'s own shared_trunk docstring) — same
+        # weight objects at every level, `window` stays genuinely per-level regardless (forward-time
+        # arg now, not baked into construction). Config.share_code_head (default False, an
+        # ablation) similarly ties every CODE level's (1..n_levels-1) own embed/ntp_head/code_pre to
+        # the FIRST code level's — "bsq head and bsq linear map... different each level by default...
+        # can be set weight sharing for ablation" (session ask). Build order matters: level 0, then
+        # level 1 (owns the shared code head if share_code_head), then the rest.
+        encoders: list[LevelLM] = []
+        for i in range(self.n_levels):
+            fuse_d_model = cfg.tier_d_models[i + 1] if i < self.n_levels - 1 else None
+            fuse_kv_window = windows[i + 1] if i < self.n_levels - 1 else None
+            shared_trunk = encoders[0] if (cfg.share_levellm and i > 0) else None
+            shared_code_head = encoders[1] if (cfg.share_code_head and i > 1) else None
+            encoders.append(LevelLM(
                 cfg, i, in_dqs[i], windows[i],
-                fuse_d_model=cfg.tier_d_models[i + 1] if i < self.n_levels - 1 else None,
-                fuse_kv_window=windows[i + 1] if i < self.n_levels - 1 else None,
-            )
-            for i in range(self.n_levels)
-        ])
+                fuse_d_model=fuse_d_model, fuse_kv_window=fuse_kv_window,
+                shared_trunk=shared_trunk, shared_code_head=shared_code_head,
+            ))
+        self.encoders = nn.ModuleList(encoders)
 
         lw = cfg.layer_warmup_steps if cfg.layer_warmup_steps else (0,) * (self.n_levels - 1)
         assert len(lw) == self.n_levels - 1, (
@@ -1799,16 +1965,32 @@ def eval_model(model: RefineLM, data: torch.Tensor, batch_size: int, n_batches: 
 
 
 def build_param_groups(model: RefineLM) -> list[dict]:
-    """One param group per activation STAGE (stage 0 = encoders[0] alone;
-    stage i>=1 = encoders[i] alone, the level that turns on once level i
-    activates — see Config.layer_warmup_steps; v4 has no DecoderLevel to
-    bundle in alongside it, unlike v2/v3) — lets train() give each stage
-    its own reset warmup schedule. With no curriculum (layer_warmup_steps
-    empty), every stage activates at step 0 and this is behaviorally
-    identical to one global param group."""
-    groups = [{"params": list(model.encoders[0].parameters()), "stage": 0}]
-    for i in range(1, model.n_levels):
-        groups.append({"params": list(model.encoders[i].parameters()), "stage": i})
+    """One param group per activation STAGE (stage 0 = encoders[0]'s own params;
+    stage i>=1 = whatever of encoders[i]'s params haven't already been claimed by an earlier
+    stage — see Config.layer_warmup_steps; v4 has no DecoderLevel to bundle in alongside it,
+    unlike v2/v3) — lets train() give each stage its own reset warmup schedule. With no
+    curriculum (layer_warmup_steps empty), every stage activates at step 0 and this is
+    behaviorally identical to one global param group.
+
+    v4.1 DEDUPLICATES by Parameter identity (`id(p)`) — under `Config.share_levellm`/
+    `share_code_head`, encoders[i>0].parameters() genuinely OVERLAPS encoders[0]'s own (same
+    nn.Module objects — see LevelLM.__init__'s shared_trunk/shared_code_head), and
+    torch.optim.Optimizer raises if the same Parameter object appears in two groups. Since
+    encoders[0] is always processed first, every SHARED weight lands in stage 0 (correct: shared
+    weights are active — and need gradient — from the very first active level onward, exactly
+    like stage 0's own params); each later stage's group then only contains whatever it did NOT
+    share (typically just that level's own embed/ntp_head/code_pre when share_code_head=False).
+    v4 (share_levellm=False) never has overlap in the first place, so this is a no-op there —
+    identical grouping to before."""
+    groups = []
+    seen: set[int] = set()
+    for i in range(model.n_levels):
+        params = []
+        for p in model.encoders[i].parameters():
+            if id(p) not in seen:
+                seen.add(id(p))
+                params.append(p)
+        groups.append({"params": params, "stage": i})
     return groups
 
 
@@ -1915,6 +2097,8 @@ def main():
     p.add_argument("--fuse_encoder_levels", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--fuse_position", type=str, default="pre", choices=["pre", "post", "both", "concat"])
     p.add_argument("--fuse_use_null_kv", type=lambda x: x.lower() != "false", default=True)
+    p.add_argument("--share_levellm", type=lambda x: x.lower() != "false", default=True)
+    p.add_argument("--share_code_head", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--byte_repr", type=str, default="bits", choices=["bits", "embed"])
     p.add_argument("--code_head_mode", type=str, default="chain", choices=["chain", "independent"])
     p.add_argument("--cross_attn_rope", type=lambda x: x.lower() != "false", default=True)
@@ -1984,6 +2168,7 @@ def main():
         fusion_ntp_weight=args.fusion_ntp_weight,
         quant_type=args.quant_type, code_embed_mode=args.code_embed_mode, fuse_encoder_levels=args.fuse_encoder_levels,
         fuse_position=args.fuse_position, fuse_use_null_kv=args.fuse_use_null_kv,
+        share_levellm=args.share_levellm, share_code_head=args.share_code_head,
         byte_repr=args.byte_repr, code_head_mode=args.code_head_mode,
         cross_attn_rope=args.cross_attn_rope,
         layer_warmup_steps=args.layer_warmup_steps,

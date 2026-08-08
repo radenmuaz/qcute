@@ -10,9 +10,14 @@ directly — no gradient-norm proxies or attention-mass workarounds needed,
 since fusion's effect on the metric that matters is now measurable head-on.
 
 Four conditions, same weights throughout:
-  1. normal    — fuse_encoder_levels=True, as trained (real PASS 2).
-  2. no_fusion — fuse_encoder_levels=False (PASS 1 only, matching v2's
-                 own byte_loss computation) — the full ablation.
+  1. normal              — fuse_encoder_levels=True, as trained (real PASS 2).
+  2. unconditional_pass1 — PASS 2 skipped entirely; ntp_losses[0] is
+                 PASS 1's own, otherwise-discarded byte_loss — i.e. what
+                 level 0 achieves completely UNCONDITIONED on the coarser
+                 level, using only its own local self-attention. Matches
+                 v2's own byte_loss computation exactly (v2 never had a
+                 PASS 2 at all). The true floor/reference point every
+                 other mode below should be read relative to.
   3. null_only — PASS 2 still runs, but fuse_kv is replaced with zeros
                  (same shape as the real level-above hidden state) before
                  quantization/projection — tests whether the model needs
@@ -52,7 +57,7 @@ from qcute.qcute_refine_v4 import (
 
 def encode_with_ablation(model: RefineLM, byte_ids: torch.Tensor, n_active: int, mode: str):
     """Mirrors RefineLM._encode's own PASS 1 + PASS 2, with an injectable
-    ablation on PASS 2's fuse_kv. mode: "normal" | "no_fusion" | "null_only"."""
+    ablation on PASS 2's fuse_kv. mode: "normal" | "unconditional_pass1" | "null_only" | "big_noise"."""
     cfg = model.cfg
     seq_repr = byte_ids
     ntp_losses, ntp_accs, h_list, x_list = [], [], [], []
@@ -64,7 +69,7 @@ def encode_with_ablation(model: RefineLM, byte_ids: torch.Tensor, n_active: int,
         h_list.append(h_i); x_list.append(seq_repr)
         seq_repr = c_i
 
-    if mode != "no_fusion" and cfg.fuse_encoder_levels:
+    if mode != "unconditional_pass1" and cfg.fuse_encoder_levels:
         for i in range(n_active - 1):
             fuse_kv = h_list[i + 1].detach()
             if mode == "null_only":
@@ -112,17 +117,18 @@ def main():
     train_data, val_data = split_train_val(data, args.val_frac)
 
     results = {}
-    for mode in ["normal", "null_only", "big_noise", "no_fusion"]:
+    for mode in ["normal", "null_only", "big_noise", "unconditional_pass1"]:
         loss, acc = eval_mode(model, val_data, args.batch_size, args.n_batches, cfg.context_len, mode, args.device)
         results[mode] = (loss, acc, loss / math.log(2))
-        print(f"{mode:12s}  val_byte_loss={loss:.4f}  val_byte_acc={acc:.4f}  val_bpb={loss/math.log(2):.4f}")
+        print(f"{mode:20s}  val_byte_loss={loss:.4f}  val_byte_acc={acc:.4f}  val_bpb={loss/math.log(2):.4f}")
 
+    U = "unconditional_pass1"
     print()
-    print(f"delta_bpb (normal - null_only)    = {results['normal'][2] - results['null_only'][2]:+.4f}  (content vs. structure-only)")
-    print(f"delta_bpb (normal - big_noise)    = {results['normal'][2] - results['big_noise'][2]:+.4f}  (content vs. drowned-out-content)")
-    print(f"delta_bpb (normal - no_fusion)    = {results['normal'][2] - results['no_fusion'][2]:+.4f}  (fusion's total contribution)")
-    print(f"delta_bpb (null_only - no_fusion) = {results['null_only'][2] - results['no_fusion'][2]:+.4f}  (structure-only vs. nothing)")
-    print(f"delta_bpb (big_noise - no_fusion) = {results['big_noise'][2] - results['no_fusion'][2]:+.4f}  (noisy-structure vs. nothing)")
+    print(f"delta_bpb (normal - null_only)     = {results['normal'][2] - results['null_only'][2]:+.4f}  (content vs. structure-only)")
+    print(f"delta_bpb (normal - big_noise)     = {results['normal'][2] - results['big_noise'][2]:+.4f}  (content vs. drowned-out-content)")
+    print(f"delta_bpb (normal - {U}) = {results['normal'][2] - results[U][2]:+.4f}  (fusion's total contribution)")
+    print(f"delta_bpb (null_only - {U}) = {results['null_only'][2] - results[U][2]:+.4f}  (structure-only vs. nothing)")
+    print(f"delta_bpb (big_noise - {U}) = {results['big_noise'][2] - results[U][2]:+.4f}  (noisy-structure vs. nothing)")
 
 
 if __name__ == "__main__":
