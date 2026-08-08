@@ -119,3 +119,134 @@ against its checkpoint, in REUSE mode this time (not pass-through), which
 would isolate the "does level 0 have an alternative to lean on" variable
 specifically. Smoke-tested (3 CPU steps, no shape/divisibility errors, no
 dense-fallback warnings) before queueing.
+
+**Result: RAN — best val_bpb 2.6206 @ step 2600 (close to `qcute_refine_rope`'s
+2.6310 despite the crippled window, itself notable — the cross-attention
+KV substitutes for local context almost fully). Probe re-run against
+`best.pt` in REUSE mode (128 batches x 16, train + val):
+`delta_loss_from_kv` mean **−0.094 (train) / −0.103 (val)** (ablating KV
+consistently RAISES loss, both splits — same sign as experiment 2's
+pass-through result, unlike experiment 1's val-only sign flip),
+`delta_acc_from_kv` mean **+0.0147 (train) / +0.0135 (val)** (consistent,
+positive, both splits), `null_slot_attn_mass` **≈0.51** (between
+experiment 1's ~0.29 reuse-mode value and experiment 2's ~0.05-0.06
+pass-through value — attention is split roughly evenly between the null
+fallback and real code content, not overwhelmingly either way),
+`grad_ratio_curr_over_prev` **≈0.07-0.08** (KV side's gradient ~7-8% of Q
+side's — small but nonzero, unlike experiment 1's ~1-2%).
+
+**Confirms the hypothesis**: with level 0's local receptive field
+crippled to 8 raw bytes, cross-attention KV contribution becomes
+unambiguous and consistent (same sign, both train and val) — much closer
+to experiment 2's pass-through finding than experiment 1's reuse-mode
+mixed result, even though this run (unlike experiment 2) still uses
+REUSE mode for Q/KV. This isolates the variable experiment 1 left
+confounded: it's not reuse-vs-pass-through mode per se that determines
+whether KV matters, it's whether level 0 has enough of its OWN local
+context to lean on instead. Strengthens the session's net conclusion:
+**KV contribution depends on what else is available to lean on, not a
+fixed property of the mechanism** — genuinely gradable, not binary,
+confirmed now by a third independent lever (window size) pointing the
+same direction as reuse/pass-through mode did.
+
+## 5. Related: `cross_attn_rope` doesn't help (`docs/status.md`'s own ablation)
+
+Worth noting alongside the above: `configs/qcute_refine_no_rope.py`'s
+completed run (see [docs/status.md](status.md) for the full result) shows
+`cross_attn_rope=False` beating `cross_attn_rope=True` — 2.5645 vs. 2.6310
+best val_bpb, same architecture, same budget. Positional information on
+top of the cross-attention KV doesn't help here, even though the KV
+content itself demonstrably does (experiments 2 and 4 above). Suggests
+the cross-attention mechanism's value is in WHAT it retrieves (the
+coarser code's content), not WHERE it's retrieved from — the jagged
+block-visibility mask (§3 above) may already carry enough positional
+structure on its own, making the explicit RoPE signal redundant or
+mildly distracting.
+
+## 6. Every self-attn/cross-attn stacking combination tried, and whether `byte_loss` actually gets conditioned
+
+The KV-contribution probes above all measure `tok_loss`/`pair0_tok_acc` —
+a metric that turned out to be structurally disconnected from
+`val_bpb`/`byte_loss` (the metric every baseline comparison in
+[docs/status.md](status.md) actually uses) in every v2 decoder mode,
+regardless of which one: `DecoderLevel` always runs AFTER the full
+bottom-up encoder sweep finishes, and both sides of its cross-attention
+read (`h_list[i]`/`h_list[i+1]`) are `.detach()`'d before use — so
+`tok_loss` can genuinely depend on the coarser code (as these probes
+show), while `byte_loss` never can, in ANY v2 mode. See the module
+docstring's own comment: "this decoder's loss must not reshape either
+EncoderLevel's own hidden state."
+
+Two distinct senses of "conditioned" matter here: **forward-value**
+conditioning (does `byte_loss`'s own computation literally use level 1's
+values?) vs. **gradient-only** conditioning (do the WEIGHTS producing
+`byte_loss` get shaped by level 1's task, even with no forward path?).
+
+| scheme | self-attn structure | cross-attn structure | `byte_loss` conditioned? | mechanism | it/s | best val_bpb |
+|---|---|---|---|---|---|---|
+| `bytelm_xs1` (reference, not qcute) | 1 layer, dense full-context | none | — | — | 3.429 | 2.4870 |
+| v2 `rope`/`no_rope`/`identity`/`curriculum`/`tiny_byte_window` | windowed, bottom-up, shared weights | 1 `CrossBlock`, detached reads, separate pass | No | — | 0.48-2.55 | 2.5645-2.6463 |
+| v2 `pass_through` | none (Q/KV are raw embeddings) | 1 `CrossBlock`, own fresh embeddings, detached | No | — | 2.149 | 2.5575 |
+| v2 `own_trunk` | separate full trunk copy, then 1 `CrossBlock` | same, detached | No | — | 1.407 | 2.5793 |
+| v2 `pq_table` | same as `no_rope`, code-embed changed | detached (unchanged) | **Indirectly** | shared-weight gradient dynamics — `code_pre`/`self.blocks` are shared between `byte_loss` and level 1's own (now better-conditioned) task; no forward path, but a real, measured effect | 2.017 | **2.4816** |
+| v3 fusion (`v3_rope`) | windowed pass 1, then a 2nd self-attn pass fused with cross-attn before it | cross-attn INSIDE the encoder, undetached for the fusing level's own weights | **Yes, directly** | real forward-value path — `byte_loss` literally depends on level 1's hidden state, not just shared parameters | 1.039 | **2.4302** — beats `bytelm_xs1` outright, largest single delta of the session (+0.201 vs. `rope`) |
+
+`v3_rope`'s result is the clearest evidence yet that direct forward-value
+conditioning is a materially stronger lever than the shared-weight/
+gradient-only channel `pq_table` exploits — though `pq_table` alone
+already closed nearly the whole gap to `bytelm_xs1`, suggesting the two
+mechanisms may be capturing overlapping, not fully independent, sources
+of improvement. `configs/qcute_refine_v3_rope_pq.py` (queued, stacks
+both) is the direct test of whether they're additive.
+
+## 7. `qcute_refine_v4_k32_narrow` — most of fusion's benefit is capacity, not content
+
+v2/v3's probes above all measure `tok_loss`, structurally disconnected
+from `byte_loss`. v4 fixes that disconnection — fusion feeds `byte_loss`
+directly — so probing it no longer needs gradient-norm/attention-mass
+proxies: just re-evaluate the SAME trained checkpoint under different
+ablations and read `val_bpb` off directly.
+`scripts/probe_v4_fusion_contribution.py` (new this session — the old
+`probe_decoder_kv_contribution.py` targets `DecoderLevel`, which v4
+doesn't have) does exactly this, three ways, same weights throughout:
+
+1. **normal** — fusion as trained.
+2. **null_only** — PASS 2 still runs (same `fuse_cross` module, same
+   null slot), but `fuse_kv` is replaced with zeros before use — isolates
+   whether the model needs REAL coarser-level content, or whether just
+   having a KV tensor (any tensor) to cross-attend to is most of the
+   benefit.
+3. **no_fusion** — `fuse_encoder_levels=False`, full ablation, matching
+   v2's own `byte_loss` computation (PASS 1 only).
+
+Run against `qcute_refine_v4_k32_narrow`'s `best.pt` (20 val batches):
+
+| mode | val_bpb | Δ from normal |
+|---|---|---|
+| normal | 2.5271 | — |
+| null_only | 2.7720 | +0.2449 |
+| no_fusion | 4.9554 | +2.4283 |
+
+**Reading**: removing fusion ENTIRELY is catastrophic (+2.43 bpb, near
+the ~8-bit-per-byte random-guessing ceiling) — expected for this specific
+config, since `attn_window=(32,32)` means level 0's own self-attention
+window exactly equals one code block (`K=32`); without fusion, level 0
+has essentially NO access to anything beyond its current 32-byte chunk.
+But the decomposition is the real finding: **null_only recovers 2.18 of
+that 2.43 bpb (≈90%) with ZERO real coarser-level content** — the
+`fuse_cross` module's own weights (extra cross-attention QKV/MLP
+parameters, plus the always-real, never-zeroed learned `null_kv` slot)
+apparently function as genuine extra capacity/depth for level 0's own
+forward pass, largely independent of what they're attending to. Only the
+remaining ≈10% (0.245 bpb, normal vs. null_only) is attributable to the
+coarser level's ACTUAL content.
+
+This adds real nuance to `qcute_refine_v3_rope`'s "direct forward-value
+conditioning beats everything" reading from §6 above: for THIS
+narrow-window config at least, most of that forward-value benefit isn't
+really about the CONTENT being conditioned on — it's about the extra
+processing capacity the fusion mechanism happens to add along the way.
+Consistent with, and motivates, the `tier_n_layers=(2,1)`/`(2,2)` depth
+ablations queued this session (see docs/status.md) — if plain depth
+matches or beats fusion's own contribution, that would confirm capacity,
+not cross-level information, was the dominant lever all along.

@@ -248,6 +248,17 @@ def rope_cos_sin(seq_len: int, head_dim: int, base: float, device: torch.device)
     return emb.cos(), emb.sin()
 
 
+def rope_cos_sin_at(pos_id: int, head_dim: int, base: float, device: torch.device):
+    """Same as rope_cos_sin, but for a single position — for KV-cache
+    generation, where only one new position's own rotary embedding is
+    needed per step, not a full 0..seq_len-1 range (ported from
+    qcute_refine_v4.py's own generation code, same convention)."""
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    freqs = torch.tensor([[float(pos_id)]], device=device) * inv_freq
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos(), emb.sin()
+
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat([-x2, x1], dim=-1)
@@ -275,6 +286,22 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).reshape(B, T, D)
         return self.out(y)
 
+    def forward_step(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
+                      cache_k: torch.Tensor | None, cache_v: torch.Tensor | None):
+        """Single-new-position forward, growing an explicit K/V cache —
+        same pattern as qcute_refine_v4.py's own Block.forward_step.
+        x_new: [B, 1, D]. Returns (y [B, 1, D], new_cache_k, new_cache_v)."""
+        B, _, D = x_new.shape
+        H, hd = self.cfg.n_heads, self.cfg.head_dim
+        qkv = self.qkv(x_new).reshape(B, 1, 3, H, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k = apply_rope(q, cos_new, sin_new), apply_rope(k, cos_new, sin_new)
+        new_k = k if cache_k is None else torch.cat([cache_k, k], dim=2)
+        new_v = v if cache_v is None else torch.cat([cache_v, v], dim=2)
+        y = F.scaled_dot_product_attention(q, new_k, new_v, is_causal=False)   # single query, full past KV — no mask needed
+        y = y.transpose(1, 2).reshape(B, 1, D)
+        return self.out(y), new_k, new_v
+
 
 class MLP(nn.Module):
     def __init__(self, cfg: LMConfig):
@@ -299,6 +326,13 @@ class Block(nn.Module):
         x = x + self.attn(self.ln1(x), cos, sin)
         x = x + self.mlp(self.ln2(x))
         return x
+
+    def forward_step(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
+                      cache_k: torch.Tensor | None, cache_v: torch.Tensor | None):
+        attn_out, new_k, new_v = self.attn.forward_step(self.ln1(x_new), cos_new, sin_new, cache_k, cache_v)
+        x_new = x_new + attn_out
+        x_new = x_new + self.mlp(self.ln2(x_new))
+        return x_new, new_k, new_v
 
 
 class ByteLM(nn.Module):
@@ -432,6 +466,93 @@ def generate_ar(model: ByteLM, prompt: torch.Tensor, n_new_bytes: int, temperatu
         tokens = torch.cat([tokens, next_tok], dim=1)
     model.train()
     return tokens
+
+
+@torch.no_grad()
+def generate_no_cache(model: ByteLM, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> torch.Tensor:
+    """Reference (slow, obviously-correct) GREEDY decode: recomputes the
+    whole trunk from scratch over the WHOLE sequence every new byte. Same
+    role/signature as qcute_refine_v4.py's own generate_no_cache — greedy
+    (argmax, deterministic) rather than generate_ar's temperature-sampled
+    decode, specifically so it can be compared byte-for-byte against
+    generate_kv_cache in validate_generation."""
+    was_training = model.training
+    model.eval()
+    prompt_bytes = prompt_bytes.to(device)
+    if prompt_bytes.dim() == 1:
+        prompt_bytes = prompt_bytes.unsqueeze(0)
+    all_bytes = prompt_bytes
+    cfg = model.cfg
+
+    for _ in range(n_new_bytes):
+        ctx = all_bytes[:, -cfg.context:]
+        logits = model(ctx)[0][:, -1]   # head 0 (immediate next-byte) only
+        next_byte = logits.argmax(-1)
+        all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
+
+    if was_training:
+        model.train()
+    return all_bytes[0]
+
+
+@torch.no_grad()
+def generate_kv_cache(model: ByteLM, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> torch.Tensor:
+    """KV-cache-efficient GREEDY decode — same mechanism as
+    qcute_refine_v4.py's own generate_kv_cache (a per-layer cache_k/cache_v
+    list, advanced one position at a time via each Block's forward_step).
+    No windowing/hierarchy to worry about here (bytelm is a plain dense
+    trunk), so this is the simple single-model case v4's own hierarchical
+    cache had to generalize from."""
+    cfg = model.cfg
+    n_layers = len(model.blocks)
+    was_training = model.training
+    model.eval()
+    prompt_bytes = prompt_bytes.to(device)
+    if prompt_bytes.dim() == 1:
+        prompt_bytes = prompt_bytes.unsqueeze(0)
+
+    cache_k: list[torch.Tensor | None] = [None] * n_layers
+    cache_v: list[torch.Tensor | None] = [None] * n_layers
+
+    def step(byte_id: torch.Tensor, pos: int) -> torch.Tensor:
+        x = model.tok_emb(byte_id).unsqueeze(1)
+        cos_new, sin_new = rope_cos_sin_at(pos, cfg.head_dim, cfg.rope_base, device)
+        for li, block in enumerate(model.blocks):
+            x, cache_k[li], cache_v[li] = block.forward_step(x, cos_new, sin_new, cache_k[li], cache_v[li])
+        return model.ln_f(x).squeeze(1)
+
+    L0 = prompt_bytes.size(1)
+    last_h = None
+    for pos in range(L0):
+        last_h = step(prompt_bytes[:, pos], pos)
+
+    out_bytes = [prompt_bytes]
+    for i in range(n_new_bytes):
+        logits = model.heads[0](last_h)
+        next_byte = logits.argmax(-1)
+        out_bytes.append(next_byte.unsqueeze(1))
+        last_h = step(next_byte, L0 + i)
+
+    if was_training:
+        model.train()
+    return torch.cat(out_bytes, dim=1)[0]
+
+
+def validate_generation(model: ByteLM, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> bool:
+    """Only meaningful while prompt_len + n_new_bytes <= model.cfg.context:
+    generate_no_cache truncates to the trailing cfg.context bytes (RoPE
+    positions reset to 0 for that window, matching generate_ar's existing
+    behavior), while generate_kv_cache's cache grows unbounded with true
+    absolute positions and never truncates — the two are only guaranteed
+    to agree inside that bound, by design, not by omission."""
+    out_a = generate_no_cache(model, prompt_bytes, n_new_bytes, device)
+    out_b = generate_kv_cache(model, prompt_bytes, n_new_bytes, device)
+    assert torch.equal(out_a, out_b), (
+        f"generate_no_cache and generate_kv_cache diverged:\n"
+        f"  no_cache = {out_a.tolist()}\n"
+        f"  kv_cache = {out_b.tolist()}"
+    )
+    return True
 
 
 @torch.no_grad()

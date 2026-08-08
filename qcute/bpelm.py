@@ -199,6 +199,16 @@ def rope_cos_sin(seq_len: int, head_dim: int, base: float, device: torch.device)
     return emb.cos(), emb.sin()
 
 
+def rope_cos_sin_at(pos_id: int, head_dim: int, base: float, device: torch.device):
+    """Same as rope_cos_sin, but for a single position — for KV-cache
+    generation (ported from qcute_refine_v4.py/qcute.bytelm's own copy,
+    same convention)."""
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    freqs = torch.tensor([[float(pos_id)]], device=device) * inv_freq
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos(), emb.sin()
+
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat([-x2, x1], dim=-1)
@@ -224,6 +234,22 @@ class CausalSelfAttention(nn.Module):
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.out(y.transpose(1, 2).reshape(B, T, D))
 
+    def forward_step(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
+                      cache_k: torch.Tensor | None, cache_v: torch.Tensor | None):
+        """Single-new-position forward, growing an explicit K/V cache —
+        same pattern as qcute.bytelm/qcute_refine_v4.py's own forward_step.
+        x_new: [B, 1, D]. Returns (y [B, 1, D], new_cache_k, new_cache_v)."""
+        B, _, D = x_new.shape
+        H, hd = self.cfg.n_heads, self.cfg.head_dim
+        qkv = self.qkv(x_new).reshape(B, 1, 3, H, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k = apply_rope(q, cos_new, sin_new), apply_rope(k, cos_new, sin_new)
+        new_k = k if cache_k is None else torch.cat([cache_k, k], dim=2)
+        new_v = v if cache_v is None else torch.cat([cache_v, v], dim=2)
+        y = F.scaled_dot_product_attention(q, new_k, new_v, is_causal=False)
+        y = y.transpose(1, 2).reshape(B, 1, D)
+        return self.out(y), new_k, new_v
+
 
 class Block(nn.Module):
     def __init__(self, cfg: BpeLMConfig):
@@ -240,6 +266,13 @@ class Block(nn.Module):
         x = x + self.attn(self.ln1(x), cos, sin)
         x = x + self.mlp(self.ln2(x))
         return x
+
+    def forward_step(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
+                      cache_k: torch.Tensor | None, cache_v: torch.Tensor | None):
+        attn_out, new_k, new_v = self.attn.forward_step(self.ln1(x_new), cos_new, sin_new, cache_k, cache_v)
+        x_new = x_new + attn_out
+        x_new = x_new + self.mlp(self.ln2(x_new))
+        return x_new, new_k, new_v
 
 
 class BpeLM(nn.Module):
@@ -385,6 +418,86 @@ def generate_ar(model: BpeLM, prompt_ids: torch.Tensor, n_new_tokens: int, tempe
         tokens = torch.cat([tokens, next_tok], dim=1)
     model.train()
     return tokens
+
+
+@torch.no_grad()
+def generate_no_cache(model: BpeLM, prompt_ids: torch.Tensor, n_new_tokens: int, device: str) -> torch.Tensor:
+    """Reference (slow, obviously-correct) GREEDY decode: recomputes the
+    whole trunk from scratch over the WHOLE sequence every new token. Same
+    role as qcute.bytelm/qcute_refine_v4.py's own generate_no_cache —
+    greedy (argmax) rather than generate_ar's temperature-sampled decode,
+    so it can be compared token-for-token against generate_kv_cache in
+    validate_generation."""
+    was_training = model.training
+    model.eval()
+    prompt_ids = prompt_ids.to(device)
+    if prompt_ids.dim() == 1:
+        prompt_ids = prompt_ids.unsqueeze(0)
+    all_ids = prompt_ids
+    cfg = model.cfg
+
+    for _ in range(n_new_tokens):
+        ctx = all_ids[:, -cfg.context:]
+        logits = model(ctx)[:, -1]
+        next_id = logits.argmax(-1)
+        all_ids = torch.cat([all_ids, next_id.unsqueeze(1)], dim=1)
+
+    if was_training:
+        model.train()
+    return all_ids[0]
+
+
+@torch.no_grad()
+def generate_kv_cache(model: BpeLM, prompt_ids: torch.Tensor, n_new_tokens: int, device: str) -> torch.Tensor:
+    """KV-cache-efficient GREEDY decode — same mechanism as qcute.bytelm/
+    qcute_refine_v4.py's own generate_kv_cache."""
+    cfg = model.cfg
+    n_layers = len(model.blocks)
+    was_training = model.training
+    model.eval()
+    prompt_ids = prompt_ids.to(device)
+    if prompt_ids.dim() == 1:
+        prompt_ids = prompt_ids.unsqueeze(0)
+
+    cache_k: list[torch.Tensor | None] = [None] * n_layers
+    cache_v: list[torch.Tensor | None] = [None] * n_layers
+
+    def step(tok_id: torch.Tensor, pos: int) -> torch.Tensor:
+        x = model.tok_emb(tok_id).unsqueeze(1)
+        cos_new, sin_new = rope_cos_sin_at(pos, cfg.head_dim, cfg.rope_base, device)
+        for li, block in enumerate(model.blocks):
+            x, cache_k[li], cache_v[li] = block.forward_step(x, cos_new, sin_new, cache_k[li], cache_v[li])
+        return model.ln_f(x).squeeze(1)
+
+    L0 = prompt_ids.size(1)
+    last_h = None
+    for pos in range(L0):
+        last_h = step(prompt_ids[:, pos], pos)
+
+    out_ids = [prompt_ids]
+    for i in range(n_new_tokens):
+        logits = model.head(last_h)
+        next_id = logits.argmax(-1)
+        out_ids.append(next_id.unsqueeze(1))
+        last_h = step(next_id, L0 + i)
+
+    if was_training:
+        model.train()
+    return torch.cat(out_ids, dim=1)[0]
+
+
+def validate_generation(model: BpeLM, prompt_ids: torch.Tensor, n_new_tokens: int, device: str) -> bool:
+    """Only meaningful while prompt_len + n_new_tokens <= model.cfg.context
+    — see qcute.bytelm's own validate_generation for why (truncation vs.
+    unbounded cache growth only agree inside that bound, by design)."""
+    out_a = generate_no_cache(model, prompt_ids, n_new_tokens, device)
+    out_b = generate_kv_cache(model, prompt_ids, n_new_tokens, device)
+    assert torch.equal(out_a, out_b), (
+        f"generate_no_cache and generate_kv_cache diverged:\n"
+        f"  no_cache = {out_a.tolist()}\n"
+        f"  kv_cache = {out_b.tolist()}"
+    )
+    return True
 
 
 @torch.no_grad()

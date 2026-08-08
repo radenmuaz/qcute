@@ -19,20 +19,23 @@ uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_ctx1024.py   # nam
                                                  # configs/bytelm_xs_mtp4.py (context=256) is superseded, kept only
                                                  # for historical reproducibility, not a comparison target anymore
 uv run python scripts/plot_run.py logs/<run_name>   # train/val bpb PNG from a run's run.jsonl
-uv run python -m qcute.qcute_refine_v2 --config configs/qcute_refine_v2_byte4_code256_simple.py   # current
-                                                 # best qcute prototype — "v1" of the qcute_refine lineage's
-                                                 # own best-so-far config (see Architecture below)
+uv run python -m qcute.qcute_refine --config configs/qcute_refine_v4_pq.py   # current best qcute
+                                                 # prototype — `qcute.qcute_refine` (no version suffix)
+                                                 # always aliases the latest qcute_refine_vN.py, currently
+                                                 # v4 (see Architecture below)
 ```
 
-All three modules read `--help` for their full flag list; all support
-`--config path.py` (see `configs/`), `--run_name` (else derived from
-`--config`/preset — logs and checkpoints both key off it: `logs/<run_name>/`,
-`checkpoints/<run_name>/`), and `--eval_only --checkpoint_path ...`;
-`qcute.bytelm`/`qcute.qcutelm` additionally support `--qual_gen_bytes` for
-qualitative generation. Tiny-corpus-scale defaults (`xs` preset, `qcutelm`'s
-`K`) target ~4 bytes/timestep, not the handover doc's 8 — see
-`qcute/bytelm.py`'s `PRESETS` comment for why. No test suite, linter, or CI
-config exists yet.
+`qcute.bytelm`, `qcute.bpelm`, and `qcute.qcute_refine` (the active
+lineage's own always-latest alias) all read `--help` for their full flag
+list; all support `--config path.py` (see `configs/` — every config file
+has its own module docstring explaining what it's testing and its exact
+`uv run` invocation, copy-pasteable directly from the file), `--run_name`
+(else derived from `--config`/preset — logs and checkpoints both key off
+it: `logs/<run_name>/`, `checkpoints/<run_name>/`), and `--eval_only
+--checkpoint_path ...`; `qcute.bytelm` additionally supports
+`--qual_gen_bytes` for qualitative generation. Tiny-corpus-scale defaults
+(`xs` preset) target ~4 bytes/timestep — see `qcute/bytelm.py`'s
+`PRESETS` comment for why. No test suite, linter, or CI config exists yet.
 
 **Only ever run one training job at a time.** All three modules train on
 MPS; two concurrent training processes contend for the same GPU and both
@@ -69,30 +72,60 @@ modules — none import each other, deliberately not factored further yet.
 Full details: [docs/architecture.md](docs/architecture.md) (also covers
 `qcutelm.py`, now archived — see below).
 
-**`qcute/qcute_refine_v1.py` and `qcute/qcute_refine_v2.py` are the current
-active lineage** — considered the project's first success, as of the
-session that built them. `qcute_refine_v1.py`: pure recursive NTP
-tower with BSQ code hand-off between levels, plus a block-local
-joint-chain-MTP detokenizer; math: [docs/qcute_refine_math.md](docs/qcute_refine_math.md).
-`qcute_refine_v2.py`: the detokenizer redesigned into a `DecoderLevel`
-that cross-attends between adjacent levels' own `EncoderLevel` hidden
-states (reused, not recomputed) instead of running a separate
-self-attention pass — the actively-developed file, with a growing set of
-session-driven flags (`byte_repr`, `code_head_mode`, `bit_head_class`
-with `BitPredictHeadAttn`/`Conv`/`SSM` variants, `cross_attn_rope`,
-`decoder_own_trunk`, `decoder_kv_pass_through`/`decoder_q_pass_through`,
-`layer_warmup_steps`) documented in its own `Config` dataclass. Configs
-live under `configs/qcute_refine_v2_*.py` and `configs/qcute_refine_*.py`
-(the latter — `qcute_refine_rope.py`, `_decoder_trunk.py`,
-`_pass_through.py`, `_rope_3level_curriculum.py` — renamed this session
-from an earlier `v1_*` naming). Diagnostic:
-`scripts/probe_decoder_kv_contribution.py` (gradient/ablation/attention-
-mass analysis of how much a `DecoderLevel`'s cross-attention KV actually
-contributes vs. is ignored — run against a saved checkpoint). Full
-narrative: [docs/status.md](docs/status.md) (session-update sections,
-newest at the bottom) — this lineage moves fast and status.md is the
-only place its current state is tracked; CLAUDE.md intentionally doesn't
-duplicate it.
+**`qcute/qcute_refine_v1.py` through `qcute/qcute_refine_v4.py` are the
+active lineage; `qcute/qcute_refine.py` (no version suffix) always
+aliases the latest one** — a thin `from qcute.qcute_refine_v4 import *`
+re-export, so `uv run python -m qcute.qcute_refine --config ...` always
+runs "whatever's current" without needing to track the version number by
+hand. Promoting a new version is a one-line change to that alias file.
+Historical/comparison work should still target a specific `qcute_refine_
+vN.py` directly (every config's own docstring already does this).
+
+- `qcute_refine_v1.py`: pure recursive NTP tower with BSQ code hand-off
+  between levels, plus a block-local joint-chain-MTP detokenizer; math:
+  [docs/qcute_refine_math.md](docs/qcute_refine_math.md).
+- `qcute_refine_v2.py`: the detokenizer redesigned into a `DecoderLevel`
+  that cross-attends between adjacent levels' own `EncoderLevel` hidden
+  states (reused, not recomputed) instead of running a separate
+  self-attention pass. Session-driven flags (`byte_repr`, `code_head_mode`,
+  `bit_head_class` with `BitPredictHeadAttn`/`Conv`/`SSM` variants,
+  `cross_attn_rope`, `decoder_own_trunk`, `decoder_kv_pass_through`/
+  `decoder_q_pass_through`, `code_embed_mode` with `linear`/`mlp`/
+  `pq_table`, `layer_warmup_steps`) documented in its own `Config`
+  dataclass. Configs live under `configs/qcute_refine_v2_*.py` and
+  `configs/qcute_refine_*.py`.
+- `qcute_refine_v3.py`: adds EncoderLevel **fusion** — a second forward
+  pass per non-top level that cross-attends to the level-above's own
+  hidden state *before* its own self-attention runs (`Config.
+  fuse_encoder_levels`, `fuse_position` for pre/post self-attention
+  ordering), so `byte_loss`/`val_bpb` can finally depend on the coarser
+  code — v2's `DecoderLevel` cross-attention never could (its reads were
+  detached, a separate scalar `tok_loss`, never compared against
+  baselines). `DecoderLevel` still present, unchanged from v2. Configs:
+  `configs/qcute_refine_v3_*.py`.
+- `qcute_refine_v4.py` (**current alias target**): removes `DecoderLevel`
+  entirely — it turned out to do the literal same job as fusion (predict
+  a level's own next token, optionally conditioned on the coarser code)
+  and never contributed to `byte_loss` even in v3. `EncoderLevel` renamed
+  to `LevelLM` (the class now does both the "encode" job — PASS 1,
+  produce the code — and the "decode" job — PASS 2, fused/conditioned
+  prediction — so "Encoder" alone was misleading). Generation
+  (`generate_no_cache`/`generate_kv_cache`) is fusion-aware — v3's own
+  generation functions were copied unchanged from v2 and never touched
+  cross-attention at all, a real train/inference mismatch v4 fixes.
+  `qcute.bytelm`/`qcute.bpelm` also gained matching `generate_kv_cache`/
+  `validate_generation` this session, same pattern. Configs:
+  `configs/qcute_refine_v4_*.py`.
+
+Diagnostic: `scripts/probe_decoder_kv_contribution.py` (gradient/
+ablation/attention-mass analysis of how much cross-attention KV actually
+contributes vs. is ignored — run against a saved v2/v3 checkpoint; v4 has
+no `DecoderLevel` for this script to target). Full narrative:
+[docs/status.md](docs/status.md), [docs/kv_contribution.md](docs/kv_contribution.md),
+[docs/bpe_like_boundaries.md](docs/bpe_like_boundaries.md) (session-update
+sections, newest at the bottom) — this lineage moves fast and these docs
+are the only place its current state is tracked; CLAUDE.md intentionally
+doesn't duplicate them.
 
 Every earlier qcute-lineage fork — `qcutelm.py`, `qcutelm_vlt*.py`
 (`vlt` through `vlt11`), `qcutelm_pyramid.py`, `qcutelm_mergetoken_v1.py`,

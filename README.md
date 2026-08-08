@@ -1,14 +1,19 @@
 # qcute
 
 ("Quantized Continuous Tokenizer") — continuous byte-level tokenizer + LM.
-Current active design: `qcute/qcute_refine_v1.py`/`qcute/qcute_refine_v2.py`
-(math: [docs/qcute_refine_math.md](docs/qcute_refine_math.md)). The
-original design spec this project started from,
+**Current active design: `qcute/qcute_refine.py`** — a thin alias that
+always points at the latest `qcute_refine_vN.py` (currently v4: recursive
+NTP tower, `LevelLM` per level, cross-level fusion instead of a separate
+decoder — see [CLAUDE.md](CLAUDE.md)'s own Architecture section for the
+full v1→v4 lineage summary, and [docs/status.md](docs/status.md) for
+session-by-session results). Math for the original v1 design:
+[docs/qcute_refine_math.md](docs/qcute_refine_math.md). The original
+design spec this project started from,
 [docs/archive/continuous_tokenizer_handover.md](docs/archive/continuous_tokenizer_handover.md),
-now describes an archived earlier lineage (`qcute/archive/`) superseded by
-`qcute_refine` — kept for historical reference. See
-[docs/architecture.md](docs/architecture.md) for how the still-active
-baselines (`bytelm`/`bpelm`) map to their own design, and
+now describes an archived earlier lineage (`qcute/archive/`, including
+`qcutelm.py`) superseded by `qcute_refine` — kept for historical
+reference. See [docs/architecture.md](docs/architecture.md) for how the
+still-active baselines (`bytelm`/`bpelm`) map to their own design, and
 [docs/status.md](docs/status.md) for phase-by-phase progress.
 
 ## Quickstart
@@ -20,27 +25,29 @@ uv sync
 # (1,000,000-byte prefix, for fast smoke/local runs)
 uv run python scripts/prepare_data.py
 
-# byte-level baseline LM w/ MTP head (Phase 0), reports bits-per-byte
+# byte-level baseline LM w/ MTP head, reports bits-per-byte
 uv run python -m qcute.bytelm --preset sd
 uv run python -m qcute.bytelm --preset xs --data datasets/enwik8_1M.gz  # quick local run
 
-# end-to-end tokenizer + latent LM (encoder + FSQ/BSQ + LM + decoder, jointly trained)
-uv run python -m qcute.qcutelm --bottleneck bsq --data datasets/enwik8_1M.gz --qual_gen_bytes 64
-
-# BPE baseline (handover §1.6's BPE half) — train the tokenizer first
+# BPE baseline — train the tokenizer first
 uv run python scripts/train_bpe.py --data datasets/enwik8_1M.gz
 uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_1M_8192.model --data datasets/enwik8_1M.gz
 
-# or via a named, reproducible config (CLI flags still override individual values)
-uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4.py
-uv run python -m qcute.qcutelm --config configs/qcutelm_bsq_k4_frozen_vocab.py     # tightly-coupled BSQ, K=4, 2-layer tokenizer, frozen tokenizer + vocab LM
+# the active design — recursive NTP tower + cross-level fusion
+uv run python -m qcute.qcute_refine --config configs/qcute_refine_v4_pq.py
+
+# or any named, reproducible config (CLI flags still override individual values) —
+# EVERY file under configs/ has its own module docstring explaining what it tests
+# and giving its exact `uv run` invocation; open the file if unsure what to run
+uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_ctx1024.py
 uv run python -m qcute.bpelm --config configs/bpelm_8192.py
 
 # evaluate a saved checkpoint only, no training
 uv run python -m qcute.bytelm --eval_only --checkpoint_path checkpoints/<run_name>/best.pt --data datasets/enwik8_1M.gz
 ```
 
-All three modules run on CUDA/MPS/CPU automatically.
+All modules run on CUDA/MPS/CPU automatically. **Only run one training job
+at a time** — see [CLAUDE.md](CLAUDE.md) for why.
 
 ## So far
 
@@ -51,51 +58,42 @@ All three modules run on CUDA/MPS/CPU automatically.
   `md` (~403M). Also includes a self-speculative decoding generator (MTP
   heads as draft, verified against a true causal pass) to benchmark
   generation latency against `qcute.qcutelm`'s K-bytes-per-step decode.
-- `qcute/qcutelm.py`: encoder + FSQ/BSQ bottleneck + latent LM + decoder,
-  trained jointly end-to-end, train/val split + periodic eval, with an
-  autoregressive generation loop. Non-streaming, non-causal chunk-local MLP
-  encoder (a causal-TCN variant was tried and reverted — causality belongs
-  to the LM, not the chunk-local encoder), simplified vs. the doc's
-  causal-SSM design. **FSQ**: loosely coupled, interface Option A (sampled
-  codes fed back directly, no re-encoding). **BSQ**: tightly coupled by
-  default — the LM's own predicted latent (not the encoder's code) is what
-  the decoder learns to decode, with the old loosely-coupled behavior
-  available as an optional `--disable_aux_recon`-toggleable auxiliary
-  loss. `--lfq` regresses BSQ's quantizer to plain LFQ (Yu et al. 2023).
-  The decoder is **MaskGIT-style** (`--maskgit_T`, default 4 refinement
-  steps): given a partially-masked byte chunk + the latent, predicts the
-  masked positions from the unmasked ones, instead of decoding all K bytes
-  independently. `--uncertainty_weighting` (Kendall & Gal 2018) and
-  `--entropy_reg_weight` (Yu et al. 2023's LFQ/BSQ entropy term) are two
-  further training-loop-only loss-combination options. This is still the
-  weakest of the three baselines on this repo's tiny-corpus numbers — see
-  [docs/status.md](docs/status.md) for the full trail of variants tried
-  (LFQ vs. BSQ, aux on/off, uncertainty weighting, entropy regularization,
-  AE pretraining, `dq` sweeps, the MaskGIT decoder change) and what each
-  one did or didn't fix. `scripts/diagnose_qcutelm.py` (per-position
-  accuracy + per-loss-term gradient norms) and
-  `scripts/qualitative_compare.py` (side-by-side generation vs.
-  bytelm/bpelm on the same prompts) are the two diagnostic tools that
-  actually explained *why*, not just *that*, qcutelm underperforms. See
-  [docs/architecture.md](docs/architecture.md) for the full design.
-- `qcute/bpelm.py`: the BPE half of handover §1.6's BPE+MTP baseline (no
-  MTP here — bytelm covers that half) — a sentencepiece-BPE-tokenized
-  causal transformer, same trunk as bytelm, with exact byte-weighted BPB
-  (not the naive mean-tokens-per-avg-token-length approximation) so it's
-  genuinely comparable to the other two. Needs `scripts/train_bpe.py` run
-  first. Has `generate_ar`/`score_continuation_bpb` functions (used by
-  `scripts/qualitative_compare.py`), but no `--qual_gen_bytes` CLI flag of
-  its own yet — narrower scope than bytelm/qcutelm.
-- All three scripts support: a `--config <file.py>` (see `configs/`) with CLI
-  flags overriding individual config values; checkpointing (`checkpoints/`,
-  gitignored) that keeps the best-so-far and most-recent model, plus
-  `--eval_only --checkpoint_path ...` to evaluate without training.
-  `qcute.bytelm`/`qcute.qcutelm` additionally support `--qual_gen_bytes` for
-  qualitative generation — a prompt (from train/val data or
-  `--qual_user_text`) alongside the model's continuation, the real
-  ground-truth continuation when available, and the model's bpb on it
-  (`qcute.bpelm` doesn't have this yet — narrower scope for now).
-- All three modules are self-contained (no shared internal submodules); see
+- `qcute/qcute_refine.py` (alias for the latest `qcute_refine_vN.py`,
+  currently v4): recursive NTP tower — each level (`LevelLM`) embeds its
+  own input, runs causal self-attention, BSQ-quantizes into a code for
+  the level above every K positions, and (v3+) cross-attends to the
+  level-above's own hidden state before its own self-attention runs
+  ("fusion") so its own next-token loss can depend on the coarser code —
+  earlier versions (v1/v2) used a separate `DecoderLevel` for this
+  instead, later found to do the same job at higher cost. Full
+  architecture history and current results: [CLAUDE.md](CLAUDE.md),
+  [docs/status.md](docs/status.md). `qcute/qcutelm.py` (the original
+  encoder+FSQ/BSQ+latent-LM+decoder design this superseded) is now
+  **archived** under `qcute/archive/` — still runnable via
+  `qcute.archive.qcutelm` for historical reference, not part of active
+  work; see [docs/archive/status_archive.md](docs/archive/status_archive.md)
+  for its own trail of variants tried (LFQ vs. BSQ, MaskGIT decoder,
+  uncertainty weighting, etc.) and [docs/architecture.md](docs/architecture.md)
+  for its design.
+- `qcute/bpelm.py`: a sentencepiece-BPE-tokenized causal transformer, same
+  trunk shape as bytelm, with exact byte-weighted BPB (not the naive
+  mean-tokens-per-avg-token-length approximation) so it's genuinely
+  comparable to the other baselines. Needs `scripts/train_bpe.py` run
+  first. Has `generate_ar`/`generate_kv_cache`/`validate_generation`
+  functions, but no `--qual_gen_bytes` CLI flag of its own yet — narrower
+  scope than bytelm.
+- All modules support: a `--config <file.py>` (see `configs/` — every
+  config file has its own module docstring explaining what it tests and
+  its exact `uv run` invocation, copy-pasteable directly from the file)
+  with CLI flags overriding individual config values; checkpointing
+  (`checkpoints/`, gitignored) that keeps the best-so-far and
+  most-recent model, plus `--eval_only --checkpoint_path ...` to evaluate
+  without training. `qcute.bytelm` additionally supports
+  `--qual_gen_bytes` for qualitative generation — a prompt (from
+  train/val data or `--qual_user_text`) alongside the model's
+  continuation, the real ground-truth continuation when available, and
+  the model's bpb on it.
+- All modules are self-contained (no shared internal submodules); see
   [docs/architecture.md](docs/architecture.md) for why and when to split further.
 - Superseded design (streaming-causal-encoder standalone autoencoder,
   no LM) kept for reference in `archive/`.

@@ -1,8 +1,60 @@
-"""qcute.qcute_refine_v2 — same recursive NTP encoder tower as
-qcute_refine.py, with the block-local joint-chain-MTP Detokenizer replaced
-by a cross-attention decoder that REUSES the encoder tower's own already-
-computed hidden states instead of running any new self-attention trunk of
-its own.
+"""qcute.qcute_refine_v3 — CLONE of qcute_refine_v2.py (same recursive NTP
+encoder tower, same DecoderLevel/tok_loss reconstruction path — see below,
+unchanged), PLUS ONE structural addition: EncoderLevel FUSION
+(Config.fuse_encoder_levels, default True).
+
+WHY (the finding this fixes): in v2, `val_bpb` — the ONLY metric every
+comparison table in docs/status.md is built from, and what checkpointer.
+step() uses to pick best.pt — is computed exclusively from `byte_loss`
+(EncoderLevel[0]'s own NTP loss), which is produced by a purely bottom-up
+sweep with ZERO access to the coarser code, cross-attention, or the
+DecoderLevel/tok_loss path (whose own h reads are DETACHED, by design —
+see below). Cross-attention could only ever move `tok_loss`/`pair0_tok_
+acc`, a metric no baseline in this project is ever compared against.
+Session's KV-contribution probes (docs/kv_contribution.md) already showed
+cross-attention genuinely helps `tok_loss` — that benefit was real, just
+structurally invisible to every val_bpb-based comparison this whole
+session made, and plausibly explains why the full v2 architecture lost to
+a trivial 1-layer bytelm diagnostic (docs/status.md) despite the
+hierarchy's added complexity.
+
+THE FIX — EncoderLevel fusion (v3's only real change, see EncoderLevel.
+_fuse and RefineLM.forward's own "v3 PASS 2" comment for the full
+mechanism): RefineLM.forward runs the SAME bottom-up sweep as v2 first
+(PASS 1 — required regardless, since level i+1's own input IS level i's
+own output code, so level i+1 structurally cannot exist before level i
+has finished; "fuse before running the encoder" is circular for a level
+fusing from ITSELF in one pass). Once PASS 1 has produced every level's
+hidden state, levels 0..n_active-2 are re-run (PASS 2, same weights, same
+input) — this time with a NEW cross-attention step (EncoderLevel._fuse)
+BEFORE their own self.blocks, attending to the level-above's own PASS-1
+hidden state (same jagged-staircase causal mask as DecoderLevel already
+uses, factored into the shared jagged_causal_mask_and_positions
+function). PASS 2's ntp_loss/h REPLACES PASS 1's for that level — so
+byte_loss (and val_bpb, and checkpointing) now genuinely depends on, and
+can learn to use, the coarser code. Q is the level's own embedding
+directly (no separately-learned q-embedding — "encoder reads this
+directly" per the session ask); KV is the level-above's hidden state via
+one new small projection (fuse_kv_proj), detached before use — same
+"don't let this reshape the OTHER level's own hidden state" principle
+DecoderLevel's own cross-attention reads already follow, so only the
+FUSING level's own weights (fuse_cross, its own embed/blocks) get shaped
+by this, not the level being attended to. Cost: roughly one extra
+self-attention-block-sized forward pass per fused level (levels below the
+top only) — level 0 is usually the shallowest (tier_n_layers=1), so
+modest relative to the whole model.
+
+Config.fuse_encoder_levels=False reproduces v2's forward exactly (PASS 1
+only) — a genuine, same-file A/B control for isolating fusion's own
+effect from any other v3-vs-v2 difference.
+
+EVERYTHING BELOW THIS POINT (the encoder tower's own per-level shape,
+CodeEmbed/code_embed_mode, DecoderLevel/tok_loss path, byte_ntp_weight)
+is UNCHANGED from qcute_refine_v2.py — same recursive NTP encoder tower
+as qcute_refine.py, with the block-local joint-chain-MTP Detokenizer
+replaced by a cross-attention decoder that REUSES the encoder tower's own
+already-computed hidden states instead of running any new self-attention
+trunk of its own.
 
 ENCODER TOWER: unchanged from qcute_refine.py — EncoderLevel[i] embeds its
 own input sequence x^(i) (bytes at i=0, else c_{i-1}), runs a causal
@@ -66,8 +118,7 @@ No shared imports with qcute_refine.py or any qcutelm_vlt* fork (self-
 contained-module convention, matching how qcutelm_vlt7->vlt8->...
 evolved) — everything duplicated.
 
-    uv run python -m qcute.qcute_refine_v2 --config configs/qcute_refine_v2_2level.py
-    uv run python -m qcute.qcute_refine_v2 --config configs/qcute_refine_v2_3level.py
+    uv run python -m qcute.qcute_refine_v3 --config configs/qcute_refine_v3_rope.py
 """
 import argparse
 import gzip
@@ -212,6 +263,17 @@ class Config:
                                     # gradient trick pq_table needs to keep training the code's own producer
                                     # (code_pre) — a naive hard lookup would otherwise sever that gradient path
                                     # entirely, since nothing else currently trains code_pre.
+    fuse_encoder_levels: bool = True   # v3's own core mechanism (see module docstring). True (default in
+                                    # this file): every level below the top gets a PASS 2 (RefineLM.forward)
+                                    # that cross-attends to the level-above's own hidden state BEFORE its own
+                                    # self.blocks, and THAT run's ntp_loss/h replaces PASS 1's for byte_loss/
+                                    # val_bpb/checkpointing purposes — fixes v2's blind spot where byte_loss
+                                    # (the ONLY metric ever compared against baselines) had zero access to the
+                                    # coarser code, cross-attention, or the decoder tower's own tok_loss
+                                    # signal (h reads there are detached too — encoder and decoder were fully
+                                    # separate graphs in v2, sharing only forward values). False: reproduces
+                                    # v2's forward exactly (PASS 1 only, no fusion) — a genuine A/B control
+                                    # for isolating fusion's own effect, same file/weights-shape otherwise.
     byte_repr: str = "bits"       # LEVEL 0 ONLY. "bits" (default/original): byte_to_bits 8-dim
                                     # projection + BitPredictHead chain NTP head (both EncoderLevel_0 and
                                     # DecoderLevel_0). "embed": traditional nn.Embedding(vocab, D) lookup
@@ -377,6 +439,30 @@ def rope_cos_sin_for_positions(position_ids: torch.Tensor, head_dim: int, base: 
     freqs = position_ids.float().unsqueeze(-1) * inv_freq
     emb = torch.cat([freqs, freqs], dim=-1)
     return emb.cos(), emb.sin()
+
+
+def jagged_causal_mask_and_positions(L: int, n_blocks: int, K: int, kv_window: int | None, device: torch.device):
+    """v3: factored out of DecoderLevel's own mask/rope-position construction (unchanged math, see
+    DecoderLevel.forward's own "JAGGED STAIRCASE" comment for the full derivation) so EncoderLevel's
+    new fusion cross-attention (v3's core change — see module docstring) can share the exact same,
+    already-verified causal geometry instead of re-deriving it. Both attend from a length-L Q sequence
+    at some level's own raw/finer-time resolution to a coarser level's own n_blocks code-block KV
+    sequence (plus a prepended, always-visible null slot). Returns (disallow [L, 1+n_blocks] bool,
+    True=blocked — nn.MultiheadAttention/CrossBlock convention; k_pos [1+n_blocks] long, each KV
+    slot's own raw-time position for cross_attn_rope, null slot pinned to 0)."""
+    t_idx = torch.arange(L, device=device).unsqueeze(1)
+    b_idx = torch.arange(n_blocks, device=device).unsqueeze(0)
+    n_complete = (t_idx + 1) // K
+    visible = b_idx < n_complete
+    if kv_window is not None:
+        visible = visible & (b_idx >= n_complete - kv_window)
+    null_col = torch.ones(L, 1, dtype=torch.bool, device=device)
+    visible = torch.cat([null_col, visible], dim=1)
+    disallow = ~visible
+    block_pos = (torch.arange(n_blocks, device=device) + 1) * K - 1
+    null_pos = block_pos.new_zeros(1)
+    k_pos = torch.cat([null_pos, block_pos])
+    return disallow, k_pos
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -893,7 +979,8 @@ class EncoderLevel(nn.Module):
     rest," agnostic to whether the logits came from a chained or
     independent head)."""
 
-    def __init__(self, cfg: Config, level: int, in_dq: int, window: int | None):
+    def __init__(self, cfg: Config, level: int, in_dq: int, window: int | None,
+                 fuse_d_model: int | None = None, fuse_kv_window: int | None = None):
         super().__init__()
         self.level = level
         self.in_dq = in_dq
@@ -919,14 +1006,61 @@ class EncoderLevel(nn.Module):
         self.ln_f = nn.LayerNorm(D)
         self.code_pre = nn.Linear(D, cfg.dqs[level])
 
-    def forward(self, seq_repr: torch.Tensor, compute_ntp: bool = True) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # v3 FUSION (module docstring has the full rationale): if this level has a level ABOVE it
+        # (fuse_d_model is not None, i.e. level < n_levels-1), it can optionally cross-attend to that
+        # level's own hidden state BEFORE running its own self.blocks — the mechanism that lets
+        # byte_loss (and any other level's own NTP loss) actually depend on, and be shaped by, the
+        # coarser code, unlike v2 where cross-attention only ever touched the separate, detached
+        # DecoderLevel/tok_loss path. Q = x directly (already D-dim, this level's own embedding —
+        # "encoder reads this directly, no separate embed" per the session ask), no extra q_proj
+        # needed. KV = the level-above's hidden state, projected D_{level+1} -> D via fuse_kv_proj
+        # (only place a new "own" weight is learned, unavoidable when D's differ). Same jagged
+        # causal mask as DecoderLevel (see jagged_causal_mask_and_positions) — position t may only
+        # see level-above blocks that completed strictly before t, so no label leakage.
+        self.fuse_d_model = fuse_d_model
+        self.fuse_kv_window = fuse_kv_window
+        if fuse_d_model is not None:
+            self.fuse_cross = CrossBlock(D, cfg.n_heads, cfg.mlp_mult)
+            self.fuse_kv_proj = nn.Linear(fuse_d_model, D)
+            self.fuse_null_kv = nn.Parameter(torch.zeros(1, 1, D))
+            nn.init.normal_(self.fuse_null_kv, std=0.02)
+
+    def _fuse(self, x: torch.Tensor, fuse_kv: torch.Tensor) -> torch.Tensor:
+        """x: [B, L, D] this level's own pre-self-attention embedding. fuse_kv: [B, n_blocks, D_above]
+        the level-above's own hidden state (already, by construction, "as of" the raw-time position
+        each block completes — see jagged_causal_mask_and_positions). Returns x, fused."""
+        cfg = self.cfg
+        K = cfg.Ks[self.level]
+        B, L, D = x.shape
+        n_blocks = fuse_kv.size(1)
+        device = x.device
+        kv = self.fuse_kv_proj(fuse_kv)
+        null = self.fuse_null_kv.expand(B, 1, D)
+        kv = torch.cat([null, kv], dim=1)
+        disallow, k_pos = jagged_causal_mask_and_positions(L, n_blocks, K, self.fuse_kv_window, device)
+        rope_q = rope_k = None
+        if cfg.cross_attn_rope:
+            head_dim = D // cfg.n_heads
+            q_pos = torch.arange(L, device=device)
+            rope_q = rope_cos_sin_for_positions(q_pos, head_dim, cfg.rope_base, device)
+            rope_k = rope_cos_sin_for_positions(k_pos, head_dim, cfg.rope_base, device)
+        return self.fuse_cross(x, kv, attn_mask=disallow, rope_q=rope_q, rope_k=rope_k)
+
+    def forward(self, seq_repr: torch.Tensor, compute_ntp: bool = True,
+                fuse_kv: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """seq_repr: level 0 gets raw byte ids [B, L] (long) regardless of
         byte_repr — this class converts internally via byte_to_bits when
         byte_repr=="bits", so RefineLM.forward stays mode-agnostic. level
         i>0 gets its own continuous code [B, L, in_dq] (float).
         compute_ntp=False SKIPS the ntp_head call entirely (real speed
-        lever — level 0 must never pass False). Returns (c_i [B,
-        n_blocks, dqs[level]], ntp_loss, ntp_acc, h [B, L, D])."""
+        lever — level 0 must never pass False). fuse_kv: v3 ONLY — None
+        (default) reproduces v2's forward exactly (this is what
+        RefineLM.forward's own PASS 1 uses, bottom-up, to produce every
+        level's code); the level-above's own hidden state (PASS 2, see
+        RefineLM.forward) fuses it in via cross-attention before
+        self.blocks runs, so THIS call's ntp_loss/h genuinely depend on
+        it. Returns (c_i [B, n_blocks, dqs[level]], ntp_loss, ntp_acc,
+        h [B, L, D])."""
         cfg = self.cfg
         K = cfg.Ks[self.level]
         D = cfg.tier_d_models[self.level]
@@ -942,6 +1076,10 @@ class EncoderLevel(nn.Module):
             x = self.embed(seq_repr)
             B, L, _ = seq_repr.shape
         n_blocks = L // K
+
+        if fuse_kv is not None:
+            assert self.fuse_d_model is not None, "fuse_kv passed but this EncoderLevel has no fuse module (no level above it?)"
+            x = self._fuse(x, fuse_kv)
 
         head_dim = D // cfg.n_heads
         cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
@@ -1114,30 +1252,16 @@ class DecoderLevel(nn.Module):
         # leakage. Verified empirically: visible blocks per t for K=4, n_blocks=4 are
         # t=0,1,2->[] t=3..6->[0] t=7..10->[0,1] t=11..14->[0,1,2] t=15->[0,1,2,3] — a step of +1
         # every K positions, offset by K-1, matching exactly when EncoderLevel actually computes
-        # each block's code (and matching cross_attn_rope's own block_pos=(b+1)*K-1 below, so the
-        # position encoding and the visibility mask agree on "when" each block conceptually exists).
-        t_idx = torch.arange(L, device=device).unsqueeze(1)          # [L, 1]
-        b_idx = torch.arange(n_blocks, device=device).unsqueeze(0)   # [1, n_blocks]
-        n_complete = (t_idx + 1) // K                                        # exclusive upper bound: blocks
-                                                                                # 0..n_complete-1 are complete
-        visible = b_idx < n_complete                                          # [L, n_blocks] bool: block b
-                                                                                # complete & visible at t
-        if self.kv_window is not None:
-            visible = visible & (b_idx >= n_complete - self.kv_window)        # cap how far BACK it can reach
-                                                                                # too, not just causality
-        null_col = torch.ones(L, 1, dtype=torch.bool, device=device)
-        visible = torch.cat([null_col, visible], dim=1)                      # [L, 1+n_blocks]
-        disallow = ~visible                                                   # nn.MultiheadAttention bool
-                                                                                # mask convention: True=blocked
+        # each block's code (and matching cross_attn_rope's own block_pos=(b+1)*K-1, so the position
+        # encoding and the visibility mask agree on "when" each block conceptually exists). v3: this
+        # geometry is now factored into jagged_causal_mask_and_positions (module-level function) so
+        # EncoderLevel's new fusion cross-attention can share it — see that function's own docstring.
+        disallow, k_pos = jagged_causal_mask_and_positions(L, n_blocks, K, self.kv_window, device)
 
         rope_q = rope_k = None
         if cfg.cross_attn_rope:
             head_dim = D // cfg.tok_n_heads
             q_pos = torch.arange(L, device=device)                            # Q's own raw-byte-time positions
-            block_pos = (torch.arange(n_blocks, device=device) + 1) * K - 1   # block b resolved at
-                                                                                 # raw position (b+1)*K-1
-            null_pos = block_pos.new_zeros(1)                                 # null slot: fixed reference position 0
-            k_pos = torch.cat([null_pos, block_pos])
             rope_q = rope_cos_sin_for_positions(q_pos, head_dim, cfg.rope_base, device)
             rope_k = rope_cos_sin_for_positions(k_pos, head_dim, cfg.rope_base, device)
 
@@ -1202,7 +1326,17 @@ class RefineLM(nn.Module):
 
         in_dqs = [8] + list(cfg.dqs[:-1])
         self.in_dqs = in_dqs
-        self.encoders = nn.ModuleList([EncoderLevel(cfg, i, in_dqs[i], windows[i]) for i in range(self.n_levels)])
+        # v3: every level below the top gets fuse_d_model/fuse_kv_window set (the level-above's own
+        # D/kv_window, same values DecoderLevel already receives for the same pair) — top level gets
+        # None (nothing coarser exists to fuse from).
+        self.encoders = nn.ModuleList([
+            EncoderLevel(
+                cfg, i, in_dqs[i], windows[i],
+                fuse_d_model=cfg.tier_d_models[i + 1] if i < self.n_levels - 1 else None,
+                fuse_kv_window=windows[i + 1] if i < self.n_levels - 1 else None,
+            )
+            for i in range(self.n_levels)
+        ])
         self.decoders = nn.ModuleList([DecoderLevel(cfg, i, in_dqs[i], kv_window=windows[i + 1]) for i in range(self.n_levels - 1)])
 
         lw = cfg.layer_warmup_steps if cfg.layer_warmup_steps else (0,) * (self.n_levels - 1)
@@ -1261,6 +1395,33 @@ class RefineLM(nn.Module):
             h_list.append(h_i)
             x_list.append(seq_repr)
             seq_repr = c_i
+
+        # v3 PASS 2 (module docstring has the full rationale): PASS 1 above is the same bottom-up
+        # sweep as v2, unchanged — needed regardless, since level i+1 structurally can't exist before
+        # level i has produced its own code c_i (level i+1's own input IS c_i), so fusing "before the
+        # encoder" is circular for a level fusing FROM ITSELF in one pass. Once PASS 1 has finished,
+        # every level's own hidden state DOES exist, so levels 0..n_active-2 can be re-run — same
+        # weights, same input x_list[i] — this time cross-attending to h_list[i+1] BEFORE their own
+        # self.blocks (EncoderLevel._fuse). This refined ntp_loss/acc REPLACES PASS 1's for exactly
+        # those levels; the TOP active level (nothing above it) keeps its PASS 1 result unchanged.
+        # h_list[i+1] is DETACHED here — same "don't reshape the other level's own hidden state"
+        # principle v2's DecoderLevel already follows for its own cross-attention reads (see its own
+        # comment) — so this only lets byte_loss/level i's own NTP loss learn to USE the coarser
+        # code (real gradient into level i's OWN fuse_cross/embed/blocks), without also making level
+        # i's own loss reshape level i+1's weights, which would be a second, competing objective over
+        # the same hidden state (the exact "moving target" failure mode this file's own encoder-side
+        # NTP design otherwise avoids). c_i (what feeds level i+1) is NOT recomputed here — always
+        # PASS 1's, so there's no infinite regress up the tower.
+        if cfg.fuse_encoder_levels:
+            for i in range(n_active - 1):
+                c_i2, ntp_loss2, ntp_acc2, h_i2 = self.encoders[i](
+                    x_list[i], compute_ntp=True, fuse_kv=h_list[i + 1].detach()
+                )
+                ntp_losses[i] = ntp_loss2
+                ntp_accs[i] = ntp_acc2
+                h_list[i] = h_i2   # PASS 2's h is strictly the better representation — decoder consumes it too
+                if i == 0:
+                    byte_loss, byte_acc = ntp_loss2, ntp_acc2
 
         compute_tok = cfg.tok_weight > 0
         tok_losses, tok_accs = [], []
@@ -1475,7 +1636,7 @@ def train(model: RefineLM, train_data: torch.Tensor, val_data: torch.Tensor, arg
     checkpointer = Checkpointer(args.checkpoint_dir / run_name, args.save_every_n_evals, minimize=True)
 
     model.train()
-    pbar = tqdm(range(1, args.steps + 1), desc="train_refine_v2", dynamic_ncols=True)
+    pbar = tqdm(range(1, args.steps + 1), desc="train_refine_v3", dynamic_ncols=True)
     for step in pbar:
         # each stage gets its OWN warmup, reset to 0 at that stage's own activation_steps[stage] — the
         # SAME shared lr_at/lr_at_warmup_constant_cosine functions every other run uses, just called with
@@ -1543,7 +1704,7 @@ def main():
     pre.add_argument("--config", type=Path, default=None)
     pre_args, _ = pre.parse_known_args()
 
-    p = argparse.ArgumentParser(description="Recursive NTP tower + cross-attention DecoderLevel (qcute_refine_v2)", parents=[pre])
+    p = argparse.ArgumentParser(description="Recursive NTP tower + cross-attention DecoderLevel + EncoderLevel fusion (qcute_refine_v3)", parents=[pre])
     p.add_argument("--dqs", type=_parse_int_tuple, default=(8, 8, 8))
     p.add_argument("--Ks", default=(2, 2, 2))
     p.add_argument("--tier_n_layers", default=(1, 1, 1))
@@ -1565,6 +1726,7 @@ def main():
     p.add_argument("--byte_ntp_weight", type=float, default=1.0)
     p.add_argument("--quant_type", type=str, default="bsq", choices=["bsq", "identity"])
     p.add_argument("--code_embed_mode", type=str, default="linear", choices=["linear", "mlp", "pq_table"])
+    p.add_argument("--fuse_encoder_levels", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--byte_repr", type=str, default="bits", choices=["bits", "embed"])
     p.add_argument("--code_head_mode", type=str, default="chain", choices=["chain", "independent"])
     p.add_argument("--tok_d_model", type=int, default=96)
@@ -1639,7 +1801,8 @@ def main():
         bit_conv_kernel_size=args.bit_conv_kernel_size, bit_conv_impl=args.bit_conv_impl,
         bit_inner_downsample=args.bit_inner_downsample, bit_ssm_d_state=args.bit_ssm_d_state,
         code_ntp_weight=args.code_ntp_weight, byte_ntp_weight=args.byte_ntp_weight,
-        quant_type=args.quant_type, code_embed_mode=args.code_embed_mode, byte_repr=args.byte_repr, code_head_mode=args.code_head_mode,
+        quant_type=args.quant_type, code_embed_mode=args.code_embed_mode, fuse_encoder_levels=args.fuse_encoder_levels,
+        byte_repr=args.byte_repr, code_head_mode=args.code_head_mode,
         tok_d_model=args.tok_d_model, tok_n_heads=args.tok_n_heads,
         tok_mlp_mult=args.tok_mlp_mult, tok_head_mode=args.tok_head_mode, tok_weight=args.tok_weight,
         cross_attn_rope=args.cross_attn_rope, decoder_own_trunk=args.decoder_own_trunk,
@@ -1653,7 +1816,7 @@ def main():
         # own help text above (train()/eval_model() pass n_active, not raw step, into the model).
         model = torch.compile(model)
 
-    run_name = args.run_name or (pre_args.config.stem if pre_args.config else f"qcute_refine_v2_{int(time.time())}")
+    run_name = args.run_name or (pre_args.config.stem if pre_args.config else f"qcute_refine_v3_{int(time.time())}")
     log = Logger(args.logs_dir / run_name)
     print(f"run_name={run_name}  logging to {log.text_path} — tail -f {log.text_path}")
     log(f"Ks={cfg.Ks} dqs={cfg.dqs} tier_d_models={cfg.tier_d_models} tier_n_layers={cfg.tier_n_layers} "

@@ -1,7 +1,176 @@
 # Status
 
 Tracks progress on the **active** lineage — `qcute/qcute_refine_v1.py` /
-`qcute/qcute_refine_v2.py` — going forward from this session onward.
+`qcute/qcute_refine_v2.py` / `qcute/qcute_refine_v3.py` — going forward
+from this session onward.
+
+**`qcute/qcute_refine_v3.py` (new this session)**: clone of v2 plus
+EncoderLevel fusion (`Config.fuse_encoder_levels`, default True) — fixes
+a finding uncovered this session: v2's `val_bpb`/checkpointing metric
+(`byte_loss`) is computed by a purely bottom-up sweep with ZERO access to
+the coarser code or cross-attention (only the separate, detached
+`tok_loss` path ever benefited from it — see
+[docs/kv_contribution.md](kv_contribution.md)). v3 adds a second pass
+that re-runs each non-top level with a new cross-attention step BEFORE
+its own self-attention blocks, attending to the level-above's own
+(detached) hidden state under the same jagged causal mask
+`DecoderLevel` already uses — so `byte_loss` itself now depends on, and
+must learn to use, the coarser code. `configs/qcute_refine_v3_rope.py`
+(queued) clones `qcute_refine_rope.py`'s architecture exactly, isolating
+fusion's own effect. Full mechanism/rationale in the module's own
+docstring.
+
+**`qcute_refine_v3_rope` RESULT — first `qcute_refine` architecture to
+beat `bytelm_xs1_ctx1024` outright.** Best val_bpb **2.4302 @ step 3500**
+(mean it/s 1.039, min train bpb 1.4159) vs. `qcute_refine_rope`'s 2.6310
+(same architecture, fusion off) — a **0.201 improvement**, by far the
+largest single delta of any ablation this session, and it beats
+`bytelm_xs1_ctx1024`'s 2.4870 by 0.057. Direct forward-value conditioning
+(byte_loss genuinely depends on the coarser code now, not just
+shared-weight gradient dynamics like `pq_table` — see
+[docs/bpe_like_boundaries.md](bpe_like_boundaries.md) and the session's
+own byte-code-causality discussion) is, on this evidence, a materially
+stronger lever than anything tried in the pure-v2 family. `qcute_refine_
+v3_rope_pq` (queued, stacks fusion + pq_table) will show whether this
+and `pq_table`'s gain are additive or redundant.
+
+**Receptive-field confound identified**: `bytelm_xs1_ctx1024`'s
+`CausalSelfAttention` (`qcute/bytelm.py`) has no window concept at all —
+always dense, full 1024-byte reach on every prediction. Every
+`qcute_refine_v2` config's level 0 uses `attn_window=256` (`tiny_byte_
+window`: 8) — a QUARTER of xs1's own reach, or worse — and per the v3
+finding above, v2's `byte_loss`/`val_bpb` never had a working channel to
+anything past that window anyway. So the whole-session xs1-vs-
+`qcute_refine_v2` comparison was never apples-to-apples on receptive
+field alone, independent of the fusion question. `configs/qcute_refine_
+dense0_starve1.py` (queued, third in line after `pq_table`/`v3_rope`)
+isolates this directly: `attn_window=(-1, 4)` — level 0 widened to dense/
+full-1024 (matches xs1 exactly), level 1 deliberately STARVED to 4 code
+positions (~16 raw bytes) so the interesting question stays clean: does
+the coarser level/cross-attention add anything once level 0 alone
+already matches xs1's own reach? Uses `qcute_refine_v2` (not v3), a
+deliberate choice to keep this test orthogonal to the fusion question — a
+v3 companion (same windowing + fusion) is a natural follow-up once both
+report back.
+
+**Result: RAN — helps, but does not close the gap alone.** Best val_bpb
+**2.5947 @ step 3900** (mean it/s 1.964) — better than `qcute_refine_rope`'s
+2.6310 (windowing does help some), but still well short of `bytelm_xs1`'s
+2.4870. So pure receptive-field widening (matching xs1's dense reach at
+level 0, with no cross-attention conditioning of `byte_loss` at all — this
+config predates fusion) is NOT sufficient on its own to close the gap.
+Combined with `pq_table`'s 2.4816 and `v3_rope`'s 2.4302 (both closing or
+beating the gap through entirely different mechanisms — code-embedding
+expressiveness and direct forward-value conditioning, respectively — see
+[docs/kv_contribution.md](kv_contribution.md) §6), this confirms the real
+levers were the ones tried elsewhere this session, not receptive field per
+se. The receptive-field CONFOUND was still real and worth ruling out
+(the xs1 comparison was never apples-to-apples on window size alone) —
+it just wasn't the dominant explanation.
+
+**`qcute/qcute_refine_v4.py` (new this session)**: clone of v3 with
+`DecoderLevel` removed entirely — see the session's own architecture
+discussion: fusion and `DecoderLevel` turned out to do the literal same
+job with the same input requirements (both predict a level's own next
+token given that level's own sequence history, optionally conditioned on
+the coarser code), and `DecoderLevel` never contributed to `byte_loss`/
+`val_bpb` even in v3 (its reads stayed detached) — so removing it costs
+nothing measurable and saves real compute (an entire extra `CrossBlock` +
+its own embeddings every step). v4 also fixes a real gap v3 left open:
+v3's `generate_no_cache`/`generate_kv_cache` were copied unchanged from
+v2 and never touched fusion at all (training used it, generation didn't).
+v4's generation is fusion-aware — `generate_kv_cache` implements a new
+hierarchical caching scheme (a CLEAN self-attention cache per level, plus
+one FUSED cache for level 0 specifically, the only level ever sampled
+from) — validated via `validate_generation` (exact match against the
+slow reference path) across fusion on/off, a 3-level config, identity
+quantization, `mlp` code-embedding, and prompts as short as 1 byte.
+`configs/qcute_refine_v4_pq.py` stacks v4's leaner architecture with
+`pq_table`, the two strongest independent wins this session, to see how
+far the combination goes.
+
+**Result: RAN — best val_bpb 2.4588 @ step 1900** (run took much longer
+than usual in wall-clock terms due to unrelated system memory pressure
+during this session, not a code/architecture issue — see it/s caveat
+below). **Clean rerun** (`qcute_refine_v4_pq_rerun`, no swap-thrashing
+this time, `caffeinate`-protected): best val_bpb **2.4565 @ step 2400**
+— reproduces closely (within 0.002 of the corrupted run, confirming the
+VALUE was never actually corrupted, only its wall-clock/it-s measurement
+was), mean it/s **1.291** — notably faster than `qcute_refine_v3_rope`'s
+1.039, consistent with v4 being cheaper than v3 (no `DecoderLevel`
+compute) while still paying more than plain v2 (extra self-attention
+pass) — matches the architectural reasoning worked out earlier this
+session. Beats `qcute_refine_pq_table` (2.4816, fusion off) and
+`bytelm_xs1_ctx1024` (2.4870), but is slightly WORSE than `qcute_refine_
+v3_rope` (2.4302, fusion alone, no pq_table) — **stacking fusion +
+pq_table did not beat fusion alone.** This is genuinely informative: the
+two mechanisms (direct forward-value conditioning via fusion,
+shared-weight gradient regularization via pq_table — see
+[docs/kv_contribution.md](kv_contribution.md) §6) are not simply
+additive, and may be partially redundant or even mildly interfering
+routes to the same underlying fix (both, in different ways, are giving
+`byte_loss` better access to what the coarser level knows). `qcute_
+refine_v3_rope_pq` (v3, same architecture, DecoderLevel still present but
+inert) confirms this isn't specific to v4's leaner setup: best val_bpb
+**2.4639 @ step 3000** — close to v4_pq's 2.4588 (v4 slightly better),
+both still worse than fusion alone (2.4302). Non-additivity holds under
+both architectures.
+
+**`qcute_refine_v4_rope` (fusion alone, no pq_table, no DecoderLevel) —
+close but not exact reproduction of `v3_rope`.** Best val_bpb **2.4710 @
+step 2800**, mean it/s 1.537. `v3_rope`'s own 2.4302 was this session's
+best single result; `v4_rope`'s 2.4710 is close (both far better than
+every pq_table-stacked or baseline-losing config) but not an exact match
+— a real 0.041 gap. No explicit seed-pinning was used between these two
+separate training invocations, so this is most plausibly ordinary
+run-to-run variance from different random initialization, not evidence
+against the detach-based independence reasoning (`DecoderLevel`'s reads
+were always detached from `byte_loss`, so removing it shouldn't
+systematically change fusion-alone's own result) — but worth recording
+as a real, unresolved small gap rather than claiming an exact
+reproduction that didn't quite happen.
+
+**`Config.fuse_position` ablation — `qcute_refine_v4_pq_postfuse`
+("post") vs. `qcute_refine_v4_pq` ("pre", default).** Best val_bpb
+**2.4678 @ step 2100** (mean it/s 1.413) — slightly WORSE than `v4_pq`'s
+2.4565, a real but small 0.011 gap. So fusing BEFORE self-attention (the
+original design: every position gets cross-level context first, then
+self-attention lets that context propagate across positions) beats fusing
+AFTER (positions mix purely among themselves first, only the final
+representation sees the coarser code, no further propagation) — small
+edge, but consistent with "pre" being the more expressive ordering
+(gives self-attention a chance to spread fused information around,
+"post" doesn't). "pre" stays the default.
+
+**v4 forward-pass cost vs. v2/v3, worked out explicitly**: v4 is cheaper
+than v3 (strictly — removing `DecoderLevel` removes compute, nothing
+added back; params confirm the direction: `v4_pq` 2.640M vs `v3_rope`
+3.563M, not a matched pair since one has `pq_table`, but the point holds
+regardless). v4 is NOT cheaper than v2, counterintuitively — v2's default
+decoder REUSES `h_prev`/`h_curr` (already computed by PASS 1), paying
+only two small linear projections + one lightweight `CrossBlock`, no
+self-attention re-run at all. v4's fusion (PASS 2) re-runs level 0's
+ENTIRE self-attention trunk on top of the cross-attention — the
+"self-attention runs twice" cost established earlier this session. So per
+step: v2 pays one self-attention pass + a cheap cross-attn-only decoder;
+v4 pays two self-attention passes + a cross-attention fusion, nothing
+cheap to offset it. v4 buys real forward-value conditioning v2's decoder
+structurally never could — that conditioning isn't free. Note: `v4_pq`'s
+own logged it/s (0.216) is NOT a fair speed measurement — that run hit
+the swap-thrashing episode; `v3_rope`'s clean it/s (1.039, unaffected) is
+the better real-world reference point, and the architectural reasoning
+above (not the noisy wall-clock numbers) is what the "v4 vs v2" cost
+comparison should rest on.
+
+**Housekeeping (this session)**: `EncoderLevel` renamed to `LevelLM`
+throughout `qcute_refine_v4.py` — the class does both the "encode"
+(PASS 1, produce the code) and "decode" (PASS 2, fused/conditioned
+prediction) jobs now, so "Encoder" alone was misleading; "LevelLM"
+matches the module's own "N-level recursive NTP tower" framing (each
+level runs its own LM). Also added `qcute/qcute_refine.py` — a thin
+alias (`from qcute.qcute_refine_v4 import *`) with the convention that
+the no-suffix file always points at the latest version; promoting to a
+future v5 is a one-line change there, not a duplicated file.
 
 **Everything prior** (Phase 0-3 of the original `continuous_tokenizer_
 handover.md` plan, and the full `qcutelm`/`qcutelm_vlt`/`qcutelm_pyramid`/
@@ -14,6 +183,26 @@ historical context/reproducibility; nothing there is still being acted on.
 `bytelm.py`/`bpelm.py` remain the active baseline comparison points (not
 archived) — see `docs/archive/status_archive.md` for their own original
 setup narrative, still valid.
+
+**This file was split this session** (had grown to 472 lines mixing
+several long-running investigative threads) — it now stays lean:
+baseline numbers, params/FLOPs, lineage pointers, and the main
+ablation-family results table. Deep-dive threads moved to their own
+docs, cross-referenced below:
+- [docs/kv_contribution.md](kv_contribution.md) — does `DecoderLevel`'s
+  cross-attention KV actually matter? Three probes/experiments.
+- [docs/torch_compile.md](torch_compile.md) — `--compile` on
+  `qcute_refine_v2`: root cause, fix, MPS speed verdict.
+- [docs/bitpredict_heads.md](bitpredict_heads.md) — `BitPredictHead`
+  speed (linear vs. attn/conv/ssm, matmul reparam, inner-downsample).
+- [docs/bpe_like_boundaries.md](bpe_like_boundaries.md) — is
+  `qcute_refine` doing anything BPE-like? Brainstorm + math for
+  content-adaptive pooling within the fixed-K grid (not yet implemented).
+- [docs/hierarchical_fusion_designs.md](hierarchical_fusion_designs.md) —
+  generalizing fusion beyond adjacent-only chains for N>2 levels:
+  DenseNet-style pervasive/dense fusion, MoE-style gated routing
+  (weighted vs. discrete), recursive/cascading refinement (not yet
+  implemented).
 
 ## Baseline numbers (current reference point for every `qcute_refine` comparison)
 
@@ -32,6 +221,10 @@ Best val_bpb/step computed from each log's final (non-stale) segment.
 | `bpelm_8192` | 256 tok (~845 byte-equiv) | **2.350** | 800 | 3.878 | 0:34:25 (8000 steps) |
 | `bpelm_32768` | 256 tok (~973 byte-equiv) | **2.134** | 500 | 1.971 | 1:07:41 (8000 steps) |
 | `bytelm_xs3_ctx1024` (3-layer, this session) | 1024 bytes | **2.408** | 2100 | 1.563 | 0:42:39 (4000 steps) |
+| `bpelm_4096_paramsmatch` (params-matched to `rope_3level_curriculum`) | 384 tok | **2.3531** | — | — | 0:14:51 (4000 steps) |
+| `bpelm_16384_ctx448_flopsmatch` (FLOPs-matched to `decoder_trunk`) | 448 tok | **2.3438** | 400 | — | killed @ step ~2750/4000 |
+| `bpelm_8192_ctx448_flopsmatch_rope` (FLOPs-matched to `rope`/`identity`) | 448 tok | **2.3559** | 500 | — | killed @ step ~2900/4000 |
+| `bytelm_xs1_ctx1024` (DIAGNOSTIC: 1-layer, this session) | 1024 bytes | **2.4870** | 3000 | 3.429 | 0:19:26 (4000 steps) |
 | ~~`qcute_refine_v2_byte4_code256_simple` ("v1")~~ | 1024 bytes | ~~**2.485**~~ | 5600 | 2.42 | 1:00:53 (8000 steps) |
 
 **This config/run was later DELETED this session** (see the "Full
@@ -42,14 +235,26 @@ through, not removed, so this table's own history stays intact; treat
 `qcute_refine_rope` (in the later table) as its replacement reference
 point instead.
 
+**Both `flopsmatch` bpelm configs (16384 and 8192 vocab) overfit
+catastrophically and were killed early**: same pattern each time — val_bpb
+bottoms out early (2.3438 @ step 400 for the 16384 config, 2.3559 @ step
+500 for the 8192 one) then climbs monotonically past 4.0 by step ~2700-
+2900 while train bpb collapses to ~0.01-0.03 — large vocab heads have
+enough capacity to memorize the ~237K-token train set outright once past
+a few hundred steps, regardless of exact vocab size in the thousands
+range. `best.pt` was saved before the divergence each time, so the
+reported val_bpb is unaffected; only the wasted remaining steps were cut
+(both runs killed manually around step 2750-2900/4000).
+`bpelm_4096_paramsmatch`, by contrast, trained cleanly to its full 4000
+steps (see the ablation-family table below for full detail on all
+three).
+
 `qcute_refine_v2`'s "v1" run: worse best-bpb than either bpelm variant,
 better than plain `bytelm`, but at ~2.1x `bytelm`'s throughput and ~4.3M
-fewer params (2.706M vs. bytelm's 3.412M) — see the FLOPs/param
-comparisons earlier in this session's conversation log for the fuller
-picture (not yet transcribed into this file). Every baseline here
-overfits well before 8000 steps (see the step-budget finding below) —
-these best-bpb numbers, not the final-step ones, are the actual
-comparison target.
+fewer params (2.706M vs. bytelm's 3.412M). Every baseline here overfits
+well before 8000 steps (see the step-budget finding below) — these
+best-bpb numbers, not the final-step ones, are the actual comparison
+target.
 
 ## Params/FLOPs comparison table (this session)
 
@@ -79,7 +284,90 @@ length. Sorted by params:
 | `qcute_refine_v2_byte4_code256_identity` | 2.706M | 3.862G |
 | `qcute_refine_rope_3level_curriculum` | 3.414M | 4.330G |
 | `qcute_refine_decoder_trunk` | 4.424M | 5.878G |
+| `qcute_refine_v4_pq` (fusion + pq_table, no DecoderLevel) | 2.640M | 5.340G |
 | `bpelm_16384_xs3` | 6.561M | 3.355G |
+
+**`qcute_refine_v4_pq` vs. every baseline, params/flops-sorted** (all
+FLOPs measured the same way — `FlopCounterMode`, single forward pass,
+batch=1, CPU, each config's own context length; `%diff` is vs. `v4_pq`'s
+own 2.640M params):
+
+| baseline | params | flops/fwd | %diff params | val_bpb | vs. `v4_pq` (2.4588) |
+|---|---|---|---|---|---|
+| `bytelm_xs1_ctx1024` | 1.050M | 2.147G | −60.2% | 2.4870 | +0.0282 (v4_pq wins, unfair — 2.5x fewer params) |
+| **`bytelm_xs3_ctx1024`** | **2.625M** | **5.369G** | **−0.6% (closest)** | **2.4080** | **−0.0508 (beats v4_pq)** |
+| `qcute_refine_v4_pq` | 2.640M | 5.340G | — | 2.4588 | — |
+| `bytelm_xs_mtp4_ctx1024` | 3.412M | 6.979G | +29.2% | 2.3650 | −0.0938 |
+| `bpelm_4096_paramsmatch` | 3.420M | 2.617G | +29.5% | 2.3531 | −0.1057 |
+| `bpelm_8192_ctx448_flopsmatch_rope` | 4.460M | 3.993G | +68.9% | 2.3559 | −0.1029 |
+| `bpelm_8192` | 5.253M | 2.684G | +99.0% | 2.3500 | −0.1088 |
+| `bpelm_16384_ctx448_flopsmatch` | 6.560M | 5.872G | +148.5% | 2.3438 | −0.1150 |
+| `bpelm_32768` | 11.544M | 5.906G | +337.3% | 2.1340 | −0.3248 |
+
+**Honest read**: `bytelm_xs3_ctx1024` is an almost exact double-match to
+`v4_pq` — within 0.6% on params AND 0.5% on FLOPs simultaneously, the
+closest/fairest single comparison in this table. At that genuinely
+matched compute, `bytelm_xs3_ctx1024` **beats** `v4_pq` by 0.051 bpb.
+Every larger baseline beats `v4_pq` too. The only baseline `v4_pq` beats
+outright is `bytelm_xs1_ctx1024` — but that's at 2.5x FEWER params, not
+a fair comparison in `v4_pq`'s favor. So despite fusion+pq_table being
+the strongest `qcute_refine` architecture built this session (beats every
+other variant, including `xs1` specifically), it has NOT closed the gap
+to a plain dense 3-layer bytelm at genuinely matched compute — worth
+stating plainly rather than only citing the comparisons that flatter it.
+
+**FLOPs and memory diverge — `qcute_refine_v4_k32_narrow.py`.** Session
+question: can `qcute_refine` match xs1/xs3's FLOPs while pushing level 1
+toward real token-granularity (`Ks=(32,32)`, ~32-byte blocks) and giving
+level 0 an extremely narrow local window (`attn_window=(32,32)` — level 0
+sees only 32 raw bytes via self-attention, level 1 gets dense/full
+attention over its own 32 positions, fusion's own reach becomes
+effectively unbounded since `fuse_kv_window` inherits `windows[1]=32 ≥`
+level 1's own block count)? Params/FLOPs: 2.640M / 4.895G — close to BOTH
+`bytelm_xs1_ctx1024` (2.147G) and, more closely, `bytelm_xs3_ctx1024`
+(5.369G, −8.8%).
+
+**Memory does NOT track FLOPs, measured directly** (peak RSS, CPU,
+forward+backward, isolated subprocess per model, net of the ~150MB
+python+torch import floor):
+
+| model | flops/fwd | net peak memory |
+|---|---|---|
+| `bytelm_xs1_ctx1024` | 2.147G | 30.1MB |
+| `qcute_refine_v4_pq` (K=4, baseline) | 5.340G | 71.7MB |
+| `bytelm_xs3_ctx1024` | 5.369G | 97.7MB |
+| `qcute_refine_v4_k32_narrow` (K=32) | 4.895G | **118.3MB** |
+
+`k32_narrow` uses MORE memory than every other row despite having the
+LOWEST FLOPs of the three `qcute_refine`/`xs3` entries — +65% memory over
+the K=4 baseline it's cloned from, despite −8.3% fewer FLOPs. Checked
+whether this is a "needs flash attention" gap: a separate scaling test
+(`F.scaled_dot_product_attention`, CPU, varying L from 256→2048) shows
+peak memory grows roughly LINEARLY with sequence length, not
+quadratically (~1.75x memory when L quadruples, not ~16x) — CPU SDPA is
+already using a memory-efficient/flash-style kernel here, so this ISN'T
+a "swap in flash attention" fix. Most likely explanation:
+`CausalSelfAttention._forward_chunked`'s own per-chunk bookkeeping
+overhead — K=32/window=32 creates 32 small chunks (vs. K=4/window=256's
+4 large chunks); more distinct reshape/permute/concat intermediate
+tensors even though each individual chunk's own FLOPs are smaller. A
+real, somewhat counter-intuitive finding: shrinking the window doesn't
+just trade accuracy for speed, it can trade FLOPs for MEMORY via the
+chunking implementation's own overhead — worth knowing before assuming
+"finer window = cheaper" holds on every axis.
+
+**`k32_narrow` RESULT: best val_bpb 2.4926 @ step 2800, mean it/s 2.259**
+(the fastest of any `qcute_refine_v4` config trained this session,
+consistent with its cheap FLOPs). Essentially tied with `bytelm_xs1_
+ctx1024` (2.4870 — k32_narrow is 0.006 worse, within noise) and clearly
+behind `bytelm_xs3_ctx1024` (2.4080). So the design (level 0 hyper-local,
+level 1 dense/full-context, fusion effectively unbounded) trains fast and
+lands in a reasonable place, but doesn't beat either matched baseline —
+consistent with this session's broader finding that no `qcute_refine`
+variant has yet beaten a properly compute-matched dense bytelm. The
+real, distinct value of this run was methodological: it's the config
+that exposed the FLOPs-vs-memory divergence above, independent of how
+its own val_bpb landed.
 
 `bytelm_xs3_ctx1024` (2.625M) lands almost exactly on top of most
 2-level `qcute_refine_v2` configs (2.6-2.7M) — a much closer param match
@@ -91,7 +379,11 @@ attention). `bpelm_16384_xs3` (6.561M) is far larger than everything
 else here — its 16384-vocab embed+unembed tables dominate — so it's not
 a fair params-matched comparison to anything in this table despite its
 FLOPs/fwd being the lowest overall (context=256 tokens is a much shorter
-sequence than the byte-level runs' context=1024).
+sequence than the byte-level runs' context=1024). Fuller grid searches
+(strict power-of-2 vocab/context, params-matched vs. FLOPs-matched picks
+per `qcute_refine_v2` ablation target) live in `qcute/bytelm.py`'s and
+`qcute/bpelm.py`'s own module docstrings ("Session notes" sections), not
+duplicated here.
 
 ## `qcute/qcute_refine_v1.py` / `qcute/qcute_refine_v2.py` — new fork lineage (this session)
 
@@ -125,15 +417,12 @@ through ~step 3000-4000, then genuinely plateaus (noisy, no further trend)
 through 8000. Since both baselines are already fully into their
 overfit/plateaued state by step 4000, comparison runs gain no signal from
 the second half of an 8000-step budget — **new `qcute_refine_v2` ablation
-configs default to `steps=4000`** going forward (already applied to every
-queued-not-yet-launched config as of this session: `qcute_refine_rope`,
-`qcute_refine_decoder_trunk`, `qcute_refine_pass_through`,
-`qcute_refine_v2_byte4_code256_identity`, `qcute_refine_rope_3level_curriculum`).
-Also worth adopting project-wide: report **best-checkpoint val_bpb**
-(`checkpoints/<run>/best.pt`, already tracked by `Checkpointer`), not
-final-step val_bpb, as the headline comparison number — final-step numbers
-on these small-corpus runs mostly measure how overfit a run got, not how
-good its best state was.
+configs default to `steps=4000`** going forward. Also worth adopting
+project-wide: report **best-checkpoint val_bpb** (`checkpoints/<run>/
+best.pt`, already tracked by `Checkpointer`), not final-step val_bpb, as
+the headline comparison number — final-step numbers on these
+small-corpus runs mostly measure how overfit a run got, not how good its
+best state was.
 
 Documentation note: `CLAUDE.md`'s own Commands section previously pointed
 its `bytelm` example at `configs/bytelm_xs_mtp4.py` (`context=256`) —
@@ -141,70 +430,6 @@ updated to `configs/bytelm_xs_mtp4_ctx1024.py`, the actual standard
 baseline as of this session (`context=1024`, matching `qcute_refine`'s own
 `context_len`). The old `context=256` config is kept (historical
 reproducibility) but is no longer the comparison target for new work.
-
-## `qcute_refine_v2_byte4_code256_simple` ("v1") finished — plateaus, doesn't overfit catastrophically
-
-**[DELETED later this session — config, logs, checkpoints all removed.**
-Section kept as historical record of what was found while it existed;
-see the "Full qcute_refine_v2 ablation-family comparison" section's own
-CORRECTION note for why it was deleted (ambiguous cross_attn_rope status
-at actual training time). Do not use `qcute_refine_v2_byte4_code256_
-simple` as a live reference point anywhere else in this file — use
-`qcute_refine_rope` instead.]**
-
-Full 8000-step run completed (`byte_repr="embed"`, `code_head_mode=
-"independent"`, no `BitPredictHead` anywhere, `Ks=(4,4)`,
-`tier_d_models=(256,256)`, matched to `bytelm_xs_mtp4_ctx1024`'s own
-budget). `logs/qcute_refine_v2_byte4_code256_simple/bpb.png`: val_bpb
-drops to ~2.6 by step ~1500-2000, then stays flat/noisy (2.5-2.9 band)
-the rest of the way to 8000 — unlike `bytelm_xs_mtp4_ctx1024`'s own
-monotonic-overfit curve (see archive), this run genuinely plateaus rather
-than climbing. `best.pt` landed at **step 5600, val_bpb 2.4846**.
-
-**Decoder KV contribution — probed, genuinely mixed/inconclusive.**
-`scripts/probe_decoder_kv_contribution.py` (new this session — gradient-
-norm ratio, KV-ablation loss/acc delta, null-slot attention mass; three
-independent signals since no one alone is trustworthy) against `best.pt`:
-`grad_ratio_curr_over_prev` **0.01-0.02** (KV side's gradient is ~1-2% of
-Q side's), `null_slot_attn_mass` **~0.29** (vs. ~0.004 uniform over 257
-KV positions — the model has learned to substantially opt out of
-attending to real code content), and on val data specifically, **ablating
-KV entirely (forcing null-only) *lowers* loss** (1.687 vs. 1.731 with
-it) despite accuracy being very slightly *worse* without it (0.532 vs.
-0.538). Cross-checked against the FULL `run.jsonl` trajectory (not just
-one checkpoint): `pair0_tok_acc` (with KV) is consistently $\ge$
-`level0_ntp_acc` (without KV) from step ~1600 onward, small but
-persistent (+0.001 to +0.016) — so KV *does* give a real, if small,
-accuracy edge across most of training. Read together: **overfit
-calibration, not overfit accuracy** — the decoder's cross-attention head
-grows more confident in ways that help top-1 accuracy marginally but hurt
-held-out cross-entropy (a classic overconfidence signature, not a "KV is
-useless" one). Genuinely unresolved which effect dominates in practice;
-`qcute_refine_pass_through`'s results (both Q and KV stripped to direct
-embeddings/projections, no `h` reliance on either side) are queued
-specifically to help resolve this.
-
-**Real bug found and fixed: `DecoderLevel`'s cross-attention KV window
-was unbounded.** The causal mask (`b < n_complete(t)`) enforced *that* a
-KV block must be complete before being visible, but never capped *how
-far back* — every completed block stayed reachable regardless of
-distance, inconsistent with the encoder's own windowed self-attention at
-that same level (`Config.attn_window`, e.g. `(256,128,64)`). Fixed:
-`DecoderLevel` now also takes `kv_window = Config.attn_window[level+1]`
-and requires `b >= n_complete(t) - kv_window` too (`None`/`-1` preserves
-the original unbounded reach) — see `docs/qcute_refine_math.md` §7.1 for
-the full algorithm. Applies automatically to every already-written config
-using per-level windows (the whole `qcute_refine_*`/`byte4_code256*`
-family) — none had launched yet when this was found, so nothing needed
-re-running.
-
-**`Config.cross_attn_rope`** (default `True`) also added this session:
-Q gets its own raw-byte-time RoPE position (`0..L-1`); each KV slot gets
-the raw-byte-time position it becomes causally resolved at
-(`(b+1)*K-1`, or `0` for the null slot) — gives the cross-attention actual
-relative-distance information instead of only the boolean visible/blocked
-mask it had before. `False` restores the original position-blind
-cross-attention. See `docs/qcute_refine_math.md` §7.2.
 
 **Housekeeping**: every earlier qcute-lineage fork (`qcutelm.py`,
 `qcutelm_vlt*.py`, `qcutelm_pyramid.py`, `qcutelm_mergetoken_v1.py`,
@@ -214,181 +439,23 @@ handover.md`, `fifo_v2.md`, `vlt12_math.tex` — to `docs/archive/`), 93 old
 log directories cleared, 4 scripts' broken imports fixed
 (`qcute.archive.*`). `bytelm.py`/`bpelm.py` are the explicit exception,
 still active baselines. The `v1_*` ablation configs renamed to
-`qcute_refine_*` for naming consistency with the rest of the lineage; the
-one already-running job (`v1_pass_through`) was stopped and relaunched
-fresh under its new name (`qcute_refine_pass_through`) rather than left
-mismatched against its renamed config file. `qcute/qcute_refine.py`
-itself later renamed to `qcute/qcute_refine_v1.py` (configs/docs updated
-to match) for naming consistency with `qcute_refine_v2.py`. This file
-itself (`docs/status.md`) reset to just the `qcute_refine`-relevant
-entries above — everything prior moved to `docs/archive/status_archive.md`.
-
-## `qcute_refine_pass_through` finished — KV contribution now UNAMBIGUOUS (opposite of "simple"'s inconclusive read)
-
-Full 4000-step run (`decoder_kv_pass_through=True` + `decoder_q_pass_through=True`,
-`cross_attn_rope=True`, windowed KV) completed: **best val_bpb 2.5575 @ step
-3300** (final-step val_bpb 2.6009, mildly overfit past that point) — worse
-than v1's own best (2.4846 @ step 5600, full h_prev/h_curr reuse), so
-stripping both Q and KV to direct raw embeddings/projections (no encoder
-hidden-state reliance on either side) costs real accuracy vs. reuse mode.
-
-`scripts/probe_decoder_kv_contribution.py` **adapted** this session to
-support non-default decoder modes (`_compute_qkv` now mirrors
-`DecoderLevel.forward`'s own own_trunk/q_pass_through/kv_pass_through
-dispatch instead of hardcoding `h_prev`/`h_curr` reuse — the original
-script crashed outright against this checkpoint, since `q_embed` is an
-`nn.Embedding` and pass-through mode feeds it raw byte ids, not a
-continuous `h_prev` hidden state). Gradient-norm signal (signal 1) is
-skipped (`NaN`) on any side using pass_through/own_trunk, since there's no
-continuous encoder hidden state on that side to take a gradient w.r.t. —
-ablation and attention-mass (signals 2/3) remain fully meaningful and are
-the ones that matter here anyway.
-
-Re-run against `qcute_refine_pass_through`'s `best.pt` (8 batches x 16,
-train + val): **`delta_loss_from_kv` ≈ −0.23 to −0.24** (ablating KV
-entirely *raises* loss substantially — opposite sign from the "simple"
-run's val-only finding), **`delta_acc_from_kv` ≈ +0.036 to +0.038**
-(consistent, positive, same sign on train AND val — no train/val split
-this time), and **`null_slot_attn_mass` ≈ 0.05–0.06** (vs. ~0.29 in the
-reuse-mode run — attention is overwhelmingly on real code content, not
-opting out to the null fallback). Read together with the "simple" run's
-own mixed result: when Q/KV are reused encoder hidden states already
-carrying most of the signal, cross-attention has less left to add and
-drifts toward overconfident-but-not-more-accurate null-heavy attention
-(the earlier "overfit calibration, not accuracy" read); when Q/KV are
-stripped to raw pass-through with no such shortcut, the model has no
-alternative but to genuinely rely on the cross-attention KV, and does —
-consistently, causally, on both loss and accuracy. Net: KV contribution
-depends heavily on what else is available to lean on, not a fixed
-property of the cross-attention mechanism itself.
-
-## BitPredictHead speed: linear vs. attn/conv/ssm, matmul reparam, and inner-downsample (this session)
-
-`scripts/bench_bit_heads.py` (new): CPU, tiny-scale (`d_model=32`,
-`N=32`) forward and forward+backward wallclock for the "independent"
-`nn.Linear` baseline (no chain-rule conditioning) vs. the three chain
-heads (`bit_head_class` = `attn`/`conv`/`ssm`), across `dq` in
-`(8,16,32)`, plus a `decode` mode (`true_bits=None` → `_forward_loop`,
-the actual sequential-loop autoregressive-generation-time cost, distinct
-from the batched teacher-forced `_forward_fixed` path used for training).
-
-**Train (fwd+bwd) slowdown vs. linear**: all three chain heads cost real
-overhead (expected — they pay for cross-bit conditioning the linear head
-skips entirely), roughly attn 11-19x, conv 9-51x, ssm 12-32x depending on
-dq. **Decode (sequential loop) slowdown is far worse and roughly
-dq-scaling**: attn 165-730x, ssm 54-136x (`ssm` consistently cheapest —
-no dq-dependent op, just a per-step linear-decay update), and `conv`
-worst-case **~3900x at dq=16 specifically** with the original `nn.Conv1d`
-implementation — a backend-quirk spike (dq=8 and dq=32 are far cheaper,
-~25-72x), not a real algorithmic cost.
-
-**Fix**: `BitPredictHeadConv` gained `conv_impl` (`"matmul"`, new
-default, vs. `"conv1d"`, original) — mathematically the SAME operation
-(fixed causal window, weights shared across positions), just
-reparametrized as `nn.Linear(kernel_size*D, D)` over a flattened window
-instead of calling `nn.Conv1d` directly. Verified numerically
-fixed/loop-consistent (~1e-7 diff) at every kernel size tried. Fixes the
-dq=16 anomaly entirely and is faster across the board: dq=16 train
-428x→14x slower than linear, decode 3876x→104x. Wired through
-`Config.bit_conv_impl` + CLI; kept BOTH modes as a flag, not a
-replacement (repo convention).
-
-**Also added**: `Config.bit_inner_downsample` (1/2/4, default 1 = exact
-prior behavior, no extra op/params) — projects the incoming hidden vector
-down to `d_model//downsample` once via a new `in_proj`, then runs every
-internal chain op (embeds/attn/conv/ssm-state/head) at that smaller width
-instead of full `d_model`, for all three `bit_head_class` variants
-uniformly. Verified fixed/loop-consistent at every downsample factor.
-**Helps train cost** (roughly halves-to-thirds the slowdown-vs-linear
-going 1x→4x, e.g. attn 25x→16x, conv 26x→12x, ssm 32x→14x at dq=32; params
-drop sharply too, e.g. attn dq=32: 5345→833). **Barely moves decode
-cost** and is sometimes non-monotonic there (attn dq=32: 728x→583x→653x
-across 1x/2x/4x) — decode's dominant cost is Python-loop/dispatch
-overhead from dq sequential calls, not per-call matmul width, so
-shrinking the matmuls doesn't touch the actual bottleneck. Net:
-`bit_inner_downsample` is a solid free-ish training-time lever, not a fix
-for generation-time cost — `ssm` remains the cheapest decode option
-regardless of downsample.
-
-## torch.compile: root-caused, fixed properly, still not a net win on MPS at this scale (this session)
-
-`--compile` (new CLI flag on `qcute/qcute_refine_v2.py`, default `False`,
-no-op unless passed): went through two wrong fixes before the real one.
-
-**Attempt 1 (wrong)**: `model = torch.compile(model)` on the whole
-`RefineLM`. Measured net SLOWER than eager (200 real steps,
-`configs/qcute_refine_rope.py`, MPS: eager steady ~2.99 it/s, compiled
-never caught up, ~2.5 it/s and still climbing). Root cause found via
-`TORCH_LOGS=recompiles`: `RefineLM.forward` took the raw training-step
-int `step` and branched on its exact value inside `n_active_levels()`
-(gating `layer_warmup_steps`) — dynamo guards on that exact int and
-recompiled almost every single step, even for configs that never set
-`layer_warmup_steps` at all, since `step` still reached the compiled
-function as a live-changing value.
-
-**Attempt 2 (workaround, since removed)**: assert `layer_warmup_steps`
-empty, pass `step=None` into the model whenever compiling. Fixed the
-recompile problem but disabled curriculum+compile entirely.
-
-**Attempt 3 (the real fix, what's in the code now)**: `RefineLM.forward`
-now takes `n_active: int | None` directly instead of raw `step`.
-`train()`/`eval_model()` compute `n_active = model.n_active_levels(step)`
-themselves, in plain eager Python, and pass that in — `step` itself never
-reaches the (possibly compiled) model call. Dynamo now guards on
-`n_active`, which only takes a handful of distinct values across an
-entire run (one per curriculum stage transition) instead of one per
-step. Verified with a real 3-stage curriculum (`layer_warmup_steps=
-(5,5)`, 20 steps crossing both transitions): every recompile event tied
-to a genuinely new tensor shape appearing for the first time (a new
-level activating really is a different compute graph), clustered right
-at the two transitions, zero guard failures mention `step` anywhere.
-Correctness verified throughout (matched-seed eager vs compiled,
-multiple architectures/curricula): loss diffs ~1e-6, grad diffs ~1e-9,
-the normal float32 op-reordering noise floor, no regression at any
-point in this process.
-
-**Real MPS speed result** (200 real steps, `qcute_refine_rope`'s
-non-curriculum config, so this isn't confounded by the old recompile
-bug): eager ~69s/199 steps (2.88 it/s), compiled (fixed) ~80s/199 steps
-(2.49 it/s) — **still ~13-15% SLOWER than eager**, even with the
-recompile bug genuinely gone. Likely cause: `d_model=256` means small
-matmuls, and MPS/Inductor's kernel-launch overhead + less mature fusion
-coverage (vs. CUDA) probably dominates over any compile-time fusion win
-at this scale. **Conclusion: `--compile` is correct and available, but
-not worth using on this hardware/model-scale combination — stays off by
-default.**
-
-As a side effect of this work, `DecoderLevel`'s cross-attention KV mask
-(`n_complete = (t_idx+1)//K`, `visible = b_idx < n_complete`) was
-re-verified correct — a "jagged staircase" pattern, empirically confirmed
-for K=4: visible block count steps +1 every K raw positions, but the
-step boundary lands at `t=(b+1)*K-1` (not a K-multiple) — block b's code
-depends on `EncoderLevel`'s hidden state at that block's LAST position,
-so it isn't causally available until that byte has been seen; the
-formula gets this exactly right (no off-by-one, no label leakage).
-Documented directly in the mask's own code comment in
+`qcute_refine_*` for naming consistency with the rest of the lineage.
+`qcute/qcute_refine.py` itself later renamed to `qcute/qcute_refine_v1.py`
+(configs/docs updated to match) for naming consistency with
 `qcute_refine_v2.py`.
 
 ## New closer-matched baselines + full ablation-family comparison table (this session)
 
-**`configs/bytelm_xs3_ctx1024.py`** (3-layer, d_model=256/n_heads=4/
-mtp_heads=4/context=1024 — required adding a new `--n_layers` CLI
-override to `qcute/bytelm.py`, which previously only exposed
-`--context`/`--mtp_heads`) and **`configs/bpelm_16384_xs3.py`** (3-layer,
-vocab=16384, d_model=256/context=256) added as closer-param-matched
-baselines to the `qcute_refine_v2` 2-level configs than the original
-4-layer/8000-step `bytelm`/`bpelm` baselines were. Full params/FLOPs
-grid search (strict power-of-2, `n_layers=3` fixed) done for both —
-see each module's own docstring (`qcute/bytelm.py`, `qcute/bpelm.py`,
-"Session notes" sections) for the complete bytes/token, params, and
-FLOPs tables plus the params-matched vs. FLOPs-matched config picks
-against every `qcute_refine_v2` ablation target. Three new fair-comparison
-bpelm configs came out of that search: `configs/bpelm_4096_paramsmatch.py`
-(params-matched to `rope_3level_curriculum`, near-exact),
-`configs/bpelm_16384_ctx448_flopsmatch.py` (FLOPs-matched to
-`decoder_trunk`, near-exact), `configs/bpelm_8192_ctx448_flopsmatch_rope.py`
-(FLOPs-matched to `rope`/`identity`) — queued to run after
-`bytelm_xs3_ctx1024`.
+**`configs/bytelm_xs3_ctx1024.py`** and **`configs/bpelm_16384_xs3.py`**
+added as closer-param-matched baselines to the `qcute_refine_v2` 2-level
+configs than the original 4-layer/8000-step `bytelm`/`bpelm` baselines
+were (see the params/FLOPs table above). Three new fair-comparison bpelm
+configs came out of the fuller grid search documented in `qcute/bpelm.py`'s
+own docstring: `configs/bpelm_4096_paramsmatch.py` (params-matched to
+`rope_3level_curriculum`, near-exact), `configs/bpelm_16384_ctx448_flopsmatch.py`
+(FLOPs-matched to `decoder_trunk`, near-exact),
+`configs/bpelm_8192_ctx448_flopsmatch_rope.py` (FLOPs-matched to
+`rope`/`identity`) — queued to run after `bytelm_xs3_ctx1024`.
 
 **Full `qcute_refine_v2` ablation-family comparison** (params/flops =
 single forward pass batch=1, `FlopCounterMode`; best val_bpb/step and min
@@ -404,6 +471,81 @@ includes eval overhead):
 | `qcute_refine_decoder_trunk` | 4.424M | 5.878G | 2.5793 | 2800 | 1.8086 | 1.407 |
 | `qcute_refine_v2_byte4_code256_identity` | 2.706M | 3.862G | 2.5868 | 3800 | 1.8957 | 2.545 |
 | `qcute_refine_rope_3level_curriculum` | 3.414M | 4.330G | 2.6463 | 3300 | 1.9569 | 0.484 |
+| `qcute_refine_tiny_byte_window` | 2.706M | ~3.86G (narrower window, not separately remeasured) | 2.6206 | 2600 | 1.7551 | 2.408 |
+| `qcute_refine_no_rope` | 2.706M | 3.862G (identical arch to `rope`, flag-only diff) | **2.5645** | 3300 | 1.7582 | 0.996 |
+| `qcute_refine_pq_table` (v2, `code_embed_mode="pq_table"`) | 2.772M | ~3.86G (not separately remeasured) | **2.4816** | 3300 | — | 2.017 |
+| `qcute_refine_v3_rope` (v3, `fuse_encoder_levels=True`) | 3.563M | not separately remeasured | **2.4302** | 3500 | 1.4159 | 1.039 |
+
+**Every `qcute_refine_v2` result so far loses to a trivial 1-layer bytelm
+diagnostic**: `bytelm_xs1_ctx1024` (see baseline table above — one
+self-attention+MLP block, 1.1M params, same `d_model=256`/`context=1024`
+as every `qcute_refine_v2` config here) reaches best val_bpb **2.4870**,
+beating even the best `qcute_refine_v2` result (`no_rope`, 2.5645) by
+0.078 — a bigger margin than any ablation delta *within* the
+`qcute_refine_v2` family itself (best-to-worst spread here is only 0.082,
+2.5645 to 2.6463). At roughly half the params of the smallest
+`qcute_refine_v2` config (1.1M vs. 2.6-2.7M) and none of the hierarchy,
+BSQ quantization, or cross-attention machinery. Session hypothesis
+(unconfirmed, under active investigation): the full architecture may not
+yet be earning its own complexity over the cheapest possible baseline —
+see [docs/kv_contribution.md](kv_contribution.md) for the KV-usefulness
+probes this bears on, and `configs/qcute_refine_unconstrained_diagnostic.py`
+(queued) for a diagnostic aimed directly at this: BSQ quantization
+removed (`quant_type="identity"`), code width maximized (`dqs=(256,256)`,
+no dimensionality reduction), and the encoder-side NTP losses zeroed out
+(`code_ntp_weight=byte_ntp_weight=0.0`, the latter a new flag added this
+session) so the DECODER's own cross-attention-based reconstruction loss
+is the sole training signal — isolates what the architecture's own
+ceiling looks like with every non-architectural constraint removed.
+
+**Result: RAN — worse, not better, and a metric caveat worth recording.**
+The training script's own `val_bpb`/`bpb` fields are computed from
+`byte_loss` (level 0's own NTP head) unconditionally — with
+`byte_ntp_weight=0.0` that head is never trained, so those fields read a
+near-random-init ~8.2 bpb, a metric artifact, NOT the architecture's real
+output quality. The real signal is `val_pair0_tok_loss` (the decoder path
+that WAS trained, since `tok_weight=1.0`) — converting nats to bits gives
+the actual result: best **2.884 bpb-equivalent @ step 3400** (44.5%
+decoder token accuracy). Still worse than `bytelm_xs1_ctx1024` (2.4870)
+and worse than every real `qcute_refine_v2` config (2.56-2.65 best-val
+band) — removing BOTH the info bottleneck (dq=256, identity quant) AND
+the encoder-side auxiliary NTP losses did NOT raise the ceiling, it
+lowered it. Suggests those auxiliary losses were doing real, load-bearing
+regularization/shaping work, not just diluting the decoder's own
+gradient as the "unconstrained" framing hypothesized. Triggered the
+conditional queue (see `configs/qcute_refine_pq_table.py`) as designed —
+the trigger's threshold check used the (misleading) raw val_bpb field,
+but the corrected 2.884 number still clears the same conclusion (worse
+than bytelm_xs1), so the triggered run is still the right call, just for
+the numerically correct reason. **Caveat for future use of
+`byte_ntp_weight=0.0`**: don't trust `val_bpb`/checkpointer's
+best-selection (which also keys off this same field) under this flag —
+compare via `val_pair0_tok_loss` (or whatever loss term IS being trained)
+instead.
+
+**`code_embed_mode="pq_table"` RAN and WINS.** Clone of `qcute_refine_no_rope`
+(2.5645, `code_embed_mode="linear"` implicitly), only the code-channel
+mapping changed to a genuine 256-row lookup table (dq=8 → 2**8=256 exact
+BSQ corners) instead of a single `nn.Linear(8, 256)`. Best val_bpb
+**2.4816 @ step 3300** — beats `no_rope` by 0.083 (~3.2%), and now
+essentially matches `bytelm_xs1_ctx1024`'s 2.4870 (within noise). The
+"dq is starved" hypothesis (a linear map over an 8-dim ±1 vector can only
+express 8 additive directions; an arbitrary function of a genuinely small
+256-state space needs a table or nonlinearity) is the first lever tried
+this session that closes essentially the ENTIRE gap to the 1-layer
+bytelm diagnostic, on its own, without touching receptive field or
+fusion. Strongest single result of the session so far.
+
+**Rope-vs-no-rope, the genuine ablation (same arch, same 4000-step
+budget, only `cross_attn_rope` differs)**: `no_rope` **beats** `rope` —
+2.5645 vs. 2.6310 best val_bpb (no_rope wins by 0.067, ~2.5%), and
+no_rope's min train bpb is also lower (1.7582 vs. 1.8923). Counter to the
+intuition that giving cross-attention explicit relative-position
+information should help — on this data/step budget it doesn't, and
+mildly hurts. Doesn't overturn `rope`'s original design rationale
+outright (one seed, one step budget), but it's now a clean, unconfounded
+data point: `cross_attn_rope`'s default should not be assumed beneficial
+without re-checking.
 
 Notable it/s spread despite `rope`/`pass_through`/`identity` sharing near-
 identical params (2.6-2.7M): 0.656 vs. 2.149 vs. 2.545 it/s — a ~3.9x
@@ -416,10 +558,9 @@ reuse) — worth a closer look if throughput matters more than architecture
 purity for future runs. `decoder_trunk` (private trunk copies, most
 params/flops) and `rope_3level_curriculum` (3 levels, more sequential
 work) are slowest, as expected from their own higher params/flops.
-`qcute_refine_v1` is by far the slowest (0.165 it/s) — its own module
-uses BitPredictHead chain-mode NTP heads throughout (unlike v2's
-`code_head_mode="independent"` runs), consistent with this session's own
-BitPredictHead speed findings (see the dedicated section above).
+`qcute_refine_v1` is by far the slowest (0.165 it/s) — see
+[docs/bitpredict_heads.md](bitpredict_heads.md) for why (chain-mode NTP
+heads throughout, unlike v2's `code_head_mode="independent"` runs).
 
 **CORRECTION (superseding this section's original text): `configs/
 qcute_refine_v2_byte4_code256_simple.py` and its results (logs/
@@ -450,23 +591,6 @@ endpoint comparison, shown for completeness only. Among the remaining
 either side of the decoder) actually edges out the others slightly
 despite being the most stripped-down. `decoder_trunk` is the most
 expensive (4.424M params, 5.878G flops — private trunk copies aren't
-free) without a proportionate quality win.
-
-## `configs/qcute_refine_tiny_byte_window.py` — queued, forcing cross-attention to matter
-
-Clone of `qcute_refine_rope.py` with `attn_window` changed `(256, 64)` ->
-`(8, -1)`: level 0 (byte encoder) window shrunk to an extremely tiny 8
-raw bytes (self-attention alone can see almost nothing), level 1 (code
-encoder) set to dense/full attention over its own 256 code positions (its
-own effective receptive field now spans the WHOLE 1024-byte context).
-Rationale: if the KV-contribution probes' mixed/inconclusive findings on
-`simple`/`rope`-family runs were partly because level 0 already had
-plenty of local context (its own `attn_window=256` already covers a full
-256-byte lookback) to lean on instead of the cross-attention, this
-config removes that alternative almost entirely — level 0 is nearly a
-bag-of-8-bytes model on its own, so genuine cross-attention KV
-contribution (if any) should show up starkly in a
-`probe_decoder_kv_contribution.py` re-run against its checkpoint. Smoke-
-tested (3 CPU steps, no shape/divisibility errors, no dense-fallback
-warnings) before queueing. Queued to run after the three new bpelm
-fair-comparison configs above.
+free) without a proportionate quality win. See
+[docs/kv_contribution.md](kv_contribution.md) for the deeper investigation
+into why KV contribution varies so much across these configs.
