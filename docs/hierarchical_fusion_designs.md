@@ -109,6 +109,503 @@ transitive) versus direct skip (3→1 or 3→0, bypassing intermediate
 levels' own refinement, closer to Axis 1's concatenation but for a
 single specific pair rather than "everything").
 
+## Axis 4: Level-depth routing — coarser and global, not a segmentation mechanism
+
+Prompted directly by contrasting this file's own design space against
+H-Net (Hwang/Wang/Dao et al., "Dynamic Chunking for End-to-End
+Hierarchical Sequence Modeling") — see [docs/bpe_like_boundaries.md]
+(bpe_like_boundaries.md) for the fuller writeup of that comparison.
+H-Net's routing decision is **local and pairwise**: a per-position
+similarity score between adjacent (smoothed) representations decides
+WHERE to cut the byte stream into chunks — genuinely content-adaptive
+segmentation, already validated in the literature. Re-deriving that same
+mechanism inside `qcute_refine` would be redundant, not novel — the
+`Ks`-grid segmentation question is effectively a solved problem
+elsewhere.
+
+What `qcute_refine`'s fixed `Ks` grid does NOT yet address, and H-Net's
+per-position boundary score doesn't either, is a **coarser, more global**
+question: for a given span, HOW MUCH hierarchical depth is worth
+engaging at all — level 1 only, or level 1 and 2, or the full tower up to
+level `N-1`? Today every level always runs, for every block, regardless
+of local complexity — a genuinely predictable run of text pays for the
+same depth as a hard-to-predict one. This is a **compute-allocation**
+question, not a segmentation question — closer in spirit to Mixture-of-
+Depths (Raposo et al. 2024, per-token layer-skip routing in a standard
+transformer) but applied along `qcute_refine`'s LEVEL axis instead of a
+transformer's LAYER axis.
+
+Two genuinely separate decisions, worth keeping distinct rather than
+conflating into one router (matches the two clauses of the prompting
+idea):
+
+1. **Compute-allocation routing**: which level(s) actually get computed
+   (PASS 1, and PASS 2 fusion into whichever is below them) for a given
+   region. Crucially, this is a **producer-side** decision — unlike
+   Axis 2's routing (which assumes every level is always computed, and
+   only routes level 0's CONSUMPTION of them), a real compute-allocation
+   router can skip computing level 2/3/etc. entirely for spans judged not
+   to need them, i.e. actual FLOPs savings, not just attention-source
+   selection.
+2. **Decode-level readout selection**: separately, at prediction/decode
+   time, which already-computed level's representation actually feeds
+   the byte prediction. Two defaults, matching "given default
+   unconstrained implicit in model or constrain inputs":
+   - **Unconstrained (implicit)**: no new mechanism at all — whatever
+     levels got computed by (1) simply flow through the existing fusion
+     cross-attention, and the network learns how much to weight each via
+     ordinary gradient descent. This is the cheap default; it only does
+     anything interesting in combination with (1) actually skipping
+     computation somewhere.
+   - **Constrained**: an explicit, externally- or heuristically-derived
+     signal forces which level's output is used for a given span — e.g.
+     reusing `bpe_like_boundaries.md`'s per-position entropy `H_t` as a
+     depth signal (low block-entropy → shallow is enough, force level-0-
+     only readout; high block-entropy → force deeper readout) rather than
+     letting the model decide. Useful both as a compute-saving heuristic
+     and as an inference-time controllability knob (forcing a depth for
+     ablation/debugging), independent of whether it's also used to gate
+     compute in (1).
+
+**Granularity, per "coarser but global"**: unlike H-Net's per-position
+score or Axis 2's per-token/per-block router, this is intended to operate
+at a coarser cadence — per coarse block (level 1's own block grid, not
+level 0's raw bytes) or even per longer span — trading routing precision
+for a much cheaper, simpler routing signal and avoiding the load-
+balancing machinery that per-position hard routing requires.
+
+**Shape/batching implications** (same constraint this whole file has
+respected throughout): naively skipping a level for SOME blocks but not
+others breaks the fixed `n_blocks`-per-level tensor shape. Two ways to
+reconcile, differing in whether compute is actually saved:
+- **Masked-but-computed** (no real FLOPs savings, but static-shape,
+  `torch.compile`-friendly, cheapest to build): always run every level
+  for every block, but zero out the loss contribution and/or the fusion
+  cross-attention read for blocks the router marks "skip." Good first
+  step to validate whether the routing SIGNAL is any good at all before
+  paying for real sparsity.
+- **Gather/scatter with a capacity factor** (real savings, genuinely
+  MoE-shaped): route only the top-`c%` of blocks (by router score) into
+  each deeper level's compute, matching Axis 2's own discrete-mode
+  caveats — needs the same load-balancing auxiliary loss to avoid
+  collapse (e.g. always routing everything to level 1 only), a new
+  failure mode this project hasn't had to solve yet.
+
+**Recommendation**: cheapest possible test first — skip the LEARNED
+router entirely and reuse `bpe_like_boundaries.md`'s already-derived
+per-position entropy as a fixed, non-differentiable HEURISTIC depth
+signal (constrained readout selection, masked-but-computed variant) —
+zero new trainable parameters, directly answers "does depth-routing even
+correlate with anything useful" before investing in a learned
+compute-allocation router with its own load-balancing concerns. Only
+graduate to a learned router (and eventually real gather/scatter compute
+savings) once the heuristic version shows the signal has legs — same
+"prefer simple things first" ordering this file already applies to
+Axes 1-3.
+
+### Sketch: masked-but-computed variant, grafted onto `_encode`
+
+Grounded directly in `RefineLM._encode`'s existing PASS 1/PASS 2 loop
+(`qcute_refine_v4.py`, current code shown for the parts that change):
+
+```python
+# PASS 1 (unchanged) — every level still runs for every block; this variant
+# saves nothing on the producer side yet, it only tests whether the ROUTING
+# SIGNAL correlates with anything, per the recommendation above.
+for i in range(n_active):
+    c_i, ntp_loss, ntp_acc, h_i = self.encoders[i](seq_repr, compute_ntp=want_ntp)
+    ntp_losses_pass1.append(ntp_loss); ntp_accs_pass1.append(ntp_acc)
+    h_list.append(h_i); x_list.append(seq_repr)
+    seq_repr = c_i
+
+# --- NEW: depth signal, one scalar per level-0 block, no new params ---
+# H_blk: [B, n_blocks_0] block-averaged predictive entropy of level 0's own
+# NTP head — reuse ntp_head's logits already computed above (detached: a
+# routing SIGNAL, not a gradient path, matching bpe_like_boundaries.md's own
+# detach convention).
+H_blk = entropy_per_block(self.encoders[0].last_logits.detach(), K=cfg.Ks[0])
+depth_mask = [None] * n_active            # depth_mask[i][b] = True -> block b uses level i's readout
+depth_mask[0] = torch.ones_like(H_blk, dtype=torch.bool)   # level 0 always usable (floor)
+for i in range(1, n_active):
+    # coarser cadence: pool H_blk up to level i's OWN block grid (product of Ks below it)
+    H_i = pool_to_level(H_blk, cfg.Ks[:i])
+    depth_mask[i] = H_i > cfg.depth_threshold[i - 1]        # heuristic: only "hard" spans reach level i
+
+# PASS 2 (fusion) — masking happens at READOUT, not at compute (still
+# masked-but-computed: self.encoders[i] itself still runs on every block)
+ntp_losses_pass2 = [None] * n_active
+ntp_accs_pass2 = [None] * n_active
+if cfg.fuse_encoder_levels:
+    for i in range(n_active - 1):
+        c_i2, ntp_loss2, ntp_acc2, h_i2 = self.encoders[i](
+            x_list[i], compute_ntp=compute_ntp, fuse_kv=h_list[i + 1].detach()
+        )
+        # constrained decode-level selection: where depth_mask[i+1] is False for
+        # a block, level i's OWN fused-but-should-have-been-shallow prediction is
+        # replaced by its PASS-1 (unfused) one — i.e. that span is DECODED as if
+        # level i+1 didn't exist, even though it was computed. unconstrained/
+        # implicit mode is simply this whole block deleted: h_list[i] = h_i2
+        # unconditionally, and the network decides the weighting on its own via
+        # ordinary cross-attention gradients (Axis 2 soft mode's own default).
+        h_list[i] = torch.where(depth_mask[i + 1][..., None], h_i2, h_list[i])
+        ntp_losses_pass2[i] = ntp_loss2   # loss bookkeeping unchanged in this cheap variant;
+        ntp_accs_pass2[i] = ntp_acc2      # a stricter version would also mask the LOSS per-block,
+                                           # not just the readout h used downstream/at generation
+```
+
+`entropy_per_block`/`pool_to_level` are the only new functions — thin
+reductions over an already-computed tensor, no new parameters, no change
+to `torch.compile`-relevant shapes (`depth_mask` is a boolean tensor of
+the SAME shape the block grid already has). The real compute-saving
+(gather/scatter) variant replaces the `torch.where` above with actually
+skipping `self.encoders[i+1]`'s forward call for masked-out blocks — a
+strictly harder, second step, deliberately deferred per the
+recommendation.
+
+### Sketch: ratio/budget regularization, targeting a compute/bpb tradeoff
+
+The sketch above uses a fixed hand-set `depth_threshold` — it has no way
+to say "route ~20% of blocks to level 2" or "spend more compute until
+val_bpb hits X," and a fixed threshold on raw entropy has no natural
+units connecting it to either a compute budget or a quality target. H-Net
+solves the analogous problem (targeting a specific average chunk length,
+i.e. compression ratio `N`) with a **ratio loss**: an auxiliary term that
+pushes the mean of a soft, differentiable routing probability toward a
+target rate, cross-coupled against the actual hard selection so the
+model can't satisfy the loss by decorrelating the soft score from what
+actually gets selected (their exact coefficients aren't reproduced here
+from memory — what follows is a simplified, self-consistent version with
+the same two properties: target-seeking mean, and a soft/hard coupling
+that resists collapse).
+
+**1. Make the router soft and differentiable** (replaces the hard
+`H_i > depth_threshold[i-1]` comparison in the earlier sketch):
+
+```python
+# small linear probe on level i's own block summary — genuinely learned,
+# not just a fixed entropy threshold (though H_i can still be a FEATURE
+# fed into it, e.g. concatenated into the block summary below)
+router_logit_i = self.depth_router[i](block_summary_i)         # [B, n_blocks_i], new tiny nn.Linear
+p_i = torch.sigmoid(router_logit_i)                             # soft engagement prob, differentiable
+depth_mask[i + 1] = (p_i > 0.5)                                 # hard decision for the forward masking,
+                                                                  # via straight-through: p_i + (mask - p_i).detach()
+```
+
+**2. Ratio loss, targeting a rate `r_i` (analogous to H-Net's `1/N`)**:
+
+```python
+F_i = p_i.mean()                    # soft: average predicted engagement prob
+G_i = depth_mask[i + 1].float().mean()   # hard: actual fraction routed to level i+1
+
+# pushes mean engagement toward r_i; the F_i*G_i cross term means the loss
+# is only truly minimized when BOTH the soft score's average AND the actual
+# hard selection rate sit at r_i together — collapsing one while drifting
+# the other (e.g. keeping F_i at target while G_i saturates at 0 or 1
+# via a degenerate threshold) still costs loss, unlike a plain (F_i - r_i)^2
+# term which only constrains the soft side.
+ratio_loss_i = r_i * (1 - G_i) * F_i + (1 - r_i) * G_i * (1 - F_i)
+```
+
+Total loss gains `cfg.depth_ratio_weight * sum(ratio_loss_i for i in ...)`
+— same additive-term pattern as `Config.fusion_ntp_weight` already
+established in `_encode`'s own loss.
+
+**3. Connecting `r_i` to a target BPB, not just a fixed compute budget**:
+`r_i` itself doesn't have to be a static hyperparameter — treat it as the
+dual variable in a rate-distortion control loop, adjusted from measured
+val_bpb rather than fixed in the config:
+
+```python
+# outside the training step, e.g. once per eval_every — a dual-ascent /
+# PI-controller update, same family as adaptive-KL-coefficient schedules
+# used elsewhere (PPO's target-KL, VAE beta-schedulers)
+bpb_error = target_bpb - measured_val_bpb        # positive: not good enough yet, spend more
+r_i = clip(r_i + controller_lr * bpb_error, 0.0, 1.0)
+```
+
+If `measured_val_bpb` is worse than `target_bpb`, `r_i` rises (route more
+blocks to deeper levels, buy quality with compute); once bpb meets the
+target, `r_i` drifts back down, continuously searching for the CHEAPEST
+depth budget that still hits the target — this is what makes it a
+genuine "target a compression bpb" knob rather than a fixed compute cap.
+Cheapest first step, matching this file's own recommendation ordering:
+fix `r_i` as a plain hyperparameter and confirm the ratio loss actually
+converges `G_i` to it at all (a static-target sanity check) BEFORE adding
+the outer bpb-driven controller loop on top.
+
+## Tiling long documents: exactness and cross-tile continuity (vs. H-Net's causal carry)
+
+A different problem than Axes 1-4 above (those are about breadth/depth of
+fusion WITHIN one already-fixed-length sequence) — this is about
+processing a document LONGER than `context_len`, split into successive
+tiles, given `qcute_refine`'s block grid is fixed-stride and
+position-modular rather than causal/streaming the way H-Net is.
+
+**Why H-Net doesn't have this problem the way `qcute_refine` does**:
+H-Net's boundary decision is local and pairwise (similarity between
+adjacent smoothed representations) — chunks are already variable-length,
+so there's no notion of a "trailing partial chunk" at all, and tiling for
+long documents just means carrying forward a small O(1) piece of state
+(the last position's smoothed representation) across the tile boundary
+so the FIRST boundary decision of the next tile is computed exactly as if
+the stream had never been cut. `qcute_refine`'s grid is the opposite
+tradeoff: block boundaries are POSITION-MODULAR and fixed ahead of time
+(`Ks`' nested products) — that rigidity is exactly what makes the
+fixed-shape/batched/`torch.compile`-friendly story work at all, but it
+also means the grid has a hard, structural notion of "complete" vs.
+"incomplete" block that H-Net's own design never has to reckon with.
+
+### The remainder math: mixed-radix decomposition, not just one leftover count
+
+Define `Ktotal_i = Ks[0] · Ks[1] · … · Ks[i]` — the number of raw bytes
+spanned by one level-`i` block (`Ktotal_0 = Ks[0]`, and so on up the
+tower). Because each `Ktotal_i` is a strict divisor of every coarser
+`Ktotal_j` (`j > i`) by construction (it's a nested product), there's a
+useful lemma:
+
+> **Padding the raw sequence to the next multiple of the COARSEST active
+> level's `Ktotal_{n_active-1}` automatically makes every FINER level's
+> blocks complete too** — no separate padding decision is needed per
+> level.
+
+Worked example matching the prompt directly — `Ks=(2,4)`, doc length
+`L=15`: `Ktotal_0=2`, `Ktotal_1=2·4=8`. `15 = 1·8 + 7` — one complete
+level-1 block (8 bytes, itself containing 4 complete level-0 blocks), a
+7-byte remainder. That remainder is ITSELF not level-0-clean: `7 = 3·2 +
+1` — 3 complete level-0 blocks (6 bytes) plus 1 raw byte that doesn't
+even complete its own level-0 pair. This is exactly a mixed-radix / place-
+value decomposition with "digits" `Ks[0], Ks[1], …` — but per the lemma,
+none of this multi-level bookkeeping needs to be done explicitly: padding
+`L=15` up to `⌈15/8⌉·8 = 16` (one pad byte) leaves every level clean
+simultaneously (16/8=2 level-1 blocks, 16/2=8 level-0 blocks, both exact).
+
+### Sketch A — pad-to-coarsest-stride + mask (exact, fully parallel, no new sequential dependency)
+
+```python
+Ktotal = math.prod(cfg.Ks[:n_active])
+pad_len = (-L) % Ktotal                      # 0 if already exact
+byte_ids_padded = F.pad(byte_ids, (0, pad_len), value=PAD_BYTE)
+# PAD_BYTE: a sentinel outside the normal byte alphabet — same pattern
+# v4.2 already uses ("bits valued 0-255 reserved for raw bytes" convention
+# for dq>8), just reserve one more out-of-range id here.
+
+pad_mask = torch.arange(L + pad_len) >= L    # [L+pad_len], True on pad positions
+```
+
+Two things must respect `pad_mask`, both reusing machinery this file's
+Axis 1-4 sketches already lean on:
+
+- **Loss/acc**: exclude pad positions from `byte_loss`/`byte_acc` — same
+  crop-before-metric pattern `v4.2`'s dq>8 fix already established
+  (compute over the padded shape, mask the metric reduction only).
+- **Attention**: PAD keys must never be attended to by REAL positions
+  (they'd otherwise pollute the pooled/last-position readout of the
+  final, still-incomplete-in-content-terms block) — extend the existing
+  `disallow`/null-KV masking machinery (`jagged_causal_mask_and_positions`,
+  already parameterized by `K` per level) with one more excluded-key
+  class, exactly the same shape of change as the null-KV slot already
+  gets threaded through `fuse_position="concat"`.
+
+Fully parallel: one padded tensor, same batched forward call, zero new
+cross-step dependency — the only cost is `<Ktotal` wasted positions
+(bounded, and negligible relative to any reasonably sized `context_len`).
+
+### Sketch B — cross-tile continuity via a carried KV tail (parallel within a tile, sequential across tiles — same tradeoff windowed attention already accepts)
+
+Sketch A handles the LAST (possibly short) tile of a document exactly.
+It does NOT address the separate problem of a windowed self-attention
+(`attn_window[i]`) or fusion cross-attention losing context right at
+EVERY tile boundary, not just the final one — the first `attn_window[i]-1`
+positions of tile `n+1` can't see tile `n`'s tail unless something
+carries it forward. This is the direct analog of "carry the segmentation
+score to the next non-overlapping chunk" — except `qcute_refine` doesn't
+need to carry an ambiguous soft score at all, because the grid tells you
+EXACTLY which positions matter: carry the trailing `attn_window[i]-1`
+already-resolved KV entries (raw byte positions for level 0; block-scaled
+positions for higher levels) from tile `n`'s forward pass into tile
+`n+1`'s, prepended as fixed (stop-gradient, matching this file's
+established "don't reshape the level above" convention) context —
+exactly `generate_kv_cache`'s existing incremental (byte-at-a-time) cache
+machinery, generalized from byte-at-a-time to tile-at-a-time increments.
+
+```python
+# tile n -> tile n+1, per level i
+carried_kv_i = kv_cache_i[:, -(attn_window[i] - 1):]   # tail from tile n, stop-gradient
+h_new = level_i.forward_tile(tile_n1_bytes, prefix_kv=carried_kv_i)
+```
+
+**Design rule this requires, stated once and satisfied by construction**:
+every NON-FINAL tile boundary must land on a multiple of `Ktotal`
+(`tile_size % Ktotal == 0`) — this guarantees no block, at any level,
+ever straddles a tile edge, so "carry the KV tail" is the ONLY thing tile
+boundaries need to fix; block-grid alignment itself is never in question.
+Only the document-final tile (possibly short) needs Sketch A's padding on
+top.
+
+**Parallelism**: identical tradeoff to `_forward_chunked`'s own windowed-
+attention chunking WITHIN a single sequence, just promoted one level up
+to the document/tile axis — each tile's own forward pass is still one
+fully parallel/batched call over its whole length; only tile `n+1` as a
+whole depends on tile `n`'s carried tail, i.e. tiles are sequential
+relative to EACH OTHER but not internally serialized. No new parallelism
+regime introduced, the same one `attn_window` chunking already relies on,
+applied at a coarser grain.
+
+### What this does NOT solve — mid-word/mid-unit cutoffs are a separate, orthogonal problem
+
+Sketch A/B make grid boundaries EXACT (no shape crashes on non-multiple
+lengths) and CONTINUOUS (no lost context at tile edges) — they do not
+make grid boundaries CONTENT-AWARE. A fixed-stride block can still land
+mid-word even with perfect tiling; that's the actual content-adaptivity
+question, already explored separately in
+[docs/bpe_like_boundaries.md](bpe_like_boundaries.md) (soft/entropy-
+weighted pooling within the fixed grid) and this file's own Axis 4
+(level-depth routing). Tiling exactness/continuity and content-adaptive
+segmentation are independent problems with independent fixes — Sketches
+A/B don't move the boundary POSITIONS, they just make the fixed positions
+well-defined and seamless across tile edges.
+
+## Simulating this in training: recurrent chunked TBPTT, receptive-field-aware carry length, per-chunk depth routing
+
+Sketch B above (carried KV tail across tiles) describes the INFERENCE-time
+mechanics. Training it means processing a long document as a sequence of
+`chunk_len`-sized chunks (e.g. 256) IN ORDER, carrying detached per-level
+state chunk-to-chunk — standard truncated backprop through time (TBPTT),
+with one `qcute_refine`-specific wrinkle: not every level's carried state
+should hold the same NUMBER of entries, because levels don't have the
+same effective receptive field per entry — combined with Axis 4's own
+idea that WHICH levels even get exercised can itself vary chunk-to-chunk
+("read first chunk, choose level 1 and 2; later chunk, level 0 only").
+
+### Why carry length must be receptive-field-aware, not entry-count-aware
+
+Level `i`'s each KV entry already summarizes `Ktotal_i = Ks[0]·…·Ks[i]`
+raw bytes (§ tiling math above). Carrying the SAME NUMBER of entries from
+every level therefore buys wildly different amounts of actual lookback —
+carrying 32 entries of level 0 (`Ktotal_0` small) reaches only slightly
+into the past, while carrying 32 entries of level 2 (`Ktotal_2` large)
+can reach an order of magnitude further back, for the same KV-cache
+memory/compute cost. So the carry length should be specified in RAW-BYTE
+reach and converted per level, not fixed as a flat entry count:
+
+```python
+target_reach_bytes = 2048          # e.g. "I want ~2048 bytes of lookback available"
+carry_entries = {
+    i: max(attn_window[i] - 1, target_reach_bytes // Ktotal[i])
+    for i in range(n_active)
+}
+# worked example, Ks=(4,4,4): Ktotal = [4, 16, 64]
+#   level 0: 2048 // 4  = 512 entries carried  (expensive: 512 KV rows)
+#   level 1: 2048 // 16 = 128 entries carried
+#   level 2: 2048 // 64 =  32 entries carried  (cheap: 32 KV rows, same reach)
+```
+
+This is precisely why routing MORE reach through a COARSER level is
+attractive, independent of the depth-routing question below: level 2's
+carried cache is ~16x cheaper than level 0's for identical raw-byte
+lookback, simply because each of its entries already did the compression
+work.
+
+### Depth routing per chunk: reuse the existing `n_active_levels(step)` curriculum, drive it by content instead of just step
+
+The codebase already has a mechanism that varies `n_active` — currently
+only as a function of TRAINING STEP (a fixed curriculum schedule, see
+`Config.layer_warmup_steps`/`n_active_levels`). The natural generalization
+here is to let a chunk-boundary router (Axis 4's compute-allocation
+router, but evaluated once per CHUNK rather than once per block) also
+condition `n_active` on carried state, making the depth decision content-
+driven within a single training run rather than only step-driven across
+runs:
+
+```python
+def n_active_for_chunk(carried_state, cfg, step):
+    curriculum_cap = n_active_levels(step)               # existing step-based ceiling, unchanged
+    router_logit = depth_router(carried_state.summary)    # small linear probe on carried KV summary —
+    n_wanted = 1 + (router_logit.sigmoid() * (curriculum_cap - 1)).round()
+    return min(n_wanted, curriculum_cap)
+```
+
+**Causality constraint, worth stating explicitly**: the router must
+decide chunk `n`'s depth using only carried state FROM chunk `n-1` and
+earlier — never chunk `n`'s own content — otherwise the routing decision
+itself becomes non-causal (can't be replicated at real generation time,
+where chunk `n`'s bytes don't exist yet when the decision is needed).
+This is a genuine difference from the single-pass Axis 4 sketch earlier
+in this file (which computed `H_blk` from logits already produced within
+the SAME forward pass — fine there because byte-level causal masking
+already made every individual prediction causal; here the decision is
+about an entire UPCOMING chunk, so it needs its own one-chunk-earlier
+causal margin, more like Adaptive Computation Time's own halting
+mechanism than a per-position entropy readout).
+
+### Handling a level that gets skipped for some chunks — lazy/deferred compute keeps the causal chain alive without paying full compute
+
+If chunk `n` routes to `n_active=1` (level 0 only) and chunk `n+1` routes
+back to `n_active=3`, level 2's carried cache has a GAP — it never saw
+chunk `n`'s content, because normally `c_i` (level `i`'s output feeding
+level `i+1`) requires level `i`'s full forward pass to exist at all. Two
+options, and the cheap one is worth defaulting to:
+
+- **Full recompute of skipped levels retroactively** — expensive, defeats
+  the purpose of skipping in the first place; rejected.
+- **Lazy placeholder code** (recommended default): when level `i+1` is
+  not engaged for a chunk, it still receives a CHEAP, non-parametric
+  placeholder input for that span — e.g. a plain mean-pool of level `i`'s
+  own codes over the skipped span (no transformer forward, no new
+  parameters) — just enough to keep the causal chain from having an
+  actual hole, deferring the FULL nonlinear compute to whenever the
+  router re-engages that level. This is the same masked-but-computed-vs-
+  compute-skip distinction Axis 4 already draws, applied across chunks
+  instead of within one: level `i+1`'s cache entry for a skipped chunk is
+  "cheap and approximate" rather than "absent."
+
+```python
+if level_active[i + 1]:
+    c_i1, h_i1 = self.encoders[i + 1](c_i, ...)          # real compute
+else:
+    c_i1 = mean_pool(c_i, window=Ktotal[i + 1] // Ktotal[i])  # lazy placeholder, no grad-bearing compute
+    h_i1 = carried_state[i + 1].last_h                        # cache simply doesn't advance its OWN h this step
+carried_state[i + 1] = update_cache(carried_state[i + 1], c_i1)
+```
+
+### The training loop, put together
+
+```python
+state = init_carried_state(cfg)     # per-level detached KV tail, per-level "last real h"
+for chunk in document.tiles(chunk_len):           # chunk_len e.g. 256, chunk_len % Ktotal[-1] == 0 (tiling § rule)
+    n_active = n_active_for_chunk(state, cfg, step)
+    loss_chunk, state = model.forward_chunk(chunk, prefix_state=state, n_active=n_active)
+    loss_chunk.backward()                          # gradient scope: THIS chunk only
+    state = detach_state(state)                    # TBPTT: carried state stops gradient here,
+    optimizer.step(); optimizer.zero_grad()         # matching _encode's existing "don't reshape the
+                                                     # level above" detach convention, now applied across
+                                                     # chunks too, not just across levels
+```
+
+Gradient scope is the standard TBPTT tradeoff, explicitly worth flagging:
+each chunk's backward pass only reaches that chunk's own compute plus
+whatever's still attached within it — carried KV state from earlier
+chunks is detached, so a chunk never gets gradient signal about HOW its
+own carried context was produced, only that it existed. Consistent with
+this codebase's own existing `fuse_kv.detach()` convention, just widened
+in scope from "the level above" to "the chunk before."
+
+### Worked numeric example, tying it together
+
+`Ks=(4,4,4)`, `chunk_len=256`, `target_reach_bytes=2048`. Chunk 1 (start
+of doc, entropy/content forces deep routing): `n_active=3`, all three
+levels compute fresh codes, caches seeded. Chunk 2 (highly predictable
+run — router picks `n_active=1`): only level 0 runs for real; levels 1
+and 2 get lazy mean-pooled placeholders, their REAL caches stay as of
+chunk 1. Chunk 3 (entropy spikes again, router picks `n_active=3` again):
+level 2 fuses against a carried cache whose most recent REAL entry is
+still from chunk 1 (chunk 2 only contributed a cheap placeholder) — a
+one-chunk-stale but never-absent context, the direct tradeoff this
+lazy-placeholder design accepts in exchange for chunk 2 costing almost
+nothing at levels 1/2. Level 0's own cache, by contrast, is never stale —
+it runs every chunk regardless of the router (the "floor" level, matching
+Axis 4's own `depth_mask[0] = always True` convention).
+
 ## Worked example: N=3, `Ks=(2,2,2)`, `context_len=1024`
 
 `seq_lens = [1024, 512, 256]`. At level 0's fusion step:

@@ -404,6 +404,354 @@ does meaningfully worse. `bytelm_xs1_ctx8`: best val_bpb 3.357 @ step
 improving at the final step) — 8 bytes is a harsher regime than 32,
 consistent with earlier findings.
 
+**`qcute_refine_v4_k32_narrow_concat` (plain v4, unshared weights,
+`fuse_position="concat"`) finished cleanly: best val_bpb 2.4925**, in the
+same 2.48-2.60 range as every other unshared K=32 config, no oscillation
+in either level's own trajectory throughout the full 4000-step run. This
+confirms concat fusion itself is not what causes v4.2's instability above
+— concat trains exactly like `"pre"`/`"post"` fusion do when weights
+aren't unified.
+
+**Byte-vs-code task-incompatibility ablation — finished; the two leading
+hypotheses turn out to compose rather than compete.**
+`qcute_refine_v4_2_k32_narrow_byte256` (v4.2, `byte_head_256way=True`:
+level 0 gets its own fully unshared exact 256-way head; TRUNK still
+shared across levels) finished at **best val_bpb 2.5660 @ step 3900** —
+back in the healthy 2.48-2.60 range, a big recovery from
+`v4_2_k32_narrow`'s 4.0369. But `val_level1_bpb_pass1` (the code level's
+OWN loss) is still unstable throughout — last-quarter std 0.52, mean
+still rising to 3.58 at the final step, essentially unresolved. Reading:
+unsharing the byte head doesn't fix the shared trunk's genuinely unstable
+code-level predictions, it just stops that instability from LEAKING into
+the byte-level readout via shared weights — in the fully-shared run, the
+same head produces both predictions, so the code level's bad gradients
+directly corrupt level 0's byte prediction too; once separated, `val_bpb`
+recovers even though the underlying pathology in the shared-trunk/code
+pathway is arguably untouched. `qcute_refine_v4_1_k32_narrow_shared`
+(trunk-shared, v4.1's own scheme — head/embed never unified at all, so
+nothing for instability to leak through even if present) is now the run
+that answers whether `val_level1_bpb_pass1`'s instability is inherent to
+trunk-sharing itself or specific to something v4.2 adds on top. Full
+detail in [docs/kv_contribution.md](kv_contribution.md) §11.
+
+**`qcute_refine_v4_2_k32_narrow_ssm` (chain/SSM head instead of
+independent) killed early at step 1550 — near-total collapse the whole
+way, no recovery trend** — `byte_acc` stuck at 0.004-0.012 (near-random)
+and `val_bpb` stuck at 7.45-7.59 from step 100 onward, far worse than any
+other config this session. Also ~2.5x slower than `byte256` (1.03 it/s
+vs. 2.54 it/s), consistent with `BitPredictHeadSSM`'s known heavier
+per-step cost. Not yet clear whether this is trunk-sharing-specific or a
+more basic issue with this head under this config — no baseline exists
+yet for `bit_head_class="ssm"` under v4/v4.1's UNSHARED scheme to compare
+against. Two follow-ups queued (both ahead of the rest of the session's
+remaining runs): `qcute_refine_v4_2_k32_narrow_byte_softmax_head_only` —
+a narrower version of `byte256` (`Config.byte_softmax_head_only`, new
+this session: level 0 keeps the shared dq-bit input embedding/`code_pre`,
+only its output readout becomes an unshared 256-way head), isolating
+whether the shared OUTPUT head specifically was what mattered for
+`byte256`'s bpb recovery; and `qcute_refine_v4_2_k32_narrow_attn_id16` — a
+reclone of the (now-deleted) `ssm` config with `Ks`/`attn_window` left
+UNCHANGED at `(32,32)`, swapping `bit_head_class="attn"` and adding
+`bit_inner_downsample=16` (the chain head's own internal working width,
+`256 -> 16` — the "16" in the filename refers to this, not `Ks`) —
+testing whether the collapse is head-type-specific or resolved by a much
+cheaper chain head, without confounding it with a block-grid change.
+
+**`byte_softmax_head_only` finished: best val_bpb 2.7696** — a partial
+recovery (better than the fully-shared 4.0369, worse than `byte256`'s
+2.5660), `val_level1_bpb_pass1` still just as unstable. Refines the
+picture: unsharing the OUTPUT head alone recovers PART of the gap;
+unsharing embed/`code_pre` too (as `byte256` does) recovers more — the
+shared embed/`code_pre` independently contributes to how much of the
+underlying instability leaks into the byte-level metric, not just the
+head. Full detail in [docs/kv_contribution.md](kv_contribution.md) §11.
+
+**`quant_type="simplex"` (new this session) — generalizes `byte_softmax_
+head_only`'s "give a level an exact softmax classifier" idea to EVERY
+level, and drops BSQ's hypercube-grid code representation entirely.**
+Session ask: "generalize with flag to mode where every level is softmax
+head 256 way... instead of sign and ste, do gumbel softmax ste...
+basically no grid assumption that bsq carries... this mode do not use
+bsq linear map, but uses shared embedding table for all level... maintain
+2 modes now: bsq, and simplex." Where BSQ's `dq` independent sign-bits
+form an implicit hypercube grid (`2**dq` corners, bit-factorized),
+`quant_type="simplex"` makes every level's code a flat, unstructured
+`V=2**code_bits`-way category — no bit factorization at all, a point on
+the probability simplex (hence the name). Quantization is
+`gumbel_quantize` (new function): **default is a cheap deterministic
+softmax+argmax straight-through** (`soft + (hard - soft).detach()`, the
+same idiom `bsq_quantize` already uses for `sign()`+STE — session: "is it
+ok to have no gumbel, just default argmax and ste like bsq did... because
+gumbel is expensive") — `Config.use_gumbel_noise=True` opts into genuine
+Gumbel-Softmax sampling instead, at real extra per-step cost. No separate
+`code_pre`/`ntp_head` modules exist in this mode at all — a level's own
+embedding table IS its classifier too (weight-tied,
+`F.linear(h, embed.weight)`), and at the default `code_bits=8`
+(`V=256=vocab`), byte level 0's table and every code level's table are
+literally the SAME OBJECT (one pool, full uniform sharing — the most
+extreme point yet in this file's own weight-sharing lineage).
+`code_bits<8` (session: "this mode can generalize to n<8") is also
+supported — a genuinely smaller, more heavily compressed code alphabet
+for levels above byte, at the cost of splitting the pool (byte's own
+vocab=256 table and the code levels' smaller table can't literally be the
+same object at different sizes — same split pattern `byte_head_256way`
+already uses). Intuition (session): "the model with end-to-end learn best
+byte code to downsample longer bytestream" — let training discover its
+own best discrete code/downsampling scheme, not one constrained by BSQ's
+hypercube structure. Gradient correctness verified directly: the
+deterministic STE path's backward gradient through `gumbel_quantize`
+matches a PURE (unrounded) softmax's gradient exactly (`torch.allclose`,
+`atol=1e-6`), and every parameter in a full forward+backward smoke test
+(trunk included) receives a nonzero, finite gradient — confirms the
+straight-through trick is doing genuine, correct work, not silently
+breaking the gradient path. `configs/qcute_refine_v4_2_k32_narrow_
+simplex.py` (K=32/narrow-window, default `code_bits=8`/`gumbel_tau=1.0`/
+`use_gumbel_noise=False` — testing the mode's own defaults first, not an
+ablation of them) queued.
+
+**`attn_id16` finished: no collapse, meaningfully more stable than every
+other shared-head config, still short of the healthy range.** Best
+val_bpb **3.6163 @ step 4000**, `val_level1_bpb_pass1` second-half std
+**0.333** — clearly better than `ssm` (diverged), `v4_2_k32_narrow`
+(0.522), `byte256` (1.14), `byte_softmax_head_only` (~1.0). Also faster
+than `ssm` (1.79 it/s vs. 1.03). `BitPredictHeadAttn` is a categorically
+better-behaved shared head type, but "more stable" hasn't yet meant
+"competitive" — 3.6163 is still well outside the 2.48-2.60 unshared
+range. **`qcute_refine_v4_2_k32_narrow_attn_id4` — killed early, genuinely
+diverging.** (session: "repeat attn_id16 to clone and make it less
+aggressive like x4" — `bit_inner_downsample=4` instead of 16.) `val_bpb`
+was actively RISING (5.34 -> 5.66 from step 800 to 900), killed at step
+900. Confirmed it used plain defaults, not `pq_table` (session: "check
+does it use pq or not").
+
+**`qcute_refine_v4_2_k32_narrow_attn_id4_pq` — `code_embed_mode=
+"pq_table"` fixes the divergence and improves both stability and fit.**
+(session: "try use pq and rerun".) Treats the dq-bit BSQ code as a table
+lookup instead of a linear combination — ~28x more effective degrees of
+freedom (rank ≤9 vs. 256) and parameters (2,304 vs. 65,536) than the
+default `"linear"` mode. Finished cleanly: **best val_bpb 3.2067**,
+`val_level1_bpb_pass1` second-half std **0.196** (even better than
+`id16`'s 0.333), train bpb ~2.3-2.6 (better fit than `id16`'s ~2.8-3.5).
+The single cleanest positive result in the `chain`-head family this
+session — the codebase's own "dq is starved" hypothesis (previously only
+validated for the independent-bit head) extends directly to
+`BitPredictHeadAttn`'s shared chain head too.
+
+**Gap identified (session: "recheck how v4 BitPredictHeadAttn is more
+expressive vs v4.2")**: the `BitPredictHeadAttn` CLASS is byte-identical
+between v4 and v4.2 (diffed directly — only difference anywhere is
+v4.2's precomputed `h_scale` buffer, a pure efficiency fix, not a
+capacity change). The real difference is WIRING: v4 has no sharing
+mechanism at all, so `build_bit_head` is called fresh per level — every
+level gets its own PRIVATE chain head. v4.2 calls `build_bit_head` once
+(only the pool owner); every other level aliases the SAME object
+(`self.ntp_head = shared_head.ntp_head`). So `attn_id16`/`attn_id4`/the
+deleted `ssm` run all confound "is this chain head TYPE worse than
+independent-bit" with "is a SHARED chain head worse than a PRIVATE one"
+— no config this session isolates the two. Worth a private-chain-head
+control once the current family reports back. Full detail in
+[docs/kv_contribution.md](kv_contribution.md) §11.
+
+**v4.2's underfitting is dose-dependent on sharing degree — a TRAIN-side
+finding, distinct from §11's val-side instability story.** Session
+question: "seems qcute variants underfitting generally vs baselines bpe
+and byte at step 4000." Confirmed directly: every UNSHARED config —
+`bytelm_xs1_ctx1024`, `qcute_refine_v4_bpe4_imitate`,
+`qcute_refine_v4_k32_narrow_concat`, `qcute_refine_v4_k32_narrow_
+nonull_uncond` — bottoms out at train bpb ~1.6-2.0 regardless of
+architecture family. No v4.2 shared-pool config gets close, and the gap
+tracks sharing degree almost monotonically: `byte256` (partial unshare)
+≈ the unshared cluster; `byte_softmax_head_only` (narrower unshare)
+measurably worse; the fully-shared configs (`attn_id16`, `v4_2_k32_
+narrow`) stuck 1-2 full bpb above it — on TRAIN data, not just val. This
+is a capacity story, complementary to (not competing with) §11's
+stability story: `attn_id16` is simultaneously the MOST capacity-starved
+run in this comparison and MORE stable than `byte256`/`v4_2_k32_narrow`
+— the two problems don't have to move together.
+
+**Two more baselines added, showing the OPPOSITE failure mode**:
+`bytelm_xs3_ctx1024` (more capacity than xs1) drives train bpb to ~1.3
+(lower than any unshared qcute config) but its val bpb (~2.70-2.77) is
+WORSE than xs1's 2.55 — genuine overfitting, the mirror image of v4.2's
+underfitting. `bpelm_32768` (best of every BPE baseline tried this
+session — all of `bpelm_8192`/`bpelm_8192_converged`/`bpelm_4096_
+paramsmatch`/`bpelm_8192_ctx448_flopsmatch_rope`/`bpelm_16384_ctx448_
+flopsmatch` show the same pattern) is far more extreme: train bpb
+~0.006-0.009 (essentially memorized), val bpb 3.17-5.02 across every BPE
+config — worse than every byte-level baseline and most qcute variants,
+including the underfit ones. BPE at this corpus scale overfits
+catastrophically, categorically worse than qcute's worst underfitting —
+opposite failure directions, neither a "model to beat." Full table and
+reasoning in [docs/kv_contribution.md](kv_contribution.md) §12.
+
+**`quant_type="simplex"` needs stochastic exploration; `BitPredictHeadSSM`
+gains a per-position head.** `qcute_refine_v4_2_k32_narrow_simplex`
+(default `use_gumbel_noise=False`) interrupted at step 1000 with
+`best_val_bpb` still improving (4.28->4.12->3.79->3.71) but noisy, `byte_
+acc` stuck low (~0.24-0.30) — `qcute_refine_v4_2_k32_narrow_simplex_
+gumbel` (`use_gumbel_noise=True`, genuine Gumbel-noise sampling) queued
+in its place to test whether stochastic exploration helps. Separately,
+`BitPredictHeadSSM`'s `self.head` changed from a single `nn.Linear(d_
+inner, 1)` shared across all `dq` bit positions to `nn.Linear(d_inner,
+dq)` — a PRIVATE weight row per bit position (session: "let each bit
+timestep use different head... similar to independent mode, but has
+state"), while keeping the alpha-decayed recurrent state unchanged — a
+genuinely new point in the design space (private weights + stateful
+conditioning, vs. `"independent"`'s private+stateless or every other
+chain head's shared+stateful). Fixed/loop consistency reverified exactly.
+
+**`ssm_id1_pq` (full width, no downsample) killed for being too slow**
+(~0.88 it/s) — directly confirming the session's own compute analysis
+(`BitPredictHeadSSM` at full width costs ~272x more FLOPs per bit-chain
+than a plain independent head). Config deleted. Three more changes made
+in response, all reverified (fixed/loop consistency + gradient checks):
+**einsum instead of full-matrix+diagonal** (removes an `n`x compute/
+memory waste in the per-position head), **concat instead of add**
+(`fetched` is now `cat([h_scale*h, state_contrib])`, not their sum —
+strictly more information reaches the head), and a **trainable BOS
+state** (`self.bos_state`, zero-init, replaces `state_proj(zeros)` at
+position 0 with something the model can actually learn away from zero).
+`qcute_refine_v4_2_k32_narrow_ssm_id4_pq_concat` (`bit_inner_downsample=
+4`, matching `attn_id4`'s width) replaces it, queued to the front —
+already confirmed faster (~1.85 it/s vs. the killed run's 0.88 and even
+`attn_id4_pq`'s 1.38). Full detail in
+[docs/kv_contribution.md](kv_contribution.md) §13.
+
+**Correction: plain `simplex` (no gumbel noise) was never actually
+unstable.** The step-1000 "noisy" read above was a snapshot of one
+truncated restart segment, not the run's real trend — inspecting its full
+uninterrupted stretch (steps 100->2200) shows clean, monotonic
+convergence, val_bpb 69.6 -> 3.21, best 3.7105 logged. Re-queued for a
+fresh full run to confirm at higher step counts.
+
+**`simplex_gumbel` crashed — genuine MPS-specific numerical bug, fixed at
+the source, not a queue artifact.** `torch.AcceleratorError: scatter:
+index -1 is out of bounds for dimension with size 256`, found via the raw
+piped stdout log (the structured `Logger`-written `run.log` showed no
+error, just silently stopped). Root cause: `F.gumbel_softmax`'s internal
+`-log(-log(u))` sampling has no epsilon clamp on its uniform draw; a rare
+float32 underflow to exactly 0.0/1.0 produces `±inf`, colliding `inf`s
+produce `NaN`, and `NaN.argmax()` returns `-1` specifically on MPS (undefined
+elsewhere). Fixed by replacing the `F.gumbel_softmax` call inside
+`gumbel_quantize` with a manual, epsilon-clamped Gumbel sampling
+(`u=torch.rand_like(logits).clamp(eps, 1-eps)`,
+`eps=torch.finfo(dtype).tiny`). Verified via gradient check plus a
+20,000-iteration x `[256,256]`-per-call stress test producing zero
+non-finite outputs, and a full-model smoke test. Re-queued behind
+`attn_id1_pq`. Full trajectory/root-cause detail in
+[docs/kv_contribution.md](kv_contribution.md) §13.
+
+**`BitPredictHeadAttn` revamped to match; all three `attn_id*` configs
+deleted** (session: "delete all attn 4.2 ablation, need revamp"). Same
+per-position/concat treatment as SSM, plus one more simplification:
+`self.qkv_proj`/`self.out_proj` replaced by Q/K-only (`self.q_proj`/
+`self.k_proj`) — attention weights are still learned, but the values
+being weighted-summed are the RAW bit-value embeddings, not a learned
+V-projection (session: "simplify _mha... remove out proj, v proj, only k
+and q proj, basically like weighted sum of h and embeds"). No BOS
+parameter needed this time — `h_t` reaches the head via CONCAT (never
+summed), so position 0 already gets a distinct signal from `h_t` alone
+without a separate learned placeholder (session: "h_t is the concat
+bos"). Reverified fixed/loop consistency + gradients.
+
+**Compute analysis** (`D=256`, `dq=8`): vs. the pre-revamp `attn` head,
+params drop 48%/22%/6% and FLOPs drop to ~51%/52%/57% of the old cost
+across `downsample=1/4/16` (roughly a 2x FLOP speedup, from cutting
+projection cost `~4·d²` -> `~2·d²`). Compared against a plain 256-way
+softmax classifier and the independent 8-bit linear head: `attn_id16`
+(downsample=16) now beats `softmax-256` on BOTH params (13x fewer) and
+FLOPs (10x fewer) at once; `attn_id4` undercuts it on params (0.40x) at
+roughly FLOP-parity (1.14x); only full-width `attn` costs more than
+`softmax-256` on both axes. Full tables in
+[docs/kv_contribution.md](kv_contribution.md) §14. Two runs queued on
+the revamped modules: `qcute_refine_v4_2_k32_narrow_attn_id1_pq`
+(full-width `attn`, the ceiling-capacity point where it costs MORE than
+`softmax-256` on both axes — testing whether that extra capacity is
+worth it) and `qcute_refine_v4_2_k32_narrow_ssm_id1_pq` (same idea for
+`ssm` — an earlier version of this exact config was killed for being too
+slow BEFORE the concat/einsum/`bos_state` revamp; the einsum fix
+specifically targets that head's own worst inefficiency, so this reruns
+the question rather than assuming the old verdict still holds).
+
+**`attn_id1_pq` killed for speed** — 0.57 it/s, actually slower than the
+`ssm_id1_pq` run killed earlier for the same reason (0.88 it/s), despite
+the revamp's own compute savings. Full-width `attn` at this scale just
+isn't worth the ~2hr/4000-step budget as the first of 8 queued jobs.
+Config kept (not deleted) for a future downsample requeue.
+
+**`BitPredictHeadAttn` gains a trainable BOS embed inside `_mha` itself**
+(session: "make zero_vec trainable embeds") — a different role from the
+head-level BOS question already settled above ("h_t is the concat bos"):
+this new `self.bos_val_emb` replaces the plain zero vector that stood in
+for "no previous bit yet" in the ATTENTION sequence itself (`_mha`'s own
+Q/K/V content at position 0), which previously gave attention no way to
+distinguish "no previous bit" from "a previous bit that embeds near
+zero." Reverified fixed/loop consistency (`atol=1e-5`) and gradient flow.
+New config `qcute_refine_v4_2_k32_narrow_attn_id4_pq.py`
+(`bit_inner_downsample=4`, `code_embed_mode="pq_table"`, same family as
+`ssm_id4_pq_concat`) queued on this updated head.
+
+**`qcute_refine_v4_2_k32_narrow_simplex_l2`** — clone of `simplex` (§13),
+`n_layers=2` instead of 1 (session: "queue simplex (code_bits=8) with
+double layer, at front"), queued at the front of the training chain.
+Tests whether trunk depth can compensate for `simplex`'s own extreme
+sharing (byte level and every code level literally share ONE embed/head
+table at `code_bits=8` — see [docs/kv_contribution.md](kv_contribution.md)
+§13). Measured params/FLOPs (`FlopCounterMode`, batch=1, context=1024):
+1.709M params / 6857M flops/fwd, roughly double `simplex`'s own
+0.921M/3573M as expected. Against the `bytelm` baselines specifically:
+params land closest to `bytelm_xs1_ctx1024` (1.050M, +0.66M away), but
+FLOPs land closest to — and actually EXCEED — `bytelm_xs3_ctx1024`'s
+5369M, despite `simplex_l2` having fewer params than that 3-layer
+baseline (1.709M vs. 2.625M). The two-pass fusion mechanism plus
+cross-level trunk sharing cost more per added layer than plain depth
+does in a single-tower transformer — the fair FLOPs-matched comparison
+target for this run is `xs3`'s 2.4078 best_val_bpb, not `xs1`'s 2.4870.
+Full detail in [docs/kv_contribution.md](kv_contribution.md) §15.
+
+Queue as of this writing: `simplex_gumbel` (running) -> `simplex_l2` ->
+`attn_id4_pq` -> `simplex` (fresh full run) -> `ssm_id1_pq` (full-width,
+revamped) -> `bpe4_imitate_uncond` -> `bpe4_imitate_uncond_l1x4` ->
+`v4_k32_narrow_both` -> `v4_1_k32_narrow_shared` (KEY, isolates
+trunk-sharing alone vs. v4.2's own additions).
+
+**Queue cleared — several strong results.** `simplex_l2` (n_layers=2)
+finished at best_val_bpb **2.5892**, essentially TYING `byte256`'s 2.5660
+for best v4.2 result of the session (0.023 apart, within noise) —
+confirms trunk depth is a real (if FLOP-costly, see
+[docs/kv_contribution.md](kv_contribution.md) §15) substitute for
+`simplex`'s missing per-level embed/head privacy. `simplex` itself, on a
+clean rerun after the queue-leak contamination (below), finished at
+2.8687 — far better than the earlier interrupted read (3.7105),
+reinforcing the earlier correction that plain `simplex` was never
+actually unstable. `simplex_gumbel` finished at 2.9443 — respectable, but
+the extra stochastic exploration still doesn't beat the clean
+non-Gumbel rerun.
+
+**Regression found: revamped `attn_id4_pq` (with the new `bos_val_emb`)
+scores 3.5659 — WORSE than the OLD pre-revamp `attn_id4_pq`'s 3.2067**,
+despite the revamp's own FLOP/param savings (§14) and the theoretical
+motivation for `bos_val_emb` (§15). Flagged as a genuine regression, not
+noise — left as an open question (per-position weights may be
+data-starved at downsample=4, or Q/K-only attention with no learned V
+may be a real expressivity cut the FLOP savings don't compensate for).
+`ssm_id1_pq` (revamped, full-width) also finished this time (unlike its
+pre-revamp version, killed for being too slow) — 3.7708, the weakest
+finished chain-head variant this session, confirming full-width chain
+heads of either flavor aren't worth their compute at this scale.
+
+**`v4_k32_narrow_both` (`fuse_position="both"`, v4 lineage not v4.2) is
+the best v4/v4.2-lineage result of the ENTIRE session: best_val_bpb
+2.4443**, nearly matching `bytelm_xs3_ctx1024`'s 2.4078 (a 3-layer
+single-tower baseline) despite using only one self-attention layer per
+tier. `bpe4_imitate_uncond`/`_l1x4` (2.5533/2.5493) and
+`v4_k32_narrow_concat` (2.4925) all finished strong too. Full ranking
+table and detail in
+[docs/kv_contribution.md](kv_contribution.md) §16.
+
+`v4_1_k32_narrow_shared` (the KEY isolator run) is now running — the
+last item in the queue.
+
 **Housekeeping (this session)**: `EncoderLevel` renamed to `LevelLM`
 throughout `qcute_refine_v4.py` — the class does both the "encode"
 (PASS 1, produce the code) and "decode" (PASS 2, fused/conditioned
