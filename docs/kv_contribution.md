@@ -1028,3 +1028,262 @@ levers (private embed+head vs. deeper shared trunk) landing at essentially the s
 `v4_1_k32_narrow_shared` (the KEY run isolating whether trunk-sharing ALONE, without any of
 v4.2's other extreme-sharing additions, causes the instability documented in §11) is now running —
 the last item in the queue, no downstream jobs after it.
+
+## 17. `v4_1_k32_narrow_shared` finishes — trunk-sharing alone is NOT the instability's cause; plus structured-softmax heads and a depthwise `BitPredictHeadConv`
+
+**`v4_1_k32_narrow_shared` finished at best_val_bpb 2.5254** — close to `byte256`/`simplex_l2`
+(2.5660/2.5892) and far better than the fully-shared `qcute_refine_v4_2_k32_narrow` baseline
+(4.0369). This answers §11-§16's long-open question directly: **trunk-sharing alone (v4.1's own
+"shared" mode — one trunk reused across every level, nothing else unshared) is NOT what causes
+v4.2's instability/underfitting.** v4.2 additionally shares the embed table, the NTP head, AND
+`code_pre` across every level (byte included) — it's specifically THAT additional layer of sharing,
+not trunk-sharing per se, that produces the val-side instability and underfitting documented
+throughout §11-§12. Every v4.2 config that partially or fully unshares embed/head (`byte256`,
+`byte_softmax_head_only`, `simplex_l2`) recovers most or all of the gap to `v4_1`'s own healthy
+result — consistent, convergent evidence across the whole session's ablation family.
+
+**Structured/cheap replacements for a dense `V`-way softmax classifier** (session: "use structured
+matrix but to replace dense linear map to 2**n way output softmax... some loss in repr ok for
+params saving"):
+
+- **`FactoredSoftmaxHead`** (new) — outer-sum over two small projections: `logits[i,j] =
+  f1(h)[i] + f2(h)[j]`, `v1*v2==vocab`. Trivially valid (an ordinary softmax over a structured
+  logit vector, no chain-rule/teacher-forcing needed — parallel/one-shot, unlike every
+  BitPredictHead*). At `vocab=256, D=256, v1=v2=16`: params `8,224` vs. dense's `65,792` (8x
+  fewer), FLOPs `16,384` vs. `131,072` (8x fewer). Cost: the reshaped `[v1,v2]` logit matrix is
+  additively separable (row-effect + column-effect only) — the effective `V×D` weight matrix has
+  rank `≤v1+v2`.
+- **`LowRankSoftmaxHead`** (new, added after session asked "how good is factoredsoftmax vs just low
+  rank... analyze rank") — the classic softmax bottleneck (Yang et al. 2018): `h -> Linear(D,rank)
+  -> Linear(rank,vocab)`. At matched budget (`rank=16`, same param/FLOP order as factored above:
+  `8,464`/`16,384`), **theoretically STRICTLY more expressive than `FactoredSoftmaxHead`**: every
+  outer-sum-representable logit matrix is also representable by low-rank at rank `v1+v2` (a
+  degenerate, zero-free-coefficient special case), but low-rank additionally gives every one of the
+  `V` classes its own FREE `rank`-dim coefficient vector, while factored's classes get NO per-class
+  freedom at all beyond a discrete row/column slot in a rigid `w1_i+w2_j` template — a strictly
+  narrower function class at the same rank ceiling. Queued as `byte_factored`/`byte_lowrank`
+  (both cloned from `byte_softmax_head_only`'s narrow ablation shape — embed/code_pre stay shared,
+  only the readout is private/structured) for a direct, budget-controlled empirical test of this
+  rank argument.
+- Real butterfly/Monarch matrices (the general structured-matrix family both of the above are
+  shallow/2-stage special cases of) would push params/FLOPs down further (`O(log V)`/`O(√V)`
+  stages instead of 2) at real implementation-correctness risk not attempted this session — noted
+  as a documented future direction, not built.
+- Compositional bit-path codes (small per-depth/per-bit embeddings summed along the tree path,
+  discussed as an alternative to `BitPredictHeadHSoftmax`'s own `O(V)` per-node table) were
+  proposed but not implemented — same reasoning, deferred as a documented direction.
+
+**`BitPredictHeadHSoftmax`** (new, from the earlier "find something that satisfies chain probs
+validity and cheap and same repr power as large softmax head" ask) — classic hierarchical softmax
+over the same `dq`-depth binary tree every BitPredictHead* factorizes, but unlike attn/conv/ssm
+(which reuse ONE classifying direction per bit POSITION, shared across every prefix reaching that
+position — the diagnosed geometric bottleneck behind why those heads underperform, even
+pre-revamp), gives every one of the `2**dq-1` tree NODES its own private weight vector. Verified:
+fixed/loop consistency (`atol=5.7e-6`), gradients, full-model smoke test, `validate_generation`
+parity — all clean. Measured (not estimated) params/FLOPs vs. dense `softmax(2**dq)`:
+
+| dq | V | hsoftmax params | hsoftmax FLOPs | dense softmax params | dense softmax FLOPs | FLOP ratio |
+|---|---|---|---|---|---|---|
+| 8 | 256 | 65,535 | 4,224 | 65,536 | 131,072 | 31x |
+| 13 | 8,192 | 2,105,087 | 6,994 | 2,097,152 | 4,194,304 | 600x |
+| 16 | 65,536 | 16,842,495 | 8,704 | 16,777,216 | 33,554,432 | 3,855x |
+
+Params stay tied to dense softmax at every scale (both `O(V·D)`); FLOPs diverge explosively in
+hsoftmax's favor (`O(log V)` vs `O(V)`). Real caveats before scaling `dq` up in this codebase: (1)
+params don't shrink, so `dq=16` alone costs ~16.8M params for this one head, dwarfing every model
+in this session's ablation family; (2) the tree is plain heap-indexed (not usage-weighted like
+classic Huffman-tree hierarchical softmax), so at `dq=13/16` with `enwik8_1M`'s modest training set
+(further shrunk by `K`-downsampling at coarser levels), many of the deep node weights risk being
+under-trained from sheer data scarcity. Not run this session — `dq=8` (matching every existing
+config) was judged the safer test; `hsoftmax` wired into `Config.bit_head_class`/`build_bit_head`/
+CLI, ready for a `dq=8` config whenever queued.
+
+**`BitPredictHeadConv` depthwise fix** (session: "consider making bitpredictconv more efficient,
+last time huge compute, maybe try group conv or depthwise") — both existing `conv_impl` options
+("conv1d"/"matmul") are FULLY DENSE across channels: every output channel reads every input channel
+at every window position, costing `K*d_inner^2` params/FLOPs. At full width (`d_model=256,
+kernel_size=dq=8`, measured via FlopCounterMode): **525,313 params / 8,392,704 FLOPs for this one
+head** — the actual "huge compute" being referenced, and the reason every prior `conv`-family
+config this session used `bit_inner_downsample>1`, never full width. New `conv_impl="depthwise"`:
+each channel gets its own private `K`-tap filter (no cross-channel mixing at all), implemented via
+plain `einsum` rather than `nn.Conv1d` (preserving "matmul"'s own loop-overhead-avoidance property
+for the sequential `_forward_loop` decode path) — **3,073 params / 36,864 FLOPs at the same full
+width: a 171x/228x reduction.** Verified: fixed/loop consistency (exact match, max diff 0.0),
+gradients, full-model smoke test, `validate_generation` parity. Cheap enough to finally test `conv`
+at full width for the first time this session (`configs/qcute_refine_v4_2_k32_narrow_conv_
+depthwise.py`, `code_embed_mode="pq_table"` carried over from the `attn_id4` divergence fix).
+
+**`BitPredictHeadConvDilated`** (new, session: "do this stacked small kernel, then check memory
+usage vs single large conv") — a WaveNet-style dilated depthwise-separable causal conv STACK
+(kernel=`dilation_base`, dilation=`dilation_base^l` per layer `l`, `L=ceil(log_b(dq))` layers deep)
+as a further compute lever beyond the single-layer depthwise fix above. PURELY LINEAR, no
+activation between stacked layers (session: "i mean for memory and param save even though
+linear") — composing linear filters stays linear, so this is representationally a *subset* of what
+a single full-width kernel can express (a real expressivity cost flagged explicitly, not a free
+win); it exists to test the params/FLOPs/wallclock side of the tradeoff in isolation.
+Initially TRAINING-ONLY (session: "no need ar gen yet for this stacked") — later completed (session:
+"then check ar gen conv code, then train this"): `_forward_loop` reuses the same `_dilated_stack`
+helper `_forward_fixed` calls, recomputed on the growing bit-history each step (no WaveNet FIFO
+cache needed — the "just recompute the window read" tradeoff `BitPredictHeadConv`'s own
+`_forward_loop` already makes, cheap enough at `dq=8`). Verified fixed/loop consistency (exact/
+near-exact match, both `depthwise` and `dense` modes), a standalone greedy-decode smoke test, full
+`RefineLM` integration (forward+backward clean, no missing grads), and `validate_generation` parity
+(`generate_no_cache` vs. `generate_kv_cache` exact match) — all clean. Now wired into `Config.
+bit_head_class="conv_dilated"`/`build_bit_head`/CLI (`conv_dilated_base`, `conv_dilated_mode`), and
+queued for training (`configs/qcute_refine_v4_2_k32_narrow_conv_dilated.py`, `mode="depthwise"`,
+`code_embed_mode="pq_table"`).
+
+Also finished (session: "finish impl conv dilated dense", "make it like conv1d groups=1, dense"): a
+`mode="dense"` variant with full cross-channel mixing per layer (weight `[D_out,D_in,K]`, the
+dilated-stack analogue of `BitPredictHeadConv`'s own dense `"matmul"` — same stack structure, just
+without the per-channel restriction). Its `unfold`+`einsum` computation was verified to EXACTLY
+reproduce a real `nn.Conv1d(groups=1)` stack (weights copied over layer-by-layer, `torch.allclose`
+exact) — confirms the einsum correctly implements standard dense dilated-conv semantics. At
+`dq=8, d_model=256, dilation_base=2`: `394,753` params / `100,728,832` FLOPs — a genuine ~25%
+reduction vs. the single big dense kernel's `525,313`/`134,283,264` (matching the tap-count math:
+`3*2=6` "dense tap-layers" vs. `8`), but wallclock (`0.47ms/fwd`) is actually SLOWER than the
+single-layer dense kernel's own `0.30ms/fwd` — per-layer overhead (3 separate `unfold`+`einsum`
+calls, intermediate allocations) outweighs the FLOP savings at this small scale, a genuinely
+different result from `depthwise` mode (which won on wallclock too). Not currently queued for
+training (the `depthwise` mode above is the config actually running) — a real, honest data point
+that "fewer FLOPs" and "faster wallclock" don't always move together at small scale.
+
+At `dq=8, d_model=256, dilation_base=2` (3 layers, dilations 1/2/4, receptive field exactly 8,
+verified via a causality check — flipping bit 5 leaves logits 0-4 unchanged but changes logit 6):
+params are a near-wash vs. single-layer `depthwise` (`3,073` — identical to single-layer at
+`b=2`, since 3 layers' extra bias terms exactly cancel the tap savings at this small scale;
+`dilation_base=3` does slightly better via fewer layers: `2,817`), while FLOPs are modestly better
+(`28,672` vs. `36,864`, 22% fewer) — both confirm the earlier prediction that dilation's real
+payoff is at larger `dq` (16+), not `dq=8`.
+
+**A real implementation pitfall surfaced and fixed along the way, independent of dilation itself**:
+the first implementation used `nn.Conv1d` directly for each layer (reasoned, at the time, that its
+per-call overhead only mattered inside `_forward_loop`'s sequential decode — not here, since this
+path runs once per training step). Measured wallclock (CPU, `_forward_fixed`, batch=16) showed this
+was wrong: **298ms/fwd** — ~300x slower than a plain single-layer `depthwise` (0.96ms). A diagnostic
+(session: "not dilated depthwise, but dilated full dense kernel") — swapping `groups=d_inner` for
+`groups=1` (fully dense per layer) while keeping everything else identical — dropped this to
+21.3ms, isolating the true cause as `nn.Conv1d`'s own per-call dispatch overhead on this backend
+(present regardless of grouping), not the multi-layer/dilation structure itself. This is the exact
+same issue `BitPredictHeadConv`'s own `"matmul"`/`"depthwise"` impls were already built to dodge
+via `unfold`+`einsum` instead of `nn.Conv1d` — applying that same fix to the dilated stack (`torch.
+Tensor` weights, `unfold`+`einsum` per layer, no `nn.Conv1d` anywhere) brought it down to
+**0.53ms/fwd — the FASTEST of every chain-head variant benchmarked** (dense `matmul` 0.64ms,
+single-layer `depthwise` 0.96ms, revamped `BitPredictHeadAttn` 1.34ms), confirming this session's
+own long-standing "avoid `nn.Conv1d`, even in the parallel/batched path" lesson applies more
+broadly than just the original sequential-decode-loop case it was first diagnosed for. Reverified
+fixed/loop-consistency-equivalent checks (causality, gradients) after the rewrite — all clean.
+
+Independent of that implementation detail, the general dilation-vs-depth math (total taps scale
+`~b*log_b(dq)` vs. a single layer's `dq`, minimized near `b=e≈2.7`) still holds and matters more at
+larger `dq`: at `dq=16`, `b=2` gives `8` taps vs. a single layer's `16` (2x fewer) — real savings,
+just not yet visible at this session's actual `dq=8` configs. A NON-dilated deep stack (`L≈dq`
+plain kernel-2 layers, linear receptive-field growth) remains strictly worse on both params
+(`~2*dq` taps) and sequential depth than either the single-kernel baseline or the dilated version —
+confirmed by the same math, not separately re-verified in code.
+
+## 18. `downsample` decoupled from `h`'s own dimension (Attn/SSM); `BitPredictHeadAttn` reverted to v4's original design
+
+Session: "for each bitpredict* can the downsample has flag only be applied on embeds, h maintains
+full dim." Every `BitPredictHead*`'s `downsample>1` previously ran an `in_proj: nn.Linear(d_model,
+d_inner)` on `h` itself before anything else — shrinking `h`'s own information, not just the
+embed/attention/state machinery's width. Feasibility check per class, by mechanism:
+
+- **Attn, SSM (concat-based)** — `h` only ever reaches the head via `torch.cat([h_scaled, ...])`,
+  which doesn't require matching dims. **Easy**: drop `in_proj`, keep `h` at full `d_model` in the
+  concat, resize `self.head`'s input from `2*d_inner` to `d_model+d_inner`. Implemented and
+  verified (fixed/loop consistency, gradients, full-model integration, `validate_generation`
+  parity — both `downsample=1` and `downsample=4`) for both classes.
+- **Conv, ConvDilated (add-based)** — `fetched = h_scale*h + conv_out` REQUIRES matching dims.
+  **Medium**: would need converting add->concat first (the same "concat is strictly more
+  information than add" argument already used for Attn/SSM's own earlier revamp). Not implemented
+  this pass — noted as the next step if these two heads need the same treatment.
+- **HSoftmax (dot-product-based)** — `h @ node_weight[node_idx]` is a genuine inner product,
+  mathematically REQUIRING `h` and `node_weight` to share a dimension. **Not possible** to decouple
+  without reintroducing a projection (i.e. `in_proj` under a different name) — this is a hard
+  constraint of the mechanism, not an engineering gap. `BitPredictHeadHSoftmax`'s own earlier
+  finding (§17: downsampling INCREASES its FLOPs/wallclock, since `in_proj`'s own cost dominates
+  its otherwise-tiny node-read) is the concrete symptom of this same constraint.
+
+**`BitPredictHeadAttn` reverted to v4's original design** while implementing the above (session:
+"for attn, comment current impl, revert to v4") — the session's own earlier revamp (concat/
+per-position head/Q-K-only attention/trainable `bos_val_emb`, §14) was found to REGRESS empirically
+(`attn_id4_pq` on the revamped head: 3.5659 best_val_bpb, worse than the original's 3.2067 — §16/
+§17), so rather than retrofit the h-decoupling onto a design already known to underperform, this
+reverts to v4's original mechanism: full QKV self-attention + `out_proj`, a single SHARED head
+(not per-position). The revamped implementation is preserved as a commented-out reference block in
+the class itself (matching the file's existing `_mha_old_full_qkv` convention), not deleted.
+
+One deliberate departure from v4's EXACT original, needed to satisfy the h-decoupling goal: v4's
+version mixed `h` directly into the attention's own INPUT (`x = h_scale*h + shifted + pos`), which
+forces `h` and the bit-embeds to share a dimension — incompatible with keeping `h` at full width
+while downsampling the embeds. Here, `h` only enters at the final concat step; attention's own
+Q/K/V machinery runs purely on bit-embeds/position at `d_inner`. Verified identically to SSM above
+(fixed/loop consistency exact/near-exact, gradients, full-model integration, `validate_generation`
+parity at `downsample=1` and `downsample=4`). Not yet re-queued for training — the reverted design's
+own best_val_bpb (with or without the h-decoupling change) hasn't been re-measured this session;
+worth a fresh `attn_id*`-family run once the current queue clears.
+
+## 19. `downsample_h` A/B configs queued; `BitPredictHeadWordPredict` designed, implemented, and wired end-to-end
+
+**`downsample_h`/`per_position_head` flags added** (session: "queue more experiments to test this
+hypothesis, repr loss because of downsample h," and "also for each self attn and ssm, allow indp
+heads for each timestep different head, on by default") — since §18's decoupling REPLACED the old
+in_proj-based behavior rather than keeping it as an option, testing "does downsampling h itself
+(not just the embeds) cause a real quality loss" required restoring it as an explicit, orthogonal
+flag on both `BitPredictHeadAttn` and `BitPredictHeadSSM`:
+
+- `downsample_h: bool = False` (default: h stays full width, §18's behavior). `True`: restores the
+  original in_proj-based behavior (h also projected to `d_inner`) for direct A/B at the same
+  downsample ratio.
+- `per_position_head: bool = True` (default: dq separate weight rows, einsum-read). `False`: a
+  single SHARED head (v4's original design) applied via broadcasting.
+
+Both flags verified across all 2x2 combinations for both classes (fixed/loop consistency,
+gradients, full-model integration, `validate_generation` parity) plus the `downsample=1` default
+case. Four new configs queued: `attn_id4_hfull`/`attn_id4_hds` and `ssm_id4_hfull`/`ssm_id4_hds`
+(all `bit_inner_downsample=4`, `bit_per_position_head=True`, differing only in `bit_downsample_h`)
+— direct, budget-controlled tests of the hypothesis.
+
+**`BitPredictHeadWordPredict`** (new — session: "design another head, wordpredict, which decompose
+to word like 8 bit, 4 bit, useful for dq more than 8... can degenerate to single softmax for
+compatibility... implement until done complete with ar gen and config to queue"). Decomposes the
+dq-bit code into `n_words=dq//word_bits` WORDS, each a genuine `2**word_bits`-way softmax — a
+middle ground between `BitPredictHeadHSoftmax`'s per-bit binary tree (many cheap steps) and a
+single flat `V=2**dq` softmax (one expensive step). Conditioning (session: "past chain prob
+conditioning make simpler but more expensive"): word `i`'s classifier reads
+`cat([h, embed(word_0),...,embed(word_{i-1})])` — plain concatenation, no recurrence/attention
+machinery, but the classifier input GROWS linearly with position (genuinely simpler, genuinely more
+expensive per step than attn/ssm's fixed-size conditioning).
+
+Returns a LIST of per-word logit tensors (not `[N,dq]` per-bit logits like every other
+`BitPredictHead*`), so it needed a new `code_head_mode="word"` pipeline path end-to-end: `Config.
+word_bits`/`word_d_embed`/`word_embed_downsample`, `LevelLM.__init__`/`forward` (own loss —
+`self.ntp_head.loss`, sum of per-word cross-entropies), and `_sample_next_byte` (own
+`logits_to_word_ints`/`word_ints_to_bits` round-trip back to the shared dq-bit representation).
+
+`word_bits==dq` (`n_words=1`) DEGENERATES to a single flat softmax with no chain/embed machinery at
+all — verified numerically IDENTICAL to a plain `nn.Linear(D,vocab)` (weights copied over,
+`torch.allclose` exact) — the "compatibility" the session asked for.
+
+**Parallel kernel launch for `_forward_fixed`** (session: "find way to parallel launch kernel,
+maybe pad, idk"): since teacher-forcing means every word is known upfront, all `n_words` steps'
+context vectors can be built in parallel (unlike generation, where each word's context depends on
+the GREEDILY decided previous one). Pads every word's context to the largest word's own width
+(zero-filling the unused tail — the padding weight columns simply never receive gradient, since
+their input is always 0) and reads all words via ONE batched einsum against a single
+`[n_words, word_vocab, max_dim]` weight tensor, instead of `n_words` separate `nn.Linear` calls —
+"find a way to parallel launch kernel" satisfied directly. `_forward_loop` (generation) stays
+genuinely sequential, reusing slices of the same weight tensor via `F.linear`.
+
+Fully verified: fixed/loop consistency across `word_bits` in {8,4,2,1} (exact/near-exact match),
+gradients, the degenerate-case exact match, causality (a later word's bits don't leak into an
+earlier word's logits — confirmed by flipping word 2's bits and checking words 0/1's logits are
+byte-for-byte unaffected while word 3's do change), full-model forward+backward, and
+`validate_generation` exact parity. Two configs queued: `word4` (`word_bits=4`, `n_words=2`, each a
+16-way softmax) and `word2` (`word_bits=2`, `n_words=4`, each a 4-way softmax) — the two ends of the
+word_bits dial at `dq=8`, both `code_embed_mode="pq_table"`.
+
+Full queue as of this writing: `byte_lowrank` (running) -> `conv_depthwise` -> `conv_dilated` ->
+`hsoftmax` -> `attn_id4_hfull` -> `attn_id4_hds` -> `ssm_id4_hfull` -> `ssm_id4_hds` -> `word4` ->
+`word2`.

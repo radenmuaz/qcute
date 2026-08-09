@@ -346,16 +346,33 @@ class Config:
                                     # same degrees of freedom as a dense softmax-256 (255*D vs 256*D
                                     # params) while only ever touching the dq=8 nodes on the true
                                     # root-to-leaf path per example (same FLOPs as "independent"'s
-                                    # nn.Linear(D,dq), ~32x cheaper than dense softmax-256). All four are
-                                    # drop-in equivalent in API (verified fixed/loop-consistent) — see
-                                    # each class's own docstring for the tradeoffs.
+                                    # nn.Linear(D,dq), ~32x cheaper than dense softmax-256). "conv_dilated"
+                                    # = BitPredictHeadConvDilated, a WaveNet-style dilated depthwise/dense
+                                    # conv STACK instead of "conv"'s single big kernel — session: "do this
+                                    # stacked small kernel... check ar gen conv code, then train this."
+                                    # Params/FLOPs scale ~L*dilation_base vs. "conv"'s dq (real savings at
+                                    # larger dq, modest at dq=8); PURELY LINEAR across layers (no
+                                    # activation), a genuine expressivity cost, not a free win — see its
+                                    # own docstring. All five are drop-in equivalent in API (verified
+                                    # fixed/loop-consistent) — see each class's own docstring for the
+                                    # tradeoffs.
     bit_conv_kernel_size: int | None = None  # None (default) = dq (full receptive field) — see
                                     # BitPredictHeadConv's own docstring for why windowing isn't obviously
                                     # the right inductive bias here. Only used when bit_head_class=="conv".
     bit_conv_impl: str = "matmul"  # "matmul" (default, session reparam) or "conv1d" (original) — same
                                     # op (fixed causal window, weights shared across positions), different
-                                    # dispatch; see BitPredictHeadConv's own docstring. Only used when
-                                    # bit_head_class=="conv".
+                                    # dispatch; see BitPredictHeadConv's own docstring. "depthwise" (new)
+                                    # = per-channel K-tap filters, no cross-channel mixing — 171x/228x
+                                    # fewer params/FLOPs at full width (session: "consider making
+                                    # bitpredictconv more efficient... maybe try group conv or
+                                    # depthwise"). Only used when bit_head_class=="conv".
+    conv_dilated_base: int = 2   # dilation_base for bit_head_class=="conv_dilated" (BitPredictHeadConvDilated)
+                                    # — layer l has kernel_size=conv_dilated_base, dilation=
+                                    # conv_dilated_base**l, L=ceil(log_base(dq)) layers. Only used when
+                                    # bit_head_class=="conv_dilated".
+    conv_dilated_mode: str = "depthwise"   # "depthwise" (default) or "dense" (session: "finish impl conv
+                                    # dilated dense") — see BitPredictHeadConvDilated's own docstring.
+                                    # Only used when bit_head_class=="conv_dilated".
     bit_inner_downsample: int = 1  # 1 (default) = no downsampling, identical to pre-flag behavior (no
                                     # extra op/params). >1 (2, 4, ...) projects the incoming hidden vector
                                     # down to d_model//bit_inner_downsample once, then runs every chain op
@@ -366,6 +383,23 @@ class Config:
                                     # (and, for bit_head_class=="attn", the resulting inner dim must be
                                     # divisible by bit_chain_n_heads too).
     bit_ssm_d_state: int | None = None       # None (default) = d_model. Only used when bit_head_class=="ssm".
+    bit_downsample_h: bool = False   # False (default): h stays at full d_model in BitPredictHeadAttn/SSM
+                                    # regardless of bit_inner_downsample — only the embed/attention/state
+                                    # machinery runs at the smaller d_inner width (session: "can the
+                                    # downsample flag only be applied on embeds, h maintains full dim").
+                                    # True: restores the ORIGINAL (pre-this-session) behavior — h ALSO
+                                    # projected down to d_inner via in_proj — for A/B testing whether
+                                    # downsampling h itself (not just the embeds) causes a real quality
+                                    # loss (session: "queue more experiments to test this hypothesis, repr
+                                    # loss because of downsample h"). Only affects bit_head_class in
+                                    # ("attn", "ssm") — "conv"/"conv_dilated" still use add (not concat) so
+                                    # can't decouple yet; "hsoftmax" fundamentally can't decouple at all
+                                    # (dot-product mechanism) — see docs/kv_contribution.md §18.
+    bit_per_position_head: bool = True   # True (default): dq SEPARATE per-bit-position weight rows in
+                                    # BitPredictHeadAttn/SSM (session: "for each self attn and ssm, allow
+                                    # indp heads for each timestep different head, on by default"). False:
+                                    # a single SHARED head instead (v4's original design). Only affects
+                                    # bit_head_class in ("attn", "ssm").
     code_head_mode: str = "independent"   # RE-ENABLED (session: "later re enable flag to use
                                     # bitpredict heads, default indp now"). "independent" (default,
                                     # matches v4.2's whole "trim other things" direction): plain
@@ -376,7 +410,24 @@ class Config:
                                     # the dq bits, teacher-forced at train time (_forward_fixed) —
                                     # same shared object across every level (byte included), same as
                                     # "independent"'s ntp_head. Unlike v4/v4.1, this is now the ONLY
-                                    # place BitPredictHead is reachable in this file.
+                                    # place BitPredictHead is reachable in this file. "word" (new) =
+                                    # BitPredictHeadWordPredict — decomposes dq bits into
+                                    # dq//word_bits WORDS, each a genuine 2**word_bits-way softmax
+                                    # (session: "design another head, wordpredict... useful for dq
+                                    # more than 8") — a middle ground between "chain"'s per-bit
+                                    # BitPredictHead* family and a single flat V=2**dq softmax.
+                                    # word_bits==dq degenerates to exactly that flat softmax (verified
+                                    # numerically identical to byte_head_256way's own nn.Linear).
+    word_bits: int = 8   # only used when code_head_mode=="word". Must evenly divide dq. Default 8 =
+                                    # one word per byte-worth of bits (matches dq's own default=8,
+                                    # so n_words=1 — the degenerate/flat-softmax case — unless dq is
+                                    # raised). Try 4 or 2 for genuine multi-word chains.
+    word_d_embed: int | None = None   # explicit override for BitPredictHeadWordPredict's per-word
+                                    # embedding width. None (default): derived from word_embed_downsample.
+    word_embed_downsample: int = 1   # d_embed = d_model // word_embed_downsample when word_d_embed
+                                    # is None (session: "if d_embed not given use embed_downsample
+                                    # param to down sample x vs d"). Only used when code_head_mode==
+                                    # "word" and word_d_embed is None.
     byte_head_256way: bool = False   # ABLATION flag (session: "another hack is make ablation use
                                     # regular byte 256-way head, put as flag"). False (default):
                                     # level 0 uses the SAME shared dq-bit embed/head as every code
@@ -406,6 +457,41 @@ class Config:
                                     # byte_head_256way (above) unshares embed+head+code_pre together
                                     # and can't distinguish which of the three actually matters;
                                     # mutually exclusive with byte_head_256way (asserted below).
+    byte_head_factored: bool = False   # ABLATION flag, same "narrow" shape as byte_softmax_head_only
+                                    # (embed/code_pre stay the shared dq-bit ones; only the byte-level
+                                    # READOUT is private) but the private readout is a
+                                    # FactoredSoftmaxHead instead of a dense nn.Linear(D,vocab) —
+                                    # session: "use structured matrix but to replace dense linear map
+                                    # to 2**n way output softmax... some loss in repr ok for params
+                                    # saving." Computes logits as an OUTER SUM of two small
+                                    # projections (D->v1, D->v2, v1*v2==vocab) instead of one dense
+                                    # D->vocab matrix — params drop from vocab*D to D*(v1+v2) (8x
+                                    # fewer at vocab=256,D=256,v1=v2=16), FLOPs drop correspondingly
+                                    # (~7.9x). Still a genuine softmax (over a STRUCTURED logit
+                                    # vector) — no chain-rule/teacher-forcing needed, unlike the
+                                    # BitPredictHead* family. Representational cost: the vocab-way
+                                    # logit vector, reshaped [v1,v2], is constrained to row-effect +
+                                    # column-effect (additively separable in the two-factor index) —
+                                    # can't express genuine "outcome i needs to interact with outcome
+                                    # j" cross terms a dense head could. Mutually exclusive with
+                                    # byte_head_256way/byte_softmax_head_only/quant_type=="simplex".
+    byte_head_lowrank: bool = False   # ABLATION flag, same "narrow" shape as byte_head_factored, but
+                                    # the private readout is LowRankSoftmaxHead (the classic "softmax
+                                    # bottleneck," Yang et al. 2018: Linear(D,rank) -> Linear(rank,
+                                    # vocab)) instead of the outer-sum FactoredSoftmaxHead — session:
+                                    # "how good is factoredsoftmax vs just low rank... analyze rank."
+                                    # Strictly MORE expressive than byte_head_factored at matched
+                                    # rank/param budget (every FactoredSoftmaxHead-representable logit
+                                    # matrix is also representable by LowRankSoftmaxHead at rank
+                                    # v1+v2, since the former is a zero-free-parameter special case of
+                                    # the latter — see LowRankSoftmaxHead's own docstring) — the
+                                    # theoretically safer of the two structured/cheap alternatives to
+                                    # a dense byte_softmax_head_only. Mutually exclusive with
+                                    # byte_head_256way/byte_softmax_head_only/byte_head_factored/
+                                    # quant_type=="simplex".
+    byte_head_rank: int | None = None   # rank for byte_head_lowrank. None (default) = d_model // 4
+                                    # (session's own suggested "4x downscale"). Only used when
+                                    # byte_head_lowrank=True.
     code_ntp_weight: float = 1.0  # scales levels>0's own NTP loss (level 0's byte_loss scaled separately,
                                     # see byte_ntp_weight below). ==0.0 SKIPS those levels' ntp_head forward
                                     # entirely (real speed lever — see qcute_refine.py's own session diagnosis).
@@ -597,13 +683,16 @@ class Config:
 
     def __post_init__(self):
         assert self.dq >= 8, f"Config.dq must be >= 8 (a byte needs 8 bits to be representable), got {self.dq}"
-        assert not (self.byte_head_256way and self.byte_softmax_head_only), \
-            "byte_head_256way and byte_softmax_head_only are mutually exclusive ablations"
+        assert sum([self.byte_head_256way, self.byte_softmax_head_only, self.byte_head_factored, self.byte_head_lowrank]) <= 1, \
+            "byte_head_256way, byte_softmax_head_only, byte_head_factored, and byte_head_lowrank are mutually exclusive ablations"
+        if self.byte_head_rank is None:
+            self.byte_head_rank = self.d_model // 4
         if self.quant_type == "simplex":
-            assert not (self.byte_head_256way or self.byte_softmax_head_only), \
+            assert not (self.byte_head_256way or self.byte_softmax_head_only or self.byte_head_factored or self.byte_head_lowrank), \
                 "quant_type='simplex' already makes every level (byte included) an exact softmax " \
                 "classifier over its own shared embedding table — byte_head_256way/" \
-                "byte_softmax_head_only are redundant with (and structurally incompatible with) it"
+                "byte_softmax_head_only/byte_head_factored/byte_head_lowrank are redundant with " \
+                "(and structurally incompatible with) it"
             if self.code_bits > 8:
                 warnings.warn(
                     f"Config.code_bits={self.code_bits} > 8 under quant_type='simplex': every code "
@@ -977,9 +1066,84 @@ class BitPredictHeadAttn(nn.Module):
     self-attention over the bit sequence — the exact chain-rule
     factorization of the joint dq-bit distribution (ported from
     qcutelm_vlt11.py via qcute_refine.py). Used for LevelLM's own NTP
-    head, in both its unconditioned (PASS 1) and fused (PASS 2) calls."""
+    head, in both its unconditioned (PASS 1) and fused (PASS 2) calls.
 
-    def __init__(self, d_model: int, dq: int, n_heads: int = 2, gamma: float = 1.0, fixed_kernel: bool = True, downsample: int = 1):
+    REVERTED to v4's original design (session: "for attn, comment current impl, revert to v4") —
+    full QKV self-attention + out_proj, a single SHARED head (not per-position), after the session's
+    own revamp (concat/per-position/Q-K-only/bos_val_emb — see SUPERSEDED block below) was found to
+    REGRESS empirically (`attn_id4_pq` on the revamped head: 3.5659 best_val_bpb, WORSE than the
+    original's 3.2067 — docs/kv_contribution.md §16/§17). One deliberate difference from v4's exact
+    original, needed to satisfy the session's other standing ask ("can the downsample flag only be
+    applied on embeds, h maintains full dim... to support same dim h"): v4's original mixed `h`
+    directly into the attention's own INPUT (`x = h_scale*h + shifted + pos`), which forces `h` and
+    the bit-embeds to share one dimension — incompatible with decoupling `h` from `d_inner`. Here,
+    `h` only enters at the FINAL fetch step (via concat, not add), so attention's own Q/K/V
+    machinery runs purely on bit-embeds/position at `d_inner` while `h` stays at full `d_model`
+    throughout, same principle already applied to BitPredictHeadSSM."""
+
+    # ============================================================================================
+    # SUPERSEDED (session revamp, later found to regress vs. v4's original — kept as a reference
+    # block, never called): per-position head (`nn.Linear(2*d_inner, dq)`, einsum-read), CONCAT
+    # `h`+attn_out, trainable `bos_val_emb`, Q/K-only attention (no V/out_proj, weighted-sums the
+    # RAW bit-embeds). Full writeup: docs/kv_contribution.md §14 (the revamp) and §16/§17 (the
+    # regression that prompted this revert).
+    #
+    # def __init__(self, d_model, dq, n_heads=2, gamma=1.0, fixed_kernel=True, downsample=1):
+    #     super().__init__()
+    #     d_inner = d_model // downsample
+    #     self.head_dim = d_inner // n_heads
+    #     self.head = nn.Linear(d_model + d_inner, dq)   # per-position, concat-sized
+    #     self.bit_pos_emb = nn.Embedding(dq, d_inner)
+    #     self.bit_val_emb = nn.Embedding(2, d_inner)
+    #     self.bos_val_emb = nn.Parameter(torch.zeros(d_inner))
+    #     self.q_proj = nn.Linear(d_inner, d_inner)
+    #     self.k_proj = nn.Linear(d_inner, d_inner)
+    #     causal_mask = torch.triu(torch.full((dq, dq), float("-inf")), diagonal=1)
+    #     self.register_buffer("causal_mask", causal_mask, persistent=False)
+    #     h_scale = torch.cat([torch.ones(1), torch.full((max(dq - 1, 0),), gamma)]).view(1, dq, 1)
+    #     self.register_buffer("h_scale", h_scale, persistent=False)
+    #
+    # def _mha(self, x, values, attn_mask):   # Q/K-only, weighted-sums RAW values (no V/out_proj)
+    #     N, T, D = x.shape
+    #     H, hd = self.n_heads, self.head_dim
+    #     q = self.q_proj(x).view(N, T, H, hd).transpose(1, 2)
+    #     k = self.k_proj(x).view(N, T, H, hd).transpose(1, 2)
+    #     v = values.view(N, T, H, hd).transpose(1, 2)
+    #     y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    #     return y.transpose(1, 2).reshape(N, T, D)
+    #
+    # def _forward_fixed(self, h, true_bits):
+    #     N, _ = h.shape
+    #     bit_ids = (true_bits > 0).long()
+    #     val_embeds = self.bit_val_emb(bit_ids)
+    #     zero_vec = self.bos_val_emb.view(1, 1, -1).expand(N, 1, -1)
+    #     shifted = torch.cat([zero_vec, val_embeds[:, :-1, :]], dim=1)
+    #     pos = self.bit_pos_emb.weight.unsqueeze(0)
+    #     x = shifted + pos
+    #     attn_out = self._mha(x, values=shifted, attn_mask=self.causal_mask)
+    #     h_scaled = self.h_scale * h.unsqueeze(1)
+    #     fetched = torch.cat([h_scaled, attn_out], dim=-1)
+    #     return torch.einsum("njd,jd->nj", fetched, self.head.weight) + self.head.bias.unsqueeze(0)
+    #
+    # def _forward_loop(self, h, true_bits):
+    #     N, _ = h.shape
+    #     raw_vecs = [self.bos_val_emb.view(1, -1).expand(N, -1)]
+    #     logits_list = []
+    #     for j in range(self.dq):
+    #         raw = torch.stack(raw_vecs, dim=1)
+    #         x = raw + self.bit_pos_emb.weight[:j + 1].unsqueeze(0)
+    #         attn_out = self._mha(x, values=raw, attn_mask=None)[:, -1, :]
+    #         h_scale_j = 1.0 if j == 0 else self.gamma
+    #         fetched = torch.cat([h_scale_j * h, attn_out], dim=-1)
+    #         logit_j = F.linear(fetched, self.head.weight[j:j + 1], self.head.bias[j:j + 1]).squeeze(-1)
+    #         logits_list.append(logit_j)
+    #         if j < self.dq - 1:
+    #             bit_val = (true_bits[:, j] > 0).long() if true_bits is not None else (logit_j > 0).long()
+    #             raw_vecs.append(self.bit_val_emb(bit_val))
+    #     return torch.stack(logits_list, dim=1)
+    # ============================================================================================
+
+    def __init__(self, d_model: int, dq: int, n_heads: int = 2, gamma: float = 1.0, fixed_kernel: bool = True, downsample: int = 1, downsample_h: bool = False, per_position_head: bool = True):
         super().__init__()
         assert d_model % downsample == 0, f"d_model={d_model} not divisible by downsample={downsample}"
         d_inner = d_model // downsample
@@ -989,78 +1153,51 @@ class BitPredictHeadAttn(nn.Module):
         self.fixed_kernel = fixed_kernel
         self.n_heads = n_heads
         self.head_dim = d_inner // n_heads
-        # downsample>1: work internally at d_inner=d_model//downsample instead of d_model — a cheap
-        # in_proj down to d_inner up front, then every chain op (embeds/qkv/out_proj/head) runs at the
-        # smaller width. downsample=1 (default): in_proj is None, identical to pre-flag behavior, no
-        # extra op/params. Session: "flag to downsample bit predict embeds or inner".
-        self.in_proj = nn.Linear(d_model, d_inner) if downsample > 1 else None
-        # PER-POSITION head, CONCAT input (session revamp: "use indp head each timestep... use
-        # concat style like ssm" — mirrors BitPredictHeadSSM's own revamp exactly). dq SEPARATE
-        # [2*d_inner]-dim weight rows, one per bit position; input is [h_t ; attn_out] concatenated,
-        # not summed — see _forward_fixed/_forward_loop below.
-        self.head = nn.Linear(2 * d_inner, dq)
+        # downsample_h (session: "queue more experiments to test this hypothesis, repr loss because
+        # of downsample h") — False (default): h stays full d_model, as implemented above/in class
+        # docstring. True: restores the ORIGINAL (pre-this-session) behavior — h ALSO projected down
+        # to d_inner via in_proj before entering the concat — so the two can be A/B'd directly at the
+        # same downsample ratio to isolate whether downsampling h itself (not just the embeds) causes
+        # a real quality loss.
+        self.downsample_h = downsample_h
+        self.in_proj = nn.Linear(d_model, d_inner) if downsample_h and downsample > 1 else None
+        # v4 original: full QKV self-attention + out_proj (manual SDPA, not nn.MultiheadAttention —
+        # session found the latter's MPS backward produces NaN gradients at d_model=256).
+        self.qkv_proj = nn.Linear(d_inner, 3 * d_inner)
+        self.out_proj = nn.Linear(d_inner, d_inner)
         self.bit_pos_emb = nn.Embedding(dq, d_inner)
         self.bit_val_emb = nn.Embedding(2, d_inner)
-        # Trainable BOS embed for the attention sequence's own position-0 "previous bit" slot
-        # (session: "make zero_vec trainable embeds"). This is a DIFFERENT role from the
-        # earlier-removed head-level bos_val_emb: h_t reaching the head via CONCAT already gives
-        # position 0 a distinct signal at the HEAD's input, but inside `_mha` itself, position 0's
-        # query/key/value content was still a plain unadorned zero — attention has no way to tell
-        # "no previous bit exists yet" apart from "previous bit happened to embed near zero".
-        # Letting the model learn this placeholder gives attention a genuine, distinguishable
-        # start-of-chain signal to attend to/from.
-        self.bos_val_emb = nn.Parameter(torch.zeros(d_inner))
-        #
-        # Q/K-only attention, no V or out_proj (session revamp: "simplify _mha... remove out proj,
-        # v proj, only k and q proj, basically like weighted sum of h and embeds") — attention
-        # weights are still learned (via q_proj/k_proj), but what gets weighted-summed is the RAW
-        # (unprojected) bit-value embeddings themselves, not a learned value transform — a genuine
-        # soft causal lookup over actual embedding content. See _mha's own docstring for the
-        # SUPERSEDED full-QKV version, kept as a comment for reference.
-        self.q_proj = nn.Linear(d_inner, d_inner)
-        self.k_proj = nn.Linear(d_inner, d_inner)
+        # per_position_head (session: "for each self attn and ssm, allow indp heads for each
+        # timestep different head, on by default") — True (default): dq SEPARATE weight rows, one
+        # per bit position (the session's own earlier revamp idea, read via einsum in
+        # _forward_fixed, per-row slice in _forward_loop — same pattern BitPredictHeadSSM already
+        # uses unconditionally). False: v4's original SINGLE SHARED head, applied identically at
+        # every position via broadcasting. Independent of the full-QKV-vs-Q/K-only question (this
+        # class always uses full QKV+out_proj now, see class docstring) and of downsample_h above —
+        # three orthogonal axes, each toggleable on its own.
+        self.per_position_head = per_position_head
+        h_dim = d_inner if (downsample_h and downsample > 1) else d_model
+        self.head = nn.Linear(h_dim + d_inner, dq if per_position_head else 1)
         causal_mask = torch.triu(torch.full((dq, dq), float("-inf")), diagonal=1)
         self.register_buffer("causal_mask", causal_mask, persistent=False)
-        # _forward_fixed's own per-position h-scale: [1, gamma, gamma, ..., gamma] (dq values) —
-        # depends only on dq/gamma (compile-time constants), not on h/true_bits, so it was wasteful
-        # to rebuild via new_ones+cat on every single forward call. Precomputed once here instead.
         h_scale = torch.cat([torch.ones(1), torch.full((max(dq - 1, 0),), gamma)]).view(1, dq, 1)
         self.register_buffer("h_scale", h_scale, persistent=False)
 
-    def _mha_old_full_qkv(self, x: torch.Tensor, attn_mask: torch.Tensor | None) -> torch.Tensor:
-        """SUPERSEDED — kept as a comment/reference only, no longer called anywhere (session
-        revamp: "simplify _mha, comment current one, make new _mha, remove out proj, v proj, only
-        k and q proj, basically like weighted sum of h and embeds"). Full QKV self-attention +
-        out_proj — the values were a LEARNED projection of x, not the raw embedding content.
-        x: [N, T, D]. attn_mask: None, or additive float [T, T]. -> [N, T, D].
-
+    def _mha(self, x: torch.Tensor, attn_mask: torch.Tensor | None) -> torch.Tensor:
+        """v4 original: full QKV self-attention + out_proj. x: [N, T, d_inner] (bit-embeds/pos
+        ONLY — h no longer mixed in here, unlike v4's exact original, so d_inner never needs to
+        match h's own dimension). -> [N, T, d_inner]."""
         N, T, D = x.shape
         H, hd = self.n_heads, self.head_dim
         qkv = self.qkv_proj(x).reshape(N, T, 3, H, hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         return self.out_proj(y.transpose(1, 2).reshape(N, T, D))
-        """
-        raise NotImplementedError("superseded — see _mha")
-
-    def _mha(self, x: torch.Tensor, values: torch.Tensor, attn_mask: torch.Tensor | None) -> torch.Tensor:
-        """Session revamp: Q/K-only attention, no V or out_proj — "basically like weighted sum of
-        h and embeds." `x` (query/key scoring content, e.g. bit-embed + position) and `values`
-        (what actually gets weighted-summed, e.g. the raw bit-embed alone) may differ in CONTENT
-        but must share shape [N, T, D] — attention weights are still learned (via q_proj/k_proj),
-        but the output is a genuine soft causal average of `values`' own raw content, not a learned
-        value transform of it. -> [N, T, D]."""
-        N, T, D = x.shape
-        H, hd = self.n_heads, self.head_dim
-        q = self.q_proj(x).view(N, T, H, hd).transpose(1, 2)
-        k = self.k_proj(x).view(N, T, H, hd).transpose(1, 2)
-        v = values.view(N, T, H, hd).transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        return y.transpose(1, 2).reshape(N, T, D)
 
     def forward(self, h: torch.Tensor, true_bits: torch.Tensor | None = None) -> torch.Tensor:
-        """h: [N, D]. true_bits: [N, dq] float in {-1,+1}-ish (teacher-forcing) or None (greedy chain
-        decode at inference). -> raw_logits [N, dq]."""
+        """h: [N, D] — stays full d_model unless downsample_h=True (see __init__). true_bits:
+        [N, dq] float in {-1,+1}-ish (teacher-forcing) or None (greedy chain decode). -> raw_logits
+        [N, dq]."""
         if self.in_proj is not None:
             h = self.in_proj(h)
         if self.fixed_kernel and true_bits is not None:
@@ -1071,33 +1208,35 @@ class BitPredictHeadAttn(nn.Module):
         N, _ = h.shape
         bit_ids = (true_bits > 0).long()
         val_embeds = self.bit_val_emb(bit_ids)                      # [N, dq, d_inner]
-        zero_vec = self.bos_val_emb.view(1, 1, -1).expand(N, 1, -1)
-        # position j holds bit (j-1)'s value embed; position 0 holds the trainable BOS embed.
-        shifted = torch.cat([zero_vec, val_embeds[:, :-1, :]], dim=1)
+        zero_vec = val_embeds.new_zeros(N, 1, val_embeds.shape[-1])
+        shifted = torch.cat([zero_vec, val_embeds[:, :-1, :]], dim=1)   # position j holds bit j-1's embed
         pos = self.bit_pos_emb.weight.unsqueeze(0)
-        x = shifted + pos                                            # query/key scoring content
-        attn_out = self._mha(x, values=shifted, attn_mask=self.causal_mask)   # weighted-sum of RAW embeds
-        h_scaled = self.h_scale * h.unsqueeze(1)                     # [N, dq, d_inner] (broadcast)
-        fetched = torch.cat([h_scaled, attn_out], dim=-1)            # CONCAT, not add — like SSM
-        # per-position head via einsum (same fix already applied to BitPredictHeadSSM — computing
-        # the full [N,dq,dq] matrix then diagonal-selecting would waste an n-x factor of compute).
-        return torch.einsum("njd,jd->nj", fetched, self.head.weight) + self.head.bias.unsqueeze(0)
+        x = shifted + pos                                            # attention input: embeds/pos ONLY
+        attn_out = self._mha(x, attn_mask=self.causal_mask)          # [N, dq, d_inner]
+        h_scaled = self.h_scale * h.unsqueeze(1)                     # [N, dq, d_model] (broadcast)
+        fetched = torch.cat([h_scaled, attn_out], dim=-1)            # CONCAT — supports h at full d_model
+        if self.per_position_head:
+            # per-position: dq separate weight rows, einsum avoids the [N,dq,dq]-then-diagonal waste
+            return torch.einsum("njd,jd->nj", fetched, self.head.weight) + self.head.bias.unsqueeze(0)
+        return self.head(fetched).squeeze(-1)                        # shared head, broadcasts over dq
 
     def _forward_loop(self, h: torch.Tensor, true_bits: torch.Tensor | None) -> torch.Tensor:
         N, _ = h.shape
-        raw_vecs = [self.bos_val_emb.view(1, -1).expand(N, -1)]   # raw_vecs[k] = bit (k-1)'s value embed; k=0 is trainable BOS
+        chain_vecs = [self.bit_pos_emb.weight[0].unsqueeze(0).expand(N, -1)]   # position 0: pos-embed only, no h/bit content yet
         logits_list = []
         for j in range(self.dq):
-            raw = torch.stack(raw_vecs, dim=1)                        # [N, j+1, D] — values, no pos
-            x = raw + self.bit_pos_emb.weight[:j + 1].unsqueeze(0)     # query/key content, WITH pos
-            attn_out = self._mha(x, values=raw, attn_mask=None)[:, -1, :]
+            x = torch.stack(chain_vecs, dim=1)
+            attn_out = self._mha(x, attn_mask=None)[:, -1, :]
             h_scale_j = 1.0 if j == 0 else self.gamma
             fetched = torch.cat([h_scale_j * h, attn_out], dim=-1)     # CONCAT
-            logit_j = F.linear(fetched, self.head.weight[j:j + 1], self.head.bias[j:j + 1]).squeeze(-1)
+            if self.per_position_head:
+                logit_j = F.linear(fetched, self.head.weight[j:j + 1], self.head.bias[j:j + 1]).squeeze(-1)
+            else:
+                logit_j = self.head(fetched).squeeze(-1)
             logits_list.append(logit_j)
             if j < self.dq - 1:
                 bit_val = (true_bits[:, j] > 0).long() if true_bits is not None else (logit_j > 0).long()
-                raw_vecs.append(self.bit_val_emb(bit_val))
+                chain_vecs.append(self.bit_val_emb(bit_val) + self.bit_pos_emb.weight[j + 1])
         return torch.stack(logits_list, dim=1)
 
 
@@ -1122,22 +1261,43 @@ class BitPredictHeadConv(nn.Module):
     absolute position).
 
     conv_impl selects the implementation of that "shared Linear read of a
-    fixed-size window" — both are the SAME operation (same weight-sharing
-    property above), just different ops: "conv1d" (original) calls
-    nn.Conv1d directly; "matmul" (session: "reparam to use nn.linear
-    instead of conv1d") flattens the window into one [K*D] vector and
-    applies a plain nn.Linear(K*D, D) instead — mathematically the same
-    class of computation (fixed window, weights shared across positions),
-    just dispatched as a matmul instead of the conv op. Session
-    benchmark (scripts/bench_bit_heads.py) found nn.Conv1d has real
-    per-call overhead in the sequential decode loop (worst case ~3900x
-    slower than a plain independent nn.Linear head at dq=16, vs.
-    "matmul"'s expected much-flatter overhead) — kept BOTH as a flag
-    rather than replacing, matching the rest of this file's convention."""
+    fixed-size window": "conv1d" (original) calls nn.Conv1d directly;
+    "matmul" (session: "reparam to use nn.linear instead of conv1d")
+    flattens the window into one [K*D] vector and applies a plain
+    nn.Linear(K*D, D) instead — mathematically the same class of
+    computation (fixed window, weights shared across positions), just
+    dispatched as a matmul instead of the conv op. Session benchmark
+    (scripts/bench_bit_heads.py) found nn.Conv1d has real per-call
+    overhead in the sequential decode loop (worst case ~3900x slower than
+    a plain independent nn.Linear head at dq=16, vs. "matmul"'s expected
+    much-flatter overhead) — kept BOTH as a flag rather than replacing,
+    matching the rest of this file's convention.
+
+    "depthwise" (session: "make bitpredictconv more efficient... maybe
+    try group conv or depthwise") — both "conv1d" and "matmul" are FULLY
+    DENSE across channels: every one of the `d_inner` output channels
+    reads from every one of the `d_inner` input channels at every one of
+    the `K` window positions, costing `K*d_inner^2` params/FLOPs — the
+    actual "huge compute" (at `d_inner=256,K=dq=8`: 524,544 params,
+    ~8.4M FLOPs/example in `_forward_fixed`). "depthwise" gives each
+    channel its OWN private `K`-tap filter (no cross-channel mixing at
+    all — output channel c depends only on input channel c's own K-window
+    history), matching `nn.Conv1d(..., groups=d_inner)`'s classic
+    depthwise-separable-conv structure, but implemented as a plain einsum
+    (not `nn.Conv1d`) to keep the same loop-overhead-avoidance property
+    "matmul" was built for. Params/FLOPs drop by a full factor of
+    `d_inner` (256x at this scale: 2,304 params, ~32K FLOPs) — the
+    honest cost is losing all cross-channel mixing within the window read
+    (channel c's bit-history influence on channel c' happens only
+    indirectly, via `self.head`'s own read of the concatenated output,
+    not within the window-conv step itself). A true intermediate (grouped
+    conv, `1<groups<d_inner`) is a documented future generalization, not
+    implemented here — depthwise is the extreme, simplest, and cheapest
+    point on that spectrum."""
 
     def __init__(self, d_model: int, dq: int, kernel_size: int | None = None, gamma: float = 1.0, conv_impl: str = "matmul", downsample: int = 1):
         super().__init__()
-        assert conv_impl in ("conv1d", "matmul")
+        assert conv_impl in ("conv1d", "matmul", "depthwise")
         assert d_model % downsample == 0, f"d_model={d_model} not divisible by downsample={downsample}"
         d_inner = d_model // downsample
         self.dq = dq
@@ -1150,8 +1310,12 @@ class BitPredictHeadConv(nn.Module):
         self.bit_val_emb = nn.Embedding(2, d_inner)
         if conv_impl == "conv1d":
             self.conv = nn.Conv1d(d_inner, d_inner, kernel_size=self.kernel_size, bias=True)
-        else:
+        elif conv_impl == "matmul":
             self.proj = nn.Linear(self.kernel_size * d_inner, d_inner, bias=True)
+        else:   # depthwise
+            self.dw_weight = nn.Parameter(torch.empty(d_inner, self.kernel_size))
+            nn.init.kaiming_uniform_(self.dw_weight, a=5 ** 0.5)   # matches nn.Conv1d's own default init scheme
+            self.dw_bias = nn.Parameter(torch.zeros(d_inner))
 
     def forward(self, h: torch.Tensor, true_bits: torch.Tensor | None = None) -> torch.Tensor:
         if self.in_proj is not None:
@@ -1162,11 +1326,15 @@ class BitPredictHeadConv(nn.Module):
 
     def _window_read(self, x_windows: torch.Tensor) -> torch.Tensor:
         """x_windows: [N, D, dq, K] (oldest->newest along last dim) ->
-        [N, dq, D]. Dispatches on conv_impl; same op either way."""
+        [N, dq, D]. Dispatches on conv_impl."""
         if self.conv_impl == "conv1d":
             N, D, dq, K = x_windows.shape
             x_t = x_windows.permute(0, 2, 1, 3).reshape(N * dq, D, K)
             return self.conv(x_t).squeeze(-1).reshape(N, dq, D)
+        if self.conv_impl == "depthwise":
+            # per-channel K-tap filter, no cross-channel mixing — einsum keeps this loop-overhead-
+            # free like "matmul" (never touches nn.Conv1d, matching that impl's own rationale).
+            return torch.einsum("ndjk,dk->njd", x_windows, self.dw_weight) + self.dw_bias.view(1, 1, -1)
         N, D, dq, K = x_windows.shape
         flat = x_windows.permute(0, 2, 3, 1).reshape(N, dq, K * D)   # [N, dq, K*D]
         return self.proj(flat)
@@ -1199,9 +1367,157 @@ class BitPredictHeadConv(nn.Module):
             if self.conv_impl == "conv1d":
                 x = torch.stack(seq, dim=2)              # [N, D, kernel_size]
                 conv_out = self.conv(x).squeeze(-1)      # [N, D]
+            elif self.conv_impl == "depthwise":
+                x = torch.stack(seq, dim=2)              # [N, D, kernel_size]
+                conv_out = torch.einsum("ndk,dk->nd", x, self.dw_weight) + self.dw_bias.view(1, -1)
             else:
                 x = torch.cat(seq, dim=-1)                # [N, kernel_size*D], oldest->newest
                 conv_out = self.proj(x)                    # [N, D]
+            h_scale_j = 1.0 if j == 0 else self.gamma
+            fetched = h_scale_j * h + conv_out
+            logit_j = self.head(fetched).squeeze(-1)
+            logits_list.append(logit_j)
+            if j < self.dq - 1:
+                bit_val = (true_bits[:, j] > 0).long() if true_bits is not None else (logit_j > 0).long()
+                past.append(self.bit_val_emb(bit_val))
+        return torch.stack(logits_list, dim=1)
+
+
+class BitPredictHeadConvDilated(nn.Module):
+    """Dilated depthwise-separable causal conv STACK (WaveNet-style
+    receptive-field-doubling) — session: "do this stacked small kernel,
+    then check memory usage vs single large conv." PURELY LINEAR, no
+    activation between the stacked layers (session: "i mean for memory
+    and param save even though linear") — composing linear filters stays
+    linear, so this is representationally a SUBSET of what
+    BitPredictHeadConv's single full-width kernel can express (a real
+    expressivity cost, not a free win — see that class's own docstring
+    for the full analysis); this class exists purely to test the
+    params/FLOPs side of the tradeoff, independent of expressivity.
+
+    `dilation_base` (default 2): layer `l` (0-indexed) has kernel_size=
+    `dilation_base` and dilation=`dilation_base**l`. Layers stack until
+    the cumulative receptive field reaches `dq` — `L=ceil(log_b(dq))`
+    layers, `L*dilation_base` total taps/channel vs. a single K=dq
+    layer's `dq` taps (real savings whenever `dq` isn't already tiny —
+    see class-level session analysis in docs/kv_contribution.md §17).
+
+    `mode` (new): "depthwise" (default — per-channel, no cross-channel
+    mixing, as described above) or "dense" (session: "finish impl conv
+    dilated dense" — full cross-channel mixing at every layer, the
+    dilated-stack analogue of `BitPredictHeadConv`'s own dense "matmul"
+    impl, just split across `L` small-kernel layers instead of one big
+    `K=dq` kernel). Params scale `L*d_inner^2*dilation_base` (dense) vs.
+    `L*d_inner*dilation_base` (depthwise) — dense is still cheaper than a
+    single big dense kernel (`L*dilation_base` "tap-layers" vs. `dq`, same
+    ratio as depthwise's own savings) but nowhere near depthwise's own
+    per-channel reduction; it exists to test whether cross-channel mixing
+    (lost entirely in "depthwise") is worth restoring at dilated-stack
+    scale specifically.
+
+    `_forward_loop` (session: "check ar gen conv code, then train this" — generation support added
+    after an initial training-only version) reuses the SAME `_dilated_stack` helper `_forward_fixed`
+    does, called on the growing bit-history each step (recomputed from scratch every step, no
+    WaveNet-style FIFO cache) — simple and correct at this `dq` scale, the same tradeoff
+    `BitPredictHeadConv`'s own `_forward_loop` already makes. Verified fixed/loop-consistent
+    (`torch.allclose`, exact/near-exact match) for both `mode`s, plus a standalone greedy-decode
+    smoke test and downsample sanity check.
+
+    Uses plain tensors (`unfold`+`einsum`), never `nn.Conv1d`, in BOTH forward paths — session
+    diagnostic ("not dilated depthwise, but dilated full dense kernel") isolated `nn.Conv1d` itself
+    as the cause of an earlier ~300x slowdown vs. single-layer `depthwise` (298ms/fwd vs. 0.96ms),
+    independent of grouping (confirmed by testing `groups=1`/dense at each layer too — 14x faster
+    than `groups=d_inner`, but still ~22x slower than a pure-tensor-op single depthwise layer) — the
+    same issue `BitPredictHeadConv`'s own "matmul"/"depthwise" impls were already built to avoid.
+    `mode="dense"`'s own `_dilated_stack` einsum verified to exactly reproduce a real
+    `nn.Conv1d(groups=1)` stack (weights copied over, `torch.allclose` exact) — confirms the einsum
+    correctly implements standard dense dilated-conv semantics, just without `nn.Conv1d`'s overhead."""
+
+    def __init__(self, d_model: int, dq: int, dilation_base: int = 2, gamma: float = 1.0, downsample: int = 1, mode: str = "depthwise"):
+        super().__init__()
+        assert d_model % downsample == 0, f"d_model={d_model} not divisible by downsample={downsample}"
+        assert dilation_base >= 2
+        assert mode in ("depthwise", "dense")
+        d_inner = d_model // downsample
+        self.dq = dq
+        self.gamma = gamma
+        self.dilation_base = dilation_base
+        self.mode = mode
+        self.in_proj = nn.Linear(d_model, d_inner) if downsample > 1 else None
+        self.head = nn.Linear(d_inner, 1)
+        self.bit_val_emb = nn.Embedding(2, d_inner)
+
+        dilations, rf, l = [], 1, 0
+        while rf < dq:
+            dilations.append(dilation_base ** l)
+            rf += (dilation_base - 1) * dilation_base ** l
+            l += 1
+        self.dilations = dilations
+        self.receptive_field = rf   # >= dq (may overshoot on the last layer)
+        # PLAIN TENSORS, not nn.Conv1d — see class docstring. "depthwise": one [d_inner,
+        # dilation_base] weight per layer (no cross-channel mixing). "dense": one
+        # [d_inner_out, d_inner_in, dilation_base] weight per layer (full cross-channel mixing,
+        # the dilated-stack analogue of BitPredictHeadConv's own dense "matmul" impl).
+        if mode == "depthwise":
+            self.dw_weights = nn.ParameterList([
+                nn.Parameter(torch.empty(d_inner, dilation_base)) for _ in dilations
+            ])
+        else:
+            self.dw_weights = nn.ParameterList([
+                nn.Parameter(torch.empty(d_inner, d_inner, dilation_base)) for _ in dilations
+            ])
+        for w in self.dw_weights:
+            nn.init.kaiming_uniform_(w, a=5 ** 0.5)
+        self.dw_biases = nn.ParameterList([nn.Parameter(torch.zeros(d_inner)) for _ in dilations])
+
+    def forward(self, h: torch.Tensor, true_bits: torch.Tensor | None = None) -> torch.Tensor:
+        if self.in_proj is not None:
+            h = self.in_proj(h)
+        if true_bits is not None:
+            return self._forward_fixed(h, true_bits)
+        return self._forward_loop(h, true_bits)
+
+    def _dilated_stack(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [N, D, T] (any T, causally padded internally per layer) -> [N, D, T] — the shared
+        multi-layer dilated read used by both _forward_fixed (T=dq, one call) and _forward_loop
+        (T=j+1, recomputed from scratch each step j — simple and correct at this dq scale, same
+        "just recompute the window read on the growing history" tradeoff BitPredictHeadConv's own
+        _forward_loop already makes, no WaveNet-style FIFO cache needed)."""
+        for weight, bias, dilation in zip(self.dw_weights, self.dw_biases, self.dilations):
+            pad = dilation * (self.dilation_base - 1)                    # causal: left-pad only
+            x_padded = F.pad(x, (pad, 0))
+            span = pad + 1                                                # = dilation*(K-1)+1
+            windows = x_padded.unfold(2, span, 1)                         # [N, D_in, T, span]
+            windows = windows[..., ::dilation]                            # [N, D_in, T, K] — dilated taps
+            if self.mode == "depthwise":
+                x = torch.einsum("ndtk,dk->ndt", windows, weight) + bias.view(1, -1, 1)
+            else:   # dense — full cross-channel mixing, weight: [D_out, D_in, K]
+                x = torch.einsum("nctk,dck->ndt", windows, weight) + bias.view(1, -1, 1)
+            # output length stays T either way
+        return x
+
+    def _forward_fixed(self, h: torch.Tensor, true_bits: torch.Tensor) -> torch.Tensor:
+        N, D = h.shape
+        bit_ids = (true_bits > 0).long()
+        val_embeds = self.bit_val_emb(bit_ids)                          # [N, dq, D]
+        zero_vec = val_embeds.new_zeros(N, 1, D)
+        shifted = torch.cat([zero_vec, val_embeds[:, :-1, :]], dim=1)   # position j holds bit j-1's embed
+        x = self._dilated_stack(shifted.transpose(1, 2))                # [N, D, dq]
+        conv_out = x.transpose(1, 2)                                     # [N, dq, D]
+        h_scale = h.new_ones(1, self.dq, 1)
+        if self.dq > 1:
+            h_scale = torch.cat([h_scale[:, :1, :], h_scale[:, 1:, :] * self.gamma], dim=1)
+        fetched = h_scale * h.unsqueeze(1) + conv_out
+        return self.head(fetched).squeeze(-1)
+
+    def _forward_loop(self, h: torch.Tensor, true_bits: torch.Tensor | None) -> torch.Tensor:
+        N, D = h.shape
+        past: list[torch.Tensor] = []   # decided bits' raw embeddings so far, oldest first
+        logits_list = []
+        for j in range(self.dq):
+            seq = past if past else [h.new_zeros(N, D)]   # position 0: single zero "no history" step
+            x = torch.stack(seq, dim=2)                     # [N, D, len(seq)]
+            conv_out = self._dilated_stack(x)[:, :, -1]      # [N, D] — last position's own output
             h_scale_j = 1.0 if j == 0 else self.gamma
             fetched = h_scale_j * h + conv_out
             logit_j = self.head(fetched).squeeze(-1)
@@ -1262,7 +1578,7 @@ class BitPredictHeadSSM(nn.Module):
     sigmoid so it can approach but never algebraically equal exactly 0;
     in practice that's not a meaningful difference (sigmoid(-8) < 1e-3)."""
 
-    def __init__(self, d_model: int, dq: int, d_state: int | None = None, gamma: float = 1.0, downsample: int = 1):
+    def __init__(self, d_model: int, dq: int, d_state: int | None = None, gamma: float = 1.0, downsample: int = 1, downsample_h: bool = False, per_position_head: bool = True):
         super().__init__()
         assert d_model % downsample == 0, f"d_model={d_model} not divisible by downsample={downsample}"
         d_inner = d_model // downsample
@@ -1272,12 +1588,26 @@ class BitPredictHeadSSM(nn.Module):
         # recurrent state width too, consistent with the other two heads' in_proj. Still independently
         # overridable via d_state, same as before.
         self.d_state = d_state if d_state is not None else d_inner
-        # see BitPredictHeadAttn's own in_proj comment — same downsample flag, same "identity at 1x" property
-        self.in_proj = nn.Linear(d_model, d_inner) if downsample > 1 else None
-        # PER-POSITION head, CONCAT input (session: "let each bit timestep use different head...
-        # h_t always concat not add with current embed") — dq SEPARATE [2*d_inner]-dim weight rows,
-        # one dedicated to each bit position (see class docstring for the full rationale/history).
-        self.head = nn.Linear(2 * d_inner, dq)
+        # downsample_h (session: "queue more experiments to test this hypothesis, repr loss because
+        # of downsample h") — False (default): h stays full d_model throughout, no in_proj (session:
+        # "can the downsample flag only be applied on embeds, h maintains full dim"). True: restores
+        # the ORIGINAL (pre-this-session) behavior — h ALSO projected down to d_inner via in_proj —
+        # so the two can be A/B'd at the same downsample ratio to isolate whether downsampling h
+        # itself (not just the state machinery) causes a real quality loss. Feasible here (unlike
+        # BitPredictHeadHSoftmax) because h only ever reaches this class via CONCAT below, which
+        # doesn't require matching dims — see BitPredictHeadAttn's own docstring for the full
+        # reasoning (same change applied there).
+        self.downsample_h = downsample_h
+        self.in_proj = nn.Linear(d_model, d_inner) if downsample_h and downsample > 1 else None
+        # per_position_head (session: "for each self attn and ssm, allow indp heads for each
+        # timestep different head, on by default") — True (default): dq SEPARATE weight rows, one
+        # per bit position (session: "let each bit timestep use different head... h_t always concat
+        # not add with current embed"), read via einsum in _forward_fixed / per-row slice in
+        # _forward_loop. False: a single SHARED head instead (v4's original design), applied
+        # identically at every position via broadcasting.
+        self.per_position_head = per_position_head
+        h_dim = d_inner if (downsample_h and downsample > 1) else d_model
+        self.head = nn.Linear(h_dim + d_inner, dq if per_position_head else 1)
         self.bit_val_emb = nn.Embedding(2, self.d_state)
         self.state_proj = nn.Linear(self.d_state, d_inner)
         # trainable BOS state (session: "consider a trainable bos token init zero at dq 0") —
@@ -1307,7 +1637,6 @@ class BitPredictHeadSSM(nn.Module):
         return self._forward_loop(h, true_bits)
 
     def _forward_fixed(self, h: torch.Tensor, true_bits: torch.Tensor) -> torch.Tensor:
-        N, D = h.shape
         bit_ids = (true_bits > 0).long()
         val_embeds = self.bit_val_emb(bit_ids)                    # [N, dq, d_state]
         alpha = self._alpha()                                      # [d_state]
@@ -1321,31 +1650,171 @@ class BitPredictHeadSSM(nn.Module):
         # not a correction of a nonzero leak.
         bos = self.bos_state.view(1, 1, -1).expand(state_contrib.shape[0], 1, -1)
         state_contrib = torch.cat([bos, state_contrib[:, 1:, :]], dim=1)
-        h_scaled = self.h_scale * h.unsqueeze(1)                     # [N, dq, d_inner] (broadcast)
-        fetched = torch.cat([h_scaled, state_contrib], dim=-1)       # [N, dq, 2*d_inner] — CONCAT, not add
-        # einsum, not self.head(fetched)+diagonal: position j only ever needs its OWN weight row
-        # (self.head.weight[j]) dotted with its OWN fetched vector — computing the full [N,dq,dq]
-        # matrix and discarding every off-diagonal entry wasted an `n`x factor of compute/memory
-        # (session: "use einsum").
-        return torch.einsum("njd,jd->nj", fetched, self.head.weight) + self.head.bias.unsqueeze(0)
+        h_scaled = self.h_scale * h.unsqueeze(1)                     # [N, dq, D] (broadcast; D = d_model or d_inner)
+        fetched = torch.cat([h_scaled, state_contrib], dim=-1)       # [N, dq, D+d_inner] — CONCAT, not add
+        if self.per_position_head:
+            # einsum, not self.head(fetched)+diagonal: position j only ever needs its OWN weight row
+            # (self.head.weight[j]) dotted with its OWN fetched vector — computing the full [N,dq,dq]
+            # matrix and discarding every off-diagonal entry wasted an `n`x factor of compute/memory
+            # (session: "use einsum").
+            return torch.einsum("njd,jd->nj", fetched, self.head.weight) + self.head.bias.unsqueeze(0)
+        return self.head(fetched).squeeze(-1)                        # shared head, broadcasts over dq
 
     def _forward_loop(self, h: torch.Tensor, true_bits: torch.Tensor | None) -> torch.Tensor:
-        N, D = h.shape
+        N = h.shape[0]
         alpha = self._alpha()
         s = h.new_zeros(N, self.d_state)
         logits_list = []
         for j in range(self.dq):
             state_contrib = self.bos_state.view(1, -1).expand(N, -1) if j == 0 else self.state_proj(s)
             h_scale_j = 1.0 if j == 0 else self.gamma
-            fetched = torch.cat([h_scale_j * h, state_contrib], dim=-1)   # [N, 2*d_inner] — CONCAT
-            # position j's own dedicated weight row (self.head.weight[j])/bias — already O(d_inner)
-            # per step, no diagonal-select waste to fix here (only _forward_fixed had that).
-            logit_j = F.linear(fetched, self.head.weight[j:j + 1], self.head.bias[j:j + 1]).squeeze(-1)
+            fetched = torch.cat([h_scale_j * h, state_contrib], dim=-1)   # [N, D+d_inner] — CONCAT
+            if self.per_position_head:
+                # position j's own dedicated weight row (self.head.weight[j])/bias — already
+                # O(d_inner) per step, no diagonal-select waste to fix here (only _forward_fixed had that).
+                logit_j = F.linear(fetched, self.head.weight[j:j + 1], self.head.bias[j:j + 1]).squeeze(-1)
+            else:
+                logit_j = self.head(fetched).squeeze(-1)
             logits_list.append(logit_j)
             if j < self.dq - 1:
                 bit_val = (true_bits[:, j] > 0).long() if true_bits is not None else (logit_j > 0).long()
                 s = alpha * s + self.bit_val_emb(bit_val)
         return torch.stack(logits_list, dim=1)
+
+
+class BitPredictHeadWordPredict(nn.Module):
+    """Decomposes the dq-bit code into a chain of WORDS (`word_bits` bits each, a genuine
+    `2**word_bits`-way softmax per word) instead of individual bits — session: "design another
+    head, wordpredict, which decompose to word like 8 bit, 4 bit, useful for dq more than 8." A
+    middle ground between `BitPredictHeadHSoftmax`'s per-BIT binary tree (`dq` sequential steps,
+    each a cheap 2-way decision, `O(V)` params) and a single flat `V=2**dq`-way softmax (1 step,
+    `O(V)` params AND FLOPs) — `n_words=dq//word_bits` sequential steps, each a genuine
+    `2**word_bits`-way softmax classifier with NO position-sharing bottleneck within a word
+    (unlike attn/conv/ssm's own per-bit-position bottleneck — every outcome within a word gets its
+    own row of the word classifier, exactly like a small dense softmax).
+
+    Returns a LIST of `n_words` per-WORD logit tensors `[N, 2**word_bits]` each — a genuinely
+    different shape than every other BitPredictHead* (`[N, dq]` per-bit logits for
+    `chain_bce_loss`), since word classification is multi-class cross-entropy per word, not BCE.
+    Wired into the pipeline via `code_head_mode="word"` (new), with its own loss (`self.loss`,
+    below) and its own `LevelLM.forward`/generation dispatch — see those call sites.
+
+    Conditioning (session: "past chain prob conditioning make simpler but more expensive" — plain
+    concatenation of ALL previous words' own embeddings, growing linearly, instead of a
+    fixed-size recurrent/attention state): word `i`'s classifier reads `cat([h, embed(word_0), ...,
+    embed(word_{i-1})])`, dimension `d_model + i*d_embed` — genuinely SIMPLER than attn/ssm (no
+    recurrence/attention machinery at all, just concatenation) but genuinely MORE EXPENSIVE per
+    step (each word's own classifier weight matrix is strictly larger than the last).
+
+    `_forward_fixed` (session: "find way to parallel launch kernel, maybe pad" — teacher-forcing
+    means every word is already known upfront, so all `n_words` steps' own context vectors can be
+    built in parallel instead of sequentially) PADS every word's context to the same `max_dim` (the
+    LAST word's own width — the largest), zero-filling the unused tail, and reads all `n_words`
+    classifiers via ONE batched einsum against a single `[n_words, word_vocab, max_dim]` weight
+    tensor (padding columns naturally contribute 0 since their input is 0 — no separate masking
+    needed) — one kernel launch instead of `n_words` separate `nn.Linear` calls. `_forward_loop`
+    (autoregressive/generation) stays genuinely sequential (future words depend on GREEDILY decided
+    previous ones, can't be precomputed), reusing the same weight tensor via a sliced `F.linear`.
+
+    `word_bits` must evenly divide `dq`. `word_bits==dq` (`n_words=1`) DEGENERATES to a single flat
+    `V=2**dq`-way softmax classifier — no concat/embedding machinery at all, structurally IDENTICAL
+    to `byte_head_256way`/`byte_softmax_head_only`'s own plain `nn.Linear(D,vocab)` (verified via
+    direct numerical comparison) — the "compatibility" the session asked for.
+
+    `d_embed`: explicit override for each previous word's embedding width. If not given, derived
+    from `embed_downsample` (session: "if d_embed not given use embed_downsample param to down
+    sample x vs d") — `d_embed = d_model // embed_downsample`, matching every other
+    BitPredictHead*'s own downsample convention."""
+
+    def __init__(self, d_model: int, dq: int, word_bits: int = 8, d_embed: int | None = None, embed_downsample: int = 1):
+        super().__init__()
+        assert dq % word_bits == 0, f"word_bits={word_bits} must evenly divide dq={dq}"
+        self.dq = dq
+        self.d_model = d_model
+        self.word_bits = word_bits
+        self.n_words = dq // word_bits
+        self.word_vocab = 2 ** word_bits
+        if d_embed is None:
+            assert d_model % embed_downsample == 0, f"d_model={d_model} not divisible by embed_downsample={embed_downsample}"
+            d_embed = d_model // embed_downsample
+        self.d_embed = d_embed
+        # max_dim: the LAST word's own context width (d_model + (n_words-1)*d_embed) — every
+        # earlier word's own weight slice is padded up to this with dead (never-trained, since
+        # their input is always 0) columns, letting all n_words be read via one batched einsum.
+        self.max_dim = d_model + (self.n_words - 1) * d_embed
+        self.word_weight = nn.Parameter(torch.empty(self.n_words, self.word_vocab, self.max_dim))
+        self.word_bias = nn.Parameter(torch.zeros(self.n_words, self.word_vocab))
+        nn.init.kaiming_uniform_(self.word_weight, a=5 ** 0.5)
+        self.word_embed = None if self.n_words == 1 else nn.Embedding(self.word_vocab, d_embed)
+        # LSB-first within a word, matching dqbits_to_byte's own convention (powers = 2**arange(K)).
+        powers = 2 ** torch.arange(word_bits)
+        self.register_buffer("_word_powers", powers, persistent=False)
+
+    def _bits_to_words(self, true_bits: torch.Tensor) -> torch.Tensor:
+        """[N, dq] float in {-1,+1}-ish -> [N, n_words] long word indices in [0, word_vocab)."""
+        N = true_bits.shape[0]
+        bit_ids = (true_bits > 0).long().view(N, self.n_words, self.word_bits)
+        return (bit_ids * self._word_powers).sum(-1)
+
+    def forward(self, h: torch.Tensor, true_bits: torch.Tensor | None = None) -> list[torch.Tensor]:
+        """h: [N, d_model]. true_bits: [N, dq] (teacher-forcing) or None (greedy). -> list of
+        n_words tensors, each [N, 2**word_bits] — per-word logits, NOT per-bit [N, dq]."""
+        if true_bits is not None:
+            return self._forward_fixed(h, true_bits)
+        return self._forward_loop(h, true_bits)
+
+    def _forward_fixed(self, h: torch.Tensor, true_bits: torch.Tensor) -> list[torch.Tensor]:
+        N = h.shape[0]
+        if self.n_words == 1:
+            return [F.linear(h, self.word_weight[0, :, :self.d_model], self.word_bias[0])]
+        word_ints = self._bits_to_words(true_bits)              # [N, n_words]
+        word_embeds = self.word_embed(word_ints)                 # [N, n_words, d_embed]
+        ctx_all = h.new_zeros(N, self.n_words, self.max_dim)
+        ctx_all[:, :, :self.d_model] = h.unsqueeze(1)
+        for i in range(1, self.n_words):
+            # word i's context needs embeds of words 0..i-1 — a python loop here only builds the
+            # padded CONTEXT tensor (cheap indexing/concat), not the expensive classifier matmul
+            # itself, which happens once, batched, below.
+            flat = word_embeds[:, :i, :].reshape(N, i * self.d_embed)
+            ctx_all[:, i, self.d_model:self.d_model + i * self.d_embed] = flat
+        logits_all = torch.einsum("nid,ivd->niv", ctx_all, self.word_weight) + self.word_bias.unsqueeze(0)
+        return [logits_all[:, i, :] for i in range(self.n_words)]
+
+    def _forward_loop(self, h: torch.Tensor, true_bits: torch.Tensor | None) -> list[torch.Tensor]:
+        N = h.shape[0]
+        word_ints_true = self._bits_to_words(true_bits) if true_bits is not None else None
+        logits_list = []
+        ctx = h
+        for i in range(self.n_words):
+            active_dim = self.d_model + i * self.d_embed
+            logits_i = F.linear(ctx, self.word_weight[i, :, :active_dim], self.word_bias[i])
+            logits_list.append(logits_i)
+            if i < self.n_words - 1:
+                word_i = word_ints_true[:, i] if word_ints_true is not None else logits_i.argmax(-1)
+                ctx = torch.cat([ctx, self.word_embed(word_i)], dim=-1)
+        return logits_list
+
+    def loss(self, logits_list: list[torch.Tensor], true_bits: torch.Tensor) -> torch.Tensor:
+        """Sum of per-word cross-entropies, matching chain_bce_loss's own "sum over units, mean
+        over batch" convention."""
+        word_ints = self._bits_to_words(true_bits)   # [N, n_words]
+        per_word = torch.stack([
+            F.cross_entropy(logits_list[i], word_ints[:, i], reduction="none")
+            for i in range(self.n_words)
+        ], dim=1)   # [N, n_words]
+        return per_word.sum(-1).mean()
+
+    def logits_to_word_ints(self, logits_list: list[torch.Tensor]) -> torch.Tensor:
+        """argmax each word's own logits -> [N, n_words] long word indices (for generation/eval
+        accuracy, mirroring how every other head's raw_logits get argmax'd)."""
+        return torch.stack([logits_list[i].argmax(-1) for i in range(self.n_words)], dim=1)
+
+    def word_ints_to_bits(self, word_ints: torch.Tensor) -> torch.Tensor:
+        """[N, n_words] long -> [N, dq] float in {-1,+1} — inverse of _bits_to_words, LSB-first
+        within each word, for handing off to the same dq-bit representation every other head uses
+        (byte reconstruction / code hand-off to the level above)."""
+        bits = ((word_ints.unsqueeze(-1) >> torch.arange(self.word_bits, device=word_ints.device)) & 1)
+        return (2 * bits.reshape(word_ints.shape[0], self.dq).float() - 1)
 
 
 class BitPredictHeadHSoftmax(nn.Module):
@@ -1431,6 +1900,85 @@ class BitPredictHeadHSoftmax(nn.Module):
         return torch.stack(logits_list, dim=1)
 
 
+def _balanced_factors(V: int) -> tuple[int, int]:
+    """Largest v1<=sqrt(V) that evenly divides V, paired with v2=V//v1 — the
+    params/FLOPs-minimizing balanced split for FactoredSoftmaxHead (fixed
+    D, minimizing v1+v2 subject to v1*v2==V is achieved at the split
+    closest to sqrt(V), by AM-GM)."""
+    v1 = int(V ** 0.5)
+    while v1 > 1 and V % v1 != 0:
+        v1 -= 1
+    return v1, V // v1
+
+
+class FactoredSoftmaxHead(nn.Module):
+    """Kronecker-factored (2-stage) replacement for a dense `nn.Linear(D,
+    V)` classifier — session: "use structured matrix but to replace dense
+    linear map to 2**n way output softmax... some loss in repr ok for
+    params saving." Computes the V-way logit vector as an OUTER SUM of two
+    small projections instead of one dense D->V matrix:
+
+        logits[i,j] = f1(h)[i] + f2(h)[j]      (i in [0,v1), j in [0,v2))
+
+    reshaped to [V]. This is trivially a valid softmax classifier — it's
+    an ordinary softmax over a STRUCTURED logit vector, no chain-rule/
+    teacher-forcing machinery needed at all (unlike BitPredictHeadHSoftmax
+    or any BitPredictHead* — this head is parallel/one-shot, not
+    autoregressive over bits). Params drop from `V*D` to `D*(v1+v2)`,
+    minimized (by AM-GM) at the balanced split v1=v2=sqrt(V) — an ~8x
+    reduction at V=256,D=256 (v1=v2=16): `256*256=65,536` -> `256*32=
+    8,192`. FLOPs drop correspondingly (`2*D*V` -> `2*D*(v1+v2)+V`, since
+    the two small matmuls dominate and the outer-sum broadcast itself is
+    just `V` additions, no multiplies).
+
+    Cost: the reshaped [v1,v2] logit matrix is constrained to row-effect
+    + column-effect (additively separable) — it CANNOT express a genuine
+    "outcome i needs outcome j specifically" interaction term a dense
+    D->V map could. A real, honest representational cut, not free lunch —
+    this is the shallowest (2-stage) member of the same structured-matrix
+    family real butterfly/Monarch matrices generalize to log(V)/sqrt(V)
+    stages; deeper factorizations would push params/FLOPs down further at
+    real implementation-complexity cost, not attempted here."""
+
+    def __init__(self, d_model: int, vocab: int):
+        super().__init__()
+        v1, v2 = _balanced_factors(vocab)
+        self.v1, self.v2, self.vocab = v1, v2, vocab
+        self.f1 = nn.Linear(d_model, v1)
+        self.f2 = nn.Linear(d_model, v2)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """h: [..., D] -> logits [..., vocab]."""
+        l1 = self.f1(h)   # [..., v1]
+        l2 = self.f2(h)   # [..., v2]
+        logits = l1.unsqueeze(-1) + l2.unsqueeze(-2)   # [..., v1, v2]
+        return logits.reshape(*h.shape[:-1], self.vocab)
+
+
+class LowRankSoftmaxHead(nn.Module):
+    """The classic "softmax bottleneck" (Yang et al. 2018) — a rank-r
+    approximation of a dense `nn.Linear(D,V)`, via `h -> Linear(D,r) ->
+    Linear(r,V)`. Session ask: "how good is factoredsoftmax vs just low
+    rank... analyze rank." Unlike FactoredSoftmaxHead's outer-sum (which
+    additionally forces every class's direction into a rigid, zero-free-
+    parameter `w1_i+w2_j` additive template), this keeps a genuine free
+    r-dim coefficient vector PER CLASS (a full row of the r->V matrix) —
+    strictly more expressive than FactoredSoftmaxHead at matched rank/
+    param budget (every outer-sum-representable logit matrix is also a
+    rank-(v1+v2) low-rank-representable one, but not vice versa). The
+    honest cost is exactly the rank-r bottleneck the cited paper studies:
+    classes are restricted to a shared r-dim subspace of R^D, whatever
+    else is free within it."""
+
+    def __init__(self, d_model: int, vocab: int, rank: int):
+        super().__init__()
+        self.down = nn.Linear(d_model, rank)
+        self.up = nn.Linear(rank, vocab)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(h))
+
+
 def chain_bce_loss(raw_logits: torch.Tensor, true_bits: torch.Tensor) -> torch.Tensor:
     """Sum over the bit dim (nats per predicted unit), then mean over
     everything else — matches qcutelm_vlt11/qcute_refine's own convention."""
@@ -1444,13 +1992,15 @@ def build_bit_head(cfg: Config, d_model: int, dq: int) -> nn.Module:
     code_head_mode=="chain" head) gets built, so switching architectures
     is one flag, not per-call-site edits."""
     if cfg.bit_head_class == "attn":
-        return BitPredictHeadAttn(d_model, dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel, downsample=cfg.bit_inner_downsample)
+        return BitPredictHeadAttn(d_model, dq, cfg.bit_chain_n_heads, cfg.bit_chain_gamma, cfg.bit_chain_fixed_kernel, downsample=cfg.bit_inner_downsample, downsample_h=cfg.bit_downsample_h, per_position_head=cfg.bit_per_position_head)
     elif cfg.bit_head_class == "conv":
         return BitPredictHeadConv(d_model, dq, kernel_size=cfg.bit_conv_kernel_size, gamma=cfg.bit_chain_gamma, conv_impl=cfg.bit_conv_impl, downsample=cfg.bit_inner_downsample)
     elif cfg.bit_head_class == "ssm":
-        return BitPredictHeadSSM(d_model, dq, d_state=cfg.bit_ssm_d_state, gamma=cfg.bit_chain_gamma, downsample=cfg.bit_inner_downsample)
+        return BitPredictHeadSSM(d_model, dq, d_state=cfg.bit_ssm_d_state, gamma=cfg.bit_chain_gamma, downsample=cfg.bit_inner_downsample, downsample_h=cfg.bit_downsample_h, per_position_head=cfg.bit_per_position_head)
     elif cfg.bit_head_class == "hsoftmax":
         return BitPredictHeadHSoftmax(d_model, dq, downsample=cfg.bit_inner_downsample)
+    elif cfg.bit_head_class == "conv_dilated":
+        return BitPredictHeadConvDilated(d_model, dq, dilation_base=cfg.conv_dilated_base, gamma=cfg.bit_chain_gamma, downsample=cfg.bit_inner_downsample, mode=cfg.conv_dilated_mode)
     else:
         raise ValueError(f"unknown bit_head_class {cfg.bit_head_class!r}")
 
@@ -1546,9 +2096,14 @@ class LevelLM(nn.Module):
             self.ntp_head = shared_head.ntp_head
             self.code_pre = shared_head.code_pre
         else:
-            assert cfg.code_head_mode in ("independent", "chain")
+            assert cfg.code_head_mode in ("independent", "chain", "word")
             self.embed = CodeEmbed(cfg, dq, D)
-            self.ntp_head = nn.Linear(D, dq) if cfg.code_head_mode == "independent" else build_bit_head(cfg, D, dq)
+            if cfg.code_head_mode == "independent":
+                self.ntp_head = nn.Linear(D, dq)
+            elif cfg.code_head_mode == "word":
+                self.ntp_head = BitPredictHeadWordPredict(D, dq, word_bits=cfg.word_bits, d_embed=cfg.word_d_embed, embed_downsample=cfg.word_embed_downsample)
+            else:
+                self.ntp_head = build_bit_head(cfg, D, dq)
             self.code_pre = nn.Linear(D, dq)
 
         if self.is_byte_level and cfg.byte_softmax_head_only:
@@ -1563,6 +2118,20 @@ class LevelLM(nn.Module):
             # aliasing to remain correct; self.byte_softmax_head is what forward() actually reads
             # for byte-level prediction under this flag.
             self.byte_softmax_head = nn.Linear(D, cfg.vocab)
+
+        if self.is_byte_level and cfg.byte_head_factored:
+            # ABLATION, same narrow shape as byte_softmax_head_only above (embed/code_pre stay
+            # shared) — only the readout differs: FactoredSoftmaxHead (outer-sum, structured/
+            # cheap) instead of a dense nn.Linear(D,vocab). See Config.byte_head_factored's own
+            # docstring for the params/FLOPs/rank tradeoff.
+            self.byte_factored_head = FactoredSoftmaxHead(D, cfg.vocab)
+
+        if self.is_byte_level and cfg.byte_head_lowrank:
+            # ABLATION, same narrow shape again — readout is LowRankSoftmaxHead (the classic
+            # softmax bottleneck) instead of dense or outer-sum. See Config.byte_head_lowrank's
+            # own docstring for why this is expected to strictly beat byte_head_factored at
+            # matched rank/param budget.
+            self.byte_lowrank_head = LowRankSoftmaxHead(D, cfg.vocab, cfg.byte_head_rank)
 
         if shared is not None:
             self.blocks = shared.blocks
@@ -1710,6 +2279,37 @@ class LevelLM(nn.Module):
                 ntp_loss = F.cross_entropy(logits, target)
                 with torch.no_grad():
                     ntp_acc = (logits.argmax(-1) == target).float().mean()
+            elif self.is_byte_level and cfg.byte_head_factored:
+                # narrower ablation, same shape as byte_softmax_head_only above — readout is
+                # self.byte_factored_head (outer-sum) instead of a dense head.
+                target = seq_repr[:, 1:].reshape(-1)
+                logits = self.byte_factored_head(h_flat)
+                ntp_loss = F.cross_entropy(logits, target)
+                with torch.no_grad():
+                    ntp_acc = (logits.argmax(-1) == target).float().mean()
+            elif self.is_byte_level and cfg.byte_head_lowrank:
+                # narrower ablation, same shape again — readout is self.byte_lowrank_head (the
+                # classic softmax bottleneck) instead of a dense or outer-sum head.
+                target = seq_repr[:, 1:].reshape(-1)
+                logits = self.byte_lowrank_head(h_flat)
+                ntp_loss = F.cross_entropy(logits, target)
+                with torch.no_grad():
+                    ntp_acc = (logits.argmax(-1) == target).float().mean()
+            elif cfg.code_head_mode == "word":
+                if self.is_byte_level:
+                    true_flat_full = byte_to_dqbits(seq_repr[:, 1:], dq).reshape(-1, dq)
+                else:
+                    true_flat_full = seq_repr[:, 1:, :].reshape(-1, dq)
+                raw_list = self.ntp_head(h_flat, true_flat_full)
+                ntp_loss = self.ntp_head.loss(raw_list, true_flat_full)
+                with torch.no_grad():
+                    pred_bits = self.ntp_head.word_ints_to_bits(self.ntp_head.logits_to_word_ints(raw_list))
+                    if self.is_byte_level:
+                        pred_byte = dqbits_to_byte(pred_bits)
+                        true_byte = seq_repr[:, 1:].reshape(-1)
+                        ntp_acc = (pred_byte == true_byte).float().mean()
+                    else:
+                        ntp_acc = ((pred_bits > 0) == (true_flat_full > 0)).float().mean()
             else:
                 if self.is_byte_level:
                     true_flat_full = byte_to_dqbits(seq_repr[:, 1:], dq).reshape(-1, dq)
@@ -1989,6 +2589,15 @@ def _sample_next_byte(model: "RefineLM", h_last: torch.Tensor) -> torch.Tensor:
     if model.cfg.byte_softmax_head_only:
         return enc0.byte_softmax_head(h_last).argmax(-1)   # own private vocab head; embed/code_pre
                                                               # still the shared dq-bit ones elsewhere
+    if model.cfg.byte_head_factored:
+        return enc0.byte_factored_head(h_last).argmax(-1)   # own private outer-sum head
+    if model.cfg.byte_head_lowrank:
+        return enc0.byte_lowrank_head(h_last).argmax(-1)   # own private low-rank-bottleneck head
+    if model.cfg.code_head_mode == "word":
+        logits_list = enc0.ntp_head(h_last)   # list of n_words tensors, greedy (true_bits=None)
+        word_ints = enc0.ntp_head.logits_to_word_ints(logits_list)
+        raw = enc0.ntp_head.word_ints_to_bits(word_ints)
+        return dqbits_to_byte(raw)
     raw = enc0.ntp_head(h_last)   # [B, dq] independent-bit logits, shared head
     return dqbits_to_byte(raw)   # crops to the first 8 bits — see dqbits_to_byte's own docstring
 
@@ -2402,14 +3011,24 @@ def main():
     p.add_argument("--bit_chain_n_heads", type=int, default=2)
     p.add_argument("--bit_chain_gamma", type=float, default=1.0)
     p.add_argument("--bit_chain_fixed_kernel", type=lambda x: x.lower() != "false", default=True)
-    p.add_argument("--bit_head_class", type=str, default="attn", choices=["attn", "conv", "ssm", "hsoftmax"])
+    p.add_argument("--bit_head_class", type=str, default="attn", choices=["attn", "conv", "ssm", "hsoftmax", "conv_dilated"])
     p.add_argument("--bit_conv_kernel_size", type=int, default=None)
-    p.add_argument("--bit_conv_impl", type=str, default="matmul", choices=["conv1d", "matmul"])
+    p.add_argument("--bit_conv_impl", type=str, default="matmul", choices=["conv1d", "matmul", "depthwise"])
     p.add_argument("--bit_inner_downsample", type=int, default=1)
+    p.add_argument("--bit_downsample_h", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--bit_per_position_head", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--bit_ssm_d_state", type=int, default=None)
-    p.add_argument("--code_head_mode", type=str, default="independent", choices=["independent", "chain"])
+    p.add_argument("--conv_dilated_base", type=int, default=2)
+    p.add_argument("--conv_dilated_mode", type=str, default="depthwise", choices=["depthwise", "dense"])
+    p.add_argument("--code_head_mode", type=str, default="independent", choices=["independent", "chain", "word"])
+    p.add_argument("--word_bits", type=int, default=8)
+    p.add_argument("--word_d_embed", type=int, default=None)
+    p.add_argument("--word_embed_downsample", type=int, default=1)
     p.add_argument("--byte_head_256way", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--byte_softmax_head_only", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--byte_head_factored", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--byte_head_lowrank", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--byte_head_rank", type=int, default=None)
     p.add_argument("--code_ntp_weight", type=float, default=1.0)
     p.add_argument("--byte_ntp_weight", type=float, default=1.0)
     p.add_argument("--fusion_ntp_weight", type=float, default=1.0)
@@ -2481,8 +3100,13 @@ def main():
         bit_chain_fixed_kernel=args.bit_chain_fixed_kernel, bit_head_class=args.bit_head_class,
         bit_conv_kernel_size=args.bit_conv_kernel_size, bit_conv_impl=args.bit_conv_impl,
         bit_inner_downsample=args.bit_inner_downsample, bit_ssm_d_state=args.bit_ssm_d_state,
+        bit_downsample_h=args.bit_downsample_h, bit_per_position_head=args.bit_per_position_head,
+        conv_dilated_base=args.conv_dilated_base, conv_dilated_mode=args.conv_dilated_mode,
         code_head_mode=args.code_head_mode, byte_head_256way=args.byte_head_256way,
+        word_bits=args.word_bits, word_d_embed=args.word_d_embed, word_embed_downsample=args.word_embed_downsample,
         byte_softmax_head_only=args.byte_softmax_head_only,
+        byte_head_factored=args.byte_head_factored, byte_head_lowrank=args.byte_head_lowrank,
+        byte_head_rank=args.byte_head_rank,
         code_ntp_weight=args.code_ntp_weight, byte_ntp_weight=args.byte_ntp_weight,
         fusion_ntp_weight=args.fusion_ntp_weight,
         quant_type=args.quant_type, code_bits=args.code_bits, gumbel_tau=args.gumbel_tau,

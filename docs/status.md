@@ -752,6 +752,122 @@ table and detail in
 `v4_1_k32_narrow_shared` (the KEY isolator run) is now running — the
 last item in the queue.
 
+**`v4_1_k32_narrow_shared` finished: best_val_bpb 2.5254 — ANSWERS the
+long-open instability question.** Close to `byte256`/`simplex_l2`
+(2.5660/2.5892), far better than the fully-shared `v4_2_k32_narrow`
+baseline (4.0369). **Trunk-sharing ALONE (v4.1's own design — one trunk
+reused across levels, nothing else unshared) is NOT what causes v4.2's
+instability/underfitting.** v4.2 additionally shares the embed table,
+NTP head, AND `code_pre` across every level — it's specifically that
+EXTRA layer of sharing, not trunk-sharing itself, that's responsible.
+Every v4.2 config that partially/fully unshares embed/head recovers most
+or all of the gap to this healthy result — consistent across the whole
+session's ablation family. Full detail in
+[docs/kv_contribution.md](kv_contribution.md) §17.
+
+**Structured/cheap alternatives to a dense V-way softmax classifier**
+(session: "use structured matrix... replace dense linear map to 2**n way
+output softmax... some loss in repr ok for params saving"): new
+`FactoredSoftmaxHead` (outer-sum of two small D->v1/D->v2 projections,
+`v1*v2==vocab`) — 8x fewer params/FLOPs than dense at vocab=256 (8,224 vs
+65,792 params). Session then asked to compare against plain low-rank
+("how good is factoredsoftmax vs just low rank... analyze rank") — new
+`LowRankSoftmaxHead` (classic softmax bottleneck) is THEORETICALLY MORE
+EXPRESSIVE at matched budget: factored forces every class into a rigid
+zero-free-parameter `w1_i+w2_j` template, while low-rank gives every
+class its own free coefficient vector within the same rank ceiling — a
+strict superset. Both queued (`byte_factored`/`byte_lowrank`, rank=16
+matched budget) for a direct empirical test. Also implemented (from an
+earlier ask): `BitPredictHeadHSoftmax`, classic hierarchical softmax
+over the dq-bit tree — gives every one of `2**dq-1` tree NODES its own
+weight vector (unlike attn/conv/ssm's one-direction-per-POSITION,
+shared-across-every-prefix bottleneck) — measured FLOP savings vs dense
+softmax grow from 31x (dq=8) to 3,855x (dq=16), though params stay tied
+to dense at every scale. Full tables in
+[docs/kv_contribution.md](kv_contribution.md) §17.
+
+**`BitPredictHeadConv` made ~171x/228x cheaper via a depthwise
+`conv_impl`** (session: "consider making bitpredictconv more efficient,
+last time huge compute, maybe try group conv or depthwise") — the
+existing "conv1d"/"matmul" impls are fully dense across channels,
+costing 525,313 params / 8,392,704 FLOPs at full width, the actual "huge
+compute" referenced. New `conv_impl="depthwise"` (per-channel K-tap
+filters, no cross-channel mixing, via `einsum` not `nn.Conv1d`): 3,073
+params / 36,864 FLOPs — cheap enough to finally test `conv` at full
+width for the first time this session. Also built `BitPredictHeadConvDilated`,
+a WaveNet-style dilated conv stack — hit and then FIXED a real ~300x
+wallclock regression along the way: the first version used `nn.Conv1d`
+directly per layer (assumed safe since only called in the parallel/
+batched path), measured at 298ms/fwd; swapping to `unfold`+`einsum` (no
+`nn.Conv1d` at all, same fix `BitPredictHeadConv`'s own impls already
+use) brought it to 0.53ms/fwd — the FASTEST chain-head variant
+benchmarked this session. Generation support (`_forward_loop`) added
+afterward and verified (`validate_generation` parity, exact match); now
+wired into `Config.bit_head_class="conv_dilated"`/`build_bit_head`/CLI
+and queued for training (`conv_dilated`, `mode="depthwise"`). A `"dense"`
+mode (full cross-channel mixing per layer, verified to exactly reproduce
+a real `nn.Conv1d(groups=1)` stack) was also finished — ~25% fewer
+params/FLOPs than a single big dense kernel, but actually SLOWER in
+wallclock at this scale (per-layer overhead dominates) — not queued for
+training, a useful negative data point. Full writeup in
+[docs/kv_contribution.md](kv_contribution.md) §17.
+
+**`v4_1_k32_narrow_shared` finished: best_val_bpb 2.5254.** Close to
+`byte256`/`simplex_l2`, far better than the fully-shared `v4_2_k32_narrow`
+baseline (4.0369) — answers the long-open instability question: trunk-
+sharing ALONE is NOT what causes v4.2's instability/underfitting. v4.2
+additionally shares the embed table, NTP head, and `code_pre` across
+every level — it's specifically that extra sharing, not trunk-sharing
+itself, responsible. Every v4.2 config that partially/fully unshares
+embed/head recovers most or all of the gap. Full detail in
+[docs/kv_contribution.md](kv_contribution.md) §17.
+
+**`downsample` decoupled from `h`'s own dimension for Attn/SSM** (session:
+"can the downsample flag only be applied on embeds, h maintains full
+dim") — feasible for concat-based heads (Attn, SSM: drop `in_proj`, keep
+`h` full-width in the concat) but NOT possible for `BitPredictHeadHSoftmax`
+(its `h @ node_weight` is a genuine dot product, fundamentally requiring
+matching dims) and not attempted yet for Conv/ConvDilated (add-based,
+would need an add->concat conversion first). While implementing this,
+**`BitPredictHeadAttn` was reverted to v4's original design** (full QKV
+self-attention + `out_proj`, single shared head) — the session's own
+earlier revamp (concat/per-position/Q-K-only/`bos_val_emb`) was found to
+REGRESS empirically (§16/§17: 3.5659 vs. the original's 3.2067), so
+rather than retrofit the h-decoupling onto an already-worse design, this
+starts from the design that actually worked. The revamped version is
+preserved as a commented-out reference block, not deleted. Full detail
+in [docs/kv_contribution.md](kv_contribution.md) §18.
+
+Follow-up (session: "queue more experiments to test this hypothesis,
+repr loss because of downsample h," and "allow indp heads for each
+timestep... on by default"): added `downsample_h`/`per_position_head`
+flags to both classes so the pre-decoupling behavior can be A/B'd
+directly against the new one at the same downsample ratio. Four configs
+queued: `attn_id4_hfull`/`attn_id4_hds`, `ssm_id4_hfull`/`ssm_id4_hds`.
+
+**`BitPredictHeadWordPredict`** (new — session: "design another head,
+wordpredict, which decompose to word like 8 bit, 4 bit... implement
+until done complete with ar gen and config to queue"). Decomposes the
+dq-bit code into `n_words=dq//word_bits` WORDS, each a genuine
+`2**word_bits`-way softmax — a middle ground between hierarchical
+softmax's per-bit tree and one expensive flat `V=2**dq` softmax. Word
+`i`'s classifier conditions on `cat([h, embed(word_0),...,embed(word_
+{i-1})])` (session: "past chain prob conditioning make simpler but more
+expensive" — plain concat, growing linearly, no recurrence/attention).
+`word_bits==dq` degenerates to a single flat softmax, verified numerically
+identical to a plain `nn.Linear`. Fully wired end-to-end (new `code_head_
+mode="word"`, own loss, own generation path) and verified (fixed/loop
+consistency, gradients, causality, full-model integration,
+`validate_generation` parity). `_forward_fixed` batches all words into
+ONE kernel launch via padding (session: "find way to parallel launch
+kernel, maybe pad") instead of `n_words` separate matmuls. Two configs
+queued: `word4` (`word_bits=4`) and `word2` (`word_bits=2`). Full detail
+in [docs/kv_contribution.md](kv_contribution.md) §19.
+
+Full queue as of this writing: `byte_lowrank` (running) -> `conv_depthwise`
+-> `conv_dilated` -> `hsoftmax` -> `attn_id4_hfull` -> `attn_id4_hds` ->
+`ssm_id4_hfull` -> `ssm_id4_hds` -> `word4` -> `word2`.
+
 **Housekeeping (this session)**: `EncoderLevel` renamed to `LevelLM`
 throughout `qcute_refine_v4.py` — the class does both the "encode"
 (PASS 1, produce the code) and "decode" (PASS 2, fused/conditioned
