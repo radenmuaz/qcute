@@ -640,3 +640,358 @@ own "prefer simple things" lesson:
    levels if the levels being routed to don't move the number.
 
 Not yet implemented — this file records the design space, not a result.
+
+## MoE adaptive-timescale compute: routing by regularity structure, not just depth
+
+Axis 2 (gated fusion) and Axis 4 (level-depth routing) above both route
+by "how much compute does this span deserve" along a single fixed `Ks`
+tower. A genuinely different framing, prompted by asking what a
+byte-level model could exploit across very different data domains (audio,
+video, 2D images, 3D voxels/point clouds, text, sensor/actuator control
+streams): different spans of the SAME stream, or entire different
+streams, have different **characteristic timescales of regularity** —
+the raw-byte distance over which a byte becomes predictable from context
+— and that timescale is itself a property worth routing on, not just
+"hard vs. easy."
+
+**The idea**: instead of one `Ks` tower with a router deciding how deep
+to go, instantiate several parallel towers ("timescale experts") at
+different fixed `Ks` profiles — e.g. a fast expert `Ks=(4,4)` (short block
+spans, good for content that decorrelates quickly: text at the
+morpheme/word scale, transient audio onsets, high-frequency sensor
+noise) and a slow expert `Ks=(64,64)` (long block spans, good for content
+that's redundant over long stretches: sustained audio tones, static
+video background, slowly-drifting sensor baselines) — and a lightweight
+router picks WHICH expert's tower actually processes a given span. This
+is Axis 2's discrete/hard mode generalized from "which LEVEL of one
+tower" to "which TOWER entirely," and Axis 4's compute-allocation router
+generalized from a depth knob to a genuinely different `Ks` hyperparameter
+per expert. Cheapest test, following this file's own "prefer simple
+things first" pattern: reuse Axis 4's exact masked-but-computed sketch,
+just with `self.encoders[i]` replaced by "tower A vs. tower B" instead of
+"level `i` vs. level `i+1`" — same straight-through/load-balancing
+caveats apply unchanged.
+
+**Why timescale (not just difficulty) is the right routing signal**:
+Axis 4's entropy-based router asks "is this span hard to predict right
+now." A pure difficulty signal conflates two different things that call
+for different fixes — a span can be locally UNPREDICTABLE (genuinely high
+entropy, needs a deeper/wider receptive field to resolve at all — the
+existing Axis 4 case) or locally predictable but only over a LONG
+horizon (needs a coarser block stride to reach far back cheaply, not more
+depth at the current stride). Routing only on entropy conflates these;
+a periodic audio waveform's individual samples can be "easy" (low
+per-byte entropy, an entropy router would send it to the shallow expert)
+while still needing the SLOW expert's long stride to actually capture the
+periodicity's ancestor lag — the two signals point in different
+directions for exactly the content this idea is meant to help with. A
+second, cheap router feature alongside entropy — local autocorrelation
+peak lag, computed the same way pitch detection or period-finding does
+(cheap: FFT or autocorrelation over a short trailing window, no learned
+parameters) — is a more direct proxy for "what timescale is this content's
+regularity actually operating at" than entropy alone.
+
+## Limits and feasibility of exploiting byte-level regularity across domains
+
+The byte-level premise this whole codebase is built on — one causal LM
+over raw bytes, domain-agnostic — is a genuine strength (no hand-built
+tokenizer, one architecture serves any byte stream) but the amount of
+exploitable regularity, and the SHAPE of that regularity, differs sharply
+by domain. Worth being explicit about where the premise is strong, where
+it's weak, and what (if anything) narrows the gap without abandoning
+byte-agnosticism.
+
+**What "regularity" byte-level models can actually exploit, in general**:
+statistical redundancy (local predictability — the thing cross-entropy
+loss directly optimizes), long-range periodicity/self-similarity
+(exploitable only if context length and hierarchy reach far enough — this
+is exactly what the `Ks` tower and its receptive field, see the tiling
+math above, are FOR), and compositionality (recurring substructures —
+words, motifs, repeated waveform cycles — which is what the hierarchical
+code levels are meant to discover and hand off, functioning as an
+implicitly learned tokenizer). None of this requires knowing the domain;
+all of it requires enough context and enough hierarchy depth to actually
+reach the regularity's timescale, which is a genuine, measurable limit,
+not just an engineering inconvenience — a model with `context_len=1024`
+structurally cannot exploit a regularity with characteristic period
+>1024 bytes no matter how well trained.
+
+**Domain-by-domain feasibility**:
+
+- **Text**: the domain this codebase already targets and the best fit for
+  flat byte-stream causal modeling — linguistic structure (morphemes,
+  words, phrases) is ALREADY naturally sequential and local in byte order,
+  so a 1D causal hierarchy's locality assumption matches the data's own
+  structure almost exactly. [docs/bpe_like_boundaries.md](bpe_like_boundaries.md)'s
+  entropy-boundary finding (learned code boundaries land close to
+  BPE/whitespace boundaries) is direct evidence the byte-level premise
+  pays off here specifically because text's regularity IS sequential.
+
+- **Raw audio (PCM)**: high sample rate means extreme short-range
+  redundancy (adjacent samples are nearly identical) but the perceptually
+  important structure — pitch period, phoneme duration, rhythm — lives at
+  timescales of hundreds to thousands of samples, i.e. exactly the "needs
+  long effective reach, not more depth at the current stride" case the
+  adaptive-timescale idea above targets. Feasible with this architecture
+  IF context/hierarchy reach the relevant period; a coarse level's block
+  stride, chosen to roughly match a domain's typical pitch period, gives
+  the tower a usable coarse "cycle" representation for free, matching the
+  same mechanism that lets a coarse code level implicitly discover
+  word-like units in text.
+
+- **2D images (raster byte streams)**: the sharpest structural mismatch
+  in this whole list. Flattening a 2D image into a raster byte order
+  destroys the 2D adjacency a native vision architecture (conv/ViT patch)
+  gets for free — two vertically adjacent pixels, which are highly
+  correlated, sit `width` bytes apart in the flattened stream, often far
+  outside a narrow attention window, and even inside `context_len` the
+  causal model has to LEARN "distance `width` back is special" purely
+  from data rather than being told it structurally. A causal byte model
+  over raster order is not fundamentally incapable of learning this (a
+  wide enough receptive field plus enough training data can discover the
+  row-stride correlation, analogous to how it discovers word boundaries)
+  but it's genuinely sample- and compute-inefficient relative to an
+  architecture with the 2D prior built in — one of the honest limits of
+  domain-agnostic byte modeling, not a bug in this codebase's design.
+
+- **3D voxels / point clouds**: worse than images along the same axis,
+  plus a second, more severe problem — extreme sparsity. Most voxels in a
+  typical 3D grid are empty; a dense byte-level flattening spends the same
+  per-byte compute on empty space as on structured content, unlike a
+  sparse-native representation (octree, point list) that pays roughly
+  zero cost for emptiness. Point clouds don't even have a fixed grid to
+  flatten in the first place — a point's (x,y,z,attrs) tuple carries no
+  intrinsic ORDER relative to its neighbors the way a raster image or a
+  time series does, so "next-byte prediction" isn't obviously well-posed
+  without first imposing SOME order. This is the domain where
+  byte-agnosticism arguably breaks down as a design choice rather than
+  just costing efficiency.
+
+- **Sensor/actuator control streams**: structurally the most different
+  case from text, in a way that matters beyond compute efficiency. Two
+  distinct issues: (1) high frame-to-frame redundancy from physical
+  continuity (real actuators/sensors have bounded rate of change —
+  bandwidth-limited by physics — so successive samples are usually close,
+  a strong and genuinely exploitable statistical regularity), but (2) the
+  bytes of a structured numeric encoding (e.g. IEEE 754 float32) are NOT
+  semantically uniform — the sign/exponent bytes determine
+  order-of-magnitude and direction, the mantissa bytes determine
+  fine-grained precision, and a plain per-byte cross-entropy loss weighs
+  a mantissa LSB flip (usually harmless) the same as a sign-bit flip
+  (can invert an actuator command's direction entirely). This is a real
+  mismatch between what the loss optimizes (uniform byte-level
+  likelihood) and what actually matters for control (bounded, physically
+  meaningful error) — not something more context or a bigger model fixes
+  on its own.
+
+**Generalization ideas that stay byte-agnostic** (extend the architecture
+without hand-building a domain-specific tokenizer, matching this
+codebase's own stated philosophy):
+
+1. **Space-filling-curve serialization for 2D/3D** (Hilbert/Morton/
+   Z-order curve) as a PREPROCESSING step, not an architecture change:
+   reordering pixels/voxels along a locality-preserving curve before
+   flattening to bytes means nearby-in-the-stream bytes are also
+   nearby-in-space, which is exactly what the causal/windowed-attention
+   locality prior already assumes for 1D data. Doesn't manufacture true
+   2D/3D equivariance, but narrows the row-stride problem above at zero
+   architectural cost — a genuinely cheap, high-leverage first step for
+   any domain with implicit spatial structure.
+
+2. **Significance-aware byte structure, reusing this session's own
+   `BitPredictHeadWordPredict`/hierarchical-code machinery**: for
+   structured numeric formats (IEEE 754, fixed-point sensor readings),
+   map a value's semantically MORE significant bytes (sign/exponent) to
+   a COARSER level of the existing `Ks` hierarchy and its LESS significant
+   bytes (mantissa) to a finer level — the code hierarchy already exists
+   to separate "coarse, load-bearing" from "fine, refining" information;
+   this just points that same mechanism at engineering byte-significance
+   instead of only temporal timescale. A natural loss-side complement:
+   weight byte cross-entropy by significance (e.g. scale the sign/exponent
+   byte's loss term up) rather than treating every byte position as
+   equally costly to get wrong — directly addresses the control-stream
+   mismatch above without redesigning tokenization.
+
+3. **Domain/timescale-conditioned expert selection**, tying back to the
+   adaptive-timescale MoE idea above: a cheap router (entropy +
+   autocorrelation-lag feature) picking among a small set of pre-configured
+   `Ks`/`attn_window` profiles per span or per stream is a way to let ONE
+   trained model cover several domains' differing native timescales
+   without hand-specifying which domain it's looking at — genuinely
+   different from training separate domain-specific models, and
+   consistent with this file's existing preference for routing/gating
+   mechanisms over hard-coded branches.
+
+4. **Physical priors as auxiliary losses, not architecture changes**, for
+   control/sensor streams specifically: a cheap regularizer penalizing
+   the model's IMPLIED derivative (next-byte prediction's decoded value,
+   differenced against the previous decoded value) for exceeding a known
+   physical bandwidth limit doesn't touch tokenization or the `Ks` tower
+   at all — same additive-loss-term pattern `Config.fusion_ntp_weight`
+   and the ratio-loss sketch above already establish, applied as a
+   physically-motivated prior instead of a compute-budget one.
+
+**Where the byte-agnostic premise has a real, not-yet-closeable gap**:
+none of the ideas above manufacture a hard geometric prior (2D
+translation-equivariance, 3D rotation-equivariance) that a domain-native
+architecture (conv-net, equivariant GNN) gets by construction — they only
+make it CHEAPER for gradient descent to discover an approximation of that
+structure from data. For domains where the geometric/physical prior is
+strong and well understood (images, 3D geometry, robot dynamics), a
+byte-level causal LM should be expected to remain less sample- and
+compute-efficient than a structure-native model, full stop — the honest
+value proposition of this codebase's approach is a single architecture
+that degrades gracefully and improves incrementally (via hierarchy depth,
+adaptive timescale routing, significance-aware structure) across many
+domains at once, not one that matches domain-specialized architectures on
+any single domain's own home turf.
+
+## H-Net's dynamic chunker vs. wider-receptive-field timescale-MoE: does either overcome the domain limits above?
+
+Correction to this file's earlier framing (Axis 4, above): H-Net doesn't
+do single-level flat segmentation — its own paper **stacks the dynamic
+chunker recursively**, each stage's chunk-pooled output feeding the next
+stage's own boundary detector, so it genuinely builds a multi-level
+hierarchy, structurally much closer to `qcute_refine`'s `Ks` tower than
+"one pairwise cut" suggests. Re-examining the domain limits above with
+that correction in mind:
+
+- **2D image raster mismatch — not overcome.** Every stage's boundary
+  decision, at every level, is still a pairwise comparison between
+  ADJACENT positions in whatever 1D order it's handed. Stacking raises
+  effective receptive field (level-2 chunks summarize more raw bytes than
+  level-1 ones) but gives no structural shortcut to "distance = image-
+  width is special" — a vertically-adjacent pixel is still buried `width`
+  positions away at every level, same as a fixed-stride `Ks` tower. Both
+  architectures could in principle learn the row-stride correlation given
+  enough capacity/data; neither gets it for free from raster-order bytes.
+
+- **3D point clouds/voxels lacking intrinsic order — not overcome,
+  orthogonal.** H-Net's chunker needs SOME 1D sequence to walk
+  adjacent-pairwise; it doesn't invent an order any more than a
+  fixed-stride grid does. This limit is about the absence of an order to
+  segment along at all, not about how segmentation is decided once one
+  exists.
+
+- **3D voxel sparsity (given some order/serialization already exists) —
+  genuinely overcome, a real structural advantage over the fixed `Ks`
+  tower.** A long empty run is maximally locally-similar, so H-Net's own
+  similarity-threshold mechanism should naturally collapse it into one
+  large chunk and spend fine boundaries only where content actually
+  varies — adaptive-length compression is built into the segmentation
+  itself. `qcute_refine`'s fixed-stride grid only gets an equivalent
+  effect by bolting on Axis 4's depth-routing (a separate router, separate
+  machinery, separate load-balancing concerns); H-Net gets it as a
+  first-class consequence of its core mechanism, no add-on required.
+
+- **Audio periodicity/timescale — partially overcome, and specifically
+  BECAUSE of the stacking.** A single H-Net stage's signal (adjacent-
+  sample smoothness) targets local continuity, not cyclical repetition —
+  consecutive samples within one waveform cycle can differ a lot even
+  though the CYCLE repeats, so a bottom-stage boundary detector isn't
+  obviously going to find period boundaries directly. Recursive stacking
+  is exactly the mechanism that could get there indirectly: if stage 1's
+  chunk summaries capture enough within-cycle shape, stage 2's
+  adjacent-CHUNK comparison could then operate at a granularity where
+  cycle-to-cycle similarity becomes locally visible. Plausible emergent
+  property, not a structural guarantee — contrast with the
+  adaptive-timescale-MoE section above's explicit autocorrelation-lag
+  router feature, which structurally forces the periodicity signal to be
+  present rather than hoping it survives multiple stages of learned
+  pooling.
+
+- **Control-stream byte significance (sign/exponent vs. mantissa) — not
+  overcome, orthogonal.** H-Net's criterion is generic representation
+  dissimilarity; nothing in it encodes semantic byte significance.
+  Segmentation only decides GROUPING, never per-byte loss weighting or
+  which hierarchy depth a byte's importance deserves — needs the
+  significance-aware idea above regardless of which chunker (fixed-stride
+  or learned) is used underneath it.
+
+**Mechanism-level contrast** — the two designs adapt along genuinely
+different axes, not competing solutions to the same problem:
+
+| | H-Net (stacked) | timescale-MoE (above) |
+|---|---|---|
+| adapts | WHERE boundaries fall, at every level | WHICH of a small fixed menu of stride-profiles handles a span |
+| decision granularity | per-position, local, cheap (adjacent-pair comparison) | per-span, coarser, needs a hand-built feature (entropy + autocorrelation lag) |
+| expressivity | arbitrary, per-instance chunk lengths | only as flexible as the pre-set menu of `Ks` profiles |
+| cost | one tower; boundary placement does all the work | multiple towers (or a shared-weight variant) plus a router |
+
+**They compose rather than compete**: H-Net-style learned per-level
+boundaries could serve as `qcute_refine`'s own segmentation mechanism
+(the natural graduation path Axis 4 already gestures at — "eventually
+replace fixed `Ks` with something content-adaptive"), with a coarse
+router still selecting among several such stacked towers pre-biased
+toward different characteristic scales, for streams whose content spans
+genuinely disparate orders of magnitude in timescale within one document
+(e.g. a mixed audio-plus-control-channel log) — answering "where to cut"
+and "how much/which scale to spend" as two independent, composable
+decisions rather than one mechanism trying to do both.
+
+## Extending H-Net past greedy pairwise causal comparison: windowed/dilated lag detection
+
+H-Net's boundary score bundles two separate limitations into one
+mechanism: it's **single-lag** (only ever measures `sim(x_t, x_{t+1})` —
+structurally blind to a period `p>1` signal, whose lag-1 similarity can
+be low even in a maximally regular region, since adjacent samples inside
+one cycle can differ a lot even though the CYCLE repeats) and it's
+**greedy** (commits at the first threshold crossing, never reconsiders
+once a few more positions of context arrive — the standard failure mode
+of greedy change-point/boundary placement, well precedented in speech
+segmentation literature). Session question: can a window/lookahead fix
+this directly, rather than relying entirely on recursive stacking (this
+file's own earlier analysis: stacking can *plausibly* discover
+periodicity emergently, but it's not guaranteed — the signal has to
+survive several stages of learned pooling).
+
+**Windowed multi-lag comparison, reusing this session's own dilated-conv
+machinery.** Instead of one similarity score at lag 1, compute a short
+VECTOR of scores across several lags — `sim(x_t, x_{t+k})` for
+`k=1..W` — a short-time local autocorrelation, the same technique
+DSP pitch/onset detectors use (YIN, short-time ACF). The concrete cheap
+implementation is already in this codebase:
+`BitPredictHeadConvDilated._dilated_stack` (`qcute_refine_v4_2.py:1386`)
+computes exactly this shape — multi-tap, per-channel, `unfold`+`einsum`,
+deliberately never `nn.Conv1d` (measured ~300x slower at this scale, see
+§17/18 of `docs/kv_contribution.md`). Two spacing choices, same tradeoff
+already established for that class:
+- **Flat window** (`k=1..W`): catches periods up to `W`, cost `O(W)`.
+- **Dilated/log-spaced taps** (`k∈{1,2,4,8,...}`, `L=log2(period)` taps
+  instead of `period`): reaches periods far larger than a flat window
+  affords WITHOUT waiting for several stacked levels to accumulate the
+  reach — a single stage directly probes candidate periods at multiple
+  scales, and the tap with highest similarity doubles as a period
+  ESTIMATE, usable to directly set a chunk's target length rather than
+  only reacting to a threshold crossing position-by-position.
+
+**Non-greedy refinement, nearly free given the window is already
+computed**: instead of committing at the first crossing, pick the LOCAL
+MINIMUM of the dissimilarity curve within a small forward span (best of
+the next few candidate cuts) before finalizing — buffered-onset-detector
+style, trading a few positions of latency for a better-placed boundary.
+
+**Causal cost — a bounded delay, not true lookahead**: both extensions
+need `W` (or `2^L`) positions AHEAD of a candidate cut to score it,
+genuinely non-causal within that span. Training (teacher-forced, full
+sequence visible): free, one batched windowed computation, same as
+`attn_window`'s own parallel training path. Streaming/generation: needs
+an actual lookahead buffer — position `t`'s boundary isn't finalized
+until `t+W` arrives, a bounded, KNOWN latency, not unbounded — identical
+shape of tradeoff `attn_window`'s own windowed attention already accepts
+in this codebase, just moved from the attention axis to the
+segmentation-decision axis.
+
+**Relationship to stacking — complementary, not a replacement.**
+Stacking still does something windowed/dilated single-stage detection
+can't: genuine representational abstraction (chunk-of-chunks, discovering
+compositional units, semantic compression). What this extension fixes is
+narrower: it lets the FIRST stage directly detect periodicity that used
+to only be discoverable emergently after several levels of stacking
+happened to preserve the right information through pooling. Concretely:
+fewer levels may be needed to reach a given periodicity, and levels that
+do still stack now start from an already period-aware segmentation
+instead of only a smoothness-aware one at every stage. Straight-through
+selection (hard chunk boundary + soft lag-similarity gradient) follows
+the same `pq_table` hard/soft pattern this codebase already established
+for `CodeEmbed`.
