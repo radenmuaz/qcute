@@ -83,6 +83,10 @@ class Config:
     code_head_tied: bool = False
     decode_pack_mode: str = "interleave"  # "interleave" | "prepend"
     decode_chunked: bool = False  # use windowed chunked decode attention instead of dense O((2L)^2); interleave only
+    decode_code_ste: bool = True  # straight-through: decode's code_kv is source_c @ embed.weight (gradient flows into
+    # the code producer). False = source_c.detach() @ embed.weight (hard argmax-equivalent forward value, no gradient
+    # into the code producer -- the original behavior before this flag existed). Forward VALUE is identical either
+    # way (source_c's forward value is already the hard one-hot); only the backward path differs.
 
 
 def gumbel_quantize(logits: torch.Tensor, tau: float, use_gumbel_noise: bool = False) -> torch.Tensor:
@@ -199,12 +203,13 @@ class Block(nn.Module):
 
 
 class LevelLM(nn.Module):
-    def __init__(self, cfg: Config, level: int, window: int | None,
+    def __init__(self, cfg: Config, level: int, window: int | None, decode_window: int | None,
                  shared: "LevelLM | None" = None):
         super().__init__()
         self.cfg = cfg
         self.level = level
         self.window = window
+        self.decode_window = decode_window
         self.is_byte_level = level == 0
         D = cfg.d_model
         V = cfg.vocab
@@ -282,32 +287,47 @@ class LevelLM(nn.Module):
         he_blocks = he.view(B, n_blocks, K + 1, D)
         return he_blocks[:, :, K, :]
 
-    def _packed_decode_forward(self, x0: torch.Tensor, code_kv: torch.Tensor) -> torch.Tensor:
+    def _packed_decode_forward(self, x0: torch.Tensor, code_kv: torch.Tensor, decode_K: int) -> torch.Tensor:
+        """One prefix token (BOS or a code) per K-byte block, generalizing the decode_K==1 case
+        (one prefix per byte) to arbitrary decode_K == Ks[i]*Ks[i+1]: code_kv has n_blocks=L//K
+        entries, one per block; prefix b is decode_bos for b==0 else code_kv[b-1] (the PREVIOUS
+        block's own code -- the last block's code is never consumed, same as the K==1 case,
+        since there's no block after it to condition). A prefix's true_pos is set to the last
+        raw byte position of the block it summarizes (b*K - 1 for prefix b, i.e. one before the
+        block it precedes) -- combined with the existing same-position exclusion, this reproduces
+        exactly the "code b visible only strictly after its last covered byte" rule at any K,
+        including K==1 (where it reduces to the original code_shifted/code_true_pos formulas)."""
         cfg = self.cfg
         B, L, D = x0.shape
         H, hd = cfg.n_heads, D // cfg.n_heads
         device = x0.device
-        W = self.window if self.window is not None else L
+        W = self.decode_window if self.decode_window is not None else L
+        K = decode_K
+        assert L % K == 0
+        n_blocks = L // K
 
         bos = self.decode_bos.view(1, 1, D).expand(B, 1, D)
-        code_shifted = torch.cat([bos, code_kv[:, :-1, :]], dim=1)
+        prefixes = torch.cat([bos, code_kv[:, :-1, :]], dim=1)  # [B, n_blocks, D]
+        prefix_true_pos = torch.arange(n_blocks, device=device) * K - 1  # [n_blocks]
 
         byte_pos = torch.arange(L, device=device)
-        code_true_pos = byte_pos - 1
 
         if cfg.decode_pack_mode == "interleave":
-            combined = torch.stack([code_shifted, x0], dim=2).view(B, 2 * L, D)
-            true_pos = torch.stack([code_true_pos, byte_pos], dim=1).reshape(-1)
-            is_code = torch.tensor([True, False], device=device).repeat(L)
+            x0_blocks = x0.view(B, n_blocks, K, D)
+            combined = torch.cat([prefixes.unsqueeze(2), x0_blocks], dim=2).view(B, n_blocks * (K + 1), D)
+            true_pos = torch.cat([prefix_true_pos.view(n_blocks, 1), byte_pos.view(n_blocks, K)], dim=1).reshape(-1)
+            is_code = torch.cat([torch.ones(n_blocks, 1, dtype=torch.bool, device=device),
+                                  torch.zeros(n_blocks, K, dtype=torch.bool, device=device)], dim=1).reshape(-1)
+            Le = n_blocks * (K + 1)
         elif cfg.decode_pack_mode == "prepend":
-            combined = torch.cat([code_shifted, x0], dim=1)
-            true_pos = torch.cat([code_true_pos, byte_pos], dim=0)
-            is_code = torch.cat([torch.ones(L, dtype=torch.bool, device=device),
+            combined = torch.cat([prefixes, x0], dim=1)
+            true_pos = torch.cat([prefix_true_pos, byte_pos], dim=0)
+            is_code = torch.cat([torch.ones(n_blocks, dtype=torch.bool, device=device),
                                   torch.zeros(L, dtype=torch.bool, device=device)])
+            Le = n_blocks + L
         else:
             raise ValueError(f"unknown decode_pack_mode {cfg.decode_pack_mode!r}")
 
-        Le = 2 * L
         cos, sin = rope_cos_sin_for_positions(true_pos.clamp(min=0), hd, cfg.rope_base, device)
 
         ti = true_pos.unsqueeze(1)
@@ -332,10 +352,10 @@ class LevelLM(nn.Module):
 
         he = self.ln_f(xe)
         if cfg.decode_pack_mode == "interleave":
-            he_pairs = he.view(B, L, 2, D)
-            return he_pairs[:, :, 1, :]
+            he_blocks = he.view(B, n_blocks, K + 1, D)
+            return he_blocks[:, :, 1:, :].reshape(B, L, D)
         else:
-            return he[:, L:, :]
+            return he[:, n_blocks:, :]
 
     def _packed_decode_forward_chunked(self, x0: torch.Tensor, code_kv: torch.Tensor, n_prev_chunks: int = 2) -> torch.Tensor:
         """Chunked equivalent of _packed_decode_forward for decode_pack_mode == "interleave" only.
@@ -352,7 +372,7 @@ class LevelLM(nn.Module):
         B, L, D = x0.shape
         H, hd = cfg.n_heads, D // cfg.n_heads
         device = x0.device
-        W = self.window
+        W = self.decode_window
         assert W is not None and L % W == 0
 
         bos = self.decode_bos.view(1, 1, D).expand(B, 1, D)
@@ -440,13 +460,13 @@ class LevelLM(nn.Module):
         head_dim = D // cfg.n_heads
 
         if decode_kv is not None:
-            assert decode_K == 1, "v4.4 packed decode only implemented for decode_K==1"
-            can_chunk = (cfg.decode_chunked and cfg.decode_pack_mode == "interleave"
-                         and self.window is not None and L % self.window == 0)
+            assert decode_K is not None
+            can_chunk = (decode_K == 1 and cfg.decode_chunked and cfg.decode_pack_mode == "interleave"
+                         and self.decode_window is not None and L % self.decode_window == 0)
             if can_chunk:
                 h = self._packed_decode_forward_chunked(x0, decode_kv)
             else:
-                h = self._packed_decode_forward(x0, decode_kv)
+                h = self._packed_decode_forward(x0, decode_kv, decode_K)
         else:
             cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
             for block in self.blocks:
@@ -505,15 +525,28 @@ class RefineLM(nn.Module):
 
         raw_windows = cfg.attn_window if isinstance(cfg.attn_window, (tuple, list)) else (cfg.attn_window,) * self.n_levels
         assert len(raw_windows) == self.n_levels, f"attn_window tuple must have length n_levels={self.n_levels}, got {len(raw_windows)}"
-        windows = [None if w == -1 else w for w in raw_windows]
+        windows: list[int | None] = []
+        decode_windows: list[int | None] = []
+        for w in raw_windows:
+            if isinstance(w, (tuple, list)):
+                assert len(w) == 2, f"attn_window per-level entry must be a scalar or an (encode_window, decode_window) 2-tuple, got {w!r}"
+                ew, dw = w
+            else:
+                ew = dw = w
+            windows.append(None if ew == -1 else ew)
+            decode_windows.append(None if dw == -1 else dw)
         self.windows = windows
+        self.decode_windows = decode_windows
         for i, (L, window) in enumerate(zip(seq_lens, windows)):
             if window is not None:
-                assert L % window == 0 or L <= window, f"attn_window[{i}] ({window}) must divide level {i}'s sequence length ({L}), or be >= it"
+                assert L % window == 0 or L <= window, f"attn_window[{i}] encode window ({window}) must divide level {i}'s sequence length ({L}), or be >= it"
+        for i, (L, dwindow) in enumerate(zip(seq_lens, decode_windows)):
+            if dwindow is not None:
+                assert L % dwindow == 0 or L <= dwindow, f"attn_window[{i}] decode window ({dwindow}) must divide level {i}'s sequence length ({L}), or be >= it"
 
         encoders: list[LevelLM] = []
         for i in range(self.n_levels):
-            lvl = LevelLM(cfg, i, windows[i], shared=(encoders[0] if i > 0 else None))
+            lvl = LevelLM(cfg, i, windows[i], decode_windows[i], shared=(encoders[0] if i > 0 else None))
             encoders.append(lvl)
         self.encoders = nn.ModuleList(encoders)
 
@@ -543,8 +576,16 @@ class RefineLM(nn.Module):
             else:
                 source_c = c_list[i]
                 decode_K = cfg.Ks[i]
-            code_ids = source_c.argmax(-1)
-            code_embeds = self.encoders[i].embed(code_ids)
+            if x_list[i].shape[1] % decode_K != 0:
+                # Ragged length (only happens during generation, where the sequence grows one
+                # byte at a time and won't generally be a multiple of decode_K -- training always
+                # uses context_len, guaranteed divisible per RefineLM.__init__'s own asserts).
+                # Decode conditioning isn't well-defined here; fall back to the encode-only h_i
+                # already sitting in h_out[i], same graceful-degradation pattern as the dense/
+                # chunked attention fallbacks elsewhere in this file.
+                continue
+            src = source_c if cfg.decode_code_ste else source_c.detach()
+            code_embeds = src @ self.encoders[i].embed.weight
             _, loss_i2, acc_i2, h_i2 = self.encoders[i](x_list[i], compute_ntp=compute_ntp,
                                                           decode_kv=code_embeds, decode_K=decode_K)
             decode_losses[i] = loss_i2
@@ -656,18 +697,25 @@ def level1_ground_truth_codes(model: "RefineLM", full_bytes: torch.Tensor, promp
     return ids[n_prompt_codes:]
 
 
-def _annotate_bytes_with_codes(byte_ids: torch.Tensor, code_ids: torch.Tensor) -> str:
+def _annotate_bytes_with_codes(byte_ids: torch.Tensor, code_ids: torch.Tensor, K: int) -> str:
+    """Group byte_ids into K-byte blocks, tagging each block with its own code_i in {}
+    (one code covers K raw bytes, decode_K in RefineLM._run terms)."""
+    bytes_list = byte_ids.tolist()
+    codes_list = code_ids.tolist()
     parts = []
-    for b, c in zip(byte_ids.tolist(), code_ids.tolist()):
-        ch = repr(bytes([b]))[2:-1]  # single-byte escaped repr, e.g. "a" or "\\n"
-        parts.append(f"{ch}{{{c}}}")
+    for b in range(0, len(bytes_list), K):
+        block = "".join(repr(bytes([x]))[2:-1] for x in bytes_list[b:b + K])
+        code_idx = b // K
+        c = codes_list[code_idx] if code_idx < len(codes_list) else "?"
+        parts.append(f"{block}{{{c}}}")
     return "".join(parts)
 
 
 @torch.no_grad()
 def _decode_source_codes(model: "RefineLM", full_bytes: torch.Tensor, device: str) -> torch.Tensor:
-    """Re-derive, per-position, the in-band code that decode conditions on (source_c in
-    RefineLM._run) for the given full (prompt+generated) byte sequence. Only valid for the
+    """Re-derive, per-position, the code_i (level i's own self-code, see the stream_i/code_i
+    terminology note in docs/status.md) that decode conditions on (source_c in RefineLM._run)
+    for the given full (prompt+generated) byte sequence. Only valid for the
     decode_K==1, decode-at-level-0-only configurations this file currently trains
     (n_levels in {1, 2})."""
     was_training = model.training
@@ -696,9 +744,11 @@ def qualitative_generate(model: "RefineLM", prompt_bytes: torch.Tensor, gen_len:
     log(f"{prefix}prompt:              {bytes(prompt_bytes.tolist())!r}")
     log(f"{prefix}level0_uncond:       {gen_bytes_uncond!r}")
     log(f"{prefix}level0_cond:         {gen_bytes_cond!r}")
+    decode_K = model.cfg.Ks[0] * model.cfg.Ks[1] if model.n_levels > 1 else model.cfg.Ks[0]
     code_ids_full = _decode_source_codes(model, out_cond, device)
-    gen_code_ids = code_ids_full[prompt_bytes.numel():]
-    annotated = _annotate_bytes_with_codes(out_cond[prompt_bytes.numel():], gen_code_ids)
+    n_prompt_codes = prompt_bytes.numel() // decode_K
+    gen_code_ids = code_ids_full[n_prompt_codes:]
+    annotated = _annotate_bytes_with_codes(out_cond[prompt_bytes.numel():], gen_code_ids, decode_K)
     log(f"{prefix}level0_cond_codes:   {annotated}  <{gen_code_ids.tolist()}>")
     if ground_truth is not None:
         log(f"{prefix}ground_truth:        {bytes(ground_truth.tolist())!r}")

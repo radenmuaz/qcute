@@ -47,7 +47,7 @@ def check_equivalence(Ks, d_model, n_layers, context_len, window, n_prev_chunks,
         code_embeds = enc0.embed(code_ids)
 
         x0 = enc0.embed(x)
-        h_dense_out = enc0._packed_decode_forward(x0, code_embeds)
+        h_dense_out = enc0._packed_decode_forward(x0, code_embeds, decode_K=1)
         h_chunked_out = enc0._packed_decode_forward_chunked(x0, code_embeds, n_prev_chunks=n_prev_chunks)
 
     max_diff = (h_dense_out - h_chunked_out).abs().max().item()
