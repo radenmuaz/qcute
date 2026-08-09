@@ -1808,3 +1808,181 @@ pending) shares the same `decode_K=4`, it would have hit the identical
 crash; the fix covers it automatically since it re-imports the file
 fresh at launch. Current queue: `l2_k1` (running) → `bpelike_1level_k4_
 retry` → `bpelike_k4_1`.
+
+## Cumulative multi-level decode conditioning
+
+Generalized decode from "level `i` conditions on level `i+1`'s code
+only" to **cumulative**: level `i` conditions on its own code (`code_i`,
+self) PLUS every coarser level above it (`code_{i+1}`, `code_{i+2}`,
+..., up to the top), each as its own independently-windowed track. The
+top level now also gets a decode pass (self-conditioning only, same
+degenerate case the old `n_levels==1` self-conditioning always was, now
+just the general "nothing coarser exists" case for whichever level
+happens to be on top).
+
+**Terminology used throughout this section**: `stream_i` (level `i`'s
+own input — raw bytes for `i=0`, `code_{i-1}` for `i>0`) and `code_i`
+(level `i`'s own output), per the `stream_i`/`code_i` convention adopted
+earlier this session in place of "in-band code."
+
+**Config**: `attn_window`'s per-level `decode_window` (the second slot
+of the `(encode_window, decode_window)` 2-tuple) is now itself either a
+scalar (broadcast to ALL of that level's decode sources) or an explicit
+tuple of length `n_levels - i`, ordered `[self, +1, +2, ..., top]`. Two
+distinct per-source sentinel values, not to be confused: `-1` means
+unbounded/full-context (the track stays ACTIVE, just with no window
+limit) and `0` means the track is EXCLUDED from decode entirely (not
+computed at all). Divisibility assertions apply to both encode and every
+active decode-source window independently.
+
+**`_packed_decode_forward(x0, tracks)`** replaces the old single-source
+`(x0, code_kv, decode_K)` signature — `tracks` is a list of `(code_kv,
+K, window)` triples, one per active decode source. Packing: multiple
+tracks only support `decode_pack_mode="prepend"` (all prefix streams
+concatenated coarsest-to-finest, self track immediately before the
+bytes — order doesn't affect correctness, causality is governed by
+`true_pos` values not physical position, but this is the more readable
+convention); single-track (`len(tracks)==1`) still supports
+`"interleave"` too, needed by the chunked decode path. The `windowed`
+mask term is now per-KEY (`window_of_key`, gathered per-track) rather
+than a single scalar `W`, since different tracks can have different
+windows within the same forward call.
+
+**`_packed_decode_forward_chunked`** unchanged in mechanism, just takes
+`window` as an explicit parameter now (was reading `self.decode_window`,
+which no longer exists as a single value) — still single-track,
+`decode_K==1`-only, gated in `LevelLM.forward`'s dispatch.
+
+**Verification**: multi-track layout directly inspected for a 2-track
+case (`Ks=(4,1)`, `L=8`) — prefix `true_pos` came out exactly
+`[-1,3,-1,3]` (coarsest track's 2 block-prefixes, then self track's 2
+block-prefixes, matching the documented coarsest-to-finest convention).
+Causality/perturbation-tested across `Ks=(1,)`, `Ks=(1,1)`, `Ks=(4,1)`,
+and a 3-level `Ks=(2,2,1)` case — level 0's own `h` always showed the
+perturbed position as the exact earliest affected one, nothing before
+it. Level 1's `h` showed the affected range starting one position later
+than the theoretical earliest point — **not a bug**: level 1's input is
+level 0's *discretized* (`gumbel_quantize`/argmax) code, and a
+perturbation that doesn't flip the discrete class at the theoretically
+susceptible position produces zero downstream effect there, a normal
+property of a quantization bottleneck (crucially, nothing *before* the
+theoretical earliest point was ever affected, in any run). Gradient
+flow verified into BOTH the self track's classifier and the +1 track's
+classifier from a single `decode_loss.backward()` call (both nonzero,
+and — expected, given full weight sharing — numerically identical,
+since `encoders[1].code_head` is literally the same aliased parameter
+tensor as `encoders[0]`'s own, not a coincidence).
+
+**`generate_no_cache`'s ragged-length handling generalized** to the
+multi-track case: `RefineLM._run` now checks divisibility per-track
+(`L_i % cum_K`) while building each level's track list, skipping
+individual disabled/misaligned tracks rather than an all-or-nothing
+single check.
+
+### Blockwise parallel decoding: built, tested, found NOT valid for this architecture
+
+Followed through on "queue it, because can catch bugs" — built
+`generate_blockwise_parallel` (drafts level1's codes autoregressively
+via its NTP head, batches all new K0-byte blocks along the batch
+dimension, aiming for `O(gen_len/K0 + K0)` instead of `generate_no_
+cache`'s `O(gen_len)`) and tested it for EXACT equivalence against
+`generate_no_cache`. It caught two real problems, the second of which
+is structural, not a fixable bug:
+
+1. **Off-by-one, fixed**: predicting byte `t+1` uses `h[t]`, and `h[t]`'s
+   decode prefix is *its own* block's code (`code_kv[block(t)-1]`) — so
+   the very FIRST new byte after the prompt is actually predicted using
+   the SECOND-to-last prompt block's code, not the last one (which only
+   starts conditioning the byte after that). The original implementation
+   uniformly assigned each new K0-byte group to `code_kv[block_index-1]`
+   assuming clean block alignment; the true alignment is shifted by
+   exactly one byte relative to that. Fixed by special-casing the first
+   new byte as an ordinary single step, then generating the group-batched
+   remainder shifted by one position, then trimming the one extra byte
+   the shifted grouping overproduces at the end.
+
+2. **Structural, NOT fixed — the whole premise doesn't hold**: even
+   with (1) fixed, outputs still didn't match. Root cause, confirmed
+   directly: `c_list[1][p]` depends on `c_list[0][p]` at the SAME
+   position (causal self-attention always includes the current position
+   as a key for itself) — meaning a new block's conditioning code
+   (`code_1` at that block's index) literally **cannot exist** before
+   that same block's own bytes are already generated. `RefineLM._run`'s
+   decode conditions on `c_list[i+1]`, level `i+1`'s DERIVED self-code —
+   a **reconstruction** of the span it summarizes ("here's a compressed
+   recap of the K bytes you just finished, use it as extra context for
+   the next K"), not an independently-forecastable quantity. This is a
+   genuinely different signal from what `generate_level1_codes`
+   produces (a next-token PREDICTION via level1's own NTP head, which
+   *is* independently forecastable, ahead of the underlying bytes
+   existing) — `generate_blockwise_parallel` drafted the latter but
+   `_run` actually conditions on the former, so they structurally
+   cannot agree. Confirmed the user's own framing of this directly:
+   self/adjacent-level conditioning in this architecture is
+   reconstruction-shaped, not draft-shaped — exactly why it's
+   sequential across blocks, matching the direct test
+   (`c_list[1][p]` genuinely responds to a perturbation at `c_list[0][p]`
+   itself, not just earlier positions).
+
+**Conclusion**: `generate_blockwise_parallel` is kept in the file
+(marked "NOT CURRENTLY VALID" in its own docstring) as a reference for
+what was tried and why it doesn't work, not as usable generation code.
+Genuine block-parallel decoding would need decode to condition on a
+DRAFTED signal (e.g. level `i+1`'s own NTP-predicted continuation of
+`stream_i`) instead of its derived self-code — a real architecture
+change, not a generation-function fix. Not attempted this session.
+
+### The fix: two-stage latent-variable model (`.detach()`, not STE) — resolves the dead end above, not yet implemented
+
+Follow-up design discussion (analysis only, no code changes yet) that
+directly resolves the "structural, NOT fixed" blocker above.
+
+**The pattern**: train this as the standard two-stage discrete latent-
+variable setup (VQ-VAE-2 / DALL-E / Jukebox's own decoder-then-prior
+training, not novel to this session) — a decoder trained on TRUE codes
+with `.detach()` (no gradient into the code producer), and a SEPARATE
+autoregressive prior over that same code space, trained purely on its
+own NTP loss, zero gradient coupling to the decoder.
+
+**Why `decode_code_ste=False` (detach), not `=True` (STE, this
+session's DEFAULT), is the right choice for this purpose**: STE lets
+decode's loss shape the code producer toward "more decode-useful"
+codes — good for decode's OWN quality in isolation, but it actively
+fights having an INDEPENDENT predictor track that code distribution
+well, since STE continuously deforms the distribution via a signal the
+predictor never sees. `.detach()` leaves the code producer shaped by
+nothing but its own objective (self next-code accuracy), which is
+exactly what an independent prior CAN learn to match closely.
+
+**Why it must be SELF-conditioning (`code_i` on its own past, the
+`self` track), not the cross-level `+1` track built earlier this
+session**: `code_{i+1}` (the coarser self-code, via `_classify`/
+`code_head`) is a DIFFERENT projection from level `i+1`'s own NTP head
+(`embed.weight`) whenever `code_head_tied=False` — no clean "predict
+this" target exists for it. But `code_i` (level `i`'s OWN code) and
+level `i+1`'s NTP prediction of "the next `code_i` token" ARE the same
+object, same embedding space — `generate_level1_codes` already computes
+exactly this prediction, completely unmodified.
+
+**The mechanism**: train decode SELF-conditioned on `code_i`
+(`decode_code_ste=False`); separately, level `i+1` (or, for `n_levels==
+1` configs with no level above to draft with, a small dedicated
+auxiliary LM — this is precisely the `aux_code_lm` idea parked earlier
+this session, now with a clear purpose) learns to predict that SAME
+`code_i` stream via its own NTP loss, untouched by decode's gradient.
+At GENERATION time, substitute the DRAFTED `code_i` predictions for the
+true reconstructed ones in decode's self-conditioning slot — since
+decode was never trained to expect anything about WHERE the code came
+from (no gradient ever shaped it around decode's specific needs), this
+substitution is a small, well-behaved distribution shift, not the
+structural mismatch the cross-level/reconstruction path had (that path
+required `code_{i+1}[p]` to depend on `code_i[p]` at the exact SAME
+position, an unavoidable circular dependency; self-conditioning +
+independent-drafter has no such cycle, since the drafter never needs
+`code_i[p]` itself to predict it).
+
+**Status: design direction only, not implemented.** Two options on the
+table for next steps, neither started: (a) flip `decode_code_ste`
+default to `False` and requeue a self-conditioning config to test the
+mechanism, or (b) hold as documented design direction until the current
+training queue clears. No decision made yet as of this note.
