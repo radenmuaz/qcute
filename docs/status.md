@@ -1312,3 +1312,340 @@ expensive (4.424M params, 5.878G flops — private trunk copies aren't
 free) without a proportionate quality win. See
 [docs/kv_contribution.md](kv_contribution.md) for the deeper investigation
 into why KV contribution varies so much across these configs.
+
+## `qcute_refine_v4_3.py` — new fork, full weight sharing only, encode/decode renamed (2026-08-09 session)
+
+New file `qcute/qcute_refine_v4_3.py`, cloned from v4.2 and stripped to
+one fixed configuration only (no comments/docstrings, no per-ablation
+flags): `quant_type="simplex"` only, `dq=8`/`code_bits=8` fixed (one
+uniform 256-way pool shared by every level including byte level 0),
+concat-only fusion (no `CrossBlock`/cross-attention module at all), no
+`untie_levels`/`untie_fusion_pass`/layer-warmup curriculum — always full,
+unconditional weight sharing across every level's trunk/embed/head.
+`Config.Ks`/`d_model`/`n_layers`/`attn_window`/`context_len` and the
+usual training/data/logging flags are all that remain.
+
+**Terminology renamed**: v4.2's "PASS 1"/"PASS 2" become **encode**
+(bottom-up, each level's own standalone NTP loss) and **decode** (a
+second, conditioned forward pass). `RefineLM._encode` → `RefineLM._run`.
+
+**New code-extraction mechanism.** v4.2 read a level's upward code
+directly from `h_t` at the block's last position — the SAME hidden state
+also used for that position's own NTP prediction, forcing "predict next
+byte" and "summarize this block for the level above" to share one
+representation. v4.3 replaces this with a `CodePool` module: a single
+shared, learned query vector `[n_heads, head_dim]` cross-attends over the
+block's own `K` local self-attention keys/values (reused directly from
+the last `Block`'s own already-computed `k,v` — no new projection),
+producing a fresh `h_code` decoupled from `h_t`. Fully batched across all
+blocks in one `scaled_dot_product_attention` call via a reshape-blocks-
+into-batch trick (`[B,H,T,hd]` → `[B*n_blocks,H,K,hd]`), no mask needed
+(the reshape itself is the block boundary). One shared `CodePool`
+instance, aliased across every level (full weight sharing).
+
+**BUG, caught and fixed same session: decode was self-referential.**
+First implementation had level *i*'s decode condition on `c_i` — its
+OWN just-computed output, the exact same code level *i+1* consumes as
+input. This has zero genuine dependency on anything hierarchically
+above level *i*. Confirmed empirically: in the first "narrow" 2-level
+configs trained under this design (`Ks=(32,16)` etc.), `level1_ntp_acc_
+encode` collapsed to `1.0000`/loss≈`0.0000` almost immediately (by step
+~300 of 4000) — level 1's own code degenerated to a single constant
+value it could trivially "predict" — and correspondingly, `qual_*_
+level0_uncond` and `qual_*_level0_cond` were near-byte-identical garbage
+throughout training (both "the the the..."-style repetition), since
+decode's conditioning signal carried no information once the code
+collapsed. This happened well before any comparison of code COUNT
+(sparse vs. dense) could matter — the collapse was upstream of that
+variable entirely.
+
+**Fix**: decode at level *i* now conditions on `c_{i+1}` — level *i+1*'s
+own `CodePool` output (already computed every forward pass and
+previously discarded, since nothing consumed it in a 2-level model) —
+not `c_i`. This is described as needing a "level *i+2*" to exist as
+`c_{i+1}`'s real consumer (by the file's own input/output naming, `c_j`
+is level `j+1`'s own input), but no level *i+2* `LevelLM`/weights/NTP
+loss are added — it's a "stub," reusing an already-shared, already-
+computed value. Makes decode genuinely wait on level *i+1*'s encode pass
+finishing (real dependency, not the previous accidental non-dependency).
+Degenerate special case: `n_levels==1` has no level above to stub from,
+so level 0 falls back to conditioning on its own `c_0` (the ORIGINAL
+self-referential design) — the one place that mechanism is intentional
+rather than a bug, since there is no alternative in a single-level model.
+`decode_K` (the raw-byte span one decode-KV row represents, needed for
+the jagged causal mask's block-resolution boundary) becomes `Ks[i]*
+Ks[i+1]` in the stubbed case, or just `Ks[i]` in the self-conditioning
+case.
+
+**Rolling `kv_window` added to decode's jagged mask.** Previously decode
+saw the ENTIRE history of resolved codes with no limit, unlike local
+self-attention's own bounded, rolling receptive field (`_forward_chunked`'s
+own current+previous-chunk pattern, `2×window` raw bytes). Fixed by
+restricting `jagged_causal_mask_and_positions`'s visibility to the
+`kv_window` most-recently-resolved blocks, sized as `ceil(2×window /
+decode_K)` — mirrors self-attention's own `2×window` reach in code-block
+units instead of an ever-growing window.
+
+**Configs**: `configs/qcute_refine_v4_3_l1_k1.py` (`n_levels=1`,
+`Ks=(1,)` — maximal-density self-conditioning, a code extracted at
+EVERY byte position, "always use query every timestep to decode") and
+`configs/qcute_refine_v4_3_l2_k1.py` (`n_levels=2`, `Ks=(1,1)` — same
+maximal density, but decode's conditioning code is now the genuine
+level-1 stub, not self-referential) — isolates whether the fixed
+`attn_window=32` itself, independent of any code-compression granularity,
+is the bottleneck on what decode can exploit. Both queued sequentially
+(single-MPS-job convention); as of this note, `l1_k1` is running and
+noticeably slow to produce its first logged step — plausibly because
+`CodePool` at `K=1` reshapes into a `B*context_len = 16*1024 = 16384`
+batch dimension for its `scaled_dot_product_attention` call, which MPS
+may handle poorly; not yet confirmed as the actual cause. Results/
+resolution not yet in as of this note.
+
+**`CodePool` removed; code extraction reverted to reading straight from
+`h`, then made pluggable (still 2026-08-09 session).** The `Ks=(1,)`
+slowness above WAS `CodePool`'s own `B*n_blocks=16384`-batch attention
+call — confirmed by removing it entirely (code extraction reverts to
+v4.2's original `h_blocks[:,:,K-1,:]` readout) and re-measuring: MPS
+forward+backward dropped from 70-80s/it to 0.7-1.0s/it, ~100x. On top of
+that plain readout, four **interchangeable extraction modes** were added
+(`Config.code_extract_mode`): `"last_h"` (the readout, now default, paired
+with `code_head_tied=False` — a private, untied classifier, since reusing
+NTP's own tied classifier on the exact same `h` risks the code degenerating
+into a redundant copy of the NTP distribution), `"softmax_pool"` (no new
+params — self-attends over the block using `h_{K-1}` as an implicit query;
+provably degenerates to `"last_h"` at `K=1` since softmax over one item is
+always weight 1, so disallowed there), `"light_query_attn"` (a genuine
+learned query + its own `out_proj`, non-degenerate even at `K=1` since
+that extra learned transform still runs), and `"query_embed"` (a learned
+token spliced into the actual trunk sequence per block, densely masked —
+"most expensive," not used for real training, kept for completeness).
+
+**Same-position decode leak found and fixed (critical correctness bug,
+present since this lineage's very first fusion/concat mechanism, not
+just this session's code).** `jagged_causal_mask_and_positions`'s
+`n_complete = (t+1)//K` made a code block visible to a query at the exact
+position that PRODUCED it — but that code is extracted from the same `h`
+NTP already uses to predict the NEXT token, so the query effectively got
+to see a smeared copy of its own upcoming answer before answering it (see
+the `docs/hierarchical_fusion_designs.md`-adjacent chat trace, not yet
+written up separately: traced concretely through the string `"abcd"` —
+`code[t]` structurally approximates `predicted byte[t+1]`, and the old
+mask made `code[t]` visible starting at query `t` itself, not `t+1`).
+Fixed by changing the formula to `n_complete = t//K` (block only visible
+starting ONE position after it resolves) plus matching fixes in the
+decode_K==1 fast path (shift `decode_kv` by one raw position before use)
+and `generate_kv_cache`'s own incremental step timing (use the PREVIOUS
+step's resolved code, never the current step's). Verified via direct
+perturbation test (`decode_kv[10]` no longer affects position 10's own
+output, only position 11 onward) and re-run `validate_generation`
+equivalence (still exact `torch.equal` under the corrected boundary).
+`generate_kv_cache` was also newly built this session (didn't exist
+before) specifically for `code_extract_mode=="last_h"`/`decode_K==1` —
+~2x faster than `generate_no_cache` at `qual_gen_bytes=64` scale on CPU,
+validated bit-identical to it.
+
+**Known remaining rough edges in the (pre-v4.4) concat mechanism**, not
+yet fixed as of the v4.4 rewrite below: (1) the `decode_K==1` fast path's
+RoPE tag is wrong — it tags the shifted decode slot with the QUERY's
+position instead of the code's true content-origin position (the general,
+non-fast path gets this right via `block_pos`); not a leak, just a
+suboptimal-but-consistent convention the model has to learn around. (2)
+Position 0's "nothing resolved yet" placeholder was a literal zero vector
+fed as a real, attendable (softmax-competing) key — diluting attention
+mass slightly versus the general path's cleaner full-exclusion at that
+position; the cheap fix (special-case the one mask entry) was identified
+but not applied before the design moved to v4.4 instead.
+
+**Performance dead-end investigated and abandoned: `l2_k1`
+(`Ks=(1,1)`) was still catastrophically slow (~83s/it) even after the
+`CodePool` fix**, isolated via direct profiling to NOT be the core
+per-step forward/backward (confirmed fast in isolation, ~1.0s/it,
+matching `l1_k1`) — the actual cost is almost certainly
+`qualitative_generate`'s own `generate_no_cache`, which recomputes the
+WHOLE model from scratch at a NEW, ever-growing sequence length every
+single generated byte; for `n_levels=2` specifically this means THREE
+separately-shaped forward passes (level 0 encode, level 1 encode, level 0
+decode) per generated byte instead of `l1_k1`'s one, and MPS appears to
+pay a large one-time-per-novel-shape compilation cost (measured directly:
+a fresh model's very first call took 120s, then steady-state dropped to
+~1s/it) — with 128 total qual-gen steps per eval round (64 train + 64
+val), most at DISTINCT lengths, this plausibly compounds into the
+observed multi-minute-per-eval-round cost. Not fully root-caused or fixed
+(the investigation was abandoned mid-profiling in favor of moving to
+v4.4); the concrete, not-yet-applied fix would be swapping
+`qualitative_generate` from `generate_no_cache` to the newly-built
+`generate_kv_cache` (fixed-shape single-token updates, shouldn't trigger
+the same per-shape recompilation).
+
+## `qcute_refine_v4_4.py` — packed-sequence decode, replacing concat entirely (2026-08-09 session)
+
+New file, cloned from v4.3. Removes the ENTIRE concat/KV-injection
+mechanism (`CausalSelfAttention` no longer has any `decode_kv`-related
+parameters at all — back to plain self-attention) in favor of **splicing
+the code embedding directly into the input sequence at the embedding
+level**, before `self.blocks` runs at all, then running the combined
+(byte+code) sequence through completely ordinary self-attention. Two
+interchangeable layouts (`Config.decode_pack_mode`): `"interleave"`
+(`code,byte,code,byte,...`) and `"prepend"` (all resolved codes for a
+region bunched before the bytes they condition) — both implemented for
+direct A/B comparison, cost-per-mode analysis deferred to after some
+training data exists.
+
+**Causality is enforced by one shared, position-based rule** (not a
+jagged block-mask anymore): for any query/key pair, `key_true_pos <=
+query_true_pos AND NOT(key_is_code AND key_true_pos == query_true_pos)`
+— ordinary inclusive causality, except a code is excluded at the EXACT
+position that produced it (the same boundary the leak-fix above
+established), regardless of where in the packed sequence it physically
+sits. This one formula is layout-agnostic — verified: perturbing a single
+byte only changes that position's own output and everything strictly
+after it, identically for both `interleave` and `prepend` (accounting for
+a `nonzero()`-on-2D-tensor display artifact in the very first check,
+which initially looked like a leak into position 0 and wasn't one — the
+"0" entries were the batch index, not a leaked position).
+
+**RoPE is applied once, after packing**, to each token's own TRUE
+timeline (byte tokens get their real raw position; code tokens get their
+true content-origin position, i.e. one less than the byte they precede)
+— fixes the RoPE-tag inconsistency flagged above for the old fast path,
+by construction (there's only one packing step now, not a separate
+projection-then-shift).
+
+**Trainable BOS, not a zero vector.** Position 0 (nothing resolved yet)
+gets a genuine learned `nn.Parameter` (`LevelLM.decode_bos`, shared/
+aliased like everything else) instead of a hardcoded zero — chosen
+specifically because it keeps the packed-sequence construction uniform
+for incremental generation (every step concatenates one more token,
+real code or BOS, no special-cased masking branch needed for the first
+position).
+
+**Implementation status: dense only, not yet windowed/chunked.** The
+packed sequence is `2L` long (one code per byte at `decode_K==1`, the
+only case implemented) and attention over it is currently computed as a
+single `O((2L)^2)`-ish masked `scaled_dot_product_attention` call per
+layer — correct (verified via the causality/gradient checks above) but
+NOT the efficient windowed/chunked form the rest of this file uses
+elsewhere; at `context_len=1024` this is expected to be impractically
+slow for real training. A chunked version (mirroring `_forward_chunked`'s
+own `kc_prev`/`kc` trick, but on `2×window`-sized combined chunks) is
+real, identified, deferred work — not started, given the added
+complexity of getting chunk-local masking right for `"prepend"`
+specifically (sequence order and true-causal order diverge within a
+prepend-packed chunk, unlike `"interleave"` where they coincide "for
+free"). `generate_kv_cache`/`validate_generation`/the old `_step_block`
+incremental-generation machinery were all REMOVED (not ported) for this
+version, since they were built entirely around the mechanism this file
+just deleted — `generate_no_cache` (recompute-from-scratch reference)
+still works unchanged, since it only calls `RefineLM._run`/
+`LevelLM.forward`, agnostic to how decode is implemented inside.
+
+**Chunked/windowed decode, `"interleave"` only.**
+`LevelLM._packed_decode_forward_chunked` (`Config.decode_chunked=True`,
+gated to `decode_pack_mode=="interleave"` in `LevelLM.forward`'s
+dispatch — `"prepend"` still falls back to the dense path, for the reason
+already noted above: prepend's sequence order and true-causal order
+diverge, so the chunk-contiguous trick below doesn't apply to it
+directly without extra work, not attempted this round). Key fact that
+makes interleave chunkable at all: its packed sequence
+(`code_0,byte_0,code_1,byte_1,...`) has **true_pos non-decreasing in
+sequence order** (each code's true_pos is one less than the byte it
+precedes, so the sequence reads `...,-1,0,0,1,1,2,2,...`), so it can be
+chunked contiguously exactly like ordinary windowed self-attention,
+reusing the "previous chunk + current chunk" trick already used
+elsewhere in this file — just with two adjustments: (1) chunk size is
+`sc = 2*W` slots (one byte's window-worth `W` covers `2*W` combined
+slots, since each byte position occupies 2 slots); (2) the per-key
+causal/window/same-position-exclusion test can't use the older
+offset-based `_causal_window_mask` (which assumes uniform 1-unit-per-slot
+spacing) since interleave's slot-to-true_pos spacing isn't uniform (some
+adjacent slots share a true_pos) — so masking is computed from the
+actual gathered `true_pos`/`is_code` values per chunk instead (still
+cheap: one small `[chunk_size, key_context_size]` mask per chunk, not
+global).
+
+The needed reach is `R = 2*W` (`decode`'s window is double the byte-level
+one, per the original spec). Using `n_prev_chunks` previous `sc`-sized
+chunks of extra key context (plus the current chunk) as a safety margin,
+`n_prev_chunks=1` was empirically **insufficient** (`max_diff=0.26`
+against dense, i.e. a real correctness gap, not a rounding difference) —
+`n_prev_chunks=2` matches dense **exactly** (`max_diff=0.0` at
+`d_model=256, context_len=256`, `~7e-7`, i.e. float rounding, at smaller
+scale) and was hardcoded as the default margin. Verified via
+`scripts/test_v4_4_chunked_decode.py`: exact match at `Ks=(1,)` and
+`Ks=(1,1)`, multiple `d_model`/`context_len`/`window` combinations,
+including the `n_chunks==1` degenerate edge case
+(`context_len==attn_window`, previous-chunk padding all zero/masked-out).
+
+**Benchmark (MPS, full train step: forward+backward+`opt.step()`,
+`d_model=256, n_layers=2, attn_window=32`):**
+
+| context_len | chunked | dense |
+|---|---|---|
+| 256 | 73.8ms | 60.1ms |
+| 512 | 129.5ms | 133.6ms |
+| 1024 | 249.2ms | skipped (extrapolated well over 500ms, quadratic) |
+
+Chunked is *not* faster at small `context_len` (gather/reshape/padding
+overhead dominates when the dense call is already cheap) but crosses
+over by `context_len=512` and its linear-in-`L` scaling wins decisively
+as `context_len` grows — exactly the tradeoff expected given dense is
+`O((2L)^2)`-ish and chunked is `O(L)`. `context_len=1024` (the
+production target) was not measured for dense (extrapolated
+impractical); chunked measured directly at `249.2ms/iter`, practical for
+real training.
+
+**First v4.4 training runs launched**: `configs/qcute_refine_v4_4_l1_k1.py`
+(`Ks=(1,)`, degenerate self-conditioning) and
+`configs/qcute_refine_v4_4_l2_k1.py` (`Ks=(1,1)`, genuine level-1-stubbed
+conditioning) — both `decode_pack_mode="interleave"`,
+`decode_chunked=True`, `context_len=512` (not yet the production 1024,
+kept lower for this first real run; only constraint is being a multiple
+of `attn_window=32`, per windowed attention's own requirement). Queued
+sequentially (`l1_k1` first, `l2_k1` auto-starts after via a wrapper
+script polling `l1_k1`'s PID), consistent with the project's one-MPS-job-
+at-a-time rule. `"prepend"` mode and `context_len=1024` remain
+unbenchmarked in a real training run as of this note.
+
+**Two real bugs found once actual training runs were attempted (neither
+is chunked-decode-specific — both present in the dense path too, and the
+init-scale one is present in `qcute_refine_v4_3.py` as well, confirmed by
+re-reading `logs/qcute_refine_v4_3_{l1_k1,l2_k1}/run.log`'s own first
+log lines):**
+
+1. **`nn.Embedding` default init (`std=1.0`) is far too large for a
+   tied classifier head** — `LevelLM.embed` was never given an explicit
+   init (unlike `qcute/bytelm.py`'s own `_init_weights`, which sets
+   `std=0.02` for every `nn.Linear`/`nn.Embedding`). With `std=1.0` and
+   `d_model=256`, `logits = h @ embed.weight.T` has variance ~`d_model`
+   (std ~16), producing wildly peaked/near-random logits at init and
+   catastrophic initial cross-entropy: **measured bpb at step 1 was
+   ~230-245** (both `qcute_refine_v4_4_l1_k1` and its v4.3 predecessor)
+   instead of the expected `log2(256)=8.0` uniform-random floor.
+   Confirmed by isolated test (`model(x)` on a fresh model, `embed.weight`
+   std ≈0.999 by default) and by reproducing exactly with `torch.nn.init.
+   normal_(embed.weight, std=0.02)` applied post-hoc — bpb dropped to
+   `8.07`, matching the analytic floor. **Fixed in `qcute_refine_v4_4.py`**:
+   `LevelLM.__init__` now calls `nn.init.normal_(self.embed.weight,
+   std=0.02)` and the same for `code_head.weight` when untied. `qcute_
+   refine_v4_3.py` (and earlier) were NOT patched — left as accurate
+   historical runs, consistent with the project's "target a specific
+   vN file for historical work" convention; this is a lineage-wide latent
+   bug, not new to v4.4, and anyone re-running v4.3 configs should expect
+   the same over-inflated initial bpb.
+
+2. **`_packed_decode_forward_chunked` crashed during
+   `qualitative_generate`** — `generate_no_cache` grows the sequence one
+   byte at a time (`T=65,66,...`), which isn't a multiple of
+   `attn_window`; the plain `CausalSelfAttention.forward` already handles
+   this gracefully (falls back to dense with a printed warning) but the
+   new chunked-decode path had a hard `assert L % W == 0`, killing both
+   training runs at their first eval (`step=100`). **Fixed**: `LevelLM.
+   forward`'s dispatch now checks `L % self.window == 0` before choosing
+   the chunked path, falling back to `_packed_decode_forward` (dense)
+   otherwise — mirrors the existing base-attention fallback pattern
+   exactly.
+
+Both `qcute_refine_v4_4_l1_k1` and `qcute_refine_v4_4_l2_k1` were
+relaunched (same queued-sequential setup) after these fixes; `l1_k1`
+confirmed at `step=49: bpb=6.18` (below the 8.0 floor and dropping),
+correcting the pre-fix run's `step=49: bpb=231.5`.

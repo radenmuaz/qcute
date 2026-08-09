@@ -503,6 +503,55 @@ class Config:
                                     # heads. Unlike code_ntp_weight==0.0, does NOT skip the level-0 NTP head's
                                     # forward pass (h/byte_acc are still needed downstream/for logging even
                                     # when byte_loss itself doesn't enter the total loss).
+    untie_levels: bool = False    # session: "by untie, make it like v4, different head, embed, lm
+                                    # transformer each level" -- v4.2's OWN defining feature is
+                                    # extreme, UNCONDITIONAL sharing (module docstring: "one trunk
+                                    # ... AND one head/embed/code_pre, across EVERY level INCLUDING
+                                    # level 0") -- RefineLM.__init__ always passes shared=encoders[0]/
+                                    # shared_head=encoders[0] (or the code_bits!=vocab split-pool
+                                    # variant) for every level i>0, with no flag to turn it off
+                                    # (v4.1's own share_levellm=False option was REMOVED when this
+                                    # file was cloned from v4.1, per its own module docstring's
+                                    # "v4.2 always shares everything" section). True here reverts
+                                    # to v4's ORIGINAL per-level separation: every level builds a
+                                    # completely FRESH self.blocks/ln_f/fuse_* trunk (shared=None)
+                                    # and a fresh embed/head/code_pre pool (shared_head=None) of its
+                                    # own -- no aliasing across levels at all, for ANY quant_type,
+                                    # not just quant_type=="simplex" (LevelLM.__init__'s existing
+                                    # `shared_head is not None -> borrow, else -> build fresh` branch
+                                    # already handles shared_head=None correctly for every mode, no
+                                    # new code path needed there). Orthogonal to and composable with
+                                    # `simplex_untie_head`: this controls whether levels share pools
+                                    # WITH EACH OTHER; simplex_untie_head controls whether, WITHIN one
+                                    # pool, the embed and NTP classifier are tied to each other.
+                                    # Setting both True is the fullest "like v4" separation --
+                                    # params scale roughly with n_levels instead of staying flat.
+    fuse_mode: str = "concat"     # session: "rerun with this: post cross attn" -- "concat" (default,
+                                    # v4.2's own unconditional mechanism, see module docstring): no
+                                    # separate cross-attention weights, the level-above's own hidden
+                                    # state is appended to self.blocks' own K/V. "cross_attn_post":
+                                    # reintroduces v4's original CrossBlock-based fusion (see that
+                                    # class's own docstring) -- a genuinely separate, separately-
+                                    # weighted cross-attention sublayer run AFTER self.blocks/ln_f
+                                    # produce this level's own clean hidden state (Q), reading the
+                                    # level-above's own hidden state (K/V). Only meaningful for a
+                                    # level with `fuse_d_model is not None` (i.e. not the top level).
+    untie_fusion_pass: bool = False   # session: "make the each level-pass separate weights, as if
+                                    # there is 3 level lm... by free weight this means like a fresh
+                                    # level lm own embed, transformer, linear head" -- True gives
+                                    # PASS 2 (this level's own FUSED forward call, RefineLM._encode's
+                                    # second sweep) a COMPLETELY separate identity from PASS 1: own
+                                    # `embed_pass2`, own `blocks_pass2`/`ln_f_pass2` trunk, own
+                                    # `simplex_head_pass2` if simplex_untie_head is also set -- not
+                                    # just a separate trunk. Combined with `untie_levels`, a 2-level
+                                    # config effectively trains THREE independent LMs: level 0's own
+                                    # unconditional pass (PASS 1), level 1's own unconditional pass
+                                    # (PASS 1, the top level, never fuses regardless), and level 0's
+                                    # fused pass (PASS 2) as a third, separately-weighted model that
+                                    # only additionally reads the level-above via cross-attention
+                                    # (`fuse_mode`). Currently only implemented for byte-level
+                                    # `quant_type=="simplex"` (LevelLM.__init__ asserts this) -- the
+                                    # only case this session's own diagnostic configs exercise.
     quant_type: str = "bsq"       # TWO real modes: "bsq" (default) and "simplex" (new this session —
                                     # session: "generalize with flag to mode where every level is softmax
                                     # head 256 way... instead of sign and ste, do gumbel softmax ste...
@@ -549,6 +598,26 @@ class Config:
                                     # you cannot alias two differently-shaped embedding tables. Warns
                                     # (doesn't error) above 8: e.g. code_bits=16 means every code level's
                                     # classifier is a dense 65536-way softmax — expensive, not unsound.
+    simplex_untie_head: bool = False   # Only used when quant_type=="simplex" (session: "easier if you can
+                                    # make 4.2 untie weight mode") — classic weight-tying ablation (Press &
+                                    # Wolf 2017's own "tied vs untied" question), applied to the ONE place
+                                    # this file's "simplex" mode literally ties weights: the NTP
+                                    # classification readout (`F.linear(h, self.embed.weight)` in forward()'s
+                                    # loss computation and _sample_next_byte) shares its weight matrix with
+                                    # the INPUT embedding table by default. False (default): unchanged,
+                                    # weight-tied, exactly as originally built. True: each level gets its
+                                    # own PRIVATE `nn.Linear(D, V)` classifier (`LevelLM.simplex_head`),
+                                    # mirroring the exact same is_byte_level/shared_head/else sharing
+                                    # structure `self.embed` itself already uses — so this is orthogonal to,
+                                    # not a replacement for, the existing byte/code-level sharing scheme:
+                                    # untying only separates "read a token" from "classify the next one,"
+                                    # it does not change WHICH levels share a pool with each other.
+                                    # Deliberately does NOT touch the OTHER weight-tie this mode has —
+                                    # `code_embed.weight`, used to produce the code a level hands UPWARD
+                                    # (forward()'s own c_i computation, `maybe_emit_code` in
+                                    # generate_kv_cache) — a conceptually different job (encoding a
+                                    # compressed representation, not classifying a known-vocabulary token),
+                                    # not what "weight tying" classically refers to.
     gumbel_tau: float = 1.0       # Softmax temperature used by the quant_type=="simplex" quantizer
                                     # (`gumbel_quantize`) regardless of `use_gumbel_noise`. Lower =
                                     # peakier/closer to a true hard argmax; higher = softer/smoother.
@@ -1030,6 +1099,57 @@ class Block(nn.Module):
         x_new = x_new + attn_out
         x_new = x_new + self.mlp(self.ln2(x_new))
         return x_new, new_k, new_v
+
+
+class CrossBlock(nn.Module):
+    """Single cross-attention transformer block: cross-attn sublayer (Q from one sequence, K/V
+    from another) + MLP sublayer, each pre-norm + residual — same shape as this file's own causal
+    `Block`, with self-attention swapped for cross-attention. Ported near-verbatim from
+    qcute_refine_v4.py's own `CrossBlock` (session: "rerun with this: post cross attn" — v4.2's
+    own concat-only fusion has no separate cross-attention weights at all, see the module
+    docstring; this reintroduces v4's original mechanism as an alternative `fuse_mode`). RoPE is
+    optional (Config.cross_attn_rope) — Q and KV live at different granularities/lengths, so they
+    can't share one contiguous rotary range the way self-attention does, but each side can still
+    get its own explicit position tag via rope_q/rope_k."""
+
+    def __init__(self, d_model: int, n_heads: int, mlp_mult: int):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.ln_q = nn.LayerNorm(d_model)
+        self.ln_kv = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.kv_proj = nn.Linear(d_model, 2 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, mlp_mult * d_model),
+            nn.GELU(),
+            nn.Linear(mlp_mult * d_model, d_model),
+        )
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor, attn_mask: torch.Tensor,
+                rope_q: tuple[torch.Tensor, torch.Tensor] | None = None,
+                rope_k: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
+        """attn_mask: bool [Lq, Lkv], True = BLOCKED — inverted internally since
+        F.scaled_dot_product_attention's boolean convention is the opposite (True = may attend)."""
+        qn, kvn = self.ln_q(q), self.ln_kv(kv)
+        B, Lq, D = qn.shape
+        Lkv = kvn.shape[1]
+        H, hd = self.n_heads, self.head_dim
+        qh = self.q_proj(qn).reshape(B, Lq, H, hd).transpose(1, 2)
+        kvp = self.kv_proj(kvn).reshape(B, Lkv, 2, H, hd).permute(2, 0, 3, 1, 4)
+        kh, vh = kvp[0], kvp[1]
+        if rope_q is not None:
+            qh = apply_rope(qh, *rope_q)
+        if rope_k is not None:
+            kh = apply_rope(kh, *rope_k)
+        sdpa_mask = ~attn_mask if attn_mask is not None else None
+        y = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=sdpa_mask)
+        attn_out = self.out_proj(y.transpose(1, 2).reshape(B, Lq, D))
+        q = q + attn_out
+        q = q + self.mlp(self.ln2(q))
+        return q
 
 
 def byte_to_dqbits(byte_ids: torch.Tensor, dq: int) -> torch.Tensor:
@@ -2070,6 +2190,11 @@ class LevelLM(nn.Module):
                 self.embed = nn.Embedding(cfg.vocab, D)
                 if V == cfg.vocab:
                     self.code_embed = self.embed   # uniform pool: same table serves both jobs
+                elif cfg.untie_levels:
+                    self.code_embed = nn.Embedding(V, D)   # untie_levels: own fresh table, never
+                                                              # aliased to level 1's (see Config.
+                                                              # untie_levels' own docstring — "no
+                                                              # aliasing across levels at all")
                 # else: left unset here — RefineLM.__init__ patches it in once level 1 exists.
             elif shared_head is not None:
                 # code_bits==8 (V==vocab): borrows level 0's OWN table — full uniform sharing,
@@ -2082,6 +2207,18 @@ class LevelLM(nn.Module):
                 # level 1 owns a fresh, separate V-sized pool for every code level to share.
                 self.embed = nn.Embedding(V, D)
                 self.code_embed = self.embed
+
+            self.simplex_head = None
+            if cfg.simplex_untie_head:
+                # mirrors the EXACT same is_byte_level/shared_head/else structure above, one
+                # private nn.Linear per pool instead of aliasing self.embed's own weight matrix —
+                # see Config.simplex_untie_head's own docstring for what this does and doesn't
+                # untie (only the NTP classifier, never code_embed's own upward-code weight-tie).
+                head_V = cfg.vocab if self.is_byte_level else V
+                if shared_head is not None and shared_head.simplex_head is not None:
+                    self.simplex_head = shared_head.simplex_head
+                else:
+                    self.simplex_head = nn.Linear(D, head_V)
         elif self.is_byte_level and cfg.byte_head_256way:
             # ABLATION (session: "make ablation use regular byte 256-way head, put as flag") —
             # level 0 opts OUT of the shared dq-bit embed/head pool entirely: its own, unshared,
@@ -2172,6 +2309,65 @@ class LevelLM(nn.Module):
                 # CausalSelfAttention layers derive K/V for the fused tail directly from their own
                 # qkv weights (see _prep_concat).
 
+        self.cross_fuse = None
+        self.embed_pass2 = self.blocks_pass2 = self.ln_f_pass2 = self.simplex_head_pass2 = None
+        if fuse_d_model is not None:
+            # session: "rerun with this: post cross attn" -- v4.2's own concat-only fusion (above)
+            # has NO separate cross-attention weights at all (module docstring: the level-above's
+            # own hidden state gets read via self.blocks' own qkv). `fuse_mode="cross_attn_post"`
+            # reintroduces v4's original `CrossBlock`-based fusion (see that class's own docstring,
+            # ported near-verbatim) -- a genuine, separately-weighted cross-attention sublayer run
+            # AFTER self.blocks/ln_f produce this level's own clean hidden state, Q=that hidden
+            # state, K/V=the level-above's own (projected, null-prepended) hidden state. One
+            # CrossBlock instance per level, not one per self.blocks layer (unlike concat, which
+            # threads fuse_kv through every layer).
+            if cfg.fuse_mode == "cross_attn_post":
+                self.cross_fuse = CrossBlock(D, cfg.n_heads, cfg.mlp_mult)
+            if cfg.untie_fusion_pass:
+                # session: "define another config make the each level-pass separate weights, as
+                # if there is 3 level lm... by free weight this means like a fresh level lm own
+                # embed, transformer, linear head" -- PASS 2 (this level's own FUSED forward call)
+                # gets a COMPLETELY separate identity from PASS 1: own embed, own self.blocks/ln_f
+                # trunk, own classifier -- not just a separate trunk. Scoped to the byte-level
+                # `quant_type=="simplex"` case (the only path either of this session's two new
+                # diagnostic configs actually exercises) -- asserted below rather than silently
+                # falling back for any other combination.
+                assert self.is_byte_level and cfg.quant_type == "simplex", (
+                    "untie_fusion_pass is only implemented for byte-level quant_type='simplex' "
+                    "(the case this session's diagnostic configs actually use)"
+                )
+                self.embed_pass2 = nn.Embedding(cfg.vocab, D)
+                self.blocks_pass2 = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
+                self.ln_f_pass2 = nn.LayerNorm(D)
+                if cfg.simplex_untie_head:
+                    self.simplex_head_pass2 = nn.Linear(D, cfg.vocab)
+
+    def _fuse_cross(self, x: torch.Tensor, fuse_kv: torch.Tensor) -> torch.Tensor:
+        """`fuse_mode=="cross_attn_post"`'s own fusion step -- ported from qcute_refine_v4.py's own
+        LevelLM._fuse (same computation, ONE CrossBlock instead of choosing between fuse_cross_pre/
+        fuse_cross_post since this file only ever supports the "post" position). x: [B, L, D] this
+        level's own POST-self.blocks hidden state (unlike v4's _fuse, called on the pre-self-
+        attention embedding for "pre"/"both" -- "post" always reads the already-self-attended
+        state). fuse_kv: [B, n_blocks, D_above] the level-above's own hidden state."""
+        cfg = self.cfg
+        K = cfg.Ks[self.level]
+        B, L, D = x.shape
+        n_blocks = fuse_kv.size(1)
+        device = x.device
+        kv = self.fuse_kv_proj(fuse_kv)
+        if cfg.fuse_use_null_kv:
+            null = self.fuse_null_kv.expand(B, 1, D)
+            kv = torch.cat([null, kv], dim=1)
+        disallow, k_pos = jagged_causal_mask_and_positions(L, n_blocks, K, self.fuse_kv_window, device,
+                                                              include_null=cfg.fuse_use_null_kv)
+        rope_q = rope_k = None
+        if cfg.cross_attn_rope:
+            head_dim = D // cfg.n_heads
+            q_pos = torch.arange(L, device=device)
+            rope_q = rope_cos_sin_for_positions(q_pos, head_dim, cfg.rope_base, device)
+            rope_k = rope_cos_sin_for_positions(k_pos, head_dim, cfg.rope_base, device)
+        return self.cross_fuse(x, kv, attn_mask=disallow, rope_q=rope_q, rope_k=rope_k)
+
     def _prep_concat(self, x: torch.Tensor, fuse_kv: torch.Tensor):
         """Concat fusion's own prep, done ONCE and shared by every self.blocks layer — projects+
         null-prepends fuse_kv and builds the jagged visibility mask/rope-k positions once, since
@@ -2196,6 +2392,21 @@ class LevelLM(nn.Module):
             rope_k = rope_cos_sin_for_positions(k_pos, head_dim, cfg.rope_base, device)
         return kv, disallow, rope_k
 
+    def simplex_logits(self, h: torch.Tensor, use_pass2: bool = False) -> torch.Tensor:
+        """quant_type=="simplex" ONLY -- the one dispatch point for "classify h into the V-way
+        next-token distribution," so Config.simplex_untie_head has exactly one place to change
+        behavior (forward()'s own loss computation and _sample_next_byte both call this instead
+        of duplicating the tied/untied branch). use_pass2 (session: "make the each level-pass
+        separate weights"): read PASS 2's own private embed_pass2/simplex_head_pass2 instead of
+        PASS 1's — only ever True when untie_fusion_pass is set."""
+        if use_pass2:
+            if self.simplex_head_pass2 is not None:
+                return self.simplex_head_pass2(h)
+            return F.linear(h, self.embed_pass2.weight)
+        if self.simplex_head is not None:
+            return self.simplex_head(h)
+        return F.linear(h, self.embed.weight)
+
     def forward(self, seq_repr: torch.Tensor, compute_ntp: bool = True,
                 fuse_kv: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """seq_repr: level 0 gets raw byte ids [B, L] (long) — converted internally to the shared
@@ -2211,8 +2422,20 @@ class LevelLM(nn.Module):
         D = cfg.d_model
         dq = cfg.dq
 
+        # session: "make the each level-pass separate weights, as if there is 3 level lm... by
+        # free weight this means like a fresh level lm own embed, transformer, linear head" --
+        # PASS 2 (fuse_kv is not None) reads through embed_pass2/blocks_pass2/ln_f_pass2 instead
+        # of the PASS-1 identity when untie_fusion_pass is set (else identical to before: same
+        # embed/blocks/ln_f regardless of pass). Only byte-level quant_type=="simplex" ever
+        # constructs *_pass2 (asserted in __init__), which is exactly the only case fuse_kv is
+        # non-None for level 0 (the top level never receives fuse_kv) in this session's configs.
+        use_pass2 = fuse_kv is not None and cfg.untie_fusion_pass
+        embed = self.embed_pass2 if use_pass2 else self.embed
+        blocks = self.blocks_pass2 if use_pass2 else self.blocks
+        ln_f = self.ln_f_pass2 if use_pass2 else self.ln_f
+
         if cfg.quant_type == "simplex" and self.is_byte_level:
-            x = self.embed(seq_repr)   # gather: seq_repr is [B, L] long raw byte ids
+            x = embed(seq_repr)   # gather: seq_repr is [B, L] long raw byte ids
             B, L = seq_repr.shape
         elif cfg.quant_type == "simplex":
             x_in = seq_repr             # [B, L, V] float, one-hot-ish (hard-STE forward value)
@@ -2237,16 +2460,21 @@ class LevelLM(nn.Module):
         if fuse_kv is not None:
             assert self.fuse_d_model is not None, "fuse_kv passed but this LevelLM has no fuse module (no level above it?)"
 
+        # concat mode threads fuse_kv through every self.blocks layer's own K/V; cross_attn_post
+        # mode runs self.blocks/ln_f CLEAN (no fuse_kv at all) and instead applies a separate
+        # CrossBlock AFTER, below.
         concat_kv = concat_disallow = concat_rope_k = None
-        if fuse_kv is not None:
+        if fuse_kv is not None and cfg.fuse_mode == "concat":
             concat_kv, concat_disallow, concat_rope_k = self._prep_concat(x, fuse_kv)
 
         head_dim = D // cfg.n_heads
         cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
-        for block in self.blocks:
+        for block in blocks:
             x = block(x, cos, sin, self.window, fuse_kv=concat_kv, fuse_disallow=concat_disallow, fuse_rope_k=concat_rope_k)
 
-        h = self.ln_f(x)
+        h = ln_f(x)
+        if fuse_kv is not None and cfg.fuse_mode == "cross_attn_post":
+            h = self._fuse_cross(h, fuse_kv)
 
         if compute_ntp:
             h_flat = h[:, :-1, :].reshape(-1, D)
@@ -2258,7 +2486,7 @@ class LevelLM(nn.Module):
                 # target-derivation, generalized to every level.
                 target = (seq_repr[:, 1:].reshape(-1) if self.is_byte_level
                           else seq_repr[:, 1:, :].argmax(-1).reshape(-1))
-                logits = F.linear(h_flat, self.embed.weight)
+                logits = self.simplex_logits(h_flat, use_pass2=use_pass2)
                 ntp_loss = F.cross_entropy(logits, target)
                 with torch.no_grad():
                     ntp_acc = (logits.argmax(-1) == target).float().mean()
@@ -2414,7 +2642,12 @@ class RefineLM(nn.Module):
         for i in range(self.n_levels):
             fuse_d_model = cfg.d_model if i < self.n_levels - 1 else None
             fuse_kv_window = windows[i + 1] if i < self.n_levels - 1 else None
-            if cfg.byte_head_256way or (cfg.quant_type == "simplex" and cfg.code_bits != 8):
+            if cfg.untie_levels:
+                # session: "make it like v4, different head, embed, lm transformer each level" —
+                # no aliasing at all, every level builds everything fresh (see Config.untie_levels'
+                # own docstring). Overrides every sharing scheme below, including the split-pool one.
+                shared_head = None
+            elif cfg.byte_head_256way or (cfg.quant_type == "simplex" and cfg.code_bits != 8):
                 # split pool: byte (level 0) owns/keeps its own private table; level 1 owns a
                 # SEPARATE pool every code level (2+) borrows from instead — same pattern for both
                 # triggers, since both boil down to "byte's table and code levels' table can't be
@@ -2426,12 +2659,14 @@ class RefineLM(nn.Module):
             encoders.append(LevelLM(
                 cfg, i, windows[i],
                 fuse_d_model=fuse_d_model, fuse_kv_window=fuse_kv_window,
-                shared=encoders[0] if i > 0 else None,
+                shared=None if cfg.untie_levels else (encoders[0] if i > 0 else None),
                 shared_head=shared_head,
             ))
-            if i == 1 and cfg.quant_type == "simplex" and cfg.code_bits != 8:
+            if i == 1 and cfg.quant_type == "simplex" and cfg.code_bits != 8 and not cfg.untie_levels:
                 # level 0's own code_embed couldn't be wired at construction time (level 1 didn't
                 # exist yet) — patch it in now that it does. See LevelLM.__init__'s own comment.
+                # Skipped under untie_levels: level 0 already built its OWN fresh code_embed table
+                # above (no aliasing across levels at all under this flag).
                 encoders[0].code_embed = encoders[1].embed
         self.encoders = nn.ModuleList(encoders)
 
@@ -2580,10 +2815,17 @@ class RefineLM(nn.Module):
         return loss, metrics
 
 
-def _sample_next_byte(model: "RefineLM", h_last: torch.Tensor) -> torch.Tensor:
+def _sample_next_byte(model: "RefineLM", h_last: torch.Tensor, from_pass2: bool = False) -> torch.Tensor:
+    """from_pass2 (session: "make the each level-pass separate weights"): True when h_last came
+    from RefineLM._encode's own PASS 2 (fused) sweep rather than PASS 1 -- callers driven by the
+    normal generate_no_cache/generate_kv_cache path pass whatever _encode/maybe_emit_code actually
+    produced (fused, whenever fuse_encoder_levels=True and n_levels>=2); a dedicated
+    level-0-unconditional generation path passes False. Only matters when
+    Config.untie_fusion_pass is set — PASS 2 then has its own private classifier, so classifying
+    its own output with PASS 1's weights would be wrong."""
     enc0 = model.encoders[0]
     if model.cfg.quant_type == "simplex":
-        return F.linear(h_last, enc0.embed.weight).argmax(-1)   # weight-tied vocab=256 classifier
+        return enc0.simplex_logits(h_last, use_pass2=from_pass2 and model.cfg.untie_fusion_pass).argmax(-1)
     if model.cfg.byte_head_256way:
         return enc0.ntp_head(h_last).argmax(-1)   # [B, vocab] exact softmax logits, unshared head
     if model.cfg.byte_softmax_head_only:
@@ -2623,7 +2865,8 @@ def generate_no_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
 
     for _ in range(n_new_bytes):
         _, _, _, _, h_list, _ = model._encode(all_bytes, n_active, compute_ntp=False)
-        next_byte = _sample_next_byte(model, h_list[0][:, -1, :])
+        from_pass2 = model.cfg.fuse_encoder_levels and n_active >= 2
+        next_byte = _sample_next_byte(model, h_list[0][:, -1, :], from_pass2=from_pass2)
         all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
 
     if was_training:
@@ -2789,7 +3032,7 @@ def generate_kv_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
 
     out_bytes = [prompt_bytes]
     for i in range(n_new_bytes):
-        next_byte = _sample_next_byte(model, last_fused_h)
+        next_byte = _sample_next_byte(model, last_fused_h, from_pass2=fuse_on)
         out_bytes.append(next_byte.unsqueeze(1))
         pos = L0 + i
         h_clean = clean_step(0, next_byte)
@@ -2799,6 +3042,60 @@ def generate_kv_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
     if was_training:
         model.train()
     return torch.cat(out_bytes, dim=1)[0]
+
+
+@torch.no_grad()
+def generate_level0_uncond(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> torch.Tensor:
+    """Session: "for level 0 uncond and level 0 pass 2 cross attn" -- level 0's own PASS-1-ONLY
+    generation, ignoring every level above it and any fusion entirely, even when
+    fuse_encoder_levels=True (unlike generate_no_cache, which always reproduces whatever
+    RefineLM._encode's own PASS 2 sweep does). Calls model.encoders[0] directly with fuse_kv=None
+    every step -- exactly PASS 1's own computation for level 0, matching _encode's own PASS 1
+    sweep at i=0. Same "recompute everything, obviously correct" tradeoff generate_no_cache
+    itself makes; no KV cache."""
+    was_training = model.training
+    model.eval()
+    prompt_bytes = prompt_bytes.to(device)
+    if prompt_bytes.dim() == 1:
+        prompt_bytes = prompt_bytes.unsqueeze(0)
+    all_bytes = prompt_bytes
+    enc0 = model.encoders[0]
+    for _ in range(n_new_bytes):
+        _, _, _, h = enc0(all_bytes, compute_ntp=False)   # fuse_kv=None always -- PASS 1 only
+        next_byte = _sample_next_byte(model, h[:, -1, :], from_pass2=False)
+        all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
+    if was_training:
+        model.train()
+    return all_bytes[0]
+
+
+def qualitative_generate(model: "RefineLM", prompt_bytes: torch.Tensor, gen_len: int,
+                          ground_truth: torch.Tensor | None, device: str, log=print, label: str = "") -> None:
+    """Same role as qcute.bytelm's own qualitative_generate -- greedy AR
+    continuation from a dataset-drawn prompt, logged alongside ground truth
+    -- but called from INSIDE train()'s own eval round here (session: "plug
+    in ar generation code in train code eval round... goal is to get
+    generation close to train sample else conclude degenerate arch"),
+    not just once after training finishes like bytelm's version. Uses
+    generate_no_cache (not generate_kv_cache): the same "obviously correct,
+    windowed-attn-safe" reference every other qual-gen script in this
+    session already standardized on. Also generates level 0's own
+    UNCONDITIONAL (PASS-1-only, no fusion) continuation for the SAME
+    prompt via generate_level0_uncond (session: "for level 0 uncond and
+    level 0 pass 2 cross attn") -- a direct within-model comparison of
+    "with fusion" vs. "without," not just against an external baseline.
+    label: prefixed to every log line (e.g. "train"/"val") so both
+    regions' output is distinguishable when logged back to back."""
+    prefix = f"qual_{label}_" if label else "qual_"
+    out = generate_no_cache(model, prompt_bytes, gen_len, device)
+    gen_bytes = bytes(out[prompt_bytes.numel():].tolist())
+    out_uncond = generate_level0_uncond(model, prompt_bytes, gen_len, device)
+    gen_bytes_uncond = bytes(out_uncond[prompt_bytes.numel():].tolist())
+    log(f"{prefix}prompt:            {bytes(prompt_bytes.tolist())!r}")
+    log(f"{prefix}generated_pass2:   {gen_bytes!r}")
+    log(f"{prefix}generated_uncond:  {gen_bytes_uncond!r}")
+    if ground_truth is not None:
+        log(f"{prefix}ground_truth:      {bytes(ground_truth.tolist())!r}")
 
 
 def validate_generation(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> bool:
@@ -2978,6 +3275,16 @@ def train(model: RefineLM, train_data: torch.Tensor, val_data: torch.Tensor, arg
             log(f"{pbar}  {val_str}  best_val_bpb={checkpointer.best_metric:.4f}",
                 step=step, **{f"val_{k}": v for k, v in val.items()}, best_val_bpb=checkpointer.best_metric)
 
+            if args.qual_gen_bytes > 0:
+                # session: "every eval round, generate both train prompt and val prompt" --
+                # args.qual_source is no longer a choice between the two, both always run.
+                total_len = args.qual_prompt_bytes + args.qual_gen_bytes
+                for label, src_data in (("train", train_data), ("val", val_data)):
+                    start = torch.randint(0, max(1, len(src_data) - total_len), (1,)).item()
+                    window = src_data[start: start + total_len]
+                    qualitative_generate(model, window[: args.qual_prompt_bytes], args.qual_gen_bytes,
+                                          window[args.qual_prompt_bytes:], device, log=log, label=label)
+
 
 def _parse_int_tuple(s) -> tuple[int, ...]:
     if isinstance(s, (tuple, list)):
@@ -3032,6 +3339,10 @@ def main():
     p.add_argument("--code_ntp_weight", type=float, default=1.0)
     p.add_argument("--byte_ntp_weight", type=float, default=1.0)
     p.add_argument("--fusion_ntp_weight", type=float, default=1.0)
+    p.add_argument("--untie_levels", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--simplex_untie_head", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--fuse_mode", type=str, default="concat", choices=["concat", "cross_attn_post"])
+    p.add_argument("--untie_fusion_pass", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--quant_type", type=str, default="bsq", choices=["bsq", "identity", "simplex"])
     p.add_argument("--code_bits", type=int, default=8)
     p.add_argument("--gumbel_tau", type=float, default=1.0)
@@ -3057,6 +3368,11 @@ def main():
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--eval_every", type=int, default=100)
     p.add_argument("--eval_batches", type=int, default=20)
+    p.add_argument("--qual_gen_bytes", type=int, default=0,
+                    help="if >0, AR-generate this many bytes EVERY eval round (not just post-training, unlike qcute.bytelm's own --qual_gen_bytes) and log prompt/generated/ground_truth -- a diagnostic to watch generation quality progress live during training")
+    p.add_argument("--qual_source", choices=["train", "val"], default="train",
+                    help="which region to draw the qual-gen prompt from -- default train (not bytelm's val default): the diagnostic question here is 'can it even reproduce train', not generalization")
+    p.add_argument("--qual_prompt_bytes", type=int, default=64)
 
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--logs_dir", type=Path, default=Path("logs"))
@@ -3109,6 +3425,8 @@ def main():
         byte_head_rank=args.byte_head_rank,
         code_ntp_weight=args.code_ntp_weight, byte_ntp_weight=args.byte_ntp_weight,
         fusion_ntp_weight=args.fusion_ntp_weight,
+        untie_levels=args.untie_levels, simplex_untie_head=args.simplex_untie_head,
+        fuse_mode=args.fuse_mode, untie_fusion_pass=args.untie_fusion_pass,
         quant_type=args.quant_type, code_bits=args.code_bits, gumbel_tau=args.gumbel_tau,
         use_gumbel_noise=args.use_gumbel_noise,
         code_embed_mode=args.code_embed_mode, fuse_encoder_levels=args.fuse_encoder_levels,
