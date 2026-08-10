@@ -25,7 +25,7 @@ def check_equivalence(Ks, d_model, n_layers, context_len, window, n_prev_chunks,
     x = torch.randint(0, cfg.vocab, (2, context_len))
 
     with torch.no_grad():
-        _, _, _, _, h_dense = model._run(x, compute_ntp=False)
+        _, _, _, _, h_dense, _, _, _ = model._run(x, compute_ntp=False)
         cfg.decode_chunked = False
 
     enc0 = model.encoders[0]

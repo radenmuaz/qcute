@@ -1981,8 +1981,913 @@ position, an unavoidable circular dependency; self-conditioning +
 independent-drafter has no such cycle, since the drafter never needs
 `code_i[p]` itself to predict it).
 
-**Status: design direction only, not implemented.** Two options on the
-table for next steps, neither started: (a) flip `decode_code_ste`
-default to `False` and requeue a self-conditioning config to test the
-mechanism, or (b) hold as documented design direction until the current
-training queue clears. No decision made yet as of this note.
+**Status: design written up in full as `docs/two_stage_latent_decode_math.md`
+(math spec, portable to code without more context), and a first test
+config queued.**
+
+**`AuxCodeLM` built, then reverted.** First implementation attempt built
+a bespoke, non-shared-weight drafter module (`AuxCodeLM`, own
+`embed`/`blocks`, for `n_levels==1` configs with no natural level above
+to reuse). User feedback: this solves the wrong problem — the
+`n_levels==1` self-conditioning base case is already correct and needs
+no special handling; "no drafter exists for the top level" is just "no
+`Ks[-1]=1` entry appended," already fully covered by the EXISTING
+shared-weight `LevelLM`/`generate_level1_codes` machinery, no new class
+needed. `AuxCodeLM` was actually addressing a DIFFERENT, unconfirmed
+concern (does the drafter's SHARED weights get pulled off-target by the
+main tower's other objectives, even with `decode_code_ste=False`
+severing the direct gradient path through the code tensor?) — a real
+question, but one to measure before building infrastructure for it.
+Reverted (`Config.aux_code_lm`/`aux_code_lm_layers`, the `AuxCodeLM`
+class, and `RefineLM.forward`'s use of it all removed) in favor of the
+simpler default: reuse `Ks=(K0, 1)` directly.
+
+**New config**: `configs/qcute_refine_v4_4_selfcond_detach_k4.py`
+(`Ks=(4,1)`, `decode_code_ste=False`) — level 0 decodes SELF-conditioned
+only (its cross-level `+1` track to level1's code is explicitly disabled,
+window value `0`); level1's own decode/self-conditioning is also disabled
+(irrelevant to this experiment); level1 exists purely as an independent
+NTP model over the `code_0` stream, i.e. exactly the drafter role,
+reusing `generate_level1_codes` unmodified. Verified directly before
+queuing: `enc0.code_head.weight.grad is None` when isolated to
+`decode_losses[0].backward()` alone (confirms the detach), and
+`generate_level1_codes` still runs unmodified against this config.
+Queued behind `bpelike_k4_1` (`caffeinate -i -w <wrapper pid>` covering
+both jobs, so the machine won't sleep through either).
+
+**What this run will tell us**: once trained, compare
+`val_level1_ntp_acc_encode` (level1's own accuracy at predicting the
+NEXT `code_0` token) against `val_level0_ntp_acc_decode`/`val_bpb`
+(decode's own quality using the TRUE `code_0`) — if level1 predicts
+`code_0` well, its drafted continuation is a credible substitute for
+decode's true self-conditioning signal at generation time (§7 of the
+math doc). The actual drafted-substitution GENERATION function itself
+is still **not implemented** — this config only tests whether training
+produces drafts good enough to make building it worthwhile.
+
+**Machine reboot mid-`bpelike_k4_1` run, silent kill, no resume
+capability.** Around 8:28am the machine rebooted outright (confirmed via
+`uptime` showing only ~6h40m elapsed, not the days-long uptime expected)
+— NOT a training-time crash. This silently killed the training process,
+its queue wrapper script, and the `caffeinate -i -w <wrapper pid>`
+watching it, all simultaneously; `bpelike_k4_1`'s raw stdout log
+(`/tmp/v4_4_bpelike_k4_1.log`) was gone entirely post-reboot.
+`qcute_refine_v4_4.py`'s `main()` has no checkpoint-resume path — it
+always starts training from step 0 — so the run had to be relaunched
+from scratch (it had reached step 1699/4000 before the reboot; that
+progress is lost, not resumed). Relaunched
+(`--run_name qcute_refine_v4_4_bpelike_k4_1`, wrapper PID 4685→python
+PID 4688), queue wrapper rebuilt (`run_v4_4_selfcond_after_bpelike_k4_1_v2.sh`,
+polls `kill -0 4688`), `caffeinate -i -w <new wrapper pid>` relaunched
+watching it. Confirmed via fresh `[00:00:00]` entries appended to
+`logs/qcute_refine_v4_4_bpelike_k4_1/run.log` (that file is append-mode,
+so it now contains both the killed run's history up to step 1699 AND the
+new run's entries concatenated — read with that in mind). `caffeinate`
+prevents idle sleep, not a full reboot; there is no mitigation in place
+against this happening again besides noticing it promptly.
+
+**Post-restart throughput degraded sharply, then root-caused and fixed**:
+by step 349/4000 (1h28m elapsed) the observed rate had degraded to
+~17.83s/it average, with individual steps as bad as 129.83s/it and
+climbing over time (not a stable slow rate — actively worsening),
+against a nominal ~30min budget. `vm_stat` showed only ~64MB free RAM at
+the time (`Pages free: 4111` × 16KB), consistent with the ~60MB-free
+pressure flagged earlier this session, though `ps aux -m` found no
+single runaway process (just cumulative load from an active VS Code +
+Chrome session) — the memory pressure looks incidental, not the root
+cause.
+
+**Root cause: `context_len=1024` decode passes are dense O((2L)²), not
+windowed.** Level 0's own `attn_window=8` encode pass genuinely takes
+the efficient chunked path (`T=1024 % window=8==0` and `T>window`
+satisfied). But: level 1's encode window (256) exactly equals its own
+sequence length (`context_len/Ks[0]=256`), so `T>window` is false and it
+silently falls back to dense (expected/flagged by the code's own
+warning, just easy to overlook the cost). More importantly, **both
+levels' decode passes ran fully dense** — `decode_chunked=False` was
+forced off in this config specifically because the chunked decode path
+(`_packed_decode_forward_chunked`) is only implemented/verified for
+`decode_K==1`, and this run has `decode_K=Ks[0]*Ks[1]=4`. Dense decode
+attention over a packed multi-track sequence at `context_len=1024` is
+the dominant cost, and it scales as `O((2·context_len)²)`.
+
+**Fix applied**: dropped `context_len` 1024→256 in both
+`bpelike_k4_1` and `selfcond_detach_k4` (attn_window's dense-fallback
+level scaled down proportionally, 256→64, keeping the same
+window==seqlen relationship). Killed the degraded run (PID 4688) and
+its queue chain, relaunched fresh. Result: **4.41 it/s** immediately
+after restart (was 17.83s/it average, worse and worsening before) — a
+~2-orders-of-magnitude improvement, confirming dense-decode-at-1024 was
+the actual bottleneck, not thermal/memory drift. New `bpelike_k4_1` ETA
+~15min for the full 4000 steps. `selfcond_detach_k4` still queued behind
+it (new wrapper/caffeinate chain rebuilt, watching python PID 8973).
+Longer-term fix, not done here: extend `_packed_decode_forward_chunked`
+to support `decode_K>1` so `context_len=1024` runs don't need this
+workaround.
+
+**`LevelLM._packed_decode_forward_banded` built: general O(L*sum(windows))
+alternative to dense's O((2L)²), any track count/K/window/pack_mode.**
+Supersedes the "extend `_packed_decode_forward_chunked`" TODO above --
+this handles `decode_K>1` and multiple simultaneous cross-level tracks by
+construction, and doesn't special-case `decode_pack_mode` at all (see
+below). `Config.decode_banded: bool = False` (default off; dense
+`_packed_decode_forward` remains the reference implementation).
+
+Design: rather than choosing a packing order and hoping it stays
+true_pos-monotonic (only true for `decode_K==1` interleave), build the
+sequence once canonically (all prefixes, then bytes) and explicitly SORT
+by `true_pos`, making it monotonic unconditionally. Then reuse
+`_packed_decode_forward_chunked`'s existing chunk-with-margin banding
+trick, generalized to a PER-KEY window (`window_of_key`) instead of one
+shared scalar, since different tracks can have different windows. The
+`allow` mask formula (causal & same_pos_code_excluded & windowed) is
+copied verbatim from dense, just evaluated on a small gathered
+`(sc, Kc)` window per query-chunk instead of the full `(Le, Le)` matrix
+-- still an exact row-wise mask, just minimal in extent, not absent.
+
+**Bug found and fixed: tie-break order at equal true_pos.** A track's
+code sits at `true_pos = b*K-1`, one unit below its block's first byte
+-- so a code and a byte routinely share the same `true_pos` (a "tie").
+The mask is ASYMMETRIC at ties: a code query CAN see a same-true_pos
+byte key (`same_pos_code_excluded` only excludes CODE keys), but a byte
+query CANNOT see a same-true_pos code key. A backward-only gather over
+one sorted sequence can only realize that asymmetry if ties are ordered
+bytes-before-codes (so codes, sorted later, can look back and find
+them; bytes, sorted earlier, never look far enough forward to find
+same-true_pos codes at all). The original sort (stable, inheriting
+codes-before-bytes from the packing order) had this backwards --
+produced small-but-real errors (~0.04-0.08 max diff) that were EASY TO
+MISS: they didn't show up with `n_layers=1` (byte outputs matched
+exactly), only with `n_layers>=2`, because code positions' own hidden
+states diverged first and only leaked into byte outputs via the next
+layer's cross-attention read. A second, unrelated bug (insufficient
+margin sizing -- `ceil(R/sc)` undercounts required sorted-array reach
+when ties let true_pos advance by 0 for several consecutive sorted
+steps; fixed by scaling margin by `len(tracks)+1`, the max ties possible
+per true_pos value) was found and fixed first, before the tie-break bug
+was isolated by comparing full (code+byte) hidden states layer-by-layer
+against dense rather than just the extracted byte output.
+
+**Correctness: verified exact.** New `scripts/test_v4_4_banded_decode.py`
+-- 8 configs (single-track K=1, single-track K>1 decode_K, 2-track and
+3-track cumulative cross-level conditioning with differing K/windows,
+production scale) all match dense to float precision (`ALL MATCH`).
+
+**Timing: RE-BENCHMARKED CLEANLY (queue fully idle, no MPS contention)
+-- verdict: banded is consistently SLOWER than dense on MPS, sometimes
+dramatically so.**
+
+| config | dense | banded | banded/dense |
+|---|---|---|---|
+| K4 W16 L=256 | 7.2ms | 31.1ms | 4.3x slower |
+| K4 W16 L=1024 | 34.4ms | 116.9ms | 3.4x slower |
+| K4 W16 L=4096 | (impractical, skipped) | 458.9ms | n/a |
+| Ks=(4,1) two-track L=1024 | 44.6ms | **1223.6ms** | **27x slower** |
+
+Correctness re-confirmed (`ALL MATCH`, same 8 configs as before). The
+multi-track case is dramatically worse -- likely the combination of
+this session's conservative `(len(tracks)+1)*R` margin sizing (derived
+for CORRECTNESS, not tuned for speed) inflating `Kc`, plus MPS's known
+weakness at advanced-indexing/gather ops (the sort + gather-based
+banding mechanism leans on exactly that). **Conclusion: `decode_banded`
+stays `False` by default (already is) -- implemented and verified
+correct, but not currently worth using on MPS.** Would need either a
+CUDA target (where gather/indexing is much cheaper relative to dense
+matmul) or a reimplementation that avoids the heavy sort+gather
+machinery to realize the asymptotically-better complexity class in
+practice on this hardware. Not pursued further this session --
+correctness was the requested deliverable, and it's met; the
+performance question is now answered (not favorably) rather than left
+open.
+
+**Bug found via verification: `generate_no_cache` silently falls back to
+encode-only (unconditioned) prediction on 3 out of every 4 generation
+steps for any `decode_K>1` config (e.g. `Ks=(4,1)` or single-level
+`Ks=(4,)`).** Found while verifying (with running code, not just static
+reasoning) whether generation reproduces training's packing/masking
+exactly. `generate_no_cache` calls `RefineLM._run` fresh on the growing
+byte sequence at every step and reads the LAST position's hidden state
+(`h_list[0][:, -1, :]`) -- but `_run`'s own decode-activation logic
+requires `L_i % cum_K == 0` for EVERY active track (`RefineLM._run`'s
+`ragged` check), and SKIPS decode entirely for that level if not met
+(falls back to `h_out[i] = h_i`, the plain encode-only hidden state,
+computed with zero code-conditioning at all -- not a degraded/partial
+version, a completely different, weaker signal). During training this
+never triggers, since `context_len` is asserted divisible by every
+track's cumulative stride at `RefineLM.__init__` time. During
+byte-by-byte generation, though, the TOTAL sequence length only revisits
+a multiple of `cum_K` once every `cum_K` steps -- for `Ks=(4,1)`
+(`cum_K=4` for both the self and cross track), that means generation is
+code-conditioned on step 1 of every 4, and completely unconditioned
+(ignoring the code entirely) on the other 3.
+
+Verified directly (`scripts/` scratch repro, not committed -- see
+session transcript): built a tiny `Ks=(4,1)` model, ran `_run` once
+teacher-forced over a full 16-byte sequence (decode active throughout,
+by construction), then ran `_run` again on each growing prefix `L=8..16`
+the way `generate_no_cache` does. Result: `L%4==0` steps exactly
+reproduce the teacher-forced hidden state (diff `0.0000`); `L%4!=0`
+steps diverge substantially (diff `0.44-1.02`, same order of magnitude
+as the hidden state's own scale) -- i.e. NOT a small approximation
+error, a qualitatively different prediction using none of the
+code-conditioning signal the model was actually trained with.
+
+**Practical impact**: `qualitative_generate`'s `level0_cond` field
+(logged every eval as `qual_train_level0_cond` / `qual_val_level0_cond`
+in every run this session with `decode_K>1` -- `bpelike_1level_k4_retry`,
+`bpelike_k4_1`, and the currently-running `selfcond_detach_k4`) calls
+`generate_no_cache` directly, so every one of those printed samples this
+session has been ~75% unconditioned generation mislabeled as
+conditioned. TRAINING METRICS (loss/bpb/accuracy) are NOT affected --
+those only ever come from full-context teacher-forced `forward()`
+passes, never from `generate_no_cache`. Only the qualitative eyeball
+samples are compromised. Not yet fixed -- needs a generation loop that
+tracks code state incrementally (buffer bytes into blocks, emit/condition
+per-block rather than re-deriving decode-readiness from the raw growing
+byte count every single step) rather than `generate_no_cache`'s current
+"just re-run `_run` on the growing prefix" approach, which implicitly
+assumed `decode_K==1` (always active) and was never re-examined when
+`decode_K>1` configs were introduced.
+
+**FIXED.** Simpler than the incremental-state-tracking approach sketched
+above: pad the growing byte sequence up to the next multiple of
+`decode_K` before each `_run` call, then read off the REAL last
+position (index `L-1`, not the padded tail) for the next-byte
+prediction, instead of always reading `h[:, -1, :]`. Pad value is
+irrelevant. Why this is exact, not an approximation: causal attention
+means position `L-1`'s hidden state can only depend on positions
+`<= L-1`; the padding is appended strictly after it, so it literally
+cannot be attended to, at any layer, at any level. The one subtlety --
+the FINAL block straddles real content and padding (since
+`pad_len < decode_K` always) -- doesn't matter either: that straddling
+block's own code is only ever used as the PREFIX for the NEXT block
+(strictly after `L-1`), never for its own bytes; position `L-1`'s
+decode computation only ever reads PREVIOUS, fully-real blocks' codes,
+at every level (padding is sized to the full product `decode_K`, so
+every active track's block boundary aligns simultaneously). Verified
+directly with the same methodology that found the bug: teacher-forced
+reference vs. the fixed `generate_no_cache`-style padded call, for
+every `L=8..15` in a `Ks=(4,1)` toy model -- ALL steps now match
+exactly (diff `<1e-6`), where previously only `L%4==0` steps matched
+and the rest diverged by `0.44-1.02`. Regression-checked: existing
+`scripts/test_v4_4_chunked_decode.py` correctness suite still `ALL
+MATCH`, and `qualitative_generate` runs cleanly end-to-end for both
+`cross_track_source` settings post-fix. `generate_self_only_cond`
+(built on top of `generate_no_cache` via `max_decode_sources=1`)
+inherits the fix automatically, no separate change needed.
+
+**`Config.decode_self_only_aux` built: level0's decode was only ever
+trained on ONE fixed track combination, never "self-only."** Follow-up
+finding to the `generate_no_cache` conditioning-gap bug above and the
+checkpoint-generation verification (both this same session): confirmed
+in code that `RefineLM._run`'s decode loop builds exactly one track
+combination per level per step (self + every coarser level with a
+nonzero window) and calls decode with it ONCE -- there was never a code
+path training decode with the coarser tracks dropped (self-only). Two
+of the three natural "how much conditioning does decode have" modes
+already got gradient signal from different loss terms (uncond via
+`encode_losses[0]`, the byte NTP loss on the plain encode pass with zero
+code conditioning at all; self+level1/"full" via `decode_losses[0]`,
+every training step since `context_len` is always divisible) -- but
+self-only had none. This matters because self-only is exactly the
+regime a graceful ragged-length generation fallback would need instead
+of the current full-cumulative-or-nothing jump, AND exactly the regime
+decode ends up in for real if a coarser level's own AR generation
+degenerates (which was directly observed: `bpelike_k4_1`'s checkpoint
+collapsed to a single repeated level1 code during generation, see the
+checkpoint-generation verification section above).
+
+Considered and rejected: random per-step dropout (truncate the track
+list to a random prefix length each step, classifier-free-guidance
+style, one mode active per step). Rejected per explicit user direction
+("do it no dropout way, just a new loss path as if trained with 1
+level") in favor of an ALWAYS-ON additional loss term: `Config.
+decode_self_only_aux: bool = False` (opt-in). When True, `RefineLM._run`
+runs a SECOND decode forward pass every step using only `tracks[:1]`
+(the self track), alongside -- not instead of -- the existing
+full-cumulative pass; both contribute to the loss every step. Weighted
+by `Config.decode_self_only_weight` (default 1.0), reported as
+`level{i}_ntp_loss_decode_self` / `level{i}_ntp_acc_decode_self` per
+level and `decode_self_only_total` in the loss breakdown.
+`decode_losses[i]` (full-cumulative, what `byte_loss`/`val_bpb` are
+computed from) is untouched -- this is purely additive.
+
+Implementation mechanism: `RefineLM._run` gained a `max_decode_sources:
+int | None = None` param that truncates every level's track list to at
+most that many sources before use. `max_decode_sources=1` forces
+self-only; this is the SAME mechanism used both for the aux loss (called
+internally with `tracks[:1]`) and for a new generation function,
+`generate_self_only_cond` (`generate_no_cache` with `max_decode_sources=1`
+forced at every step, sidestepping the ragged-length fallback for the
+self track specifically -- there's no coarser track to be inconsistently
+available when only the self track is requested).
+
+**Naming scheme for the three modes** (used consistently in metrics and
+qualitative output): "uncond" (zero code conditioning), "cond_self"
+(self track only), "cond_full" (self + every coarser level, the
+previous behavior, previously just called "cond"). `qualitative_generate`
+renamed its existing `level0_cond`/`level0_cond_codes` fields to
+`level0_cond_full`/`level0_cond_full_codes` and added
+`level0_cond_self`/`level0_cond_self_codes` (annotated with level 0's
+OWN code via `_decode_source_codes(..., level=0)`, not the topmost level
+`_decode_source_codes` shows by default for the "full" case) --
+verified all three modes print correctly and the aux loss trains/
+backprops correctly via a small script before launching a real run.
+
+**Verified via running code** (not committed, scratch repro): built a
+tiny `Ks=(4,1)` model with `decode_self_only_aux=True`, confirmed (a)
+`forward()` in train mode returns a nonzero `decode_self_only_total`
+with a working `.backward()`, (b) the SAME model in eval mode returns
+`decode_self_only_total=0.0` (aux only applies when `self.training`),
+and (c) `qualitative_generate` prints all three modes plus two code-
+annotation lines without error. Both `scripts/test_v4_4_chunked_decode.py`
+and `scripts/test_v4_4_banded_decode.py` (whose `_run(...)` unpacking
+needed updating for the new 8-tuple return, since `decode_self_only_
+losses`/`decode_self_only_accs` were appended) re-verified `ALL MATCH`
+after the change -- this feature is orthogonal to the banded/chunked
+decode-attention paths, doesn't touch masking, just which tracks reach
+them.
+
+**New config**: `configs/qcute_refine_v4_4_bpelike_k4_1_selfonly_aux.py`
+-- identical to `bpelike_k4_1.py` (`Ks=(4,1)`, `context_len=256`,
+`attn_window=(8,256)`) plus `decode_self_only_aux=True`. Launched
+immediately after `selfcond_detach_k4` finished (queue was idle, no
+contention) -- first real run to exercise the self-only aux loss and
+the three-mode qualitative print in practice, ~4.4 it/s, ETA ~15min.
+
+**Bug found (via the user asking "does this train run actually include
+all 3 modes"), significant: `main()`'s argparse/Config wiring silently
+dropped FOUR Config fields added this session -- `decode_code_ste`,
+`decode_banded`, `decode_self_only_aux`, `decode_self_only_weight`
+(`vocab` too, though nothing had tried overriding it).** `main()`
+constructs `Config(...)` from an explicitly hand-written kwargs list
+that was never updated when these fields were added to the `Config`
+dataclass, AND none of them had a matching `p.add_argument("--...")`
+registered -- so `p.set_defaults(**{k: v for k, v in
+load_config_module(...).items() if k in {a.dest for a in
+p._actions}})` silently filtered them out at the FIRST stage already
+(no matching argparse dest), before even reaching the `Config(...)`
+call. Net effect: a config `.py` file setting any of these had that
+setting completely ignored, no error, no warning -- the dataclass
+DEFAULT was used instead, always.
+
+**This invalidates `selfcond_detach_k4`'s entire premise.** That run's
+whole point was `decode_code_ste=False` (detach, no STE, required per
+`docs/two_stage_latent_decode_math.md` for the drafted-substitution
+generation scheme) -- but the flag never reached the model. It trained
+with the DEFAULT `decode_code_ste=True` (straight-through) the entire
+time, which is a materially different training setup (gradient DOES
+flow from decode into the code producer, the opposite of what the
+experiment needed to isolate). The run completed successfully and
+produced real numbers (`best_val_bpb=2.4369`), but those numbers don't
+answer the question the run was built to answer. Needs a genuine rerun
+now that the wiring is fixed -- todo list updated to reflect this
+(item was "compare val_level1_ntp_acc_encode vs
+val_level0_ntp_acc_decode from `selfcond_detach_k4`"; now blocked on a
+rerun, not just interpretation of the existing checkpoint).
+`bpelike_k4_1` and `bpelike_1level_k4_retry` did NOT set any of the
+four broken fields, so those results are unaffected and still valid as
+reported.
+
+Also explains directly why `qcute_refine_v4_4_bpelike_k4_1_selfonly_aux`
+(the run launched right after building `decode_self_only_aux`) showed
+`decode_self_only_total=0.0000` in BOTH train-step and val logs --
+looked at first like it might be the `self.training`-gating logic
+itself being wrong, but the real cause was one level up: the flag never
+reached `cfg.decode_self_only_aux` at all, so the gate's own condition
+(`cfg.decode_self_only_aux and self.training and ...`) was always
+false regardless of train/eval state. Killed that run immediately on
+finding this (not measuring anything real).
+
+**Fix applied**: added the five missing `p.add_argument(...)` calls and
+wired all five into the `Config(...)` constructor call. Verified
+directly: a 5-step smoke run now shows `decode_self_only_total=5.617`
+on an actual train-step log entry (was `0.0000` before the fix).
+
+**Permanent safety net added**, since this bug class (a Config field
+quietly added without updating the hand-maintained CLI-wiring list) can
+recur any time a new `Config` field is added: `main()` now asserts, at
+argparse-setup time, that every `Config` dataclass field name has a
+matching registered `--arg` dest (`{f.name for f in
+dataclass_fields(Config)} <= {a.dest for a in p._actions}`, with an
+explicit-but-currently-empty `_cli_excluded_config_fields` escape hatch
+for any field that's deliberately CLI-unreachable in the future). A
+future field added to `Config` without a matching `add_argument` call
+now fails LOUDLY at startup with a clear message, instead of silently
+training with the wrong config forever.
+
+**Relaunched, chained**: `bpelike_k4_1_selfonly_aux` (now actually
+exercising the self-only aux loss and 3-mode qualitative print) first,
+`selfcond_detach_k4` rerun (now actually using `decode_code_ste=False`)
+queued behind it.
+
+**Live confirmation of the collapse, from `bpelike_k4_1_selfonly_aux`'s
+own qualitative output (step ~2500)**: `level0_cond_full_codes` had
+collapsed to a SINGLE repeated code value (`{24}` for every block in
+one observed sample) and `level1_gen` (level1's own AR code generation)
+had ALSO collapsed to a single repeated value, while that SAME run's
+`level0_cond_self` showed healthy, varied codes
+(`{5,8,103,141,166,62,213,...}`) for the identical prompt. Directly
+motivates the next experiment below: isolate whether the cross-track/
+level1 dependency is *the* cause of the collapse, not just a
+contributing factor, by removing it entirely rather than adding a
+parallel signal alongside it.
+
+**New config**: `configs/qcute_refine_v4_4_bpelike_k4_1_selfonly_only.py`
+-- same base numbers as `bpelike_k4_1.py`, but level0's cross track to
+level1 is disabled entirely (`decode_window=0` for that source, not
+just de-prioritized), verified via `decode_windows[0] == [8, 0]`. Since
+the cross track never gets built, the ONE decode pass level0 runs IS
+self-only by construction -- distinct from `decode_self_only_aux`
+(which runs self-only as an ADDITIONAL pass alongside the full
+cumulative one); this config never computes "self+code1" NTP at all.
+Level1 itself is left otherwise unchanged (still trains its own encode
+NTP over the `code_0` stream) purely so its qualitative output stays
+available for comparison, even though level0 no longer depends on it.
+
+**New script**: `scripts/compare_v4_4_checkpoints.py` -- loads six
+checkpoints (`bpelike_1level_k4_retry`, `bpelike_k4_1` (old two-track),
+`bpelike_k4_1_selfonly_aux`, `bpelike_k4_1_selfonly_only`, and the two
+pre-existing "past-success" checkpoints `qcute_refine_v4_4_l1_k1`/
+`l2_k1` for an external reference point), CPU-only (no MPS contention
+with the training queue), runs `qualitative_generate` on the SAME real
+validation-set prompt for each, prints `best_val_bpb` alongside. Not
+run standalone -- auto-runs as the last step of the training queue
+chain below, output to `/tmp/v4_4_checkpoint_comparison.log`.
+
+**New config**: `configs/qcute_refine_v4_4_k1_k1_w32.py` -- degenerate
+`Ks=(1,1)` (neither level compresses at all; both levels run at full
+byte-rate sequence length), `attn_window=32` scalar (broadcasts to
+every level's encode window AND every decode source's window
+uniformly). A genuine 2-track (self+cross) `decode_K=1` case --
+`decode_chunked` stays False since its single-track-only implementation
+still can't take this shape (verified `decode_windows[0]==[32,32]`,
+`decode_windows[1]==[32]`, decode active both levels before queuing).
+Simplest possible uniform-window baseline, no per-track tuning, useful
+as a clean sanity point.
+
+**Full training queue as of this update** (each stage waits on the
+previous via a `kill -0 <pid>` polling wrapper, `caffeinate -i -w
+<wrapper pid>` layered on every stage so the machine can't sleep through
+any of it):
+1. `bpelike_k4_1_selfonly_aux` -- near-finished (step 3999/4000) as this
+   was written.
+2. `selfcond_detach_k4` rerun -- queued.
+3. `bpelike_k4_1_selfonly_only` (the collapse-isolation test) -- queued.
+4. `scripts/compare_v4_4_checkpoints.py` -- auto-runs after #3.
+5. `k1_k1_w32` (degenerate sanity baseline) -- queued.
+
+Per user direction ("auto research 12 hours, queue relevant hparams,
+test generation, probe gradients iff needed, then always update docs"):
+this session is now running as a self-paced autonomous loop, checking
+back in via scheduled wakeups roughly matched to each stage's expected
+duration (~15-20min/training stage observed so far), deciding follow-up
+experiments from each stage's results, and updating this file after
+every stage, not just at the end.
+
+**Round 1 results: `bpelike_k4_1_selfonly_only` (the collapse-isolation
+test) does NOT fix the collapse -- self-only collapses too, just more
+slowly.** Live qualitative samples across its own training run: early
+steps show varied codes, but by step ~4000 `level0_cond_self_codes` is
+dominated by 2-3 repeating values (`{213}`/`{170}`/`{58}`, occasionally
+alternating pairs like `{212,250}`) -- the classic signature of
+codebook/index collapse, not a self-vs-cross-conditioning-specific
+symptom. Ruled out: cross-level dependency is not "the" cause of
+`bpelike_k4_1`'s original collapse (`{24}` constant) after all --
+disabling it entirely still lets level0's own code collapse
+independently, just on a different (slower) timeline.
+
+**Follow-up diagnostic, `scripts/probe_code_usage_entropy.py`**: rather
+than eyeballing more single-prompt qualitative snippets, measured code
+usage entropy directly over ~5000 validation-set code tokens per
+checkpoint (bits, active-index count, top-5 mass). Chose this over a
+gradient probe as the first diagnostic step per the user's "probe
+gradients iff needed" framing -- entropy/histogram analysis fully
+explained the pattern without needing one. Results, most important
+finding of this research round:
+
+| checkpoint | Ks | code_0 entropy (max 8 bits) | code_0 active/256 | code_1 entropy |
+|---|---|---|---|---|
+| 1level | (4,) | 2.62 | 30 | -- |
+| bpelike_k4_1 (old) | (4,1) | 2.01 | 13 | 0.00 (1 active) |
+| +decode_self_only_aux | (4,1) | 1.76 | 16 | 0.00 (1 active) |
+| self-only-ONLY | (4,1) | 1.76 | 16 | 0.11 (3 active) |
+| selfcond_detach (real detach) | (4,1) | 0.92 | 14 | 0.03 (3 active) |
+| **l1_k1 (past-success)** | **(1,)** | **6.03** | **219** | -- |
+| **l2_k1 (past-success)** | **(1,1)** | **4.46** | **59** | **0.66 (23 active)** |
+
+**The collapse tracks `Ks[0]=4` (grouping 4 raw bytes into one
+discrete code), not the self-vs-cross architecture variant at all** --
+EVERY `Ks[0]=4` config tested, including the plain 1-level one, shows
+low code_0 entropy (0.9-2.6 bits); every `Ks[0]=1` config (one code per
+raw byte, no block-grouping) shows healthy, actively-used codebooks
+(4.5-6.0 bits, 59-219/256 indices active). `code_1` (level1's own
+quantizer, `Ks=(4,1)` only) is far worse still -- essentially a single
+constant symbol in every variant -- consistent with it trying to
+further quantize an already near-degenerate ~2-bit `code_0` stream into
+another 256-way codebook and finding nothing left to encode.
+
+None of the `Ks[0]=4` configs tested so far touch `gumbel_tau`/
+`use_gumbel_noise` (all left at the defaults: `tau=1.0`, no noise) --
+both are standard collapse mitigations for discrete bottlenecks (noise
+encourages exploration, higher tau softens assignment so more of the
+codebook receives gradient). **New config**:
+`configs/qcute_refine_v4_4_bpelike_k4_1_gumbelfix.py`
+(`use_gumbel_noise=True`, `gumbel_tau=2.0`, otherwise identical to
+`bpelike_k4_1.py`) -- queued to test whether this is a fixable
+optimization issue or an inherent property of `Ks[0]=4` block-grouping.
+`scripts/probe_code_usage_entropy.py` re-runs automatically after it
+finishes, output to `/tmp/v4_4_entropy_probe_round2.log`.
+
+**Current full queue** (7 stages, each `caffeinate`-protected):
+1-3. `bpelike_k4_1_selfonly_aux`, `selfcond_detach_k4` rerun,
+   `bpelike_k4_1_selfonly_only` -- done.
+4. `compare_v4_4_checkpoints.py` -- queued.
+5. `k1_k1_w32` (degenerate `Ks=(1,1)`, uniform window=32 sanity
+   baseline) -- queued.
+6. `bpelike_k4_1_gumbelfix` + entropy re-probe -- queued.
+7. `selfcond_ste_k4` (decode_code_ste=True counterpart to
+   `selfcond_detach_k4_rerun`) + `scripts/compare_ste_vs_detach.py` --
+   queued.
+
+**Ablation added per explicit user request: STE vs detach, properly
+this time.** `selfcond_detach_k4`'s ORIGINAL run (pre-wiring-fix)
+unintentionally WAS the straight-through condition despite its name --
+so the "ablation" that mattered (does detach vs STE actually change
+anything for this self-conditioning-only design) was never genuinely
+run on both sides. New config: `configs/qcute_refine_v4_4_selfcond_ste_
+k4.py` -- byte-for-byte identical to `selfcond_detach_k4.py` except
+`decode_code_ste=True`. New script: `scripts/compare_ste_vs_detach.py`
+-- diffs val metrics (`val_level0_ntp_acc_decode`, `val_level1_ntp_
+acc_encode` i.e. the drafter's own accuracy at predicting `code_0`,
+`val_bpb`) AND code usage entropy for both `code_0`/`code_1` side by
+side between the two runs, auto-runs after `selfcond_ste_k4` finishes.
+
+**Round 2: `compare_v4_4_checkpoints.py` output reveals a THIRD
+mechanism, refining (not replacing) the `Ks[0]=4` finding.** Side by
+side on the same real prompt, `k1_k1_w32` (Ks=(1,1), no block-grouping
+at all -- currently training, ~52% done at this check) showed
+`level0_cond_full_codes` collapsed to a single repeated value (`{211}`)
+during GENERATION, despite `code_0` having HIGH entropy (4.46-6.03
+bits) under the entropy probe's TEACHER-FORCED measurement (real
+ground-truth bytes fed in, not self-generated). That's a real
+distinction: the probe measures how diverse the trained model's code
+assignment is GIVEN REAL DATA; generation feeds the model's OWN
+predictions back autoregressively, which is a different regime.
+`level0_cond_self` in that same sample showed much more code variation
+(`{122,18,8,36,21,144,136,239,209,27,181,16,22}`) than `cond_full`
+(`{211}` almost exclusively) -- fewer compounding self-referential
+tracks fed back seems to reduce (not eliminate) the repetitive
+collapse.
+
+Traced the actual mechanism: EVERY generation function in this codebase
+(`_sample_next_byte`, `generate_level1_codes`, `generate_blockwise_
+parallel`) uses pure `argmax(-1)` -- no temperature, no top-k/nucleus
+sampling anywhere. Pure greedy autoregressive decoding is a
+well-documented cause of repetitive degenerate loops, independent of
+any training-time codebook issue -- a real candidate explanation for
+WHY generation specifically (not the entropy probe) shows collapse even
+for healthy-entropy `Ks[0]=1` checkpoints.
+
+**Tested directly, cheaply, no retraining needed** (scratch script,
+temperature-sampled generation vs greedy on two EXISTING checkpoints,
+`l2_k1` and `bpelike_k4_1`): temperature sampling (0.7, 1.0) changes
+which specific tokens come out, but does NOT rescue overall text
+coherence -- temp=0.7 is still word-salad for both, temp=1.0 is
+actively WORSE (produces non-ASCII garbage bytes for `l2_k1`). **This
+argues against "just add sampling" as a fix**: greedy decoding is a
+real contributing factor to the specific visually-repetitive-code
+pattern, but not the dominant explanation for the underlying quality
+gap. The honest conclusion across all three investigated mechanisms so
+far: (1) `code_0` teacher-forced entropy genuinely tracks `Ks[0]=4`
+block-grouping (training-time, real effect, confirmed); (2) generation-
+time repetitive collapse is partly a generic greedy-decoding artifact
+(confirmed, but sampling alone doesn't fix quality); (3) these models
+are simply undertrained at this scale (~1600-2600 steps, d_model=256,
+~1M-byte corpus) -- likely the dominant factor underneath both (1) and
+(2), not fully separable from them with the experiments run so far.
+
+**Round 3: `k1_k1_w32` finished, confirms round 2's dual-mechanism
+finding with a second independent data point.** `best_val_bpb=2.3943`
+-- the best of every config tested this session (Ks=(4,) and Ks=(4,1)
+included). Qualitatively: `level1_gen` STARTS varied
+(`[21,8,27,8,8,131,...]`) then LOCKS INTO a repetitive loop (`240`
+repeated ~58 times straight) mid-generation -- the textbook signature
+of greedy-decoding degenerate-attractor collapse (a model wanders into
+a locally-self-reinforcing token and never escapes it under pure
+argmax), not a training-time codebook-entropy problem, since this same
+checkpoint's `code_0` entropy under teacher forcing was already
+measured healthy (round 1 table). `level0_cond_self` stayed richly
+varied throughout the same sample (dozens of distinct code values) vs.
+`level0_cond_full`'s total collapse to `{211}` -- consistent with round
+2's "fewer compounding self-referential tracks fed back reduces (but
+doesn't eliminate) the repetitive collapse" observation. Two
+independent Ks=(1,1) checkpoints (`l2_k1`, now `k1_k1_w32`) both show
+this exact pattern -- level1-generation-collapse-via-greedy-decoding
+looks universal across `Ks[0]` values, not specific to block-grouping.
+
+**Gumbel-noise grid added, per explicit user request ("repeat with true
+later" / "grid").** User asked to hold off on temperature-annealing
+(explicitly: "no annealing first, past training used no gumbel") and
+instead first systematically test plain (static-temperature) Gumbel
+noise across every base architecture already tested with the Config
+default `use_gumbel_noise=False` -- confirmed precisely (grepped every
+config file) that EVERY prior run this session, including the
+past-success `l1_k1`/`l2_k1`, used the default `False`; the only
+config setting `True` is `bpelike_k4_1_gumbelfix`. Completed the grid
+with two new configs, both `use_gumbel_noise=True, gumbel_tau=2.0`
+(matching `gumbelfix`'s values for a controlled comparison):
+`configs/qcute_refine_v4_4_k1_k1_w32_gumbel.py` (Ks=(1,1) counterpart
+to `k1_k1_w32`) and `configs/qcute_refine_v4_4_bpelike_1level_k4_
+gumbel.py` (Ks=(4,) counterpart to `bpelike_1level_k4_retry`, run at
+`context_len=256` instead of the original's 1024 -- no reason to repeat
+the pre-context_len-fix O((2L)^2) slowdown here). Full grid:
+
+| Ks | gumbel=False | gumbel=True |
+|---|---|---|
+| (4,) 1level | bpelike_1level_k4_retry | bpelike_1level_k4_gumbel (queued) |
+| (4,1) | bpelike_k4_1 | bpelike_k4_1_gumbelfix (queued) |
+| (1,1) | k1_k1_w32 | k1_k1_w32_gumbel (queued) |
+
+`scripts/probe_code_usage_entropy.py`'s `CHECKPOINTS` list extended to
+cover the whole grid; re-runs automatically as the LAST stage of the
+queue, output to `/tmp/v4_4_entropy_probe_grid.log`.
+
+**Round 4 results, two stages landed.**
+
+**`bpelike_k4_1_gumbelfix` (static `tau=2.0`, `use_gumbel_noise=True`)
+partially helps -- `code_1`, not `code_0`.** `code_0` entropy: 0.90 bits
+-- essentially unchanged from every non-gumbel `Ks=(4,1)` baseline
+(0.92-2.01 bits), gumbel noise did NOT rescue the primary Ks[0]=4
+block-grouping collapse. `code_1` entropy: **0.85 bits** -- a real,
+substantial jump from every non-gumbel `Ks=(4,1)` variant's ~0.00-0.11
+bits (essentially one constant symbol), though still far below the
+healthy 4-6 bit range `Ks[0]=1` configs show untouched. Verdict so far:
+gumbel noise measurably helps the SECONDARY, more severely collapsed
+quantity (level1's own code) but not the primary one (`code_0`'s
+Ks[0]=4-driven collapse) -- a partial, not a full, fix.
+
+**STE vs detach ablation (`compare_ste_vs_detach.py`), a genuinely
+counterintuitive result.** The drafter-accuracy metric this whole
+experiment exists to measure (`val_level1_ntp_acc_encode` -- how well
+level1 predicts `code_0`) is dramatically BETTER under STE than detach:
+**66.4% (STE) vs 47.5% (detach)**. By the letter of `selfcond_detach_
+k4`'s own stated success criterion ("if level1 predicts code_0 well,
+its drafted continuation is a credible substitute"), STE looks like the
+winner. BUT: `code_0`'s own entropy is WORSE under STE (0.27 bits vs
+detach's 0.92 bits) -- STE achieves its higher drafting accuracy partly
+BECAUSE decode's gradient pushes `code_0` toward a MORE collapsed,
+more trivially-predictable distribution (a near-constant target is
+inherently easy to "predict"), not because level1 got better at
+modeling a genuinely informative signal. `code_1` entropy also jumps
+under STE (0.75 bits vs detach's 0.03) -- consistent with the same
+"decode's gradient reduces collapse severity, but by making the target
+less informative" pattern seen with gumbel noise above, though via a
+completely different mechanism (gradient-path change, not
+temperature/noise). `val_level0_ntp_acc_decode` (decode's own quality)
+and `best_val_bpb` are roughly comparable between the two (STE
+best_val_bpb=2.4258 vs detach 2.4320 -- within noise). Net read: the
+higher "drafting accuracy" under STE is a somewhat hollow signal --
+easier to predict a code that carries less information isn't the same
+as level1 successfully modeling a rich, useful `code_0` distribution.
+The two-stage-latent-variable design's ORIGINAL premise (code_0 stays
+informative AND independently predictable) isn't cleanly validated by
+either setting so far; the underlying `code_0` collapse (present
+regardless of STE/detach) is still the more fundamental problem to
+solve first.
+
+**Optimization + conceptual clarification, per explicit user request:
+the detach path's matmul replaced with a plain embedding lookup.**
+`RefineLM._run`'s decode-conditioning path (`code_embeds = src @
+self.encoders[i].embed.weight`) previously always used a full
+`vocab x D` matmul regardless of `decode_code_ste`. When
+`decode_code_ste=False` (detach), that's unnecessary: `source_c.
+detach() @ embed.weight`'s forward value is mathematically a
+one-hot-row selection, IDENTICAL to `embed.weight[source_c.argmax(-1)]`
+-- and since no gradient into `source_c` is wanted in the detach case
+anyway, a plain index lookup gives the exact same forward value AND the
+exact same gradient w.r.t. `embed.weight` (index-select's gradient
+scatters into the selected row, same as `one_hot@W`'s), for less
+compute. Verified directly (scratch script): forward values match
+exactly, `embed.weight.grad` matches exactly between the two
+formulations, and ~1.6x faster at production-ish scale (vocab=256,
+d_model=256, CPU). In the STE case (`decode_code_ste=True`), the matmul
+is still REQUIRED and was left untouched -- `source_c`'s value is the
+hard one-hot but its GRADIENT behaves as the soft distribution
+(`gumbel_quantize`'s straight-through construction); that gradient
+estimate only exists via the matmul, since index-select has no gradient
+w.r.t. which index was chosen. Regression-checked: both existing
+correctness suites (`scripts/test_v4_4_chunked_decode.py`,
+`scripts/test_v4_4_banded_decode.py`) still report `ALL MATCH` after
+the change (their timing sections were killed early to avoid MPS
+contention with the live training queue -- correctness sections, which
+run on CPU/small scale, completed first and are unaffected).
+
+Also affirmed the user's framing directly, since it explains WHY this
+optimization is not just a speed win but the conceptually correct
+reading of what detach is FOR: the decoder should condition on the code
+as a fixed discrete query/embedding lookup -- latent-variable /
+Markov-chain style, where the decoder doesn't get to reshape which
+latent it's conditioning on -- not as a soft mixture it could partially
+steer. This directly reframes the STE-vs-detach ablation result just
+above: STE's higher drafting accuracy (66.4% vs 47.5%) looks less like
+a genuine win once you see it's achieved partly by letting decode's
+gradient collapse `code_0` into something more trivially predictable
+(lower entropy under STE, 0.27 vs detach's 0.92 bits) -- i.e. STE
+blurs exactly the boundary detach is designed to keep clean. Detach
+remains the architecturally-motivated choice for the two-stage
+latent-variable design, independent of this specific ablation's raw
+numbers; the `code_0` collapse itself (present under BOTH settings) is
+still the more fundamental unsolved problem.
+
+**New capability + ablation, per explicit user request: cross-track
+conditioning from decode instead of encode.** User's question ("where
+did you extract code_1 to pass to level0, is it h from uncond encode or
+h from cond decode") led to confirming precisely: cross tracks always
+came from `c_list[j]`, populated ONCE in the encode-only loop, never
+from a coarser level's own decode output. User's follow-up argued
+detach makes decode's role cleanest read as reconstruction-from-latent,
+and that RECURSIVELY sourcing a lower level's cross track from the
+level above's OWN decode pass is more consistent with that generative
+structure than pulling from an uncond-NTP-focused encode pass -- except
+for the degenerate `n_levels==1` case, where no higher-level decode
+exists to source from at all (must stay on encode there, unconditionally).
+
+Turned out to be directly implementable with much less new code than
+expected: `LevelLM.forward` ALREADY computes a fresh code from
+whichever `h` it produced (same pooling+classify+quantize pipeline
+either way) and returns it as its first value -- `RefineLM._run`'s
+decode loop was simply discarding it (`_, loss_i2, acc_i2, h_i2 = ...`).
+New `Config.cross_track_source: str = "encode"` (`"encode"` | `"decode"`).
+When `"decode"`: cross tracks (`j>i`, a coarser level's code) source
+from that level's captured decode-derived code instead of `c_list[j]`,
+falling back to `c_list[j]` if unavailable (e.g. level `j`'s decode was
+itself ragged/disabled -- keeps correctness rather than crashing). SELF
+tracks (`j==i`) are UNCHANGED regardless of this setting -- a level
+can't condition its own decode on its own not-yet-decoded output, so
+self always sources from encode. Requires top-down decode iteration
+(`reversed(range(n_levels))`) so a coarser level's decode-derived code
+exists before a finer level needs it; `_run` now always iterates this
+way (provably a no-op for `"encode"`, since `c_list` is fully built
+before the decode loop starts regardless of iteration order -- verified
+via the existing `scripts/test_v4_4_chunked_decode.py` correctness
+suite, still `ALL MATCH` after the change).
+
+Verified directly: both settings train/backward without error and
+produce genuinely different results (not a silent no-op), safety-net
+assertion passes with the new field wired through argparse, and a real
+end-to-end 2-step training run via the actual config-file-loading path
+completes cleanly.
+
+**New config**: `configs/qcute_refine_v4_4_bpelike_k4_1_crosstrack_
+decode.py` -- identical to `bpelike_k4_1.py` except
+`cross_track_source="decode"`. Updated in place (before it started
+running -- wrapper still waiting on the gumbel grid at the time) per
+explicit user follow-up ("with detach"): also sets `decode_code_ste=
+False`, pairing the decode-sourced cross track with the same detach
+principle already established for the self-conditioning experiments --
+without it, decode's gradient could flow back through the RECURSIVELY-
+SOURCED decode-derived code into level1's own code producer, compounding
+across levels in a way that's especially hard to reason about once
+decode's own output feeds the next level's conditioning input. Verified
+the combination trains/backprops correctly (scratch smoke test) -- the
+detach dispatch (`if cfg.decode_code_ste: matmul else: index`) applies
+uniformly regardless of whether `source_c` came from `c_list[j]` or the
+newly-captured decode-derived code, so no extra plumbing was needed.
+Queued as the final stage of the current chain (after the gumbel grid),
+`scripts/probe_code_usage_entropy.py`
+extended with this checkpoint and re-runs automatically after it,
+output to `/tmp/v4_4_entropy_probe_final.log`.
+
+**Round 6: full gumbel grid landed, revises round 5's preliminary
+read.** All three architectures now have both cells:
+
+| Ks | gumbel | code_0 entropy | code_1 entropy |
+|---|---|---|---|
+| (4,) 1level | False | 2.62 | -- |
+| (4,) 1level | **True** | **2.21 (WORSE)** | -- |
+| (4,1) | False | 2.01 | 0.00 |
+| (4,1) | **True** | **0.93 (WORSE)** | **0.85 (better)** |
+| (1,1) | False | 3.72 | 0.00 |
+| (1,1) | **True** | **5.00 (better)** | 0.13 (marginal) |
+
+Round 5's "helps whichever code was already less collapsed" hypothesis
+doesn't survive the third cell: `1level` had NO second code to be
+"more collapsed" for comparison, yet its `code_0` still got WORSE under
+gumbel (2.62->2.21) -- the same direction as `Ks=(4,1)`'s `code_0`. The
+pattern that actually holds across all three cells: **gumbel noise
+hurts `code_0` for BOTH `Ks[0]=4` architectures (1level AND 2level)
+and HELPS it for the one `Ks[0]=1` architecture** -- correlates with
+`Ks[0]` (task difficulty: compressing 4 raw bytes into one code is a
+much harder discretization problem than 1-to-1), not with "which code
+happened to be less collapsed already." Plausible mechanism (not
+verified further this round): stochastic exploration during training
+of an intrinsically HARD compression target may push optimization
+toward a low-entropy "safe" solution faster, while the same noise is
+pure beneficial regularization for an EASY, already-tractable target.
+`code_1` (present only in the two 2-level configs, already the more
+severely collapsed quantity in both) improved somewhat under gumbel in
+BOTH cases (0.00->0.85 for `Ks=(4,1)`, 0.00->0.13 for `Ks=(1,1)`) --
+this part of round 4/5's finding holds.
+
+**Final verdict on static gumbel noise (`tau=2.0`, no annealing)**:
+NOT a reliable fix. It actively makes the FLAGSHIP problem this whole
+investigation started with (`Ks[0]=4`'s `code_0` collapse) slightly
+WORSE, while helping a secondary quantity (`code_1`) and an already-
+healthy architecture (`Ks[0]=1`'s `code_0`) that didn't need fixing as
+badly. Static noise + fixed elevated temperature is not the answer;
+proper annealing (start high, decay down over training -- the standard
+Gumbel-Softmax recipe, deliberately NOT tested this round per explicit
+user direction to test static noise first) remains untested and could
+behave differently, but that's a separate future direction, not
+something this round's results extrapolate to.
+
+**Round 6, headline result: `cross_track_source="decode"` + detach is
+the first genuinely clean win of the whole collapse investigation.**
+`bpelike_k4_1_crosstrack_decode` (level0's cross track sourced from
+level1's OWN cond decode pass instead of its uncond encode pass, paired
+with `decode_code_ste=False` per user follow-up) vs the `bpelike_k4_1`
+baseline (encode-sourced, default STE):
+
+| metric | baseline (encode, STE) | crosstrack_decode (decode, detach) |
+|---|---|---|
+| `code_0` entropy | 2.01 bits | **2.37 bits (better)** |
+| `code_1` entropy | 0.00 bits | **0.72 bits (much better)** |
+| `val_level1_ntp_acc_encode` | 24.9% | **47.5% (nearly doubled)** |
+| `best_val_bpb` | 2.4223 | 2.4246 (statistically unchanged) |
+
+Both `code_0` AND `code_1` improved SIMULTANEOUSLY -- something no
+other single intervention this session achieved (gumbel noise always
+traded one off against the other, or actively hurt `code_0` for
+`Ks[0]=4`; `decode_self_only_aux` and `self-only-ONLY` didn't move
+`code_0` at all). Level1's own accuracy at modeling `code_0` nearly
+doubled, essentially for free (`best_val_bpb` unchanged within noise).
+Plausible mechanism: recursively sourcing the cross track from level1's
+OWN reconstruction-style decode pass (rather than a plain uncond
+encode pass) gives level1's decode objective a genuine downstream
+consumer/purpose -- previously level1's decode ran and contributed a
+loss term, but nothing else in the architecture actually USED its
+output, whereas now level0 directly depends on the quality of what
+level1's decode produces, which appears to pull level1 toward a richer,
+more useful representation instead of collapsing into whatever's
+locally easiest to fit its own isolated NTP loss.
+
+**Final verdict on this round's collapse investigation, addressing the
+open question directly**: NOT diminishing returns -- ends on a real,
+positive, actionable architectural finding
+(`cross_track_source="decode"` + detach), a better outcome than either
+gumbel-noise path tested. Recommended as the new reference direction
+for `Ks=(4,1)`-style configs going forward; a longer-training follow-up
+of specifically this config (not the gumbel variants) would be the
+natural next step if this investigation continues, but per the
+session's own prioritization, pivoting NOW to the two long-deferred,
+well-scoped engineering items below (queue is finally idle) rather than
+opening a new research thread.
+
+**Round 5 preliminary: gumbel noise helps DIFFERENT code depending on
+architecture -- not a uniform effect.** Checked `k1_k1_w32_gumbel`'s
+in-progress checkpoint (77% through training, `best.pt` already usable)
+against its non-gumbel counterpart `k1_k1_w32`: `code_0` entropy
+**3.72 -> 5.00 bits** (real, meaningful jump), but `code_1` stayed
+collapsed (**0.00 -> 0.11 bits**, marginal). This is the OPPOSITE
+pattern from `Ks=(4,1)`'s `gumbelfix` result (round 4: `code_1` jumped
+0.00-0.11 -> 0.85 bits, `code_0` stayed flat at ~0.9 bits). So gumbel
+noise isn't uniformly "fixing collapse" -- it seems to help whichever
+code was CLOSER to being learnable already (`Ks=(1,1)`'s already-healthy
+`code_0` gets pushed higher; `Ks=(4,1)`'s already-more-active `code_1`,
+relatively speaking, gets pushed up more than its severely-collapsed
+`code_0`). Preliminary -- full grid (including `bpelike_1level_k4_gumbel`,
+the third cell) still running; will confirm/revise once all three
+architectures' gumbel-vs-no-gumbel pairs are in.
+
+**Full queue as of this update (10 stages)**: stages 1-5 done
+(`bpelike_k4_1_selfonly_aux`, `selfcond_detach_k4` rerun,
+`bpelike_k4_1_selfonly_only`, `compare_v4_4_checkpoints.py`,
+`k1_k1_w32`); 6. `bpelike_k4_1_gumbelfix` + entropy re-probe; 7.
+`selfcond_ste_k4` + `compare_ste_vs_detach.py`; 8. `k1_k1_w32_gumbel`;
+9. `bpelike_1level_k4_gumbel`; 10. `probe_code_usage_entropy.py` (full
+grid). All `caffeinate`-protected end to end.
+
+**Also addressed directly (user question): does level1 also run its
+own self-code decode, analogous to a 1-level config's level0
+self-decode?** Yes, confirmed via both code (`RefineLM._run`'s decode
+loop is unconditional over `range(n_levels)`, top level always gets
+exactly one track -- its own code) and log evidence
+(`bpelike_k4_1`'s own val log has `val_level1_ntp_loss_decode=2.2937
+val_level1_ntp_acc_decode=0.2495` populated). ONE exception found:
+`selfcond_detach_k4`(_rerun) deliberately disables level1's own decode
+(`attn_window`'s level1 entry is `(64, 0)`) by original design -- level1
+was meant to be a pure NTP drafter with no self-conditioning confound.
+Asked the user whether to change this given the collapse research;
+answered "leave as-is" -- that isolation stays intact, not touched.
+
+**Answers the "does packing scheme affect efficiency" question**: no,
+by construction, for the banded path -- it ignores `cfg.decode_pack_mode`
+entirely (always builds prepend-style pre-sort order, then explicitly
+sorts by true_pos), generalizing dense's own docstring observation that
+"physical packing order doesn't affect correctness, only true_pos does"
+into the efficiency question too. Packing mode only ever mattered for
+the OLD chunked path (`_packed_decode_forward_chunked`), which needed
+physical interleave order as a substitute for an explicit sort -- a
+shortcut that only worked because `decode_K==1`, single-track made
+physical order and true_pos order coincide already.

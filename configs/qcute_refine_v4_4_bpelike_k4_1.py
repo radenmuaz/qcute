@@ -10,10 +10,12 @@ attention only -- decode_chunked is left False since chunking was only derived/v
 decode_K==1).
 
 attn_window=(8, 256): level 0's raw-byte window is 8 (must divide context_len -- deliberately
-narrow, 2 code-blocks' worth of raw bytes); level 1's window is 256, equal to its own sequence
-length (context_len // Ks[0] == 256 when context_len=1024), i.e. effectively full/dense attention
-over the whole code sequence (no windowing benefit at that length, falls back to dense with a
-printed warning -- expected, not a bug).
+narrow, 2 code-blocks' worth of raw bytes); level 1's window is 256, larger than its own sequence
+length (context_len // Ks[0] == 64 when context_len=256 -- see docs/status.md's mid-session
+context_len=1024->256 fix, dense-decode-was-O((2L)^2) note), i.e. effectively full/dense attention
+over the whole code sequence (window >= L falls back to dense with a printed warning -- expected,
+not a bug; kept as literal 256 rather than rewritten to 64 to preserve "unambiguously larger than
+any L this run will ever see" as the intent, not a number tied to the current context_len).
 
     uv run python -m qcute.qcute_refine_v4_4 --config configs/qcute_refine_v4_4_bpelike_k4_1.py
 
@@ -25,7 +27,7 @@ from pathlib import Path
 Ks = (4, 1)
 d_model = 256
 n_layers = 2
-context_len = 1024
+context_len = 256
 attn_window = (8, 256)
 decode_pack_mode = "interleave"
 decode_chunked = False  # decode_K=4 != 1 -- chunked path only implemented/verified for decode_K==1
