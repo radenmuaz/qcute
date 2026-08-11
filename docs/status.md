@@ -3163,3 +3163,292 @@ headline result) -- on the standard overfit10k testbed (`n_bytes=10000`, `steps=
 throughout. Results pending; will compare final train/val bpb against the bytelm parity target
 (`l2`: 0.0072 train bpb @ ~11.4 it/s) and against the SAME configs' `share_level_weights=True`
 (default) counterparts once the queue finishes.
+
+### 2x2 grid results, all 3 batches (12 runs total)
+
+Second grid queued identically but `use_gumbel_noise=False`/`gumbel_tau=1.0` (`decode_code_ste`
+stays `False`/detach, unchanged) -- isolates the gumbel-noise effect specifically. Third grid:
+single-level `Ks=(4,)` ("ae cond every 4 bytes", no cascade at all, unlike `k4_1`) x gumbel/no-gumbel,
+both frameworks -- isolates whether 4-byte block-grouping behavior depends on having a second
+(cascade) level. All 12 runs: `share_level_weights=False`, `cross_track_source="decode"`,
+`decode_code_ste=False`, `n_layers=2`, overfit10k testbed (n_bytes=10000, steps=1000).
+
+| config | final train bpb | best_val_bpb |
+|---|---|---|
+| v4.4 k4_1, gumbel | 0.0788 | 3.8763 |
+| v4.4 k1, gumbel | 0.0709 | 4.0766 |
+| v4.5 k4_1, gumbel | 0.1014 | 4.0484 |
+| v4.5 k1, gumbel | 0.0660 | 4.1181 |
+| v4.4 k4_1, no-gumbel | 0.0907 | 3.9829 |
+| v4.4 k1, no-gumbel | 0.0674 | 3.9362 |
+| v4.5 k4_1, no-gumbel | 0.1711 | 3.9566 |
+| v4.5 k1, no-gumbel | 0.0600 | 4.1346 |
+| v4.4 k4single, gumbel | 0.0710 | 3.8881 |
+| **v4.4 k4single, no-gumbel** | **0.0718** | **3.8869** |
+| v4.5 k4single, gumbel | 0.1010 | 3.9296 |
+| v4.5 k4single, no-gumbel | 0.0724 | **3.8440** (lowest val_bpb of the 12) |
+
+Final train bpb for all 12 (0.06-0.17) is still ~10x worse than bytelm's parity target
+(0.0072) -- no-sharing alone does not close the gap to bytelm's fast-overfit ability, though it IS
+roughly 2x better than the earlier SHARED-weight overfit10k batch's train bpb (0.14-0.35). No
+consistent winner between gumbel-noise on/off (helps v4.4 k4_1, hurts v4.5 k4_1 and k4single).
+v4.4 generally edges v4.5 but not uniformly (v4.5 wins the k4single no-gumbel cell). Best raw
+`val_bpb` overall (3.8440, v4.5 k4single no-gumbel) is still WORSE than the very first overfit10k
+batch's best (v4.4 `k4_1_l1`, SHARED weights, `best_val_bpb=3.7404`, from earlier this session) --
+at this tiny scale/1000-step budget, sharing's implicit parameter-efficiency (more effective
+signal per parameter when data is scarce) apparently beats no-sharing's extra expressiveness on
+raw `val_bpb`, the reverse of what might be expected.
+
+**But `val_bpb` is not the whole story -- v4.4's `nosharegrid_nogumbel_k4single` genuinely
+fast-overfits, qualitatively, for the first time this session**: greedy `cond_full` generation
+from 4 different train-set prompts (byte offsets 100, 2000, 4600, 5850, all outside the 64-byte
+prompt window used to seed generation):
+
+- offset 100: `"xport-0.3/ http://www.mediawiki.org/xml/export-0.3.xsd" version='` -- **EXACT
+  verbatim match** to ground truth.
+- offset 2000: `'e="preserve">#REDIRECT [[Algeria]]{{R from CamelCase}}</text>\n  '` -- **EXACT
+  verbatim match**.
+- offset 5850: `'mic institutions, anarchists advocate social relations based upo'` -- **EXACT
+  verbatim match**.
+- offset 4600: `'onal Polian Polical Cooperation], from the final protocoltions t'` vs ground
+  truth `'onal Police Cooperation], from the final protocols of the &quot;'` -- close but
+  imperfect (small local drift), still clearly reconstructing memorized structure rather than
+  collapsing.
+
+Held-out VAL prompt (never seen in training, correctly NOT memorized): `'ctnal Conference of
+Rome for the Social Defense Against Anarchis'` -- WRONG relative to the actual (unrelated)
+ground truth continuation, exactly as expected for a held-out prompt, but critically: fluent,
+grammatical, ON-TOPIC English prose -- no character-repetition collapse (`nnn`/`[[[[[[[`/single-
+byte loops), the dominant failure mode in every other config tested this session (v4.4 shared,
+v4.5 shared or not, bytelm). This is the first config in the entire session to show the
+architecture is CAPABLE of coherent generation at all, once genuinely fit to its training data.
+
+Config: `configs/qcute_refine_v4_4_nosharegrid_nogumbel_k4single.py` --
+`share_level_weights=False`, `use_gumbel_noise=False`, `decode_code_ste=False`, single-level
+`Ks=(4,)`, `n_layers=2`. Its raw `val_bpb` (3.8869) is unremarkable relative to the other 11 grid
+cells -- this result would have been MISSED by ranking on `val_bpb` alone, only found by actually
+inspecting greedy generation directly. Worth a longer/full-scale run to see if this specific
+combination (no-sharing + no-gumbel + single-level K=4) continues to outperform qualitatively at
+scale, not just at the tiny overfit10k budget.
+
+## Full same-prompt generation survey, all 26 checkpoints, deduced best ablation
+
+Per user request: extended the same-prompt (byte offset 5850, train split, prompt `"egarded as
+authoritarian political structures and coercive econo"`, ground truth `"mic institutions,
+anarchists advocate social relations based upo"`), same-checkpoint-step (`last.pt`, step 1000),
+greedy (argmax) generation comparison to ALL 26 overfit10k checkpoints from this session: the
+original 12 SHARED-weight configs (v4.4/v4.5 x l1/l2 x Ks=(4,1)/(1,1)/(1,)), the 3 no-sharing
+grids (12 configs: gumbel/no-gumbel x v4.4/v4.5 x k4_1/k1, plus gumbel/no-gumbel x v4.4/v4.5 x
+single-level k4single), and the 2 bytelm baselines. `val_bpb` intentionally ignored per user
+direction -- ranking is purely by (a) exact-match / qualitative fluency of greedy generation and
+(b) convergence speed, both it/s (median over steady-state, post-warmup log lines -- robust to
+transient slowdowns/disruption, NOT total-wall-time-based) and total wall-clock for 1000 steps.
+
+**Baseline (bytelm):**
+
+| config | it/s (median) | generated |
+|---|---|---|
+| bytelm l1 | 20.14 | `"miding there is aly [[cernamis; aut]]..&lt;ref&gt;[http://en.wik"` |
+| bytelm l2 | 11.23 | `"mety the word as andiviontions anarchist also [[hittp://www.me/i"` |
+
+**SHARED weights (default), l1/l2 x Ks=(4,1)/(1,1)/(1,):**
+
+| config | it/s | time | EXACT | generated |
+|---|---|---|---|---|
+| v4.4 k4_1 l1 | 8.19 | 2:24 | no | `"menc ition wikiquote.org/wiki/Main_Page</base>\n    <generator>Me"` |
+| v4.4 k4_1 l2 | 3.86 | 4:42 | no | `"mic institutions, anarchists also offer positive visions of what"` (coherent, plausible, not verbatim) |
+| v4.4 k1_k1 l1 | 2.84 | 6:34 | no | `"mic institutions, anarchists advocate social related [[social mo"` (very close) |
+| v4.4 k1_k1 l2 | 1.29 | 18:43 | no | `"mic institutions, anarchists advocate society. withs pelieve to "` |
+| v4.4 k1 l1 | 6.29 | 2:56 | no | `"mic institutions, anarchists ate its also of authow a free unner"` |
+| **v4.4 k1 l2** | 3.45 | 5:16 | **YES** | `"mic institutions, anarchists advocate social relations based upo"` |
+| v4.5 k4_1 l1 | 5.92 | 3:09 | no | `"m ttcentllllletarotoculedddees inbedd arcccccordelarr talllly so"` |
+| v4.5 k4_1 l2 | 3.07 | 6:07 | no | `"man to quated othennny Annnnn Ane ann coedaut soccennercs20002To"` |
+| v4.5 k1_k1 l1 | 3.38 | 5:31 | no | `"me sccity thesmvetesocsetims&quot;shof&gt;[[l isoonsophiismmmmed"` |
+| v4.5 k1_k1 l2 | 1.85 | 10:10 | no | `"moto socooto os mo ofounde iins iarididoatithe i iaoorice icoedo"` |
+| v4.5 k1 l1 | 7.86 | 2:21 | no | `"mic to dion s aaliithabannndeatt es</ame3elaalennnnn battttheabb"` |
+| v4.5 k1 l2 | 4.15 | 4:21 | no | `"mmic ety m      [[[[[D th [[[Dllg]]]  eaniantthe re m 2</  m rel"` |
+
+**NO-SHARING (`share_level_weights=False`), n_layers=2, gumbel vs no-gumbel:**
+
+| config | it/s | time | EXACT | generated |
+|---|---|---|---|---|
+| v4.4 k4_1, gumbel | 3.88 | 5:03 | no | `"mic institutions, anarchists advocate social relationd the domni"` (very close) |
+| v4.4 k1, gumbel | 3.14 | 5:43 | no | `"mic institutions, anarchists advocate social relatiocal alaciomm"` (very close) |
+| v4.5 k4_1, gumbel | 3.82 | 5:05 | no | `"met aid]]]]] fromhhhhism], a\n thighhhe Sthhhheem] hhht Anrrrrism"` |
+| v4.5 k1, gumbel | 5.44 | 3:21 | no | `"mic ticies tated cted s stritarlais tarlatirallatsthetutiricivio"` |
+| **v4.4 k4_1, no-gumbel** | 2.79 | 6:48 | **YES** | `"mic institutions, anarchists advocate social relations based upo"` |
+| **v4.4 k1, no-gumbel** | 3.04 | 6:22 | **YES** | `"mic institutions, anarchists advocate social relations based upo"` |
+| v4.5 k4_1, no-gumbel | 3.37 | 5:38 | no | `"mttttein ttttern ttttituttttt;rerrtttalk</nttitletttt erritttann"` |
+| v4.5 k1, no-gumbel | 5.29 | 3:28 | no | `"miannand preanananacshiand and coessounsatimucssss ranananarchan"` |
+
+**NO-SHARING, single-level Ks=(4,) ("k4single"):**
+
+| config | it/s | time | EXACT | generated |
+|---|---|---|---|---|
+| **v4.4 k4single, gumbel** | 4.34 | 4:22 | **YES** | `"mic institutions, anarchists advocate social relations based upo"` |
+| **v4.4 k4single, no-gumbel** | **4.48** | **4:17** | **YES** | `"mic institutions, anarchists advocate social relations based upo"` |
+| v4.5 k4single, gumbel | 5.06 | 3:32 | no | `"malar goouuuld assssspace teationcala ptialal lsoalaroschal and "` |
+| v4.5 k4single, no-gumbel | 5.79 | 3:14 | no | `"mere tate palk</na p agair p as a a a ter ta as a e trermou uf a"` |
+
+### Per-axis ablation deduction
+
+- **v4.4 (packed/concat decode) vs v4.5 (cross-attention decode) -- decisive, dominant axis.**
+  6 of 24 qcute runs hit exact verbatim reproduction; ALL 6 are v4.4, ZERO are v4.5. Every v4.5
+  run, regardless of sharing/gumbel/Ks/depth, degenerates into character-repetition loops
+  (`llll`/`nnnn`/`tttt`/`aaaa`). Consistent with the earlier gradient-depth analysis: v4.5's
+  decode is `n_layers*(1+n_tracks)` deep sequentially vs v4.4's flat `n_layers`.
+- **Weight sharing vs not.** Modestly helps (expands the exact-match set from 1 to 3 within
+  v4.4), but not decisive alone -- matters mainly combined with no-gumbel.
+- **Gumbel noise vs none.** For v4.4, no-gumbel matches-or-beats gumbel every time compared
+  head-to-head (never worse). For v4.5, neither escapes collapse. No-gumbel is the safer default.
+- **1-layer vs 2-layer** (only cleanly isolated in the SHARED batch, since all no-sharing grids
+  used `n_layers=2`): 2-layer reached the only exact match in that batch; every 1-layer run fell
+  short. More depth clearly helps reach exact memorization, ~2x wall-clock cost.
+- **Ks=4 vs Ks=1 (block granularity).** Once combined with no-sharing, block size stopped
+  mattering -- `k4_1`, `k1`, AND `k4single` all reach exact match under v4.4/no-share/no-gumbel.
+  The earlier-session finding "`Ks[0]=4` causes code collapse" appears specific to the *shared*-
+  weights regime; no-sharing removes that penalty.
+- **Convergence speed (it/s, median steady-state).** bytelm fastest by far (11-20 it/s, no
+  encode+decode double pass or multi-level structure). Among the 6 exact-match v4.4 configs,
+  `k4single` is BOTH the fastest wall-clock (4:17-4:22) AND fastest per-step (4.3-4.5 it/s vs
+  2.8-3.0 it/s for `k4_1`/`k1`) -- confirms this isn't just "fewer total seconds," it's genuinely
+  cheaper per step (no second-level compute), not a disruption artifact.
+
+**Deduced best ablation**: v4.4 (packed decode) + `share_level_weights=False` +
+`use_gumbel_noise=False` + single-level `Ks=(4,)` + `n_layers=2` --
+`configs/qcute_refine_v4_4_nosharegrid_nogumbel_k4single.py`. In the exact-match group AND the
+fastest member of that group both by wall-clock and by steady-state it/s.
+
+## v4.5 uncond (encode-only) generation survey -- suspected structural cause found
+
+Per user request: checked `generate_encode_only` (pure unconditioned generation, no decode/
+cross-attn involved at all) on the same prompt/offset (5850) for all 12 v4.5 checkpoints, since
+v4.5's cond_full generation was uniformly collapsed (see above) and the question was whether the
+PLAIN uncond pathway is at least healthy on its own.
+
+It is not -- every one of the 12 v4.5 checkpoints' uncond generation is ALSO collapsed
+(`"m mouuusnnnnrrrlyy bbbbblyyyyyyy tt bbbbelt..."`, `"morthhhht aca\nact authhherrrthers..."`,
+`"malarealy tarearddealary tareialy eded ered..."`, etc. -- heavy character-repetition throughout,
+same failure mode as cond_full). For comparison, v4.4's uncond generation on the same 5 spot-check
+checkpoints is variable -- sometimes reasonable (`k1 l2 (shared)`: `"mic institutions,
+anarchists advoist, [[[anarchy '''"`, close to the real continuation) but sometimes ALSO badly
+collapsed (`k4single noshare nogumbel`: `"merrrrrronnrrrererrererefereererercereceererecers"` --
+notably, this is the SAME checkpoint whose cond_full output was an EXACT verbatim match).
+
+**Checked for an actual code bug first**: `LevelLM.encode()` (v4.5) and v4.4's plain
+`decode_tracks is None` branch are structurally byte-identical (same `rope_cos_sin` call, same
+`for block in self.blocks: x = block(x, cos, sin, window)` loop, same final `self.ln_f`) -- no
+implementation divergence found.
+
+**Real structural asymmetry found instead**: v4.5's decode Stage 0 REUSES `encode_lms[i]`'s own
+already-computed `h` directly as its input (by design, see `LevelLM.encode`'s docstring -- this
+is what makes v4.5's decode cheaper, no redundant self-attention recompute). This means that even
+under `share_level_weights=False` (independent parameter TENSORS for encode vs decode), gradient
+from decode's own loss still flows BACKWARD through that shared `h` into `encode_lms[i]`'s
+parameters -- encode is being pulled toward two different objectives simultaneously (good at
+plain uncond NTP, AND a good Stage-0 starting point for decode's conditioned NTP). v4.4's decode,
+by contrast, computes from raw `x_list[i]` through `decode_lms[i]`'s OWN independent embedding
+under no-sharing -- ZERO shared computation graph with encode at all. This is a plausible
+explanation for why v4.5's uncond quality is uniformly worse/more collapsed than v4.4's.
+
+**Sanity check queued to test this directly**: `configs/qcute_refine_v4_5_uncondonly_{k4single,
+k4_1}.py` -- `decode_ntp_weight=0.0` (every decode-derived loss term contributes exactly zero
+gradient via the zero coefficient, even though decode's forward pass still runs using `h` as
+input) -- fully decoupling `encode_lms`'s training from decode's forward computation.
+`share_level_weights=False` (shared-weights variant skipped per user direction for this specific
+task), `decode_code_ste=False` (detach), `use_gumbel_noise=False`, single-level `Ks=(4,)` and
+2-level `Ks=(4,1)`, `n_layers=2`, standard overfit10k testbed. If uncond generation cleans up
+dramatically here relative to the normal (`decode_ntp_weight=1.0`) runs above, that confirms the
+theory -- v4.5's decode design, not v4.5's encode implementation itself, is what's degrading
+uncond quality. Results pending.
+
+### uncondonly result: theory REFUTED -- decode-gradient interference is NOT the (sole) cause
+
+Both `decode_ntp_weight=0.0` runs (`k4single`, `k4_1`) finished. Generation is STILL badly
+collapsed under greedy decoding despite `encode_lms` receiving ZERO gradient contamination from
+decode (`val_decode_total=0.0000`, `val_decode_stage_extra_total=0.0000` confirm the isolation
+worked as intended): `k4single` train prompt -- `"rengenge 66666&lt;hateear     &lt;heee
+6geeeeeeedge eeeerge ee h"`; `k4_1` train prompt -- `"umes [[[Anthes Anaratior
+Anteserstiaranaliontantibe Antictary An"`. Both show the same character/substring-repetition
+collapse pattern as every other v4.5 config tested.
+
+Notably, teacher-forced `val_level0_ntp_acc_encode` is actually reasonable (0.398 for k4single,
+0.384 for k4_1) -- the model IS learning something under teacher forcing. The collapse only shows
+up under free-running greedy generation, i.e. this looks like ordinary exposure bias/error
+accumulation (a well-known general phenomenon, not evidence of a v4.5-specific defect) rather than
+decode's gradient corrupting encode's weights. **This refutes the decode-gradient-interference
+theory as the primary or sole cause of v4.5's collapse** -- something more fundamental about
+v4.5's own generation dynamics at this tiny training budget is responsible, not simply "decode's
+loss pulls on shared/coupled weights." The `decode_separate_stage0`/`decode_stage0_recompute`
+ablation queue (next section) may still show a partial improvement on CONDITIONED generation
+specifically (a different question -- whether decode's cross-attn stages benefit from decoupled
+Stage-0 weights, independent of whether uncond generation itself is already collapse-prone), but
+expectations should be tempered given this result.
+
+## Stage-0 coupling ablation: decode_separate_stage0 vs decode_stage0_recompute vs baseline
+
+Per user request, two new v4.5-only Config flags, both targeting the Stage-0 reuse question from
+different angles:
+
+- **`Config.decode_separate_stage0`** (implemented): Stage 0 gets a genuinely INDEPENDENT LM
+  (`self.decode_stage0_lms[i]`, separate weights from `encode_lms[i]`) instead of reusing
+  `encode_lms[i]`'s own `h` -- "even though it basically learns the same thing" (user's framing),
+  this fully decouples encode's training from decode's gradient. Gets its own NTP loss (added to
+  `decode_stage_extra_total`), same mechanism as any other non-final independent stage.
+- **`Config.decode_stage0_recompute`** (implemented): ablates `decode_separate_stage0`'s TWO
+  conflated changes separately -- Stage 0 keeps the SAME weights as `encode_lms[i]`
+  (`self.decode_stage0_lms[i]` still aliases `encode_lms[i]`) but runs a FRESH forward pass over
+  `x_list[i]` instead of literally reusing the `h` tensor. Mathematically predicted to behave
+  IDENTICALLY to the plain-reuse baseline (autograd sums gradient contributions from multiple loss
+  terms into shared weights the same way regardless of whether they flow through one shared graph
+  node or two separate forward passes with identical weights/inputs) -- included specifically to
+  verify that prediction empirically rather than assume it, and to cleanly separate "does WEIGHT
+  independence matter" from "does GRAPH-node independence matter."
+
+Both flags only have any effect when `share_level_weights=False` (moot under sharing, where
+reusing vs. recomputing with the literal same weights is mathematically identical either way).
+
+Queued: full rerun of the 6-cell v4.5 no-sharing grid (`k4_1`/`k1`/`k4single` x gumbel/no-gumbel)
+under EACH flag (12 runs total) -- `configs/qcute_refine_v4_5_sep0_*.py` and `configs/
+qcute_refine_v4_5_recompute0_*.py`. Given the uncondonly refutation above, the more informative
+comparison here is against the ORIGINAL (plain-reuse) v4.5 no-share grid's CONDITIONED
+(`cond_full`) generation specifically.
+
+**Results (same offset-5850 train prompt, `generate_no_cache`, `last.pt`, all `step=1000`):**
+
+| cell | baseline (reuse) train_bpb | sep0 train_bpb | recompute0 train_bpb | EXACT (any variant) |
+|---|---|---|---|---|
+| k4_1 | 0.1014 | 0.1036 | 0.0887 | False / False / False |
+| k1 | 0.0660 | 0.0591 | 0.0618 | False / False / False |
+| k4single | 0.1010 | 0.0967 | 0.0750 | False / False / False |
+| nogumbel_k4_1 | 0.1711 | 0.0870 | 0.1326 | False / False / False |
+| nogumbel_k1 | 0.0600 | 0.0652 | 0.0599 | False / False / False |
+| nogumbel_k4single | 0.0724 | 0.0683 | 0.0717 | False / False / False |
+
+All 18 checkpoints (6 baseline x 3 stage-0 variants) produce garbled, non-degenerate-but-incoherent
+greedy output at this prompt -- none reach exact match, matching the earlier 26-checkpoint survey's
+finding that no v4.5 config ever reaches exact match regardless of ablation axis. `train_bpb` moves
+around (sometimes better under `sep0`/`recompute0`, e.g. `nogumbel_k4_1`: 0.17 -> 0.09; sometimes
+roughly flat or slightly worse) but **conditioned generation quality does not track it** -- lower
+bpb here never translated into a qualitatively better (let alone exact) greedy continuation.
+`decode_stage0_recompute`'s outputs are not meaningfully different from plain reuse's, consistent
+with the mathematical prediction that graph-node sharing vs. fresh-forward-with-identical-weights
+is not itself the mechanism (autograd sums gradients the same way either way).
+
+**Conclusion: Stage-0 coupling is not the bottleneck for v4.5's conditioned generation either.**
+Combined with the earlier uncond refutation (`decode_ntp_weight=0.0` still collapsed), this closes
+out the Stage-0-reuse hypothesis entirely -- neither the uncond nor the conditioned collapse is
+explained by Stage-0 gradient/graph coupling. The remaining, more likely explanation is exposure
+bias intrinsic to v4.5's staged cross-attention decode itself (multi-stage sequential dependence
+compounds greedy-decoding error faster than v4.4's flat concat decode), not a fixable coupling bug.
+
+**Note (explicit user framing, worth stating plainly):** across every ablation this session,
+*separate (non-shared) weights solve much of the degenerate-generation problem* -- but only for
+v4.4. `share_level_weights=False` is what took v4.4 from uniformly collapsed/degenerate output
+(the SHARED overfit10k grid) to `nosharegrid_nogumbel_k4single`'s exact verbatim memorization on
+3/4 train prompts and fluent held-out generation -- the single best result all session. The same
+"give it independent weights" move, applied at increasingly fine grain to v4.5 (`share_level_
+weights=False`, then `decode_separate_stage0`, then `decode_stage0_recompute`), never produces an
+analogous jump for v4.5 -- its degenerate generation is not a weight-sharing problem at any level
+tested. So the finding is specifically **v4.4 benefits decisively from weight independence; v4.5's
+problem lies elsewhere** (architecture-level exposure bias in the staged decode itself).

@@ -167,6 +167,28 @@ class Config:
     # (2*n_levels separate LevelLM instances total). The ONLY thing crossing from encode to decode (or between
     # levels) in that case is the bare integer code id (source_c.argmax(-1)) -- decode always re-embeds that id in
     # ITS OWN embedding table (self.decode_lms[i].embed), never touching whichever LM produced/represented it.
+    decode_separate_stage0: bool = False  # False (default): decode's Stage 0 (self-attention, unconditioned)
+    # REUSES encode_lms[i]'s own already-computed `h` directly -- cheap (no redundant recompute), but means
+    # decode's loss backprops through that shared `h` into encode_lms[i]'s parameters even under
+    # share_level_weights=False, pulling encode toward two objectives at once (plain uncond NTP, AND being a good
+    # Stage-0 starting point for decode). True: decode gets its OWN independent Stage-0 LM (self.decode_stage0_lms
+    # -- a genuinely separate LevelLM per level, even though it "basically learns the same thing" as encode's own
+    # self-attention pass) -- fully decouples encode's training from decode's forward computation, at the cost of
+    # redundant compute/parameters. Only has any effect when share_level_weights=False (under sharing, reusing vs.
+    # recomputing with the SAME weights gives an IDENTICAL result -- moot, so always reuses for efficiency
+    # regardless of this flag in that case). When True, Stage 0 also gets its own NTP loss added to
+    # decode_stage_extra_total (same mechanism as any other non-final independent stage) -- otherwise this new LM
+    # would only get weak indirect gradient via feeding Stage 1.
+    decode_stage0_recompute: bool = False  # Ablates decode_separate_stage0's TWO conflated changes (new
+    # independent weights, AND a fresh forward pass instead of tensor reuse) separately. False (default): no
+    # effect beyond decode_separate_stage0's own behavior. True (and decode_separate_stage0=False, share_level_
+    # weights=False): Stage 0 uses the SAME weights as encode_lms[i] (self.decode_stage0_lms[i] still aliases
+    # encode_lms[i] in this case) but runs a FRESH forward pass over x_list[i] instead of reusing h_list[i] --
+    # isolates whether the coupling problem decode_separate_stage0 fixes is really about WEIGHT sharing (in which
+    # case this variant should behave identically to the plain reuse case -- autograd sums gradient contributions
+    # from multiple loss terms into shared weights the same way whether they flow through one shared graph node or
+    # two separate forward passes with identical weights/inputs) or about something in the graph-sharing itself
+    # (in which case this variant would behave differently -- worth confirming empirically, not just assuming).
 
 
 def gumbel_quantize(logits: torch.Tensor, tau: float, use_gumbel_noise: bool = False) -> torch.Tensor:
@@ -561,16 +583,27 @@ class RefineLM(nn.Module):
         # instance -- reproduces the original behavior exactly. When False, every encode_lms[i]
         # and every decode_stage_lms[i][t] is its own independently-constructed LevelLM -- the
         # only thing crossing between any of them is the bare integer code id.
+        # decode_stage0_lms[i]: only meaningfully independent when share_level_weights=False AND
+        # decode_separate_stage0=True (see Config.decode_separate_stage0) -- gives decode's Stage
+        # 0 its own dedicated LM instead of reusing encode_lms[i]'s own `h`. Moot under sharing
+        # (same weights either way) or when the flag is off (default: aliases encode_lms, unused
+        # by _run in that case -- reuse path is taken directly).
         if cfg.share_level_weights:
             shared_lm = LevelLM(cfg)
             encode_lms = [shared_lm for _ in range(self.n_levels)]
+            decode_stage0_lms = [shared_lm for _ in range(self.n_levels)]
             decode_stage_lms = [nn.ModuleList([shared_lm for _ in range(self.n_levels - i)])
                                  for i in range(self.n_levels)]
         else:
             encode_lms = [LevelLM(cfg) for _ in range(self.n_levels)]
+            if cfg.decode_separate_stage0:
+                decode_stage0_lms = [LevelLM(cfg) for _ in range(self.n_levels)]
+            else:
+                decode_stage0_lms = encode_lms
             decode_stage_lms = [nn.ModuleList([LevelLM(cfg) for _ in range(self.n_levels - i)])
                                  for i in range(self.n_levels)]
         self.encode_lms = nn.ModuleList(encode_lms)
+        self.decode_stage0_lms = nn.ModuleList(decode_stage0_lms)
         self.decode_stage_lms = nn.ModuleList(decode_stage_lms)
 
     def _run(self, byte_ids: torch.Tensor, compute_ntp: bool = True, max_decode_sources: int | None = None):
@@ -636,7 +669,18 @@ class RefineLM(nn.Module):
                 full_track_specs = full_track_specs[:max_decode_sources]
 
             stage_lms_i = self.decode_stage_lms[i]
-            x = h_list[i]  # Stage 0: reuse encode's own output directly, never recomputed
+            if (cfg.decode_separate_stage0 or cfg.decode_stage0_recompute) and not cfg.share_level_weights:
+                # Fresh forward pass over x_list[i] -- self.decode_stage0_lms[i] is either a
+                # genuinely independent LM (decode_separate_stage0=True) or literally
+                # encode_lms[i] itself (decode_stage0_recompute=True, decode_separate_stage0=
+                # False -- SAME weights, still a fresh forward call, not a tensor reuse). Either
+                # way this is no longer "reuse", so it needs its own NTP loss, same mechanism as
+                # any other non-final independent stage.
+                _, loss_stage0, _, x = self.decode_stage0_lms[i].encode(
+                    x_list[i], level=i, window=self.windows[i], compute_ntp=compute_ntp)
+                decode_stage_extra_losses.append(loss_stage0)
+            else:
+                x = h_list[i]  # Stage 0: reuse encode's own output directly, never recomputed
             loss_final = acc_final = c_final = None
             for t, (source_c, track_K, window) in enumerate(full_track_specs):
                 stage_lm = stage_lms_i[t]
@@ -1045,6 +1089,8 @@ def main():
     p.add_argument("--decode_code_ste", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--vocab", type=int, default=256)
     p.add_argument("--share_level_weights", type=lambda x: x.lower() != "false", default=True)
+    p.add_argument("--decode_separate_stage0", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--decode_stage0_recompute", type=lambda x: x.lower() != "false", default=False)
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -1094,6 +1140,7 @@ def main():
         decode_self_only_aux=args.decode_self_only_aux, cross_track_source=args.cross_track_source,
         decode_self_only_weight=args.decode_self_only_weight, decode_code_ste=args.decode_code_ste,
         vocab=args.vocab, share_level_weights=args.share_level_weights,
+        decode_separate_stage0=args.decode_separate_stage0, decode_stage0_recompute=args.decode_stage0_recompute,
     )
     model = RefineLM(cfg).to(device)
     n_params = sum(p_.numel() for p_ in model.parameters())
