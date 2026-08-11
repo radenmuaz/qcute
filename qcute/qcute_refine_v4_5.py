@@ -161,6 +161,12 @@ class Config:
     # flows into the code producer). False = embed(source_c.argmax(-1)) (hard argmax-equivalent forward
     # value via index lookup, no gradient into the code producer). Forward VALUE is identical either way;
     # only the backward path differs.
+    share_level_weights: bool = True  # True (default, original behavior): ONE shared LevelLM instance is used
+    # for every level's encode pass AND decode pass -- literally the same object, same embed/blocks/ln_f/code_head
+    # weights everywhere. False: every level gets its own INDEPENDENT encode LM and its own INDEPENDENT decode LM
+    # (2*n_levels separate LevelLM instances total). The ONLY thing crossing from encode to decode (or between
+    # levels) in that case is the bare integer code id (source_c.argmax(-1)) -- decode always re-embeds that id in
+    # ITS OWN embedding table (self.decode_lms[i].embed), never touching whichever LM produced/represented it.
 
 
 def gumbel_quantize(logits: torch.Tensor, tau: float, use_gumbel_noise: bool = False) -> torch.Tensor:
@@ -311,45 +317,36 @@ class Block(nn.Module):
 
 
 class LevelLM(nn.Module):
-    def __init__(self, cfg: Config, level: int, window: int | None, decode_windows: list[int | None],
-                 shared: "LevelLM | None" = None):
+    """Pure weight-holder -- no level-specific state (level index, window, decode_windows) stored
+    on the instance. Those are passed as forward() arguments instead, so the SAME instance can
+    safely be reused (literally aliased) across multiple levels/roles when Config.
+    share_level_weights=True (see RefineLM.__init__)."""
+
+    def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
-        self.level = level
-        self.window = window
-        self.decode_windows = decode_windows  # one per decode source: [self, +1, +2, ..., top]
-        self.is_byte_level = level == 0
         D = cfg.d_model
         V = cfg.vocab
-        if shared is not None:
-            self.embed = shared.embed
-            self.blocks = shared.blocks
-            self.ln_f = shared.ln_f
-            self.code_head = shared.code_head
-            self.code_query = shared.code_query
-            self.code_out = shared.code_out
-            self.query_embed = shared.query_embed
-        else:
-            self.embed = nn.Embedding(V, D)
-            nn.init.normal_(self.embed.weight, std=0.02)
-            self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
-            self.ln_f = nn.LayerNorm(D)
-            self.code_head = None if cfg.code_head_tied else nn.Linear(D, V, bias=False)
-            if self.code_head is not None:
-                nn.init.normal_(self.code_head.weight, std=0.02)
-            self.code_query = self.code_out = self.query_embed = None
-            if cfg.code_extract_mode == "light_query_attn":
-                self.code_query = nn.Parameter(torch.zeros(D))
-                nn.init.normal_(self.code_query, std=0.02)
-                self.code_out = nn.Linear(D, D, bias=False)
-            elif cfg.code_extract_mode == "query_embed":
-                self.query_embed = nn.Parameter(torch.zeros(D))
-                nn.init.normal_(self.query_embed, std=0.02)
+        self.embed = nn.Embedding(V, D)
+        nn.init.normal_(self.embed.weight, std=0.02)
+        self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
+        self.ln_f = nn.LayerNorm(D)
+        self.code_head = None if cfg.code_head_tied else nn.Linear(D, V, bias=False)
+        if self.code_head is not None:
+            nn.init.normal_(self.code_head.weight, std=0.02)
+        self.code_query = self.code_out = self.query_embed = None
+        if cfg.code_extract_mode == "light_query_attn":
+            self.code_query = nn.Parameter(torch.zeros(D))
+            nn.init.normal_(self.code_query, std=0.02)
+            self.code_out = nn.Linear(D, D, bias=False)
+        elif cfg.code_extract_mode == "query_embed":
+            self.query_embed = nn.Parameter(torch.zeros(D))
+            nn.init.normal_(self.query_embed, std=0.02)
 
     def _classify(self, pooled: torch.Tensor) -> torch.Tensor:
         return self.code_head(pooled) if self.code_head is not None else F.linear(pooled, self.embed.weight)
 
-    def _query_embed_pool(self, x0: torch.Tensor, K: int, n_blocks: int) -> torch.Tensor:
+    def _query_embed_pool(self, x0: torch.Tensor, K: int, n_blocks: int, window: int | None) -> torch.Tensor:
         cfg = self.cfg
         B, L, D = x0.shape
         H, hd = cfg.n_heads, D // cfg.n_heads
@@ -368,7 +365,7 @@ class LevelLM(nn.Module):
 
         cos, sin = rope_cos_sin_for_positions(real_pos, hd, cfg.rope_base, device)
 
-        win = self.window if self.window is not None else L
+        win = window if window is not None else L
         ti = real_pos.unsqueeze(1)
         tj = real_pos.unsqueeze(0)
         causal = tj <= ti
@@ -392,71 +389,11 @@ class LevelLM(nn.Module):
         he_blocks = he.view(B, n_blocks, K + 1, D)
         return he_blocks[:, :, K, :]
 
-    def _decode_forward(self, x0: torch.Tensor, tracks: list[tuple[torch.Tensor, int, int | None]]) -> torch.Tensor:
-        """Staged decode: Stage 0 is a full self-attention pass over x0 (IDENTICAL to this level's
-        own encode computation, same weights, same self.window) -- then one full n_layers
-        cross-attention stage per track in `tracks` (ordered [self, +1, +2, ..., top]), each
-        continuing the residual stream from the previous stage, cross-attending ONLY to that
-        track's own code embeddings, masked jagged-causal at that track's block granularity (a
-        code can only be attended to by query positions strictly past its own block's end -- see
-        this module's own top-of-file docstring for the full derivation). Final self.ln_f applied
-        once, after the last stage."""
-        cfg = self.cfg
-        B, L, D = x0.shape
-        H, hd = cfg.n_heads, D // cfg.n_heads
-        device = x0.device
-
-        cos_self, sin_self = rope_cos_sin(L, hd, cfg.rope_base, device)
-        x = x0
-        for block in self.blocks:
-            x = block(x, cos_self, sin_self, self.window)
-
-        query_pos = torch.arange(L, device=device)
-        cos_q, sin_q = rope_cos_sin_for_positions(query_pos, hd, cfg.rope_base, device)
-        for code_kv, K, window in tracks:
-            n_blocks = code_kv.shape[1]
-            code_pos = (torch.arange(n_blocks, device=device) + 1) * K - 1  # last real byte position each code summarizes
-            cos_k, sin_k = rope_cos_sin_for_positions(code_pos, hd, cfg.rope_base, device)
-            causal = code_pos.view(1, -1) < query_pos.view(-1, 1)  # [L, n_blocks]: code's own block must be strictly past
-            if window is not None:
-                reach = query_pos.view(-1, 1) - code_pos.view(1, -1)
-                allow = causal & (reach < window)
-            else:
-                allow = causal
-            attn_mask = allow.view(1, 1, L, n_blocks)
-            for block in self.blocks:
-                x = block.forward_cross(x, code_kv, cos_q, sin_q, cos_k, sin_k, attn_mask)
-
-        return self.ln_f(x)
-
-    def forward(self, seq_repr: torch.Tensor, compute_ntp: bool = True,
-                decode_tracks: list[tuple[torch.Tensor, int, int | None]] | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        cfg = self.cfg
-        K = cfg.Ks[self.level]
-        D = cfg.d_model
-
-        if self.is_byte_level:
-            x = self.embed(seq_repr)
-            B, L = seq_repr.shape
-        else:
-            x = seq_repr @ self.embed.weight
-            B, L, _ = seq_repr.shape
-
-        x0 = x
-        head_dim = D // cfg.n_heads
-
-        if decode_tracks is not None:
-            assert len(decode_tracks) >= 1
-            h = self._decode_forward(x0, decode_tracks)
-        else:
-            cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
-            for block in self.blocks:
-                x = block(x, cos, sin, self.window)
-            h = self.ln_f(x)
-
+    def _ntp(self, h: torch.Tensor, seq_repr: torch.Tensor, is_byte_level: bool, D: int,
+             compute_ntp: bool) -> tuple[torch.Tensor, torch.Tensor]:
         if compute_ntp:
             h_flat = h[:, :-1, :].reshape(-1, D)
-            target = (seq_repr[:, 1:].reshape(-1) if self.is_byte_level
+            target = (seq_repr[:, 1:].reshape(-1) if is_byte_level
                       else seq_repr[:, 1:, :].argmax(-1).reshape(-1))
             logits = F.linear(h_flat, self.embed.weight)
             ntp_loss = F.cross_entropy(logits, target)
@@ -465,7 +402,11 @@ class LevelLM(nn.Module):
         else:
             ntp_loss = h.new_zeros(())
             ntp_acc = h.new_zeros(())
+        return ntp_loss, ntp_acc
 
+    def _extract_code(self, h: torch.Tensor, x0: torch.Tensor, K: int, window: int | None) -> torch.Tensor:
+        cfg = self.cfg
+        B, L, D = h.shape
         n_blocks = L // K
         h_blocks = h[:, :n_blocks * K, :].view(B, n_blocks, K, D)
         if cfg.code_extract_mode == "last_h":
@@ -481,12 +422,85 @@ class LevelLM(nn.Module):
             pooled = (weights.unsqueeze(-1) * h_blocks).sum(2)
             pooled = self.code_out(pooled)
         elif cfg.code_extract_mode == "query_embed":
-            pooled = self._query_embed_pool(x0, K, n_blocks)
+            pooled = self._query_embed_pool(x0, K, n_blocks, window)
         else:
             raise ValueError(f"unknown code_extract_mode {cfg.code_extract_mode!r}")
         pre_q = self._classify(pooled)
-        c_i = gumbel_quantize(pre_q, cfg.gumbel_tau, cfg.use_gumbel_noise)
+        return gumbel_quantize(pre_q, cfg.gumbel_tau, cfg.use_gumbel_noise)
 
+    def encode(self, seq_repr: torch.Tensor, level: int, window: int | None,
+               compute_ntp: bool = True) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Plain self-attention pass, unconditioned -- this level's own encode computation. Also
+        used, UNCHANGED and NOT recomputed, as decode's own Stage 0 input (see RefineLM._run) --
+        running a second, separately-weighted self-attention pass over the identical input would
+        either be exactly redundant (Config.share_level_weights=True: same weights, same result,
+        pure waste) or a pointless unrelated computation (share_level_weights=False: different
+        weights operating on the same unconditioned input have no principled relationship to
+        "conditioning" at all -- there is nothing yet to condition ON at Stage 0)."""
+        cfg = self.cfg
+        K = cfg.Ks[level]
+        D = cfg.d_model
+        is_byte_level = level == 0
+        if is_byte_level:
+            x = self.embed(seq_repr)
+            B, L = seq_repr.shape
+        else:
+            x = seq_repr @ self.embed.weight
+            B, L, _ = seq_repr.shape
+        x0 = x
+        head_dim = D // cfg.n_heads
+        cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
+        for block in self.blocks:
+            x = block(x, cos, sin, window)
+        h = self.ln_f(x)
+        ntp_loss, ntp_acc = self._ntp(h, seq_repr, is_byte_level, D, compute_ntp)
+        c_i = self._extract_code(h, x0, K, window)
+        return c_i, ntp_loss, ntp_acc, h
+
+    def cross_attn_stage(self, x_in: torch.Tensor, code_kv: torch.Tensor, seq_repr: torch.Tensor, level: int,
+                          track_K: int, window: int | None, compute_ntp: bool = True,
+                          want_code: bool = False) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """ONE cross-attention stage (full n_layers deep), continuing the residual stream from
+        x_in, using THIS instance's OWN weights (qkv/out/mlp/embed/head) -- under Config.
+        share_level_weights=False every track gets its own independent LevelLM instance for this
+        stage (see RefineLM.__init__'s decode_stage_lms), so this stage's NTP loss is what
+        actually supervises those otherwise-orphaned weights (they only get weak indirect
+        gradient via feeding the next stage, otherwise). want_code=True (only the LAST stage in a
+        level's chain): also extract this level's own code from the resulting h, via THIS
+        instance's own code-extraction weights -- self-contained, recomputes its own x0 from
+        seq_repr rather than reusing encode's (consistent: the classifier applied is this stage's
+        own, so the pooled representation it pools over should be too)."""
+        cfg = self.cfg
+        K = cfg.Ks[level]
+        D = cfg.d_model
+        is_byte_level = level == 0
+        B, L, _ = x_in.shape
+        hd = D // cfg.n_heads
+        device = x_in.device
+
+        n_blocks = code_kv.shape[1]
+        code_pos = (torch.arange(n_blocks, device=device) + 1) * track_K - 1
+        query_pos = torch.arange(L, device=device)
+        cos_q, sin_q = rope_cos_sin_for_positions(query_pos, hd, cfg.rope_base, device)
+        cos_k, sin_k = rope_cos_sin_for_positions(code_pos, hd, cfg.rope_base, device)
+        causal = code_pos.view(1, -1) < query_pos.view(-1, 1)
+        if window is not None:
+            reach = query_pos.view(-1, 1) - code_pos.view(1, -1)
+            allow = causal & (reach < window)
+        else:
+            allow = causal
+        attn_mask = allow.view(1, 1, L, n_blocks)
+
+        x = x_in
+        for block in self.blocks:
+            x = block.forward_cross(x, code_kv, cos_q, sin_q, cos_k, sin_k, attn_mask)
+        h = self.ln_f(x)
+
+        ntp_loss, ntp_acc = self._ntp(h, seq_repr, is_byte_level, D, compute_ntp)
+        c_i = None
+        if want_code:
+            x0 = self.embed(seq_repr) if is_byte_level else seq_repr @ self.embed.weight
+            c_i = self._extract_code(h, x0, K, window)
         return c_i, ntp_loss, ntp_acc, h
 
 
@@ -537,11 +551,27 @@ class RefineLM(nn.Module):
         # (decode windows need no analogous divisibility assert -- cross-attention here is a
         # dense masked SDPA over [L, n_blocks], not chunked, so any window value works.)
 
-        encoders: list[LevelLM] = []
-        for i in range(self.n_levels):
-            lvl = LevelLM(cfg, i, windows[i], decode_windows[i], shared=(encoders[0] if i > 0 else None))
-            encoders.append(lvl)
-        self.encoders = nn.ModuleList(encoders)
+        # encode_lms[i]: level i's encode LM. decode_stage_lms[i]: a ModuleList of length
+        # n_levels-i, one independent LM per cross-attention TRACK for level i's decode (self,
+        # +1, ..., top) -- NOT one shared decode LM per level. Stage 0 (self-attention over
+        # bytes/this level's own input) never gets its own weights at all, shared or not -- decode
+        # always reuses encode_lms[i]'s own already-computed output directly (see LevelLM.encode's
+        # docstring and RefineLM._run). When cfg.share_level_weights (default), EVERY one of these
+        # (encode_lms and every decode_stage_lms[i][t]) literally aliases the SAME single LevelLM
+        # instance -- reproduces the original behavior exactly. When False, every encode_lms[i]
+        # and every decode_stage_lms[i][t] is its own independently-constructed LevelLM -- the
+        # only thing crossing between any of them is the bare integer code id.
+        if cfg.share_level_weights:
+            shared_lm = LevelLM(cfg)
+            encode_lms = [shared_lm for _ in range(self.n_levels)]
+            decode_stage_lms = [nn.ModuleList([shared_lm for _ in range(self.n_levels - i)])
+                                 for i in range(self.n_levels)]
+        else:
+            encode_lms = [LevelLM(cfg) for _ in range(self.n_levels)]
+            decode_stage_lms = [nn.ModuleList([LevelLM(cfg) for _ in range(self.n_levels - i)])
+                                 for i in range(self.n_levels)]
+        self.encode_lms = nn.ModuleList(encode_lms)
+        self.decode_stage_lms = nn.ModuleList(decode_stage_lms)
 
     def _run(self, byte_ids: torch.Tensor, compute_ntp: bool = True, max_decode_sources: int | None = None):
         """max_decode_sources: if set, every level's decode track list is truncated to at most this
@@ -553,7 +583,7 @@ class RefineLM(nn.Module):
 
         for i in range(self.n_levels):
             want_ntp = compute_ntp and (i == 0 or cfg.code_ntp_weight > 0)
-            c_i, loss_i, acc_i, h_i = self.encoders[i](seq_repr, compute_ntp=want_ntp)
+            c_i, loss_i, acc_i, h_i = self.encode_lms[i].encode(seq_repr, level=i, window=self.windows[i], compute_ntp=want_ntp)
             encode_losses.append(loss_i)
             encode_accs.append(acc_i)
             h_list.append(h_i)
@@ -565,16 +595,30 @@ class RefineLM(nn.Module):
         decode_accs: list = [None] * self.n_levels
         decode_self_only_losses: list = [None] * self.n_levels
         decode_self_only_accs: list = [None] * self.n_levels
+        # decode_stage_extra_losses: only populated when NOT share_level_weights -- every
+        # non-final cross-attn stage's own NTP loss (using ITS OWN independent weights), so those
+        # otherwise only-weakly-supervised parameters get direct training signal. When sharing,
+        # skipped entirely (every stage already uses the SAME already-optimized weights as the
+        # final stage/encode, so an extra intermediate loss here would just duplicate existing
+        # signal) -- matches pre-this-flag behavior exactly in that mode.
+        decode_stage_extra_losses: list = []
         decode_derived_c: dict[int, torch.Tensor] = {}
         h_out = list(h_list)
+        # final_embed_weight[i]: the embed table of whichever LM produced h_out[i] -- None means
+        # decode never ran for this level (ragged/no tracks), so h_out[i] is encode's own output
+        # and callers should use encode_lms[i].embed.weight instead. Needed because under
+        # share_level_weights=False, decode's LAST stage's embed table is NOT necessarily
+        # encode_lms[i]'s own (each stage has independent weights) -- generation helpers that
+        # project a raw h into logits (e.g. _sample_next_byte) need to know exactly which table.
+        final_embed_weight: list[torch.Tensor | None] = [None] * self.n_levels
         for i in reversed(range(self.n_levels)):  # top-down: required for cross_track_source=="decode"
             L_i = x_list[i].shape[1]
-            tracks: list[tuple[torch.Tensor, int, int | None]] = []
+            track_specs: list[tuple[torch.Tensor, int, int | None]] = []  # (source_c, track_K, window)
             cum_K = 1
             ragged = False
             for j in range(i, self.n_levels):
                 cum_K *= cfg.Ks[j]
-                window = self.encoders[i].decode_windows[j - i]
+                window = self.decode_windows[i][j - i]
                 if window == 0:
                     continue  # track disabled
                 if L_i % cum_K != 0:
@@ -584,35 +628,57 @@ class RefineLM(nn.Module):
                     source_c = decode_derived_c[j]
                 else:
                     source_c = c_list[j]
-                if cfg.decode_code_ste:
-                    code_embeds = source_c @ self.encoders[i].embed.weight
-                else:
-                    code_embeds = self.encoders[i].embed(source_c.argmax(-1))
-                tracks.append((code_embeds, cum_K, window))
-            if ragged or not tracks:
+                track_specs.append((source_c, cum_K, window))
+            if ragged or not track_specs:
                 continue
-            full_tracks = tracks
+            full_track_specs = track_specs
             if max_decode_sources is not None:
-                full_tracks = full_tracks[:max_decode_sources]
-            c_i2, loss_i2, acc_i2, h_i2 = self.encoders[i](x_list[i], compute_ntp=compute_ntp, decode_tracks=full_tracks)
-            decode_losses[i] = loss_i2
-            decode_accs[i] = acc_i2
-            h_out[i] = h_i2
+                full_track_specs = full_track_specs[:max_decode_sources]
+
+            stage_lms_i = self.decode_stage_lms[i]
+            x = h_list[i]  # Stage 0: reuse encode's own output directly, never recomputed
+            loss_final = acc_final = c_final = None
+            for t, (source_c, track_K, window) in enumerate(full_track_specs):
+                stage_lm = stage_lms_i[t]
+                if cfg.decode_code_ste:
+                    code_embeds = source_c @ stage_lm.embed.weight
+                else:
+                    code_embeds = stage_lm.embed(source_c.argmax(-1))
+                is_last = t == len(full_track_specs) - 1
+                c_stage, loss_stage, acc_stage, h_stage = stage_lm.cross_attn_stage(
+                    x, code_embeds, x_list[i], i, track_K, window, compute_ntp=compute_ntp, want_code=is_last)
+                x = h_stage
+                if is_last:
+                    loss_final, acc_final, c_final = loss_stage, acc_stage, c_stage
+                    final_embed_weight[i] = stage_lm.embed.weight
+                elif not cfg.share_level_weights:
+                    decode_stage_extra_losses.append(loss_stage)
+            decode_losses[i] = loss_final
+            decode_accs[i] = acc_final
+            h_out[i] = x
             if max_decode_sources is None:
-                decode_derived_c[i] = c_i2
-            if cfg.decode_self_only_aux and self.training and max_decode_sources is None and len(tracks) > 1:
-                _, loss_self, acc_self, _ = self.encoders[i](x_list[i], compute_ntp=compute_ntp,
-                                                               decode_tracks=tracks[:1])
+                decode_derived_c[i] = c_final
+            if cfg.decode_self_only_aux and self.training and max_decode_sources is None and len(track_specs) > 1:
+                stage_lm0 = stage_lms_i[0]
+                source_c0, track_K0, window0 = track_specs[0]
+                if cfg.decode_code_ste:
+                    code_embeds0 = source_c0 @ stage_lm0.embed.weight
+                else:
+                    code_embeds0 = stage_lm0.embed(source_c0.argmax(-1))
+                _, loss_self, acc_self, _ = stage_lm0.cross_attn_stage(
+                    h_list[i], code_embeds0, x_list[i], i, track_K0, window0,
+                    compute_ntp=compute_ntp, want_code=False)
                 decode_self_only_losses[i] = loss_self
                 decode_self_only_accs[i] = acc_self
 
         return (encode_losses, encode_accs, decode_losses, decode_accs, h_out, c_list,
-                decode_self_only_losses, decode_self_only_accs)
+                decode_self_only_losses, decode_self_only_accs, decode_stage_extra_losses, final_embed_weight)
 
     def forward(self, byte_ids: torch.Tensor) -> tuple[torch.Tensor, dict]:
         cfg = self.cfg
         (encode_losses, encode_accs, decode_losses, decode_accs, h_list, c_list,
-         decode_self_only_losses, decode_self_only_accs) = self._run(byte_ids)
+         decode_self_only_losses, decode_self_only_accs, decode_stage_extra_losses,
+         _final_embed_weight) = self._run(byte_ids)
 
         byte_loss = decode_losses[0] if decode_losses[0] is not None else encode_losses[0]
         byte_acc = decode_accs[0] if decode_accs[0] is not None else encode_accs[0]
@@ -629,12 +695,16 @@ class RefineLM(nn.Module):
         decode_self_only_total = (cfg.decode_self_only_weight * torch.stack(self_only_terms).sum()
                                    if self_only_terms else byte_loss.new_zeros(()))
 
-        loss = encode_total + decode_total + decode_self_only_total
-        ntp_total = torch.stack(encode_losses + decode_terms + self_only_terms).sum()
+        decode_stage_extra_total = (cfg.decode_ntp_weight * torch.stack(decode_stage_extra_losses).sum()
+                                     if decode_stage_extra_losses else byte_loss.new_zeros(()))
+
+        loss = encode_total + decode_total + decode_self_only_total + decode_stage_extra_total
+        ntp_total = torch.stack(encode_losses + decode_terms + self_only_terms + decode_stage_extra_losses).sum()
         metrics = {
             "loss": loss, "byte_loss": byte_loss, "byte_acc": byte_acc,
             "encode_total": encode_total, "decode_total": decode_total,
-            "decode_self_only_total": decode_self_only_total, "ntp_loss_total": ntp_total,
+            "decode_self_only_total": decode_self_only_total,
+            "decode_stage_extra_total": decode_stage_extra_total, "ntp_loss_total": ntp_total,
             **{f"level{i}_ntp_loss_encode": l for i, l in enumerate(encode_losses)},
             **{f"level{i}_ntp_acc_encode": a for i, a in enumerate(encode_accs)},
             **{f"level{i}_ntp_loss_decode": l for i, l in enumerate(decode_losses) if l is not None},
@@ -646,9 +716,11 @@ class RefineLM(nn.Module):
         return loss, metrics
 
 
-def _sample_next_byte(model: "RefineLM", h_last: torch.Tensor) -> torch.Tensor:
-    enc0 = model.encoders[0]
-    logits = F.linear(h_last, enc0.embed.weight)
+def _sample_next_byte(embed_weight: torch.Tensor, h_last: torch.Tensor) -> torch.Tensor:
+    """embed_weight must come from whichever LM actually produced h_last -- under
+    Config.share_level_weights=False, different stages/levels no longer share an embedding
+    table, so the caller must pass the matching one explicitly (see call sites below)."""
+    logits = F.linear(h_last, embed_weight)
     return logits.argmax(-1)
 
 
@@ -673,8 +745,10 @@ def generate_no_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
         pad_len = (-L) % decode_K
         padded = (torch.cat([all_bytes, all_bytes.new_zeros(all_bytes.shape[0], pad_len)], dim=1)
                   if pad_len > 0 else all_bytes)
-        _, _, _, _, h_list, _, _, _ = model._run(padded, compute_ntp=False, max_decode_sources=max_decode_sources)
-        next_byte = _sample_next_byte(model, h_list[0][:, L - 1, :])
+        _, _, _, _, h_list, _, _, _, _, final_embed_weight = model._run(
+            padded, compute_ntp=False, max_decode_sources=max_decode_sources)
+        embed_w = final_embed_weight[0] if final_embed_weight[0] is not None else model.encode_lms[0].embed.weight
+        next_byte = _sample_next_byte(embed_w, h_list[0][:, L - 1, :])
         all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
     if was_training:
         model.train()
@@ -694,10 +768,10 @@ def generate_encode_only(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_by
     if prompt_bytes.dim() == 1:
         prompt_bytes = prompt_bytes.unsqueeze(0)
     all_bytes = prompt_bytes
-    enc0 = model.encoders[0]
+    enc0 = model.encode_lms[0]
     for _ in range(n_new_bytes):
-        _, _, _, h = enc0(all_bytes, compute_ntp=False)
-        next_byte = _sample_next_byte(model, h[:, -1, :])
+        _, _, _, h = enc0.encode(all_bytes, level=0, window=model.windows[0], compute_ntp=False)
+        next_byte = _sample_next_byte(enc0.embed.weight, h[:, -1, :])
         all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
     if was_training:
         model.train()
@@ -711,11 +785,11 @@ def generate_level1_codes(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_c
     prompt_bytes = prompt_bytes.to(device)
     if prompt_bytes.dim() == 1:
         prompt_bytes = prompt_bytes.unsqueeze(0)
-    enc0, enc1 = model.encoders[0], model.encoders[1]
-    codes, _, _, _ = enc0(prompt_bytes, compute_ntp=False)
+    enc0, enc1 = model.encode_lms[0], model.encode_lms[1]
+    codes, _, _, _ = enc0.encode(prompt_bytes, level=0, window=model.windows[0], compute_ntp=False)
     n_prompt_codes = codes.shape[1]
     for _ in range(n_new_codes):
-        _, _, _, h1 = enc1(codes, compute_ntp=False)
+        _, _, _, h1 = enc1.encode(codes, level=1, window=model.windows[1], compute_ntp=False)
         logits = F.linear(h1[:, -1, :], enc1.embed.weight)
         next_id = logits.argmax(-1)
         next_code = F.one_hot(next_id, num_classes=model.cfg.vocab).to(codes.dtype)
@@ -730,9 +804,9 @@ def level1_ground_truth_codes(model: "RefineLM", full_bytes: torch.Tensor, promp
     full_bytes = full_bytes.to(device)
     if full_bytes.dim() == 1:
         full_bytes = full_bytes.unsqueeze(0)
-    enc0 = model.encoders[0]
+    enc0 = model.encode_lms[0]
     K0 = model.cfg.Ks[0]
-    c0, _, _, _ = enc0(full_bytes, compute_ntp=False)
+    c0, _, _, _ = enc0.encode(full_bytes, level=0, window=model.windows[0], compute_ntp=False)
     ids = c0[0].argmax(-1)
     n_prompt_codes = prompt_len // K0
     return ids[n_prompt_codes:]
@@ -759,7 +833,7 @@ def _decode_source_codes(model: "RefineLM", full_bytes: torch.Tensor, device: st
         seq_repr = seq_repr.unsqueeze(0)
     c_list = []
     for i in range(model.n_levels):
-        c_i, _, _, _ = model.encoders[i](seq_repr, compute_ntp=False)
+        c_i, _, _, _ = model.encode_lms[i].encode(seq_repr, level=i, window=model.windows[i], compute_ntp=False)
         c_list.append(c_i)
         seq_repr = c_i
     source_c = c_list[level]
@@ -970,6 +1044,7 @@ def main():
     p.add_argument("--decode_self_only_weight", type=float, default=1.0)
     p.add_argument("--decode_code_ste", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--vocab", type=int, default=256)
+    p.add_argument("--share_level_weights", type=lambda x: x.lower() != "false", default=True)
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -1018,7 +1093,7 @@ def main():
         code_extract_mode=args.code_extract_mode, code_head_tied=args.code_head_tied,
         decode_self_only_aux=args.decode_self_only_aux, cross_track_source=args.cross_track_source,
         decode_self_only_weight=args.decode_self_only_weight, decode_code_ste=args.decode_code_ste,
-        vocab=args.vocab,
+        vocab=args.vocab, share_level_weights=args.share_level_weights,
     )
     model = RefineLM(cfg).to(device)
     n_params = sum(p_.numel() for p_ in model.parameters())

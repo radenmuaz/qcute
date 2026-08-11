@@ -2891,3 +2891,275 @@ the OLD chunked path (`_packed_decode_forward_chunked`), which needed
 physical interleave order as a substitute for an explicit sort -- a
 shortcut that only worked because `decode_K==1`, single-track made
 physical order and true_pos order coincide already.
+
+## qcute_refine_v4_5: staged same-weight cross-attention decode (replaces packed sequences)
+
+New file `qcute/qcute_refine_v4_5.py`, forked from v4.4. Session ask (via
+several "restate to check" rounds, concrete `abcd`/code-`z` example
+worked through by hand): strip out v4.4's packed/interleaved-sequence
+decode entirely (`decode_pack_mode`, the BOS-shifted-prefix trick,
+`_packed_decode_forward{,_banded,_chunked}`) and replace it with
+EXPLICIT cross-attention, reusing the SAME shared LM weights (not a
+separate decoder tower/module) -- confirmed design:
+
+- **Stage 0 (self-attn)**: full `n_layers`-deep causal self-attention
+  over this level's own input, unconditioned -- literally identical
+  computation to this level's own encode pass.
+- **Stage 1..T (cross-attn, one per track)**: for each conditioning
+  track in order `[self, +1, +2, ..., top]`, one MORE full `n_layers`
+  stage, continuing the residual stream from the previous stage,
+  cross-attending ONLY to that track's own code embeddings. Masked
+  jagged-causal at block granularity: query position `p` may attend to
+  code `j` (covering `[j*K, (j+1)*K)`) only if `(j+1)*K - 1 < p` -- i.e.
+  a code can never be attended to by a query inside its own (still
+  in-progress) block, same constraint v4.4 enforced via its BOS-shift
+  trick, now a direct mask instead of sequence packing.
+- **Linear head**, unchanged, applied to the final stage's output.
+
+Every stage reuses the literal same `nn.Linear` qkv/out/mlp parameters
+(`Block.forward_cross` splits the existing self-attention `qkv` weight
+into query/key/value row-blocks, applies query rows to the residual
+stream and key/value rows to the code embeddings) -- confirmed "same
+lm" at the parameter level, not just architecture-level. Confirmed
+`decode_windows`/`attn_window` per-track semantics carry over unchanged
+in spirit, though the literal `window` value now means a direct
+byte-position reach (`query_pos - code_last_byte_pos < window`) rather
+than v4.4's `2*window` chunk-approximation artifact -- not numerically
+comparable to a v4.4 `attn_window` value of the same magnitude.
+`generate_blockwise_parallel`/`LevelLM._block_decode_step` dropped
+(packed-decode-specific, and the former was already marked invalid in
+v4.4 for unrelated reasons). Everything else (encode loop,
+`decode_derived_c`/`cross_track_source`, `decode_code_ste`,
+`decode_self_only_aux`, generation functions, training loop, CLI)
+unchanged from v4.4.
+
+### Overfit10k batch, v4.4 vs v4.5 vs bytelm baseline (bytelm = the primary baseline to beat)
+
+Per user request: 8-config tiny-overfit sanity batch (n_bytes=10000,
+steps=1000, `cross_track_source="decode"`, `decode_code_ste=False`
+throughout) run on v4.4, then the SAME 6 qcute_refine configs cloned
+and rerun unchanged on v4.5, both against the same `qcute.bytelm`
+baseline (n_layers=1/2, same n_bytes/steps/context) as the reference
+point:
+
+| config | v4.4 best_val_bpb | v4.5 best_val_bpb | bytelm baseline |
+|---|---|---|---|
+| k4_1_l1 | **3.7404** | 3.9599 | 3.9495 (l1) |
+| k4_1_l2 | 3.9324 | 3.9460 | 3.9552 (l2) |
+| k1_k1_l1 | 3.8988 | 3.9491 | -- |
+| k1_k1_l2 | **3.8507** | 4.0921 | -- |
+| k1_l1 | 3.8820 | 4.0547 | -- |
+| k1_l2 | 3.9179 | 4.0526 | -- |
+
+v4.4 beats v4.5 on every one of the 6 matched architectures. v4.4's
+best (`k4_1_l1`, 3.7404) clearly beats the bytelm baseline (~3.95);
+v4.5's best (`k4_1_l2`, 3.9460) barely ties it -- the new staged
+cross-attention design does not yet demonstrate a real advantage over
+even the plain byte-level baseline at this scale. All configs across
+all three families show a large train/val gap (train bpb 0.02-0.35 vs
+val bpb 3.7-4.9) -- genuine memorization of the 9k-byte train split,
+not generalization, exactly as intended by the tiny-overfit design.
+
+Qualitative generation (train-prompt, `cond_full`, best checkpoint of
+each): v4.4's `k4_1_l1` sample --
+`"or dere abour ef mod mon wikiquote. org/ralitarian and lacked"` --
+garbled but with recognizable memorized substrings (`wikiquote.org`,
+`ralitarian`~`egalitarian`). v4.5's `k4_1_l2` sample --
+`"sse  monnnhane_omnhat Connnarchistnrnancandanc Annndaged atnn th"`
+-- visibly MORE degenerate, heavy character-repetition, less word-like
+structure at a comparable point in training. Both inherit the SAME two
+failure modes identified earlier this session, unaffected by the
+packed-vs-staged-cross-attention change: `level0_cond_full_codes`
+collapses to one repeated code value across the whole generated span,
+and `level1_gen` fully collapses to one repeated code value via greedy
+argmax decoding.
+
+**Verdict so far**: the staged same-weight cross-attention redesign is
+architecturally cleaner (no packed sequences, simpler jagged-causal
+masking, uniform depth per track) but does not yet outperform v4.4 at
+this tiny scale, and does not fix either of the two known collapse
+mechanisms. Not yet clear whether this is a fundamental disadvantage of
+the design or an artifact of the tiny/short overfit setup (e.g. more
+optimization steps needed to make full use of the extra depth each
+cross-attn stage adds) -- worth a full-scale run before drawing a
+final conclusion.
+
+### Same-checkpoint-step, same-prompt comparison (4 models, identical train prompt)
+
+Rather than comparing random-window samples pulled at different points
+in each run, generated all 4 models' output on the IDENTICAL prompt
+(`"egarded as authoritarian political structures and coercive econo"`,
+enwik8_1M byte offset 5850, an English-prose "anarchism" passage, not
+XML markup) from each model's own final (`last.pt`, step 1000)
+checkpoint, greedy (argmax) decoding throughout -- including a new
+`scripts/bytelm_greedy_qual.py` (bytelm's own `qualitative_generate`
+uses temperature-sampled `generate_speculative`, not apples-to-apples
+with qcute_refine's pure-argmax generation functions) and
+`scripts/refine_greedy_qual.py` (fixed-prompt-offset wrapper around
+`qualitative_generate`, works for both v4.4 and v4.5 modules):
+
+| model | generated (64 bytes) |
+|---|---|
+| v4.4 (`k4_1_l1`) | `"menc ition wikiquote.org/wiki/Main_Page</base>\n    <generator>Me"` |
+| v4.5 (`k4_1_l2`) | `"man to quanrn othennn '''''''&quonnnncessnnnn andWnnnersitnnn of"` |
+| bytelm (`l1`) | `"miding there is aly [[cernamis; aut]]..&lt;ref&gt;[http://en.wik"` |
+| bytelm (`l2`) | `"mety the word as andiviontions anarchist also [[hittp://www.me/i"` |
+
+bytelm's two samples are the most fluent-looking (real wiki-markup
+structure, plausible word fragments, no character-repetition
+collapse). v4.4 close behind (also real markup fragments, though
+`level0_cond_full_codes` shows the code frozen at one value across the
+whole span). v4.5 the most degenerate (visible character-doubling/
+repetition, also code-frozen). Ranking: bytelm >~ v4.4 > v4.5 on
+surface fluency -- notably NOT the same ranking `val_bpb` gave (where
+v4.4 beat bytelm) -- teacher-forced `val_bpb` and free-running greedy
+generation quality are measuring different things.
+
+### Final-step TRAIN bpb reveals the comparison was confounded: bytelm was near-fully memorized, qcute_refine was not
+
+Checking final (step 1000) TRAIN bpb (not val) for the same 4
+models/checkpoints above -- from each run's own live tqdm progress-bar
+readout at the last logged step:
+
+| model | final train bpb |
+|---|---|
+| v4.4 (`k4_1_l1`) | 0.3495 |
+| v4.5 (`k4_1_l2`) | 0.1397 |
+| bytelm (`l1`) | 0.0212 |
+| bytelm (`l2`) | 0.0072 |
+
+bytelm memorized the 9k-byte train split far more completely (train
+bpb ~0.007-0.02) than either qcute_refine variant (~0.14-0.35) by step
+1000 -- so the generation-fluency comparison above was confounded:
+bytelm's more-fluent output partly just reflects it being much closer
+to literally reproducing memorized text, not necessarily a cleaner
+architecture. v4.5 fits train BETTER than v4.4 (0.14 vs 0.35) despite
+producing the more degenerate generation of the two -- lower train
+loss is not translating into better free-running behavior for v4.5,
+if anything the opposite holds.
+
+### Why convergence is slower for qcute_refine than bytelm (not just "needs more steps")
+
+Two compounding, distinct problems (user-identified, this session):
+
+1. **Moving-target/cascade problem, n_levels=2 vs n_levels=1** (`k4_1`
+   vs `k1`/`k1_k1`): a 1-level config (`Ks=(1,)` or `(1,1)`) is a plain
+   sequence autoencoder -- encode produces a code from a FIXED byte
+   sequence, decode reconstructs from it, nothing about the
+   conditioning signal is itself in flux beyond the encoder's own
+   weights updating. `Ks=(4,1)` (2 levels) is that autoencoder PLUS a
+   cascade: level0's decode conditions on level1's code, and level1's
+   code is ALSO mid-training -- produced by `gumbel_quantize`'s
+   straight-through argmax over a representation shifting under SGD
+   every step. Classic hierarchical-VQ-VAE non-stationary-target
+   problem: level0 is trying to learn what a code means while the
+   thing assigning meaning to codes (level1) simultaneously
+   reorganizes what it emits. No codebook-stabilization mechanism (EMA
+   codebook, commitment loss, code-usage regularization) exists
+   anywhere in this lineage -- the code producer only ever gets
+   gradient indirectly, through whatever NTP loss chains happen to
+   reach it downstream.
+2. **Depth-of-gradient-path problem, v4.4 vs v4.5 specifically**: v4.4's
+   decode is ONE packed self-attention pass, `n_layers` deep total --
+   gradient from the NTP loss back to the code producer traverses
+   `n_layers` layers. v4.5's decode is `(1 self-attn stage) + (1
+   cross-attn stage per track)`, each stage a FULL `n_layers`-deep
+   pass -- for `k4_1` (1 self track + 1 cross track), gradient now
+   traverses `2 * n_layers` sequential nonlinear stages to reach the
+   same code producer, and every stage reuses the SAME shared weight
+   matrices for both self-attn and cross-attn roles, so each step's
+   gradient on those shared weights sums contributions from multiple
+   stages pulling in different directions. A second, purely
+   architectural slow-convergence cause, compounding on top of (1).
+
+Candidate smoothing levers (not yet tried): gumbel-tau annealing
+(deferred earlier this session -- directly targets problem 1, soft/
+high-tau early lets gradient flow smoothly into the still-forming code
+producer instead of hard-committing early); an explicit
+commitment-loss-style term to reduce code-producer drift; a curriculum
+warming up level1 before level0 starts conditioning on it (directly
+reduces the moving-target effect); for v4.5, possibly untying the
+shared weights per stage if joint optimization proves fundamentally
+harder (trades away the "same lm" design goal).
+
+### Standing methodology: bytelm parity as the fast-overfit bar, 10k-byte slice as the standard testbed
+
+Per user direction: use the `n_bytes=10000` slice (not the full
+~900k-byte corpus) as the standard fast-iteration testbed for
+`qcute_refine_v4_4`/`v4_5` architecture changes going forward, until a
+config can actually fast-overfit that slice to a train bpb comparable
+to bytelm's own numbers on the identical slice (see table above:
+`l1`=0.0212 @ ~19.7 it/s, `l2`=0.0072 @ ~11.4 it/s). Full-scale runs
+and generation-quality comparisons between architectures are not
+trustworthy before that parity bar is cleared -- also noted in
+CLAUDE.md.
+
+## Config.share_level_weights: optional independent (non-shared) weights, v4.4 and v4.5
+
+Both `qcute_refine_v4_4.py` and `qcute_refine_v4_5.py` previously had NO way to disable weight
+sharing across levels at all -- `LevelLM(cfg, i, windows[i], decode_windows[i], shared=(encoders[0]
+if i > 0 else None))` unconditionally reused level 0's weights for every level i>0. New
+`Config.share_level_weights: bool = True` (default preserves this exact original behavior) makes
+it optional.
+
+**Overhaul required first, in both files**: `LevelLM` no longer stores any level-specific state
+(`level`, `window`, `decode_windows` -- previously instance attributes set once in `__init__`) --
+it's now a pure weight-holder (`embed`, `blocks`, `ln_f`, `code_head`, etc.), always constructing
+its own full parameter set at construction time regardless of sharing mode. `level`/`window` moved
+to being explicit `forward()`/`encode()` arguments instead. This was necessary because the new
+sharing mechanism works by literal Python-object aliasing (`encode_lms[i] = shared_lm` for every
+`i`) -- if `LevelLM` still carried per-level instance state, aliasing the same object across levels
+would leak level 0's window/index onto every other level silently.
+
+**v4.4**: `RefineLM.encoders` (single list) replaced by `RefineLM.encode_lms`/`RefineLM.
+decode_lms`, each length `n_levels`. `share_level_weights=True`: both lists point at one shared
+`LevelLM` instance everywhere (today's behavior, just implemented via aliasing instead of
+per-submodule copying). `False`: `2*n_levels` fully independent `LevelLM`s. The only thing
+crossing between encode and decode (or between levels) is the bare integer code id
+(`source_c.argmax(-1)`) -- decode always re-embeds that id via `self.decode_lms[i].embed`, never
+touching whichever LM produced/represented it. `generate_blockwise_parallel` and `LevelLM.
+_block_decode_step` (already marked "NOT CURRENTLY VALID" for unrelated reasons) were dropped
+entirely -- incompatible with the new per-level-state-free `LevelLM` interface, and unused.
+
+**v4.5, more involved (user-identified subtlety this session)**: v4.5's decode is a STAGED chain
+(self-attn "Stage 0" then one cross-attn stage per track). If Stage 0 got its own independent
+weights under no-sharing, it would be a pointless self-attention pass over bytes unrelated to
+encode's own already-computed representation -- nothing to condition on yet at Stage 0, so no
+principled reason for it to have separate weights. Corrected design: **Stage 0 is NEVER given
+independent weights, in either sharing mode** -- decode always reuses `encode_lms[i]`'s own
+already-computed output directly (`LevelLM.encode()`), never recomputing it. Each cross-attention
+stage (one per TRACK, not one per level) gets its own weights when not sharing -- `RefineLM.
+decode_stage_lms[i]` is a `ModuleList` of length `n_levels-i` (one independent `LevelLM` per
+track: self, +1, ..., top). For `n_levels=2`, level 0 has 2 independent cross-attn LMs (self-code
+stage, level-1-code stage) -- "2 not 3" (Stage 0 needs zero new weights). For `n_levels=1`: exactly
+2 LMs total (encode, reused for Stage 0 + one independent cross-attn LM for the single self-code
+stage) -- an uncond-NTP "encode" LM and a code-conditioned "decode"/"ae cond" LM, matching the
+session's own worked example. **Every stage now computes its own NTP loss** (`LevelLM.
+cross_attn_stage`'s own `_ntp` call, using that stage's own `embed.weight` as head) -- necessary
+because an independent stage's weights would otherwise only get weak indirect gradient via
+feeding the next stage. Non-final per-stage losses are summed into a new `decode_stage_extra_total`
+metric/loss term, but ONLY when `share_level_weights=False` -- when sharing, every stage already
+uses the SAME already-being-optimized weights as encode/the final stage, so an intermediate loss
+there would just duplicate existing signal (this mechanism is intentionally distinct from --
+and now partially redundant with, under no-sharing -- the pre-existing `decode_self_only_aux`
+opt-in). `RefineLM._run`'s return tuple grew a `final_embed_weight` list (which LM's embedding
+table actually produced each level's returned `h`, `None` if decode didn't run) -- needed because
+`_sample_next_byte` and friends can no longer assume "the shared embed table" once encode and
+decode-per-track have independent ones.
+
+Verified via CPU smoke tests (2 steps, `--device cpu`) across all 4 (framework x sharing-mode)
+combinations x both `n_levels` values (`k4_1`, `k1`) before launching real training -- all pass,
+`decode_stage_extra_total` correctly nonzero only for v4.5 no-sharing with `n_levels=2` (zero for
+`n_levels=1`, where the single track's stage is always the final one, never intermediate) and
+correctly absent/zero whenever sharing.
+
+### 2x2 no-sharing grid, overfit10k, gumbel+detach enabled
+
+Queued (see `configs/qcute_refine_v4_4_nosharegrid_{k4_1,k1}.py` and `qcute_refine_v4_5_
+nosharegrid_{k4_1,k1}.py`): `share_level_weights=False`, combined with the session's other
+established "good settings" -- `use_gumbel_noise=True`/`gumbel_tau=2.0` (codebook-collapse
+mitigation) and `cross_track_source="decode"`/`decode_code_ste=False` (the crosstrack_decode
+headline result) -- on the standard overfit10k testbed (`n_bytes=10000`, `steps=1000`), `n_layers=2`
+throughout. Results pending; will compare final train/val bpb against the bytelm parity target
+(`l2`: 0.0072 train bpb @ ~11.4 it/s) and against the SAME configs' `share_level_weights=True`
+(default) counterparts once the queue finishes.

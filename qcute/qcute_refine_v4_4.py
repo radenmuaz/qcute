@@ -124,6 +124,15 @@ class Config:
     # two_stage_latent_decode_math.md -- False is REQUIRED for the drafted-substitution generation scheme there.
     # (A drafter for an n_levels==1 config is just Ks=(K0, 1) -- reuses the existing shared-weight
     # LevelLM/generate_level1_codes machinery, no separate module needed; see two_stage_latent_decode_math.md.)
+    share_level_weights: bool = True  # True (default, original behavior): ONE shared LevelLM instance is used
+    # for every level's encode pass AND decode pass -- literally the same object, same embed/blocks/ln_f/code_head
+    # weights everywhere. False: every level gets its own INDEPENDENT encode LM and its own INDEPENDENT decode LM
+    # (2*n_levels separate LevelLM instances total, e.g. n_levels==1 gives one "encode_lm" doing uncond NTP and one
+    # separate "decode_lm" doing code-conditioned NTP, sharing NO weights -- not embed, not transformer blocks, not
+    # head). The ONLY thing crossing from encode to decode (or between levels) in that case is the bare integer code
+    # id (source_c.argmax(-1)) -- decode always re-embeds that id in ITS OWN embedding table
+    # (self.decode_lms[i].embed), never touching whichever LM produced/represented it. See RefineLM.__init__ and
+    # RefineLM._run's code_embeds construction.
 
 
 def gumbel_quantize(logits: torch.Tensor, tau: float, use_gumbel_noise: bool = False) -> torch.Tensor:
@@ -240,48 +249,41 @@ class Block(nn.Module):
 
 
 class LevelLM(nn.Module):
-    def __init__(self, cfg: Config, level: int, window: int | None, decode_windows: list[int | None],
-                 shared: "LevelLM | None" = None):
+    """Pure weight-holder -- no level-specific state (level index, window, decode_windows) stored
+    on the instance anymore. Those are passed as forward() arguments instead, so the SAME instance
+    can safely be reused (literally aliased) across multiple levels/roles when Config.
+    share_level_weights=True (see RefineLM.__init__), without any stale per-level state leaking
+    across levels. Always constructs its own full parameter set at construction time -- sharing
+    (or not) is handled entirely by RefineLM choosing whether to construct one LevelLM and alias
+    it everywhere, or construct 2*n_levels independent ones."""
+
+    def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
-        self.level = level
-        self.window = window
-        self.decode_windows = decode_windows  # one per decode source: [self, +1, +2, ..., top]
-        self.is_byte_level = level == 0
         D = cfg.d_model
         V = cfg.vocab
-        if shared is not None:
-            self.embed = shared.embed
-            self.blocks = shared.blocks
-            self.ln_f = shared.ln_f
-            self.code_head = shared.code_head
-            self.code_query = shared.code_query
-            self.code_out = shared.code_out
-            self.query_embed = shared.query_embed
-            self.decode_bos = shared.decode_bos
-        else:
-            self.embed = nn.Embedding(V, D)
-            nn.init.normal_(self.embed.weight, std=0.02)
-            self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
-            self.ln_f = nn.LayerNorm(D)
-            self.code_head = None if cfg.code_head_tied else nn.Linear(D, V, bias=False)
-            if self.code_head is not None:
-                nn.init.normal_(self.code_head.weight, std=0.02)
-            self.code_query = self.code_out = self.query_embed = None
-            if cfg.code_extract_mode == "light_query_attn":
-                self.code_query = nn.Parameter(torch.zeros(D))
-                nn.init.normal_(self.code_query, std=0.02)
-                self.code_out = nn.Linear(D, D, bias=False)
-            elif cfg.code_extract_mode == "query_embed":
-                self.query_embed = nn.Parameter(torch.zeros(D))
-                nn.init.normal_(self.query_embed, std=0.02)
-            self.decode_bos = nn.Parameter(torch.zeros(D))
-            nn.init.normal_(self.decode_bos, std=0.02)
+        self.embed = nn.Embedding(V, D)
+        nn.init.normal_(self.embed.weight, std=0.02)
+        self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
+        self.ln_f = nn.LayerNorm(D)
+        self.code_head = None if cfg.code_head_tied else nn.Linear(D, V, bias=False)
+        if self.code_head is not None:
+            nn.init.normal_(self.code_head.weight, std=0.02)
+        self.code_query = self.code_out = self.query_embed = None
+        if cfg.code_extract_mode == "light_query_attn":
+            self.code_query = nn.Parameter(torch.zeros(D))
+            nn.init.normal_(self.code_query, std=0.02)
+            self.code_out = nn.Linear(D, D, bias=False)
+        elif cfg.code_extract_mode == "query_embed":
+            self.query_embed = nn.Parameter(torch.zeros(D))
+            nn.init.normal_(self.query_embed, std=0.02)
+        self.decode_bos = nn.Parameter(torch.zeros(D))
+        nn.init.normal_(self.decode_bos, std=0.02)
 
     def _classify(self, pooled: torch.Tensor) -> torch.Tensor:
         return self.code_head(pooled) if self.code_head is not None else F.linear(pooled, self.embed.weight)
 
-    def _query_embed_pool(self, x0: torch.Tensor, K: int, n_blocks: int) -> torch.Tensor:
+    def _query_embed_pool(self, x0: torch.Tensor, K: int, n_blocks: int, window: int | None) -> torch.Tensor:
         cfg = self.cfg
         B, L, D = x0.shape
         H, hd = cfg.n_heads, D // cfg.n_heads
@@ -300,7 +302,7 @@ class LevelLM(nn.Module):
 
         cos, sin = rope_cos_sin_for_positions(real_pos, hd, cfg.rope_base, device)
 
-        win = self.window if self.window is not None else L
+        win = window if window is not None else L
         ti = real_pos.unsqueeze(1)
         tj = real_pos.unsqueeze(0)
         causal = tj <= ti
@@ -573,51 +575,6 @@ class LevelLM(nn.Module):
         he = he[:, inv_perm, :]  # restore original (prefixes-then-bytes) order
         return he[:, n_prefix:, :]
 
-    def _block_decode_step(self, x0: torch.Tensor, prefix_embed: torch.Tensor, window: int | None) -> torch.Tensor:
-        """Single-block decode used by generate_blockwise_parallel: x0 is [Bblocks, K, D] (one
-        K-byte block per batch row), prefix_embed is [Bblocks, 1, D] -- the REAL preceding code
-        for that block (not decode_bos-shifted, since every block generated by
-        generate_blockwise_parallel genuinely has a real code before it). Positions are LOCAL
-        (code at -1, bytes at 0..K-1) rather than the block's true absolute offset in the full
-        sequence -- exact under RoPE's relative-position property (attention only depends on
-        query/key position DIFFERENCES, and every block has the identical -1,0,...,K-1 relative
-        layout, so using local positions is mathematically identical to using real absolute ones,
-        not an approximation)."""
-        cfg = self.cfg
-        B, K, D = x0.shape
-        H, hd = cfg.n_heads, D // cfg.n_heads
-        device = x0.device
-        W = window if window is not None else K
-
-        combined = torch.cat([prefix_embed, x0], dim=1)  # [B, K+1, D]
-        true_pos = torch.cat([torch.tensor([-1], device=device), torch.arange(K, device=device)])
-        is_code = torch.cat([torch.ones(1, dtype=torch.bool, device=device),
-                              torch.zeros(K, dtype=torch.bool, device=device)])
-        Le = K + 1
-        cos, sin = rope_cos_sin_for_positions(true_pos.clamp(min=0), hd, cfg.rope_base, device)
-
-        ti = true_pos.unsqueeze(1)
-        tj = true_pos.unsqueeze(0)
-        causal = tj <= ti
-        same_pos_code_excluded = ~(is_code.unsqueeze(0) & (tj == ti))
-        windowed = (ti - tj) < (2 * W)
-        allow = causal & same_pos_code_excluded & windowed
-        attn_mask = allow.view(1, 1, Le, Le)
-
-        xe = combined
-        for block in self.blocks:
-            xn = block.ln1(xe)
-            qkv = block.attn.qkv(xn).reshape(B, Le, 3, H, hd).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
-            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-            a = block.attn.out(y.transpose(1, 2).reshape(B, Le, D))
-            xe = xe + a
-            xe = xe + block.mlp(block.ln2(xe))
-
-        he = self.ln_f(xe)
-        return he[:, 1:, :]  # drop the prefix-code position, keep the K byte positions
-
     def _packed_decode_forward_chunked(self, x0: torch.Tensor, code_kv: torch.Tensor, window: int, n_prev_chunks: int = 2) -> torch.Tensor:
         """Chunked equivalent of _packed_decode_forward for decode_pack_mode == "interleave" only,
         single-track (decode_K==1) only.
@@ -705,13 +662,14 @@ class LevelLM(nn.Module):
         he_pairs = he.view(B, L, 2, D)
         return he_pairs[:, :, 1, :]
 
-    def forward(self, seq_repr: torch.Tensor, compute_ntp: bool = True,
+    def forward(self, seq_repr: torch.Tensor, level: int, window: int | None, compute_ntp: bool = True,
                 decode_tracks: list[tuple[torch.Tensor, int, int | None]] | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         cfg = self.cfg
-        K = cfg.Ks[self.level]
+        K = cfg.Ks[level]
         D = cfg.d_model
+        is_byte_level = level == 0
 
-        if self.is_byte_level:
+        if is_byte_level:
             x = self.embed(seq_repr)
             B, L = seq_repr.shape
         else:
@@ -736,12 +694,12 @@ class LevelLM(nn.Module):
         else:
             cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
             for block in self.blocks:
-                x = block(x, cos, sin, self.window)
+                x = block(x, cos, sin, window)
             h = self.ln_f(x)
 
         if compute_ntp:
             h_flat = h[:, :-1, :].reshape(-1, D)
-            target = (seq_repr[:, 1:].reshape(-1) if self.is_byte_level
+            target = (seq_repr[:, 1:].reshape(-1) if is_byte_level
                       else seq_repr[:, 1:, :].argmax(-1).reshape(-1))
             logits = F.linear(h_flat, self.embed.weight)
             ntp_loss = F.cross_entropy(logits, target)
@@ -766,7 +724,7 @@ class LevelLM(nn.Module):
             pooled = (weights.unsqueeze(-1) * h_blocks).sum(2)
             pooled = self.code_out(pooled)
         elif cfg.code_extract_mode == "query_embed":
-            pooled = self._query_embed_pool(x0, K, n_blocks)
+            pooled = self._query_embed_pool(x0, K, n_blocks, window)
         else:
             raise ValueError(f"unknown code_extract_mode {cfg.code_extract_mode!r}")
         pre_q = self._classify(pooled)
@@ -829,11 +787,22 @@ class RefineLM(nn.Module):
                         f"attn_window[{i}]'s decode_window[{src_offset}] ({dwindow}) must divide "
                         f"level {i}'s sequence length ({L}), or be >= it")
 
-        encoders: list[LevelLM] = []
-        for i in range(self.n_levels):
-            lvl = LevelLM(cfg, i, windows[i], decode_windows[i], shared=(encoders[0] if i > 0 else None))
-            encoders.append(lvl)
-        self.encoders = nn.ModuleList(encoders)
+        # encode_lms[i] / decode_lms[i]: level i's encode-pass LM and decode-pass LM. When
+        # cfg.share_level_weights (default), ALL 2*n_levels slots literally alias the SAME single
+        # LevelLM instance -- one shared LM does every level's encode AND decode, reproducing the
+        # original (pre-this-flag) behavior exactly. When False, every slot gets its own
+        # independently-constructed LevelLM -- encode and decode (and every level) have fully
+        # separate embed/blocks/ln_f/code_head weights, coupled only through the bare integer code
+        # ids that cross from one LM to another (see _run's code_embeds construction).
+        if cfg.share_level_weights:
+            shared_lm = LevelLM(cfg)
+            encode_lms = [shared_lm for _ in range(self.n_levels)]
+            decode_lms = [shared_lm for _ in range(self.n_levels)]
+        else:
+            encode_lms = [LevelLM(cfg) for _ in range(self.n_levels)]
+            decode_lms = [LevelLM(cfg) for _ in range(self.n_levels)]
+        self.encode_lms = nn.ModuleList(encode_lms)
+        self.decode_lms = nn.ModuleList(decode_lms)
 
     def _run(self, byte_ids: torch.Tensor, compute_ntp: bool = True, max_decode_sources: int | None = None):
         """max_decode_sources: if set, every level's decode track list is truncated to at most this
@@ -848,7 +817,7 @@ class RefineLM(nn.Module):
 
         for i in range(self.n_levels):
             want_ntp = compute_ntp and (i == 0 or cfg.code_ntp_weight > 0)
-            c_i, loss_i, acc_i, h_i = self.encoders[i](seq_repr, compute_ntp=want_ntp)
+            c_i, loss_i, acc_i, h_i = self.encode_lms[i](seq_repr, level=i, window=self.windows[i], compute_ntp=want_ntp)
             encode_losses.append(loss_i)
             encode_accs.append(acc_i)
             h_list.append(h_i)
@@ -891,7 +860,7 @@ class RefineLM(nn.Module):
             ragged = False
             for j in range(i, self.n_levels):
                 cum_K *= cfg.Ks[j]
-                window = self.encoders[i].decode_windows[j - i]
+                window = self.decode_windows[i][j - i]
                 if window == 0:
                     continue  # track disabled -- excluded, but doesn't affect coarser tracks' own cum_K
                 if L_i % cum_K != 0:
@@ -917,7 +886,7 @@ class RefineLM(nn.Module):
                     # via this matmul against embed.weight; an index lookup has no gradient w.r.t.
                     # which index was chosen, so it would silently drop the code producer's
                     # gradient entirely, defeating decode_code_ste=True's whole purpose.
-                    code_embeds = source_c @ self.encoders[i].embed.weight
+                    code_embeds = source_c @ self.decode_lms[i].embed.weight
                 else:
                     # detach: forward value of source_c.detach() @ embed.weight is mathematically
                     # a one-hot-row selection, IDENTICAL to embed.weight[argmax(source_c)] -- and
@@ -930,14 +899,15 @@ class RefineLM(nn.Module):
                     # query/embedding lookup (latent-variable / Markov-chain style -- the decoder
                     # doesn't get to reshape which latent it's conditioning on), not as a soft
                     # mixture it could partially steer.
-                    code_embeds = self.encoders[i].embed(source_c.argmax(-1))
+                    code_embeds = self.decode_lms[i].embed(source_c.argmax(-1))
                 tracks.append((code_embeds, cum_K, window))
             if ragged or not tracks:
                 continue
             full_tracks = tracks
             if max_decode_sources is not None:
                 full_tracks = full_tracks[:max_decode_sources]
-            c_i2, loss_i2, acc_i2, h_i2 = self.encoders[i](x_list[i], compute_ntp=compute_ntp, decode_tracks=full_tracks)
+            c_i2, loss_i2, acc_i2, h_i2 = self.decode_lms[i](x_list[i], level=i, window=self.windows[i],
+                                                               compute_ntp=compute_ntp, decode_tracks=full_tracks)
             decode_losses[i] = loss_i2
             decode_accs[i] = acc_i2
             h_out[i] = h_i2
@@ -947,8 +917,8 @@ class RefineLM(nn.Module):
                 # a deliberately different, narrower conditioning set, not "this level's real code".
                 decode_derived_c[i] = c_i2
             if cfg.decode_self_only_aux and self.training and max_decode_sources is None and len(tracks) > 1:
-                _, loss_self, acc_self, _ = self.encoders[i](x_list[i], compute_ntp=compute_ntp,
-                                                               decode_tracks=tracks[:1])
+                _, loss_self, acc_self, _ = self.decode_lms[i](x_list[i], level=i, window=self.windows[i],
+                                                                 compute_ntp=compute_ntp, decode_tracks=tracks[:1])
                 decode_self_only_losses[i] = loss_self
                 decode_self_only_accs[i] = acc_self
 
@@ -992,9 +962,11 @@ class RefineLM(nn.Module):
         return loss, metrics
 
 
-def _sample_next_byte(model: "RefineLM", h_last: torch.Tensor) -> torch.Tensor:
-    enc0 = model.encoders[0]
-    logits = F.linear(h_last, enc0.embed.weight)
+def _sample_next_byte(embed_weight: torch.Tensor, h_last: torch.Tensor) -> torch.Tensor:
+    """embed_weight must come from whichever LM actually produced h_last -- under
+    Config.share_level_weights=False, encode and decode no longer share an embedding table, so
+    the caller must pass the matching one explicitly (see call sites below)."""
+    logits = F.linear(h_last, embed_weight)
     return logits.argmax(-1)
 
 
@@ -1039,7 +1011,11 @@ def generate_no_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
         padded = (torch.cat([all_bytes, all_bytes.new_zeros(all_bytes.shape[0], pad_len)], dim=1)
                   if pad_len > 0 else all_bytes)
         _, _, _, _, h_list, _, _, _ = model._run(padded, compute_ntp=False, max_decode_sources=max_decode_sources)
-        next_byte = _sample_next_byte(model, h_list[0][:, L - 1, :])
+        # h_list[0] is decode's output whenever decode ran for level 0 (the normal case once
+        # padded -- decode fires at every step), encode's output only in the (rare) fully-ragged
+        # fallback -- decode_lms[0].embed is correct for the former; see this function's own
+        # padding argument for why decode fires at every step here.
+        next_byte = _sample_next_byte(model.decode_lms[0].embed.weight, h_list[0][:, L - 1, :])
         all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
     if was_training:
         model.train()
@@ -1063,10 +1039,10 @@ def generate_encode_only(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_by
     if prompt_bytes.dim() == 1:
         prompt_bytes = prompt_bytes.unsqueeze(0)
     all_bytes = prompt_bytes
-    enc0 = model.encoders[0]
+    enc0 = model.encode_lms[0]
     for _ in range(n_new_bytes):
-        _, _, _, h = enc0(all_bytes, compute_ntp=False)
-        next_byte = _sample_next_byte(model, h[:, -1, :])
+        _, _, _, h = enc0(all_bytes, level=0, window=model.windows[0], compute_ntp=False)
+        next_byte = _sample_next_byte(enc0.embed.weight, h[:, -1, :])
         all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
     if was_training:
         model.train()
@@ -1080,11 +1056,11 @@ def generate_level1_codes(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_c
     prompt_bytes = prompt_bytes.to(device)
     if prompt_bytes.dim() == 1:
         prompt_bytes = prompt_bytes.unsqueeze(0)
-    enc0, enc1 = model.encoders[0], model.encoders[1]
-    codes, _, _, _ = enc0(prompt_bytes, compute_ntp=False)
+    enc0, enc1 = model.encode_lms[0], model.encode_lms[1]
+    codes, _, _, _ = enc0(prompt_bytes, level=0, window=model.windows[0], compute_ntp=False)
     n_prompt_codes = codes.shape[1]
     for _ in range(n_new_codes):
-        _, _, _, h1 = enc1(codes, compute_ntp=False)
+        _, _, _, h1 = enc1(codes, level=1, window=model.windows[1], compute_ntp=False)
         logits = F.linear(h1[:, -1, :], enc1.embed.weight)
         next_id = logits.argmax(-1)
         next_code = F.one_hot(next_id, num_classes=model.cfg.vocab).to(codes.dtype)
@@ -1095,122 +1071,13 @@ def generate_level1_codes(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_c
 
 
 @torch.no_grad()
-def generate_blockwise_parallel(model: "RefineLM", prompt_bytes: torch.Tensor, gen_len: int, device: str) -> torch.Tensor:
-    """NOT CURRENTLY VALID -- kept for reference, do not use for real generation. See docs/
-    status.md's "blockwise parallel decoding" section for the full story: this function drafts
-    level1's codes via its NTP head (same mechanism as generate_level1_codes), but RefineLM._run's
-    decode conditioning actually uses c_list[i+1] -- level i+1's DERIVED self-code (via gumbel_
-    quantize/_classify), which is a RECONSTRUCTION of the span it summarizes, not an independently
-    forecastable quantity. Confirmed directly: c_list[1][p] depends on c_list[0][p] at the SAME
-    position (causal self-attention always includes the current position as a key for itself), so
-    a new block's conditioning code literally cannot exist before that same block's own bytes do
-    -- the cross-block independence this function relies on does not hold for the architecture as
-    actually implemented. Genuine block-parallel decoding would require decode to condition on the
-    DRAFTED/predicted signal instead of the derived one -- a real architecture change, not a
-    generation-function fix. An earlier version of this function had a since-fixed off-by-one (the
-    byte immediately after the prompt is predicted using the SECOND-to-last prompt block's code,
-    not the last one, per the h[t]-predicts-byte(t+1) convention) but even with that fixed, exact
-    equivalence with generate_no_cache does not hold, for the structural reason above.
-
-    Exact block-parallel decode generation for n_levels==2, Ks=(K0,1) architectures -- see
-    docs/status.md's "blockwise parallel decoding" note for the full derivation. Two decoupled
-    costs instead of one: (1) draft level1's codes autoregressively (O(gen_len/K0) steps, same
-    loop as generate_level1_codes); (2) once codes exist, every new K0-byte block's own bytes
-    are independent of every OTHER new block's sampled bytes (each only needs its own preceding
-    code + its own within-block causal structure) -- so all new blocks are processed as a batch
-    dimension, taking O(K0) sequential micro-steps total, not O(gen_len/K0 * K0) = O(gen_len).
-    Total: O(gen_len/K0 + K0) instead of generate_no_cache's O(gen_len).
-
-    Requires the level-0-coarser (+1) track's window <= K0 (asserted): if decode were configured
-    to reach past a block boundary into raw bytes, block b would genuinely depend on block b-1's
-    own SAMPLED bytes (not just its code), breaking the cross-block independence this relies on.
-
-    Also requires level 0's SELF track (decode_windows[0], its own cumulative code_0
-    conditioning) to be DISABLED -- window value 0, not -1 (-1 means unbounded/full-context,
-    still an active track; 0 is the actual "excluded from decode" sentinel, see RefineLM._run).
-    Self-conditioning means block b's prefix would be code_0 from block b-1 -- but that code can
-    only be computed AFTER block b-1's own bytes are fully generated and encoded, reintroducing
-    exactly the block-to-block sequential dependency this function exists to avoid. This function
-    only exploits the level-1 (coarser) track, which is free of that problem since level1's codes
-    are all drafted upfront, independent of level0's own within-block generation.
-    """
-    was_training = model.training
-    model.eval()
-    cfg = model.cfg
-    assert model.n_levels == 2, "blockwise parallel decode only implemented for n_levels==2"
-    K0 = cfg.Ks[0]
-    assert cfg.Ks[1] == 1, "requires Ks[1]==1 (one code per level-0 block, no further compression)"
-    assert gen_len % K0 == 0, f"gen_len ({gen_len}) must be a multiple of K0 ({K0})"
-    enc0, enc1 = model.encoders[0], model.encoders[1]
-    assert enc0.decode_windows[0] == 0, (
-        "level 0's self track (decode_windows[0]) must be disabled (window value 0, not -1) for "
-        "exact block-parallel decoding -- see this function's own docstring."
-    )
-    dW = enc0.decode_windows[1]
-    assert dW is not None and dW <= K0, (
-        f"level 0's +1 (coarser) track window ({dW}) must be <= K0={K0} for EXACT block-parallel "
-        f"decoding -- see this function's own docstring."
-    )
-
-    prompt_bytes = prompt_bytes.to(device)
-    if prompt_bytes.dim() == 1:
-        prompt_bytes = prompt_bytes.unsqueeze(0)
-    assert prompt_bytes.shape[1] % K0 == 0, f"prompt length must be a multiple of K0 ({K0})"
-    n_prompt_blocks = prompt_bytes.shape[1] // K0
-    # Predicting byte t+1 uses h[t], and h[t]'s decode prefix is ITS OWN block's code
-    # (code_kv[block(t)-1]) -- so the very first new byte (position P = n_prompt_blocks*K0) is
-    # predicted via h[P-1], which belongs to the LAST PROMPT block, whose prefix is the
-    # SECOND-TO-LAST prompt block's code (code_kv[n_prompt_blocks-2]). Need that to exist.
-    assert n_prompt_blocks >= 2, "need at least two prompt blocks (the first new byte's prefix is the SECOND-to-last prompt block's code)"
-    n_new_blocks = gen_len // K0
-
-    codes, _, _, _ = enc0(prompt_bytes, compute_ntp=False)
-    for _ in range(n_new_blocks):
-        _, _, _, h1 = enc1(codes, compute_ntp=False)
-        logits = F.linear(h1[:, -1, :], enc1.embed.weight)
-        next_id = logits.argmax(-1)
-        next_code = F.one_hot(next_id, num_classes=cfg.vocab).to(codes.dtype)
-        codes = torch.cat([codes, next_code.unsqueeze(1)], dim=1)
-
-    # Byte P (the very first new byte): one ordinary (non-batched) step, re-decoding the prompt's
-    # own last block against the SECOND-to-last block's code.
-    last_block_ids = prompt_bytes[:, -K0:]
-    last_block_prefix = enc0.embed(codes[0, n_prompt_blocks - 2].argmax(-1)).view(1, 1, -1)
-    h_last = enc0._block_decode_step(enc0.embed(last_block_ids), last_block_prefix, dW)
-    byte_P = F.linear(h_last[:, -1, :], enc0.embed.weight).argmax(-1)  # [1]
-
-    # Bytes [P+1, ..., P+gen_len]: group g (g=0..n_new_blocks-1) is K0 bytes sharing ONE prefix,
-    # code_kv[n_prompt_blocks-1+g] -- these ARE cleanly block-aligned (unlike byte P above), since
-    # predicting byte t+1 via h[t] where block(t)=n_prompt_blocks+g lands h[t] on prefix
-    # code_kv[n_prompt_blocks+g-1], for t ranging over that WHOLE block, i.e. K0 consecutive
-    # predicted bytes per group. One byte more than gen_len is produced this way (the group
-    # boundary doesn't align with gen_len's own end) and trimmed off below.
-    prefix_ids = codes[0, n_prompt_blocks - 1: n_prompt_blocks - 1 + n_new_blocks].argmax(-1)  # [n_new_blocks]
-    prefix_embeds = enc0.embed(prefix_ids).unsqueeze(1)  # [n_new_blocks, 1, D]
-
-    block_bytes = torch.zeros(n_new_blocks, K0, dtype=torch.long, device=device)
-    for t in range(K0):
-        x0 = enc0.embed(block_bytes)  # positions >= t are placeholders, masked out by causality
-        h = enc0._block_decode_step(x0, prefix_embeds, dW)
-        logits = F.linear(h[:, t, :], enc0.embed.weight)
-        block_bytes[:, t] = logits.argmax(-1)
-
-    tail_bytes = block_bytes.reshape(1, gen_len)[:, :gen_len - 1]  # drop the one extra byte (position P+gen_len)
-    gen_bytes = torch.cat([byte_P.unsqueeze(1), tail_bytes], dim=1)  # [1, gen_len]
-
-    if was_training:
-        model.train()
-    return torch.cat([prompt_bytes, gen_bytes], dim=1)[0]
-
-
-@torch.no_grad()
 def level1_ground_truth_codes(model: "RefineLM", full_bytes: torch.Tensor, prompt_len: int, device: str) -> torch.Tensor:
     full_bytes = full_bytes.to(device)
     if full_bytes.dim() == 1:
         full_bytes = full_bytes.unsqueeze(0)
-    enc0 = model.encoders[0]
+    enc0 = model.encode_lms[0]
     K0 = model.cfg.Ks[0]
-    c0, _, _, _ = enc0(full_bytes, compute_ntp=False)
+    c0, _, _, _ = enc0(full_bytes, level=0, window=model.windows[0], compute_ntp=False)
     ids = c0[0].argmax(-1)
     n_prompt_codes = prompt_len // K0
     return ids[n_prompt_codes:]
@@ -1244,7 +1111,7 @@ def _decode_source_codes(model: "RefineLM", full_bytes: torch.Tensor, device: st
         seq_repr = seq_repr.unsqueeze(0)
     c_list = []
     for i in range(model.n_levels):
-        c_i, _, _, _ = model.encoders[i](seq_repr, compute_ntp=False)
+        c_i, _, _, _ = model.encode_lms[i](seq_repr, level=i, window=model.windows[i], compute_ntp=False)
         c_list.append(c_i)
         seq_repr = c_i
     source_c = c_list[level]
@@ -1468,6 +1335,7 @@ def main():
     p.add_argument("--decode_self_only_weight", type=float, default=1.0)
     p.add_argument("--decode_code_ste", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--vocab", type=int, default=256)
+    p.add_argument("--share_level_weights", type=lambda x: x.lower() != "false", default=True)
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -1525,7 +1393,7 @@ def main():
         decode_banded=args.decode_banded, decode_self_only_aux=args.decode_self_only_aux,
         cross_track_source=args.cross_track_source,
         decode_self_only_weight=args.decode_self_only_weight, decode_code_ste=args.decode_code_ste,
-        vocab=args.vocab,
+        vocab=args.vocab, share_level_weights=args.share_level_weights,
         decode_pack_mode=args.decode_pack_mode, decode_chunked=args.decode_chunked,
     )
     model = RefineLM(cfg).to(device)

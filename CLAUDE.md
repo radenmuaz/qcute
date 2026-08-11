@@ -117,6 +117,34 @@ vN.py` directly (every config's own docstring already does this).
   `validate_generation` this session, same pattern. Configs:
   `configs/qcute_refine_v4_*.py`.
 
+`qcute_refine_v4_4.py`/`qcute_refine_v4_5.py` (not yet promoted to the
+`qcute_refine.py` alias) continue past v4: v4.4 adds packed-sequence
+multi-track cumulative decode (self + every coarser level's code,
+`decode_pack_mode`); v4.5 replaces that with explicit staged
+cross-attention through the same shared weights (no packed sequences).
+Both now also support `Config.share_level_weights` (default `True`,
+original behavior unchanged) — `False` gives every level (v4.4) or
+every level's own encode LM plus one independent LM per decode
+cross-attention track (v4.5) fully independent weights, coupled only
+through the bare integer code id crossing between them. Full detail,
+including an ongoing slow-convergence investigation (a moving-target/
+cascade effect for n_levels=2 configs, compounded in v4.5 by a much
+deeper gradient path back to the code producer — decode is now
+`n_layers * (1 + n_tracks)` deep sequentially, vs. v4.4's flat
+`n_layers`): [docs/status.md](docs/status.md).
+
+**Standing methodology as of this session**: use a small (`n_bytes=10000`)
+slice of the corpus with a short step budget as the standard
+fast-iteration testbed for `qcute_refine_v4_4`/`v4_5` architecture
+changes — see `configs/*_overfit10k_*.py` — until a config can actually
+fast-overfit that slice to a train bpb comparable to `qcute.bytelm`'s
+own parity numbers on the same slice (`n_layers=1`: 0.0212 train bpb at
+step 1000, ~19.7 it/s; `n_layers=2`: 0.0072, ~11.4 it/s — see
+`configs/bytelm_overfit10k_*.py`). Full-scale (~900k-byte) runs and
+generation-quality comparisons are not trustworthy until that parity
+bar is cleared — a config that hasn't even memorized a 10k-byte slice
+yet tells you little about its behavior at scale.
+
 Diagnostic: `scripts/probe_decoder_kv_contribution.py` (gradient/
 ablation/attention-mass analysis of how much cross-attention KV actually
 contributes vs. is ignored — run against a saved v2/v3 checkpoint; v4 has
