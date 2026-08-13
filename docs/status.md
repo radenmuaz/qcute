@@ -3452,3 +3452,119 @@ weights=False`, then `decode_separate_stage0`, then `decode_stage0_recompute`), 
 analogous jump for v4.5 -- its degenerate generation is not a weight-sharing problem at any level
 tested. So the finding is specifically **v4.4 benefits decisively from weight independence; v4.5's
 problem lies elsewhere** (architecture-level exposure bias in the staged decode itself).
+
+## v4.4-vs-v4.5-specific-bug diagnostic: v4.4 ALSO collapses under decode_ntp_weight=0.0
+
+Per user request, built `configs/qcute_refine_v4_4_uncondonly_{k4single,k4_1}.py` -- exact
+hyperparameter twins of the v4.5 uncondonly configs above, same `decode_ntp_weight=0.0` isolation.
+**Result: v4.4's uncond generation is ALSO badly collapsed** (`qual_train_level0_uncond`:
+`"[[[[innnannnnind in pdn afindiiindd wiiiaddiindd pddidingagagaga"` -- same character-repetition
+failure mode as v4.5), and teacher-forced `val_level0_ntp_acc_encode=0.4094` is essentially the
+same magnitude as v4.5's `0.398`/`0.384`. **This directly refutes the v4.5-specific-bug hypothesis
+for the uncond-collapse question**: both architectures fail identically when decode contributes
+zero gradient, confirming ordinary exposure bias/undertraining rather than an architecture defect.
+
+(Caution for future readers: the tqdm `bpb=` field logged during these particular runs is
+`byte_loss = decode_losses[0] if decode_losses[0] is not None else encode_losses[0]` -- i.e. it's
+DECODE's own loss whenever decode is active, which under `decode_ntp_weight=0.0` is permanently
+untrained/near-random and therefore a meaningless number for this diagnostic. Use
+`val_level0_bpb_encode`/`val_level0_ntp_acc_encode` from the eval line instead when judging uncond
+quality specifically.)
+
+Also verified numerically (not just by code inspection) that v4.4's plain encode forward and
+v4.5's `LevelLM.encode()` are **bit-identical**: given identical weights and identical random
+input, `h`/code/loss/accuracy all diff=0.0, and gradients across every parameter diff=0.0. So the
+uncond loss/gradient computation itself is provably not a source of divergence between the two
+architectures -- confirmed by direct forward/backward comparison, not just by reading the source.
+
+## Decode redesign: self-code autoencoder (path 1 vs path 2), leading to v4.4.1/v4.5.1
+
+Follow-up investigation into decode's actual training signal surfaced a real design gap in BOTH
+v4.4 and v4.5's CURRENT decode: `extract()` strips the prefix/code position's own hidden output
+before NTP is computed, so the code position is only ever used as an attendable KEY, never as a
+QUERY with its own supervised target. Tracing through the continuous (non-block-segmented) NTP
+shift showed this gap is narrower than initially feared -- block `b`'s first byte (`b >= 1`) is
+already implicitly supervised via the previous block's last byte acting as query -- but it also
+surfaced the deeper point (user-driven): the CURRENT design conditions block `b`'s bytes on
+`code_kv[b-1]` (the PREVIOUS block's code), an autoregressive-over-blocks scheme, not a genuine
+per-block autoencoder. The user's intended semantics for "decode" is different: given a block's
+OWN code `x` (computed by encode, non-causally, from that block's own bytes -- exactly like any
+VQ-VAE/autoencoder bottleneck), decode should reconstruct that SAME block's bytes from `x`,
+teacher-forced within the block (`x`->`a`, `x,a`->`b`, `x,a,b`->`c`, ...). This is not leakage in
+the harmful sense -- it's the standard, intended behavior of an autoencoder's decode half; `x` is
+a GIVEN input during training, and the model must learn to compress a block into `x` such that
+reconstruction from it is possible.
+
+Two ways to implement this were discussed:
+
+- **Path 1**: keep a generic, position-content-independent trainable "bos" query token, inserted
+  uniformly at every block boundary (not just block 0 as today), which cross/self-attends to `x`
+  (supplied as a separate key) to predict the block's first byte. `K+1` slots per block: bos is
+  one entity, `x`-as-key is conceptually a second -- tiles uniformly across every block boundary
+  (no more block-0 special case needed relative to today's `decode_bos`), but keeps bos and `x` as
+  two separate roles.
+- **Path 2** (chosen): `x` itself IS the query -- no separate bos identity needed at all, since
+  `x`'s own embedding carries both the key content (informs the block's own self-attention) and
+  the query role (predicts the block's first byte) in one token. Still `K+1` slots per block
+  physically, but path 1's two separate entities (generic bos query + `x` key) collapse into one
+  -- described as "saving one timestep" relative to path 1's fuller accounting. For v4.5
+  specifically, since `x` now packs directly into the ordinary self-attention sequence (Stage 0),
+  the self-track's dedicated cross-attention LM stage becomes unnecessary entirely -- only the
+  "+1 level"/coarser tracks (genuinely different levels, can't be packed inline with level 0's own
+  bytes) still need real cross-attention. Elegant side effect: block 0 is no longer special at all
+  -- its own code is exactly as computable as any other block's, so `decode_bos` disappears
+  entirely rather than needing to be generalized.
+
+Both paths share the same open point: at GENERATION time, `x` (block `b`'s own code) doesn't exist
+until block `b`'s bytes are generated -- circular for the block currently being produced. Default
+resolution for this first implementation: self-code reconstruction is a TRAINING-time objective
+(shapes code quality); single-level configs' actual byte generation continues to use the existing
+`generate_no_cache`/`generate_encode_only` fallback (not yet self-code-conditioned) until a
+generation-time story (e.g. relying on a coarser level to supply codes top-down, or a two-pass
+draft-then-refine scheme) is decided separately.
+
+**Implementation**: `qcute_refine_v4_4_1.py` (path 2, packed self-attention, self-code inlined
+directly into the byte sequence -- `x,a,b,c,d,y,e,f,g,h,...` with sequential integer positions,
+no fractional-position hack needed) and `qcute_refine_v4_5_1.py` (path 2, self-code merged into
+Stage 0's ordinary self-attention pass, eliminating the self-track's cross-attention stage).
+Scoped to the SELF track only for this first cut (matches the `k4single`/`k1`/self-portion-of-
+`k4_1` configs already used throughout this session's testing) -- multi-level coarser-track
+conditioning (the "+1 level" tracks) is left on today's existing mechanism, unchanged, noted as
+future work rather than redesigned in this pass.
+
+### Correction: path 2 as first implemented was still an autoencoder -- fixed to LM continuation
+
+After implementing `v4_4_1.py`'s packed self-code decode (`x,a,b,c,d,y,e,f,g,h,...`, i.e. code
+`x` reconstructing its OWN block `abcd`), the user caught that this is still literally an
+autoencoder, not the LM-continuation behavior "decode" should have. Corrected spec: given
+`abcdefghijkl` (K=4, codes `x=encode(abcd)`, `y=encode(efgh)`), decode should be `x,efgh,y,ijkl`
+-- code `x` (block 0's own code) predicts/conditions block 1 (`efgh`), NOT block 0 itself. Block 0
+(`abcd`) is skipped entirely from decode (never reconstructed -- nothing precedes it to condition
+on, same as how no LM predicts its own first token from nothing; no bos needed to paper over this,
+just don't supervise it). The last code that appears in a given window (`encode(ijkl)` here) is
+computed but unused, dangling, since nothing follows to condition on it. This single one-block
+shift resolves the generation-time circularity noted above for free: `code_b` only ever
+conditions bytes strictly AFTER block `b` completes, so there's no circular dependency for the
+block currently being generated -- weight-sharing tricks aren't needed to fix this specific issue
+(a separate `share_level_weights` ablation is still queued for later, independent of this fix).
+
+Fixed in `LevelLM._packed_decode_forward_selfcode` (v4.4.1): pack `code_kv[:, :-1, :]` (all codes
+except the last) against `x0_blocks[:, 1:, :, :]` (all blocks except the first) -- `n_units =
+n_blocks - 1` units of `(code, K bytes)` each, rather than `n_blocks` self-paired units. NTP
+target shifts correspondingly to `seq_repr[:, K:]` (bytes of blocks `1..n_blocks-1`). Verified via
+smoke test (50 steps, CPU): loss decreases normally, no crash -- mechanically sound. Same fix
+being applied to `v4_5_1.py`. Module docstrings and this doc's "Path 2" description above are
+now stale in describing the self-reconstruction version specifically -- the MECHANISM described
+(code as both key and query, one fewer separate entity than path 1, cross-attn-stage elimination
+for v4.5) is otherwise unchanged, only WHICH block each code conditions is corrected.
+
+Full forward-pass math (train and infer, both files) written up in
+[docs/qcute_refine_v4_4_1_v4_5_1_math.md](qcute_refine_v4_4_1_v4_5_1_math.md).
+
+### v4.4.1/v4.5.1 grid launched: levels{1,2} x Ks{(1,),(1,1),(4,1)} x gumbel{on,off}
+
+12 configs (`configs/qcute_refine_v4_4_1_nosharegrid_{,nogumbel_}{k1,k1_k1,k4_1}.py` and the
+`v4_5_1` equivalents), `share_level_weights=False` throughout. All smoke-tested (parse + 3-step
+CPU run) before queueing; `generate_no_cache` additionally verified directly on both a 2-byte
+(short, exercises the new `n_blocks<2` guard) and a 20-byte prompt for both files, no crash.
+Queued via `run_v441_v451_grid_queue.sh`, results pending.
