@@ -171,6 +171,12 @@ Original design source-of-truth for the now-archived lineage:
 (historical — `qcute_refine`'s own design isn't specified by it).
 Phase-by-phase progress: [docs/status.md](docs/status.md).
 
+## Code style
+
+Docstrings and comments must be extremely concise — assume code is self-descriptive; comments
+never exceed 2 lines. Only the module-level (top-of-file) docstring is exempt from the length
+limit, and should still be kept reasonably tight rather than accumulating restated history.
+
 ## Response format
 
 Prefix every reply to the user with the current timestamp (run `date` for
