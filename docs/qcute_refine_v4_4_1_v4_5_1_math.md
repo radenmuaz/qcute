@@ -98,7 +98,7 @@ $h^{\text{dec}}_i \to h^{\text{enc}}_i$ for that step.
 
 Unchanged from v4.4/v4.5: applies only when level $i$ has a coarser level above it. That path
 still uses the original previous-block-code / cross-attention mechanism (already causal, no
-per-code query — out of scope here, see `docs/qcute_refine_math.md`).
+per-code query — out of scope here, see `docs/archive2/qcute_refine_math.md`).
 
 ## 7. Generation
 

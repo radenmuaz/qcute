@@ -113,8 +113,8 @@ single specific pair rather than "everything").
 
 Prompted directly by contrasting this file's own design space against
 H-Net (Hwang/Wang/Dao et al., "Dynamic Chunking for End-to-End
-Hierarchical Sequence Modeling") — see [docs/bpe_like_boundaries.md]
-(bpe_like_boundaries.md) for the fuller writeup of that comparison.
+Hierarchical Sequence Modeling") — see [docs/archive2/bpe_like_boundaries.md]
+(archive2/bpe_like_boundaries.md) for the fuller writeup of that comparison.
 H-Net's routing decision is **local and pairwise**: a per-position
 similarity score between adjacent (smoothed) representations decides
 WHERE to cut the byte stream into chunks — genuinely content-adaptive
@@ -458,7 +458,7 @@ lengths) and CONTINUOUS (no lost context at tile edges) — they do not
 make grid boundaries CONTENT-AWARE. A fixed-stride block can still land
 mid-word even with perfect tiling; that's the actual content-adaptivity
 question, already explored separately in
-[docs/bpe_like_boundaries.md](bpe_like_boundaries.md) (soft/entropy-
+[docs/archive2/bpe_like_boundaries.md](archive2/bpe_like_boundaries.md) (soft/entropy-
 weighted pooling within the fixed grid) and this file's own Axis 4
 (level-depth routing). Tiling exactness/continuity and content-adaptive
 segmentation are independent problems with independent fixes — Sketches
@@ -722,7 +722,7 @@ structurally cannot exploit a regularity with characteristic period
   flat byte-stream causal modeling — linguistic structure (morphemes,
   words, phrases) is ALREADY naturally sequential and local in byte order,
   so a 1D causal hierarchy's locality assumption matches the data's own
-  structure almost exactly. [docs/bpe_like_boundaries.md](bpe_like_boundaries.md)'s
+  structure almost exactly. [docs/archive2/bpe_like_boundaries.md](archive2/bpe_like_boundaries.md)'s
   entropy-boundary finding (learned code boundaries land close to
   BPE/whitespace boundaries) is direct evidence the byte-level premise
   pays off here specifically because text's regularity IS sequential.
@@ -954,7 +954,7 @@ implementation is already in this codebase:
 `BitPredictHeadConvDilated._dilated_stack` (`qcute_refine_v4_2.py:1386`)
 computes exactly this shape — multi-tap, per-channel, `unfold`+`einsum`,
 deliberately never `nn.Conv1d` (measured ~300x slower at this scale, see
-§17/18 of `docs/kv_contribution.md`). Two spacing choices, same tradeoff
+§17/18 of `docs/archive2/kv_contribution.md`). Two spacing choices, same tradeoff
 already established for that class:
 - **Flat window** (`k=1..W`): catches periods up to `W`, cost `O(W)`.
 - **Dilated/log-spaced taps** (`k∈{1,2,4,8,...}`, `L=log2(period)` taps

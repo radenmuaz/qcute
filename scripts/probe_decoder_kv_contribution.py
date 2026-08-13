@@ -51,7 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 import torch.nn.functional as F
 
-from qcute.qcute_refine_v2 import Config, RefineLM, load_enwik8, sample_context, split_train_val
+from qcute.archive2.qcute_refine_v2 import Config, RefineLM, load_enwik8, sample_context, split_train_val
 
 
 def _compute_qkv(decoder, main_input: torch.Tensor, kv_input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -74,7 +74,7 @@ def _compute_qkv(decoder, main_input: torch.Tensor, kv_input: torch.Tensor) -> t
             if decoder.use_byte_softmax:
                 q = decoder.q_embed(main_input)
             else:
-                from qcute.qcute_refine_v2 import byte_to_bits
+                from qcute.archive2.qcute_refine_v2 import byte_to_bits
                 q_in = byte_to_bits(main_input) if decoder.level == 0 else main_input
                 q = decoder.q_embed(q_in)
         else:
@@ -141,7 +141,7 @@ def _decode_ablated_no_kv(decoder, main_input: torch.Tensor, kv_input: torch.Ten
         loss = F.cross_entropy(logits, target)
         acc = (logits.argmax(-1) == target).float().mean()
     else:
-        from qcute.qcute_refine_v2 import byte_to_bits, chain_bce_loss
+        from qcute.archive2.qcute_refine_v2 import byte_to_bits, chain_bce_loss
         true_seq = byte_to_bits(seq_repr) if decoder.level == 0 else seq_repr
         true_flat = true_seq[:, 1:, :].reshape(-1, decoder.in_dq)
         raw = decoder.head(h_flat, true_flat) if cfg.tok_head_mode == "chain" else decoder.head(h_flat)

@@ -32,7 +32,7 @@ sys.path.insert(0, '/Users/muaz/code/qcute')
 import torch
 import torch.nn as nn
 
-from qcute.qcute_refine_v2 import BitPredictHeadAttn, BitPredictHeadConv, BitPredictHeadSSM
+from qcute.archive2.qcute_refine_v2 import BitPredictHeadAttn, BitPredictHeadConv, BitPredictHeadSSM
 
 device = 'cpu'
 torch.manual_seed(0)

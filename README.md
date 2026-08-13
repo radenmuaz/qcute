@@ -1,20 +1,24 @@
 # qcute
 
 ("Quantized Continuous Tokenizer") — continuous byte-level tokenizer + LM.
-**Current active design: `qcute/qcute_refine.py`** — a thin alias that
-always points at the latest `qcute_refine_vN.py` (currently v4: recursive
-NTP tower, `LevelLM` per level, cross-level fusion instead of a separate
-decoder — see [CLAUDE.md](CLAUDE.md)'s own Architecture section for the
-full v1→v4 lineage summary, and [docs/status.md](docs/status.md) for
-session-by-session results). Math for the original v1 design:
-[docs/qcute_refine_math.md](docs/qcute_refine_math.md). The original
-design spec this project started from,
+**Current active designs: `qcute/qcute_v5_concat.py` and
+`qcute/qcute_v5_stack.py`** — recursive NTP tower, `LevelLM` per level,
+cross-level fusion instead of a separate decoder, forked from the
+now-archived `qcute_refine` lineage's `v4_4_1.py`/`v4_5_1.py` (see
+[CLAUDE.md](CLAUDE.md)'s own Architecture section for the full lineage
+summary, and [docs/status.md](docs/status.md) for session-by-session
+results). Math for the LM-continuation decode mechanism both share:
+[docs/qcute_refine_v4_4_1_v4_5_1_math.md](docs/qcute_refine_v4_4_1_v4_5_1_math.md)
+(math for the original v1 design, now archived:
+[docs/archive2/qcute_refine_math.md](docs/archive2/qcute_refine_math.md)).
+The original design spec this project started from,
 [docs/archive/continuous_tokenizer_handover.md](docs/archive/continuous_tokenizer_handover.md),
 now describes an archived earlier lineage (`qcute/archive/`, including
-`qcutelm.py`) superseded by `qcute_refine` — kept for historical
-reference. See [docs/architecture.md](docs/architecture.md) for how the
-still-active baselines (`bytelm`/`bpelm`) map to their own design, and
-[docs/status.md](docs/status.md) for phase-by-phase progress.
+`qcutelm.py`) superseded by `qcute_refine`, itself now archived under
+`qcute/archive2/` and superseded by `qcute_v5_concat`/`qcute_v5_stack` —
+kept for historical reference. See [docs/architecture.md](docs/architecture.md)
+for how the still-active baselines (`bytelm`/`bpelm`) map to their own
+design, and [docs/status.md](docs/status.md) for phase-by-phase progress.
 
 ## Quickstart
 
@@ -33,8 +37,9 @@ uv run python -m qcute.bytelm --preset xs --data datasets/enwik8_1M.gz  # quick 
 uv run python scripts/train_bpe.py --data datasets/enwik8_1M.gz
 uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_1M_8192.model --data datasets/enwik8_1M.gz
 
-# the active design — recursive NTP tower + cross-level fusion
-uv run python -m qcute.qcute_refine --config configs/qcute_refine_v4_pq.py
+# the active designs — recursive NTP tower + cross-level fusion
+uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_overfit10k_k4single.py
+uv run python -m qcute.qcute_v5_stack --config configs/qcute_v5_stack_overfit10k_k4single.py
 
 # or any named, reproducible config (CLI flags still override individual values) —
 # EVERY file under configs/ has its own module docstring explaining what it tests
@@ -58,21 +63,24 @@ at a time** — see [CLAUDE.md](CLAUDE.md) for why.
   `md` (~403M). Also includes a self-speculative decoding generator (MTP
   heads as draft, verified against a true causal pass) to benchmark
   generation latency against `qcute.qcutelm`'s K-bytes-per-step decode.
-- `qcute/qcute_refine.py` (alias for the latest `qcute_refine_vN.py`,
-  currently v4): recursive NTP tower — each level (`LevelLM`) embeds its
-  own input, runs causal self-attention, BSQ-quantizes into a code for
-  the level above every K positions, and (v3+) cross-attends to the
-  level-above's own hidden state before its own self-attention runs
-  ("fusion") so its own next-token loss can depend on the coarser code —
-  earlier versions (v1/v2) used a separate `DecoderLevel` for this
-  instead, later found to do the same job at higher cost. Full
-  architecture history and current results: [CLAUDE.md](CLAUDE.md),
-  [docs/status.md](docs/status.md). `qcute/qcutelm.py` (the original
-  encoder+FSQ/BSQ+latent-LM+decoder design this superseded) is now
-  **archived** under `qcute/archive/` — still runnable via
-  `qcute.archive.qcutelm` for historical reference, not part of active
-  work; see [docs/archive/status_archive.md](docs/archive/status_archive.md)
-  for its own trail of variants tried (LFQ vs. BSQ, MaskGIT decoder,
+- `qcute/qcute_v5_concat.py`/`qcute/qcute_v5_stack.py` (standalone
+  modules, forked from the archived `qcute_refine` lineage's
+  `v4_4_1.py`/`v4_5_1.py`): recursive NTP tower — each level (`LevelLM`)
+  embeds its own input, runs causal self-attention, quantizes into a
+  code for the level above every K positions (`Config.quant_type`:
+  categorical softmax, default, or `"bsq"` binary spherical
+  quantization), and cross-attends to the level-above's own hidden state
+  before its own self-attention runs ("fusion") so its own next-token
+  loss can depend on the coarser code — earlier `qcute_refine` versions
+  (v1/v2) used a separate `DecoderLevel` for this instead, later found
+  to do the same job at higher cost. Full architecture history and
+  current results: [CLAUDE.md](CLAUDE.md), [docs/status.md](docs/status.md).
+  `qcute/qcutelm.py` (the original encoder+FSQ/BSQ+latent-LM+decoder
+  design this superseded) is now **archived** under `qcute/archive/` —
+  still runnable via `qcute.archive.qcutelm` for historical reference,
+  not part of active work; see
+  [docs/archive/status_archive.md](docs/archive/status_archive.md) for
+  its own trail of variants tried (LFQ vs. BSQ, MaskGIT decoder,
   uncertainty weighting, etc.) and [docs/architecture.md](docs/architecture.md)
   for its design.
 - `qcute/bpelm.py`: a sentencepiece-BPE-tokenized causal transformer, same
