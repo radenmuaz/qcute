@@ -65,6 +65,56 @@ bug. Consistent with the standing conclusion above that staged cross-attention (
 worse than packed self-attention (concat) for multi-track decode; worth another look now that the
 comparison is no longer confounded by the `can_chunk`/windowing bugs.
 
+## K0>1 generation bug hunt: floor-tolerance, not padding (this session)
+
+`check_gen_consistency` on `Ks=(2,1)`-style configs (K0>1) showed a striking pattern: exact match
+at `t % K0 == 0`, large mismatch elsewhere. Root cause was structural, in both modules:
+`_run`'s track-building loop and `_packed_decode_forward`/`cross_attn_stage` all hard-required
+`L_i % cum_K == 0` to use any decode conditioning at all. Training never violates this (context_len
+is built to divide evenly at every level), but generation's growing, non-block-aligned prefix
+almost always does — so `generate_no_cache` padded with fake zero bytes to force alignment, which
+corrupts the trailing block's own pooled code and, in the multi-track case, still only reads the
+byte-slot fallback at `L-1` post-padding rather than what training actually optimizes for.
+
+Fix, in three parts:
+1. **Floor, don't discard** (concat and stack both — same `_run` logic, forked identically):
+   the ragged check now stops adding tracks (keeping whichever finer ones already qualify) instead
+   of discarding the whole level's decode conditioning the moment any single track isn't exactly
+   block-aligned.
+2. **`_packed_decode_forward` was missing the freshest prefix slot** (concat only): it built
+   prefixes from `code_kv[:-1]` (n_blocks total), never from the block that just completed —
+   invisible during training/one-shot TF (a long fixed window always has enough later blocks to
+   cover this slot anyway) but a real, missing piece of context for a short growing generation
+   prefix. Now builds `n_blocks + 1` slots, one per available code including the freshest.
+   **Stack doesn't have this bug.** Its multi-track path (`cross_attn_stage`) is genuine
+   cross-attention — `x_in` queries attend directly to a `code_kv` key/value array via a position
+   mask (`code_pos < query_pos`), using every entry (`n_blocks = code_kv.shape[1]`, no `[:-1]`).
+   Concat instead packs codes and bytes into *one* flat self-attention sequence, which requires
+   materializing codes as shifted, prepended synthetic tokens (`bos, code_kv[:-1]`) to fake the
+   "code_b conditions block b+1" causal order — that manual bookkeeping is where the off-by-one
+   lived. Cross-attention addresses codes by position instead, so there's no synthetic-sequence
+   step for a count to go wrong in.
+3. **Ragged tail in the single-track selfcode path** (concat and stack both — same
+   `.view(B, n_blocks, K, D)` reshape, same LM-continuation mechanism, forked identically):
+   `_packed_decode_forward_selfcode`/`selfcode_decode` can't handle a non-block-aligned trailing
+   remainder — now floor-truncate internally and `_run` splices the corresponding tail of the
+   plain encode-only `h` back in.
+
+`generate_no_cache` no longer pads at all in either module — it calls `_run` on the true, growing
+byte sequence every step. Verified via `check_gen_consistency` on untrained models (no training
+needed — this is a forward-pass architecture check) across a base-case-then-widened Ks grid
+(`(1,)`, `(1,1)`, `(1,1,1)`, `(2,1)`, `(2,2)`, `(2,1,1)`, `(2,2,1)`, `(2,2,2)`, `(4,1)`, `(4,2)`,
+`(4,2,1)`, `(4,4,2)`) on both modules, with `prompt_len` past the warm-up floor below (same floor
+applies to both modules — stack reproduces the identical short mismatch window at a too-short
+`prompt_len`, e.g. `(4,2,1)` with `prompt_len=8`; it's the inherent cold-start gap described below,
+not a module-specific issue). Also re-checked all four existing trusted checkpoints (no regression).
+One remaining, expected (not a bug) gap: a 3-level
+config shows mismatches only in a short window before `prompt_len`, exactly until the deepest level
+accumulates its own minimum 2 native blocks (confirmed by tracing `decode_derived_c`'s availability
+directly) — training never sees a context shorter than `context_len`, so there's no trained ground
+truth to match before that point; it's an inherent generation cold-start, not something
+`check_gen_consistency` should expect to pass with too short a `prompt_len` relative to `n_levels`.
+
 ## Must-dos when writing generation code (learned the hard way, repeatedly)
 
 "The model isn't learning" is wrong far more often than "generation is querying something the
@@ -73,6 +123,10 @@ excellent teacher-forced accuracy, garbage free-running generation.
 
 - **Trace the exact tensor** the training loss reads at that point — don't assume shape parity
   (`(B,L,D)`) means value parity between two code paths.
+- **Padding to satisfy an alignment assert is a code smell, not a fix.** If generation needs to pad
+  a fixed-length training assumption to force an assert to pass, the assert is usually stricter
+  than the underlying computation actually requires — check whether floor/ragged tolerance was the
+  real answer before reaching for padding.
 - **Any control-flow-changing param is a suspect** (`max_decode_sources`, `want_code`,
   `compute_ntp`, truncation/masking). Confirm both branches it can select were actually trained,
   not just the untouched one.

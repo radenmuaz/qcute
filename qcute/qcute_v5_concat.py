@@ -329,6 +329,11 @@ class LevelLM(nn.Module):
         n_blocks = L // K
         n_units = n_blocks - 1
         assert n_units >= 1, f"self-code LM-continuation decode needs at least 2 blocks (n_blocks={n_blocks})"
+        # Floor, not exact-divide: L is a clean multiple of K during training (see RefineLM.__init__),
+        # but generation's growing prefix rarely is. Drop the ragged tail here -- it belongs to a
+        # block that isn't complete yet and can't get a self-code-conditioned representation; the
+        # caller (RefineLM._run) splices the corresponding tail of the plain encode-only h back in.
+        x0 = x0[:, :n_blocks * K, :]
         x0_blocks = x0.view(B, n_blocks, K, D)
         codes = code_kv[:, :n_units, :]
         blocks_ = x0_blocks[:, 1:, :, :]
@@ -367,57 +372,58 @@ class LevelLM(nn.Module):
 
     def _packed_decode_forward(self, x0: torch.Tensor, tracks: list[tuple[torch.Tensor, int, int | None]],
                                 return_debug: bool = False):
+        # Always called with len(tracks) >= 2 (LevelLM.forward routes the single-track case to
+        # _packed_decode_forward_selfcode instead), so there is exactly one code path here -- the
+        # flat "prepend" layout, used regardless of cfg.decode_pack_mode's string value.
+        assert len(tracks) >= 2, "single-track decode must go through _packed_decode_forward_selfcode"
         cfg = self.cfg
         B, L, D = x0.shape
         H, hd = cfg.n_heads, D // cfg.n_heads
         device = x0.device
         byte_pos = torch.arange(L, device=device)
 
-        if len(tracks) == 1 and cfg.decode_pack_mode == "interleave":
-            code_kv, K, window = tracks[0]
-            W = window if window is not None else L
-            assert L % K == 0
+        prefix_parts, true_pos_parts, window_parts = [], [], []
+        for code_kv, K, window in tracks:
+            # Floor, not exact-divide: during generation L grows byte-by-byte and is rarely a
+            # multiple of K. n_blocks = L // K is the number of complete blocks currently available
+            # -- a trailing partial block simply isn't given a prefix slot yet, never
+            # padded/fabricated. Training always has L a clean multiple of every track's K (see
+            # RefineLM.__init__ / _run's track-building loop), so the floor is a no-op there.
+            #
+            # n_avail = min(n_blocks, code_kv.shape[1]) prefixes get built, at true_pos
+            # [-1, K-1, 2K-1, ..., n_avail*K-1] with values [bos, code_kv[0], ..., code_kv[n_avail-1]]
+            # -- i.e. one prefix slot PER code, including code_kv[n_avail-1] itself (the freshest
+            # complete block), not code_kv[:-1]. That last slot sits at true_pos = n_avail*K - 1,
+            # right before the next (currently incomplete) block's bytes start -- exactly the
+            # conditioning a mid-block generation query needs and, without it, silently lacked
+            # (invisible in training/one-shot teacher-forcing, where n_blocks is always large enough
+            # that this slot gets built anyway as part of a later, still-unused prefix; only a short,
+            # growing generation prefix exposes the gap). code_kv can be shorter than n_blocks for a
+            # decode-derived coarser track (its own LM-continuation shifts it by one) -- n_avail
+            # simply clamps to what's actually there.
             n_blocks = L // K
+            n_avail = min(n_blocks, code_kv.shape[1])
+            W = window if window is not None else L
             bos = self.decode_bos.view(1, 1, D).expand(B, 1, D)
-            prefixes = torch.cat([bos, code_kv[:, :-1, :]], dim=1)
-            prefix_true_pos = torch.arange(n_blocks, device=device) * K - 1
-            x0_blocks = x0.view(B, n_blocks, K, D)
-            combined = torch.cat([prefixes.unsqueeze(2), x0_blocks], dim=2).view(B, n_blocks * (K + 1), D)
-            true_pos = torch.cat([prefix_true_pos.view(n_blocks, 1), byte_pos.view(n_blocks, K)], dim=1).reshape(-1)
-            is_code = torch.cat([torch.ones(n_blocks, 1, dtype=torch.bool, device=device),
-                                  torch.zeros(n_blocks, K, dtype=torch.bool, device=device)], dim=1).reshape(-1)
-            window_of_key = torch.cat([torch.full((n_blocks, 1), float(W), device=device),
-                                        torch.full((n_blocks, K), float(W), device=device)], dim=1).reshape(-1)
-            Le = n_blocks * (K + 1)
-            extract = lambda he: he.view(B, n_blocks, K + 1, D)[:, :, 1:, :].reshape(B, L, D)
-        elif cfg.decode_pack_mode in ("interleave", "prepend"):
-            prefix_parts, true_pos_parts, window_parts = [], [], []
-            for code_kv, K, window in tracks:
-                assert L % K == 0
-                n_blocks = L // K
-                W = window if window is not None else L
-                bos = self.decode_bos.view(1, 1, D).expand(B, 1, D)
-                prefixes = torch.cat([bos, code_kv[:, :-1, :]], dim=1)
-                prefix_parts.append(prefixes)
-                true_pos_parts.append(torch.arange(n_blocks, device=device) * K - 1)
-                window_parts.append(torch.full((n_blocks,), float(W), device=device))
-            prefix_parts, true_pos_parts, window_parts = prefix_parts[::-1], true_pos_parts[::-1], window_parts[::-1]
+            prefixes = torch.cat([bos, code_kv[:, :n_avail, :]], dim=1)
+            prefix_parts.append(prefixes)
+            true_pos_parts.append(torch.arange(n_avail + 1, device=device) * K - 1)
+            window_parts.append(torch.full((n_avail + 1,), float(W), device=device))
+        prefix_parts, true_pos_parts, window_parts = prefix_parts[::-1], true_pos_parts[::-1], window_parts[::-1]
 
-            all_prefixes = torch.cat(prefix_parts, dim=1)
-            n_prefix = all_prefixes.shape[1]
-            prefix_true_pos = torch.cat(true_pos_parts, dim=0)
-            prefix_window = torch.cat(window_parts, dim=0)
-            byte_window = tracks[0][2] if tracks[0][2] is not None else L
+        all_prefixes = torch.cat(prefix_parts, dim=1)
+        n_prefix = all_prefixes.shape[1]
+        prefix_true_pos = torch.cat(true_pos_parts, dim=0)
+        prefix_window = torch.cat(window_parts, dim=0)
+        byte_window = tracks[0][2] if tracks[0][2] is not None else L
 
-            combined = torch.cat([all_prefixes, x0], dim=1)
-            true_pos = torch.cat([prefix_true_pos, byte_pos], dim=0)
-            is_code = torch.cat([torch.ones(n_prefix, dtype=torch.bool, device=device),
-                                  torch.zeros(L, dtype=torch.bool, device=device)])
-            window_of_key = torch.cat([prefix_window, torch.full((L,), float(byte_window), device=device)])
-            Le = n_prefix + L
-            extract = lambda he: he[:, n_prefix:, :]
-        else:
-            raise ValueError(f"unknown decode_pack_mode {cfg.decode_pack_mode!r}")
+        combined = torch.cat([all_prefixes, x0], dim=1)
+        true_pos = torch.cat([prefix_true_pos, byte_pos], dim=0)
+        is_code = torch.cat([torch.ones(n_prefix, dtype=torch.bool, device=device),
+                              torch.zeros(L, dtype=torch.bool, device=device)])
+        window_of_key = torch.cat([prefix_window, torch.full((L,), float(byte_window), device=device)])
+        Le = n_prefix + L
+        extract = lambda he: he[:, n_prefix:, :]
 
         cos, sin = rope_cos_sin_for_positions(true_pos.clamp(min=0), hd, cfg.rope_base, device)
 
@@ -854,14 +860,20 @@ class RefineLM(nn.Module):
             L_i = x_list[i].shape[1]
             tracks: list[tuple[torch.Tensor, int, int | None]] = []
             cum_K = 1
-            ragged = False
             for j in range(i, self.n_levels):
                 cum_K *= cfg.Ks[j]
                 window = self.decode_windows[i][j - i]
                 if window == 0:
                     continue
-                if L_i % cum_K != 0:
-                    ragged = True
+                # Training always calls with L_i an exact multiple of cum_K (context_len is built
+                # to divide evenly at every level, see __init__), so this floor check is a no-op
+                # there. It only bites during generation, where L_i grows one byte at a time and is
+                # rarely block-aligned -- stop adding tracks (keep whichever finer ones already
+                # collected) rather than discarding everything, so e.g. a self track can still be
+                # used even when a coarser track isn't affordable yet. _packed_decode_forward's own
+                # prefix construction is floor-based too, so a not-yet-complete trailing block is
+                # simply excluded from the code prefix, never fabricated.
+                if L_i // cum_K < 1:
                     break
                 if j > i and cfg.cross_track_source == "decode" and j in decode_derived_c:
                     source_c = decode_derived_c[j]
@@ -875,7 +887,7 @@ class RefineLM(nn.Module):
                 else:
                     code_embeds = self.decode_lms[i].embed(source_c.argmax(-1))
                 tracks.append((code_embeds, cum_K, window))
-            if ragged or not tracks:
+            if not tracks:
                 continue
             if len(tracks) == 1 and (L_i // tracks[0][1]) < 2:
                 continue  # self-code decode needs 2+ blocks; treat as ragged
@@ -887,6 +899,12 @@ class RefineLM(nn.Module):
                 decode_tracks=full_tracks, extra_query=(want_next_query and i == 0))
             decode_losses[i] = loss_i2
             decode_accs[i] = acc_i2
+            if h_i2.shape[1] < L_i:
+                # Single-track selfcode decode floor-truncates a ragged tail internally (see
+                # _packed_decode_forward_selfcode) -- splice the plain encode-only h back in for
+                # those trailing positions rather than leaving them missing. Never triggered during
+                # training (L_i is always block-aligned there).
+                h_i2 = torch.cat([h_i2, h_list[i][:, h_i2.shape[1]:, :]], dim=1)
             h_out[i] = h_i2
             next_query[i] = query_last_i
             query_seq_out[i] = query_seq_i
@@ -963,23 +981,26 @@ def generate_no_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
     prompt_bytes = prompt_bytes.to(device)
     if prompt_bytes.dim() == 1:
         prompt_bytes = prompt_bytes.unsqueeze(0)
-    decode_K = 1
-    for k in model.cfg.Ks:
-        decode_K *= k
+    K0 = model.cfg.Ks[0]
     all_bytes = prompt_bytes
     for _ in range(n_new_bytes):
         L = all_bytes.shape[1]
-        pad_len = (-L) % decode_K
-        padded = (torch.cat([all_bytes, all_bytes.new_zeros(all_bytes.shape[0], pad_len)], dim=1)
-                  if pad_len > 0 else all_bytes)
+        # No padding: _run/_packed_decode_forward are floor-tolerant now, so feeding the true,
+        # growing byte sequence gives exactly the same decode-conditioned (or, below a level's
+        # minimum block count, encode-only) representation training would compute at this position
+        # -- never a fabricated trailing byte. want_next_query only matters (and is only honored)
+        # on a K0-aligned prefix, where the single-track selfcode path can append a genuine
+        # bare-code extra query; elsewhere it's a no-op and next_query[0] stays None.
+        block_aligned = L % K0 == 0
         _, _, _, _, h_list, _, _, _, next_query, _decode_derived_c, _query_seq = model._run(
-            padded, compute_ntp=False, max_decode_sources=max_decode_sources, want_next_query=(pad_len == 0))
-        # next_query[0] is the actual next-byte-predicting representation (see
-        # _packed_decode_forward_selfcode's extra_query docstring); h_list[0][:, L-1, :] has
-        # already attended to its own byte value and is the wrong slot to sample from -- falls
-        # back to it only when next_query is unavailable (padding, or a multi-track/multi-level
-        # decode path that doesn't compute it).
-        query = next_query[0] if pad_len == 0 and next_query[0] is not None else h_list[0][:, L - 1, :]
+            all_bytes, compute_ntp=False, max_decode_sources=max_decode_sources,
+            want_next_query=block_aligned)
+        # next_query[0]: the single-track selfcode path's genuine code-slot query (see
+        # _packed_decode_forward_selfcode's extra_query docstring). h_list[0][:, -1, :]: the
+        # standard byte-slot next-token representation used everywhere else (multi-track decode, or
+        # the encode-only fallback when no track has a complete block yet) -- both are real,
+        # trained-for slots, matching what check_gen_consistency compares against.
+        query = next_query[0] if next_query[0] is not None else h_list[0][:, -1, :]
         next_byte = _sample_next_byte(model.decode_lms[0].embed.weight, query)
         all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
     if was_training:
@@ -1094,24 +1115,30 @@ def check_gen_consistency(model: "RefineLM", full_bytes: torch.Tensor, device: s
         full_bytes = full_bytes.unsqueeze(0)
     L_total = full_bytes.shape[1]
     embed0 = model.decode_lms[0].embed.weight
+    K0 = model.cfg.Ks[0]
 
     _, _, _, _, h_list_tf, _, _, _, _, _, query_seq_tf = model._run(
         full_bytes, compute_ntp=False, max_decode_sources=None, want_next_query=False)
-    # query_seq_tf[0] (code-slot, K=1 assumed) is the tensor training's own NTP loss actually reads
-    # for the single-track selfcode-decode path -- h_list_tf[0] (byte-slot) is WRONG there (see
-    # docs/status.md); for the multi-track path query_seq_tf[0] is None and h IS correct, so fall
-    # back to it.
-    query_ref_tf = query_seq_tf[0] if query_seq_tf[0] is not None else h_list_tf[0]
-    logits_tf_all = F.linear(query_ref_tf[0], embed0)  # (L_total-1, vocab); [i] predicts byte i+1
+    # query_seq_tf[0] is the tensor training's own NTP loss actually reads for the single-track
+    # selfcode-decode path -- h_list_tf[0] (byte-slot) is WRONG there (see docs/status.md); for the
+    # multi-track path query_seq_tf[0] is None and h IS correct, so fall back to it. query_seq[j]
+    # predicts byte (K0+j) (it's aligned to seq_repr[:, K0:], not seq_repr[:, 1:]) -- only equal to
+    # "byte j+1" when K0==1, so byte t's reference index is (t-K0) via query_seq but (t-1) via h.
+    using_query_seq = query_seq_tf[0] is not None
+    query_ref_tf = query_seq_tf[0] if using_query_seq else h_list_tf[0]
+    logits_tf_all = F.linear(query_ref_tf[0], embed0)
 
     n_mismatch = 0
     for t in range(prompt_len, L_total - 1):
+        ref_idx = t - K0 if using_query_seq else t - 1
+        if ref_idx < 0 or ref_idx >= logits_tf_all.shape[0]:
+            continue
         padded = full_bytes[:, :t]
         _, _, _, _, h_list_gen, _, _, _, next_query_gen, _, _ = model._run(
             padded, compute_ntp=False, max_decode_sources=None, want_next_query=True)
         query_gen = next_query_gen[0] if next_query_gen[0] is not None else h_list_gen[0][:, t - 1, :]
         logits_gen = F.linear(query_gen[0], embed0)
-        if (logits_gen - logits_tf_all[t - 1]).abs().max().item() >= tol:
+        if (logits_gen - logits_tf_all[ref_idx]).abs().max().item() >= tol:
             n_mismatch += 1
     if was_training:
         model.train()

@@ -147,6 +147,29 @@ generation-quality comparisons are not trustworthy until that parity
 bar is cleared — a config that hasn't even memorized a 10k-byte slice
 yet tells you little about its behavior at scale.
 
+**Ks regression grid, simplest to hardest** (for config-writing later): ranked by
+`product(Ks)` (compression ratio / minimum warm-up context) first, `n_levels` second,
+`max(Ks)` third.
+
+| # | Ks | levels | product(Ks) | max K |
+|---|---|---|---|---|
+| 1 | `(1,)` | 1 | 1 | 1 |
+| 2 | `(1,1)` | 2 | 1 | 1 |
+| 3 | `(1,1,1)` | 3 | 1 | 1 |
+| 4 | `(2,1)` | 2 | 2 | 2 |
+| 5 | `(2,1,1)` | 3 | 2 | 2 |
+| 6 | `(2,2)` | 2 | 4 | 2 |
+| 7 | `(4,1)` | 2 | 4 | 4 |
+| 8 | `(2,2,1)` | 3 | 4 | 2 |
+| 9 | `(4,2)` | 2 | 8 | 4 |
+| 10 | `(2,2,2)` | 3 | 8 | 2 |
+| 11 | `(4,2,1)` | 3 | 8 | 4 |
+| 12 | `(4,4,2)` | 3 | 32 | 4 |
+
+Ranks generation/architecture-correctness difficulty (raggedness, warm-up depth), not
+training/learnability difficulty — a high-product config may be easier to overfit10k
+(fewer effective tokens) despite being harder to verify `check_gen_consistency` on.
+
 Diagnostic: `scripts/probe_decoder_kv_contribution.py` (gradient/
 ablation/attention-mass analysis of how much cross-attention KV actually
 contributes vs. is ignored — run against a saved v2/v3 checkpoint, now
