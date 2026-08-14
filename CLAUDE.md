@@ -199,3 +199,6 @@ limit, and should still be kept reasonably tight rather than accumulating restat
 
 Prefix every reply to the user with the current timestamp (run `date` for
 the actual value — never guess it).
+
+Keep chat replies terse. State results and next steps directly — no restating context the user
+already has, no padding, no multi-paragraph recaps. Save detail for docs/status.md, not the chat.

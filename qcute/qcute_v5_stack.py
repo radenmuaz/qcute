@@ -83,7 +83,7 @@ class Config:
     rope_base: float = 10000.0
     byte_ntp_weight: float = 1.0
     code_ntp_weight: float = 1.0
-    decode_ntp_weight: float = 1.0
+    decode_ntp_weight: float | tuple[float, ...] = 1.0   # scalar (broadcast) or one weight per level
     gumbel_tau: float = 1.0
     use_gumbel_noise: bool = False
     vocab: int = 256
@@ -95,7 +95,6 @@ class Config:
     decode_code_ste: bool = True
     share_level_weights: bool = True
     decode_separate_stage0: bool = False
-    decode_stage0_recompute: bool = False
     quant_type: str = "softmax"   # "softmax" (categorical code_head + gumbel/argmax) or "bsq"
     bsq_bits: int = 4             # code width in bits when quant_type="bsq"
 
@@ -195,7 +194,6 @@ class CausalSelfAttention(nn.Module):
         self.n_heads = n_heads
         self.d_model = d_model
         self.head_dim = d_model // n_heads
-        self._warned_dense_fallback = False
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
 
@@ -205,13 +203,18 @@ class CausalSelfAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        if window is not None and T % window == 0 and T > window:
-            y = self._forward_chunked(q, k, v, window)
+        if window is not None:
+            # Exact windowed mask, correct for any T -- the old chunked fast path only worked
+            # when T % window == 0 and T > window, silently falling back to DENSE (unwindowed)
+            # attention otherwise. Training always uses a fixed, window-aligned context_len, so
+            # it never hit that fallback; no-cache generation recomputes this on a growing
+            # sequence length that's window-aligned only by rare coincidence, so it almost always
+            # did -- a genuine train/inference computational mismatch (see docs/status.md).
+            pos = torch.arange(T, device=x.device)
+            ti, tj = pos.unsqueeze(1), pos.unsqueeze(0)
+            attn_mask = ((tj <= ti) & (ti - tj < window)).view(1, 1, T, T)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
-            if window is not None and not self._warned_dense_fallback:
-                print(f"WARNING: CausalSelfAttention window={window} set but T={T} doesn't satisfy "
-                      f"T % window == 0 and T > window -- falling back to DENSE attention for this layer.")
-                self._warned_dense_fallback = True
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.out(y.transpose(1, 2).reshape(B, T, D))
 
@@ -228,38 +231,6 @@ class CausalSelfAttention(nn.Module):
         k = apply_rope(k, cos_k, sin_k)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         return self.out(y.transpose(1, 2).reshape(B, T, D))
-
-    def _chunk_local_window(self, t: torch.Tensor, B: int, H: int, n_chunks: int, W: int, hd: int) -> torch.Tensor:
-        tc = t.view(B, H, n_chunks, W, hd)
-        zero_chunk = torch.zeros(B, H, 1, W, hd, device=t.device, dtype=t.dtype)
-        t_prev = torch.cat([zero_chunk, tc[:, :, :-1]], dim=2)
-        t_local = torch.cat([t_prev, tc], dim=3)
-        return t_local.permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, 2 * W, hd)
-
-    def _causal_window_mask(self, n_chunks: int, W: int, device: torch.device) -> torch.Tensor:
-        i = torch.arange(W, device=device).view(W, 1)
-        j_prev = torch.arange(W, device=device).view(1, W) - W
-        j_cur = torch.arange(W, device=device).view(1, W)
-        key_offset = torch.cat([j_prev, j_cur], dim=1)
-        diff = i - key_offset
-        causal_window = (diff >= 0) & (diff < W)
-        mask_per_chunk = causal_window.unsqueeze(0).expand(n_chunks, W, 2 * W).clone()
-        mask_per_chunk[0, :, 0:W] = False
-        return mask_per_chunk
-
-    def _forward_chunked(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int) -> torch.Tensor:
-        B, H, T, hd = q.shape
-        W = window
-        n_chunks = T // W
-
-        qb = q.view(B, H, n_chunks, W, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, W, hd)
-        kb = self._chunk_local_window(k, B, H, n_chunks, W, hd)
-        vb = self._chunk_local_window(v, B, H, n_chunks, W, hd)
-        mask_per_chunk = self._causal_window_mask(n_chunks, W, q.device)
-        mask_batched = mask_per_chunk.unsqueeze(0).expand(B, n_chunks, W, 2 * W).reshape(B * n_chunks, 1, W, 2 * W)
-
-        yb = F.scaled_dot_product_attention(qb, kb, vb, attn_mask=mask_batched)
-        return yb.view(B, n_chunks, H, W, hd).permute(0, 2, 1, 3, 4).reshape(B, H, T, hd)
 
 
 class Block(nn.Module):
@@ -510,6 +481,12 @@ class LevelLM(nn.Module):
 
         he_blocks = he.view(B, n_units, K + 1, D)
         query_h = he_blocks[:, :, :-1, :].reshape(-1, D)
+        # query_seq keeps the batch dim (unlike query_h, flattened for the loss) -- the code-slot
+        # representation actually used for NTP at every position, needed by
+        # check_gen_consistency's teacher-forced reference. Plain `h` below is byte-slot and is
+        # the WRONG tensor to compare against for this path, same class as query_last's docstring
+        # above.
+        query_seq = he_blocks[:, :, :-1, :].reshape(B, n_units * K, D)
         h = torch.cat([x0[:, :K, :], he_blocks[:, :, 1:, :].reshape(B, n_units * K, D)], dim=1)
         if compute_ntp:
             ntp_loss, ntp_acc = self._ntp_loss_acc(query_h, seq_repr[:, K:], is_byte_level)
@@ -517,7 +494,7 @@ class LevelLM(nn.Module):
             ntp_loss = h.new_zeros(())
             ntp_acc = h.new_zeros(())
         c_i = self._extract_code(h, x0, K, window) if want_code else None
-        return c_i, ntp_loss, ntp_acc, h, query_last
+        return c_i, ntp_loss, ntp_acc, h, query_last, query_seq
 
     def cross_attn_stage(self, x_in: torch.Tensor, code_kv: torch.Tensor, seq_repr: torch.Tensor, level: int,
                           track_K: int, window: int | None, compute_ntp: bool = True,
@@ -637,6 +614,7 @@ class RefineLM(nn.Module):
         decode_derived_c: dict[int, torch.Tensor] = {}
         h_out = list(h_list)
         next_query: list[torch.Tensor | None] = [None] * self.n_levels
+        query_seq_out: list[torch.Tensor | None] = [None] * self.n_levels
         final_embed_weight: list[torch.Tensor | None] = [None] * self.n_levels
         for i in reversed(range(self.n_levels)):
             L_i = x_list[i].shape[1]
@@ -665,11 +643,20 @@ class RefineLM(nn.Module):
                 full_track_specs = full_track_specs[:max_decode_sources]
 
             stage_lms_i = self.decode_stage_lms[i]
-            if len(full_track_specs) == 1:
+            # Dispatch on the UNTRUNCATED track count, not len(full_track_specs) -- a level with
+            # >1 real tracks (e.g. self+coarser) is always trained via the cross_attn_stage loop
+            # below (both the full chain and decode_self_only_aux use it for stage 0), never via
+            # selfcode_decode. max_decode_sources=1 (generate_self_only_cond) truncates
+            # full_track_specs to length 1 for exactly such a level -- dispatching on that
+            # truncated length would route stage_lms_i[0]'s weights through selfcode_decode, a
+            # mechanism they were never trained through, producing garbage despite the weights
+            # themselves being well-trained (via cross_attn_stage). selfcode_decode is only
+            # correct when the level genuinely has just one possible track to begin with.
+            if len(track_specs) == 1:
                 source_c0, track_K0, window0 = full_track_specs[0]
                 stage_lm0 = stage_lms_i[0]
                 code_embeds0 = code_embed_for_decode(cfg, stage_lm0, source_c0)
-                c_final, loss_final, acc_final, x_out, query_last = stage_lm0.selfcode_decode(
+                c_final, loss_final, acc_final, x_out, query_last, query_seq = stage_lm0.selfcode_decode(
                     x_list[i], code_embeds0, i, track_K0, window0, compute_ntp=compute_ntp,
                     want_code=(max_decode_sources is None), extra_query=(want_next_query and i == 0))
                 final_embed_weight[i] = stage_lm0.embed.weight
@@ -677,10 +664,11 @@ class RefineLM(nn.Module):
                 decode_accs[i] = acc_final
                 h_out[i] = x_out
                 next_query[i] = query_last
+                query_seq_out[i] = query_seq
                 if max_decode_sources is None:
                     decode_derived_c[i] = c_final
                 continue
-            if (cfg.decode_separate_stage0 or cfg.decode_stage0_recompute) and not cfg.share_level_weights:
+            if cfg.decode_separate_stage0 and not cfg.share_level_weights:
                 _, loss_stage0, _, x = self.decode_stage0_lms[i].encode(
                     x_list[i], level=i, window=self.windows[i], compute_ntp=compute_ntp)
                 decode_stage_extra_losses.append(loss_stage0)
@@ -716,13 +704,13 @@ class RefineLM(nn.Module):
 
         return (encode_losses, encode_accs, decode_losses, decode_accs, h_out, c_list,
                 decode_self_only_losses, decode_self_only_accs, decode_stage_extra_losses, final_embed_weight,
-                next_query)
+                next_query, decode_derived_c, query_seq_out)
 
     def forward(self, byte_ids: torch.Tensor) -> tuple[torch.Tensor, dict]:
         cfg = self.cfg
         (encode_losses, encode_accs, decode_losses, decode_accs, h_list, c_list,
          decode_self_only_losses, decode_self_only_accs, decode_stage_extra_losses,
-         _final_embed_weight, _next_query) = self._run(byte_ids)
+         _final_embed_weight, _next_query, _decode_derived_c, _query_seq) = self._run(byte_ids)
 
         byte_loss = decode_losses[0] if decode_losses[0] is not None else encode_losses[0]
         byte_acc = decode_accs[0] if decode_accs[0] is not None else encode_accs[0]
@@ -731,19 +719,27 @@ class RefineLM(nn.Module):
                               else byte_loss.new_zeros(()))
         encode_total = cfg.byte_ntp_weight * encode_losses[0] + cfg.code_ntp_weight * encode_code_total
 
-        decode_terms = [l for l in decode_losses if l is not None]
-        decode_total = (cfg.decode_ntp_weight * torch.stack(decode_terms).sum() if decode_terms
-                         else byte_loss.new_zeros(()))
+        decode_ntp_weight = (cfg.decode_ntp_weight if isinstance(cfg.decode_ntp_weight, (tuple, list))
+                              else (cfg.decode_ntp_weight,) * self.n_levels)
+        assert len(decode_ntp_weight) == self.n_levels, (
+            f"decode_ntp_weight tuple must have length n_levels={self.n_levels}, got {len(decode_ntp_weight)}")
+        decode_terms = [decode_ntp_weight[i] * l for i, l in enumerate(decode_losses) if l is not None]
+        decode_total = torch.stack(decode_terms).sum() if decode_terms else byte_loss.new_zeros(())
 
         self_only_terms = [l for l in decode_self_only_losses if l is not None]
         decode_self_only_total = (cfg.decode_self_only_weight * torch.stack(self_only_terms).sum()
                                    if self_only_terms else byte_loss.new_zeros(()))
 
-        decode_stage_extra_total = (cfg.decode_ntp_weight * torch.stack(decode_stage_extra_losses).sum()
+        # decode_stage_extra_losses aren't tied to one specific level index (they come from
+        # decode_separate_stage0's recompute, or non-final tracks in a multi-track chain), so a
+        # per-level decode_ntp_weight tuple doesn't map onto them cleanly -- use the mean weight.
+        decode_stage_extra_weight = sum(decode_ntp_weight) / len(decode_ntp_weight)
+        decode_stage_extra_total = (decode_stage_extra_weight * torch.stack(decode_stage_extra_losses).sum()
                                      if decode_stage_extra_losses else byte_loss.new_zeros(()))
 
         loss = encode_total + decode_total + decode_self_only_total + decode_stage_extra_total
-        ntp_total = torch.stack(encode_losses + decode_terms + self_only_terms + decode_stage_extra_losses).sum()
+        ntp_total = torch.stack(encode_losses + [l for l in decode_losses if l is not None] + self_only_terms
+                                 + decode_stage_extra_losses).sum()
         metrics = {
             "loss": loss, "byte_loss": byte_loss, "byte_acc": byte_acc,
             "encode_total": encode_total, "decode_total": decode_total,
@@ -782,7 +778,7 @@ def generate_no_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
         pad_len = (-L) % decode_K
         padded = (torch.cat([all_bytes, all_bytes.new_zeros(all_bytes.shape[0], pad_len)], dim=1)
                   if pad_len > 0 else all_bytes)
-        _, _, _, _, h_list, _, _, _, _, final_embed_weight, next_query = model._run(
+        _, _, _, _, h_list, _, _, _, _, final_embed_weight, next_query, _decode_derived_c, _query_seq = model._run(
             padded, compute_ntp=False, max_decode_sources=max_decode_sources, want_next_query=(pad_len == 0))
         embed_w = final_embed_weight[0] if final_embed_weight[0] is not None else model.encode_lms[0].embed.weight
         # next_query[0] is the actual next-byte-predicting representation (see selfcode_decode's
@@ -846,6 +842,51 @@ def generate_level1_codes(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_c
 
 
 @torch.no_grad()
+def generate_level1_codes_via_decode(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_codes: int,
+                                      device: str) -> torch.Tensor:
+    """Level1's DECODE-based (selfcode_decode) code generation, as opposed to
+    generate_level1_codes's ENCODE-based generation -- tests whether level1's own decode readout
+    (decode_losses[1], teacher-forced acc = val_level1_ntp_acc_decode) is a coherent free-running
+    generator, not just a good teacher-forced predictor. No prior diagnostic covered this: every
+    existing qual_*_level1_gen line actually reflects level1's *encode* pass, not its decode."""
+    was_training = model.training
+    model.eval()
+    prompt_bytes = prompt_bytes.to(device)
+    if prompt_bytes.dim() == 1:
+        prompt_bytes = prompt_bytes.unsqueeze(0)
+    cfg = model.cfg
+    enc0 = model.encode_lms[0]
+    codes, _, _, _ = enc0.encode(prompt_bytes, level=0, window=model.windows[0], compute_ntp=False)
+    n_prompt_codes = codes.shape[1]
+    stage_lm1 = model.decode_stage_lms[1][0]
+    K1 = cfg.Ks[1]
+    window1 = model.decode_windows[1][0]
+    for _ in range(n_new_codes):
+        L = codes.shape[1]
+        pad_len = (-L) % K1
+        padded = (torch.cat([codes, codes.new_zeros(codes.shape[0], pad_len, codes.shape[2])], dim=1)
+                  if pad_len > 0 else codes)
+        c1, _, _, _ = model.encode_lms[1].encode(padded, level=1, window=model.windows[1], compute_ntp=False)
+        code_embeds1 = code_embed_for_decode(cfg, stage_lm1, c1)
+        _, _, _, _, query_last, _ = stage_lm1.selfcode_decode(
+            padded, code_embeds1, level=1, K=K1, window=window1, compute_ntp=False,
+            want_code=False, extra_query=(pad_len == 0))
+        if query_last is None:
+            break
+        if cfg.quant_type == "bsq":
+            pred = stage_lm1.code_predict(query_last)
+            next_code = bsq_quantize(pred, cfg.bsq_bits)
+        else:
+            logits = F.linear(query_last, stage_lm1.embed.weight)
+            next_id = logits.argmax(-1)
+            next_code = F.one_hot(next_id, num_classes=cfg.vocab).to(codes.dtype)
+        codes = torch.cat([codes, next_code.unsqueeze(1)], dim=1)
+    if was_training:
+        model.train()
+    return code_to_ids(codes[0, n_prompt_codes:], cfg)
+
+
+@torch.no_grad()
 def level1_ground_truth_codes(model: "RefineLM", full_bytes: torch.Tensor, prompt_len: int, device: str) -> torch.Tensor:
     full_bytes = full_bytes.to(device)
     if full_bytes.dim() == 1:
@@ -888,6 +929,52 @@ def _decode_source_codes(model: "RefineLM", full_bytes: torch.Tensor, device: st
     return code_to_ids(source_c, model.cfg)[0]
 
 
+@torch.no_grad()
+def check_gen_consistency(model: "RefineLM", full_bytes: torch.Tensor, device: str,
+                           prompt_len: int = 32, tol: float = 1e-3, log=print, label: str = "") -> int:
+    """Cheap, reusable correctness check: the incremental no-cache generation code path and the
+    one-shot teacher-forced training forward pass MUST produce identical logits when both are fed
+    the same ground-truth bytes -- any gap is a genuine generation-vs-training bug (this caught
+    the windowed-attention dense-fallback bug, see docs/status.md), not exposure bias or model
+    quality. Returns the mismatch count (0 = pass).
+    """
+    was_training = model.training
+    model.eval()
+    full_bytes = full_bytes.to(device)
+    if full_bytes.dim() == 1:
+        full_bytes = full_bytes.unsqueeze(0)
+    L_total = full_bytes.shape[1]
+
+    _, _, _, _, h_list_tf, _, _, _, _, final_embed_weight_tf, _, _, query_seq_tf = model._run(
+        full_bytes, compute_ntp=False, max_decode_sources=None, want_next_query=False)
+    embed_tf = (final_embed_weight_tf[0] if final_embed_weight_tf[0] is not None
+                else model.encode_lms[0].embed.weight)
+    # query_seq_tf[0] (code-slot, K=1 assumed) is what training's own NTP loss actually reads for
+    # the single-track selfcode-decode path -- h_list_tf[0] (byte-slot) is WRONG there (see
+    # docs/status.md); for the multi-track cross_attn_stage path query_seq_tf[0] is None and h IS
+    # correct, so fall back to it.
+    query_ref_tf = query_seq_tf[0] if query_seq_tf[0] is not None else h_list_tf[0]
+    logits_tf_all = F.linear(query_ref_tf[0], embed_tf)  # (L_total-1, vocab); [i] predicts byte i+1
+
+    n_mismatch = 0
+    for t in range(prompt_len, L_total - 1):
+        padded = full_bytes[:, :t]
+        _, _, _, _, h_list_gen, _, _, _, _, final_embed_weight_gen, next_query_gen, _, _ = model._run(
+            padded, compute_ntp=False, max_decode_sources=None, want_next_query=True)
+        embed_gen = (final_embed_weight_gen[0] if final_embed_weight_gen[0] is not None
+                     else model.encode_lms[0].embed.weight)
+        query_gen = next_query_gen[0] if next_query_gen[0] is not None else h_list_gen[0][:, t - 1, :]
+        logits_gen = F.linear(query_gen[0], embed_gen)
+        if (logits_gen - logits_tf_all[t - 1]).abs().max().item() >= tol:
+            n_mismatch += 1
+    if was_training:
+        model.train()
+    prefix_log = f"gen_consistency_{label}" if label else "gen_consistency"
+    log(f"{prefix_log}: {n_mismatch}/{L_total - 1 - prompt_len} timesteps mismatched "
+        f"(generation vs teacher-forced logits on ground-truth input)")
+    return n_mismatch
+
+
 def qualitative_generate(model: "RefineLM", prompt_bytes: torch.Tensor, gen_len: int,
                           ground_truth: torch.Tensor | None, device: str, log=print, label: str = "") -> None:
     prefix = f"qual_{label}_" if label else "qual_"
@@ -896,6 +983,8 @@ def qualitative_generate(model: "RefineLM", prompt_bytes: torch.Tensor, gen_len:
     out_uncond = generate_encode_only(model, prompt_bytes, gen_len, device)
     gen_bytes_uncond = bytes(out_uncond[prompt_bytes.numel():].tolist())
     log(f"{prefix}prompt:              {bytes(prompt_bytes.tolist())!r}")
+    if ground_truth is not None:
+            log(f"{prefix}ground_truth:        {bytes(ground_truth.tolist())!r}")
     log(f"{prefix}level0_uncond:       {gen_bytes_uncond!r}")
     log(f"{prefix}level0_cond_full:    {gen_bytes_cond_full!r}")
     decode_K = 1
@@ -916,14 +1005,15 @@ def qualitative_generate(model: "RefineLM", prompt_bytes: torch.Tensor, gen_len:
         # gen_code_ids_self = code_ids_self[n_prompt_codes_self:]
         # annotated_self = _annotate_bytes_with_codes(out_cond_self[prompt_bytes.numel():], gen_code_ids_self, self_K)
         # log(f"{prefix}level0_cond_self_codes: {annotated_self}  <{gen_code_ids_self.tolist()}>")
-    if ground_truth is not None:
-        log(f"{prefix}ground_truth:        {bytes(ground_truth.tolist())!r}")
+    
     if model.n_levels > 1:
         K0 = model.cfg.Ks[0]
         n_new_codes = gen_len // K0
         if n_new_codes > 0:
             level1_gen = generate_level1_codes(model, prompt_bytes, n_new_codes, device)
             log(f"{prefix}level1_gen:          {level1_gen.tolist()}")
+            level1_gen_decode = generate_level1_codes_via_decode(model, prompt_bytes, n_new_codes, device)
+            log(f"{prefix}level1_gen_decode:   {level1_gen_decode.tolist()}")
             if ground_truth is not None:
                 full_bytes = torch.cat([prompt_bytes.reshape(-1), ground_truth.reshape(-1)])
                 level1_gt = level1_ground_truth_codes(model, full_bytes, prompt_bytes.numel(), device)
@@ -1055,6 +1145,8 @@ def train(model: RefineLM, train_data: torch.Tensor, val_data: torch.Tensor, arg
                     window = src_data[start: start + total_len]
                     qualitative_generate(model, window[: args.qual_prompt_bytes], args.qual_gen_bytes,
                                           window[args.qual_prompt_bytes:], device, log=log, label=label)
+                    check_gen_consistency(model, window, device, prompt_len=args.qual_prompt_bytes,
+                                           log=log, label=label)
 
 
 def _parse_int_tuple(s) -> tuple[int, ...]:
@@ -1092,7 +1184,6 @@ def main():
     p.add_argument("--vocab", type=int, default=256)
     p.add_argument("--share_level_weights", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--decode_separate_stage0", type=lambda x: x.lower() != "false", default=False)
-    p.add_argument("--decode_stage0_recompute", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--quant_type", type=str, default="softmax", choices=["softmax", "bsq"])
     p.add_argument("--bsq_bits", type=int, default=4)
 
@@ -1144,7 +1235,7 @@ def main():
         decode_self_only_aux=args.decode_self_only_aux, cross_track_source=args.cross_track_source,
         decode_self_only_weight=args.decode_self_only_weight, decode_code_ste=args.decode_code_ste,
         vocab=args.vocab, share_level_weights=args.share_level_weights,
-        decode_separate_stage0=args.decode_separate_stage0, decode_stage0_recompute=args.decode_stage0_recompute,
+        decode_separate_stage0=args.decode_separate_stage0,
         quant_type=args.quant_type, bsq_bits=args.bsq_bits,
     )
     model = RefineLM(cfg).to(device)

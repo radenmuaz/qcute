@@ -1,8 +1,7 @@
-"""v5_stack, softmax quant_type, single-level K=1, n_layers=1, gumbel disabled, STE on,
-overfit10k testbed. All NTP loss weights on (decode_ntp_weight=1.0, the default) -- the standard
-level=1 baseline, must pass before trusting any n_levels>1 result (see docs/status.md).
+"""v5_concat, softmax quant_type, single-level K=1, n_layers=1, gumbel disabled, STE on,
+overfit10k testbed. Variant of qcute_v5_concat_overfit10k_k4single.py with Ks=(1,), n_layers=1.
 
-uv run python -m qcute.qcute_v5_stack --config configs/qcute_v5_stack_k1_l1.py
+uv run python -m qcute.qcute_v5_stack --config configs/qcute_v5_stack_1.py
 """
 from pathlib import Path
 
@@ -15,11 +14,15 @@ cross_track_source = "decode"
 decode_code_ste = True
 share_level_weights = False
 use_gumbel_noise = False
+# gumbel_tau = 1.0
 
 decode_separate_stage0 = False
-
+# decode_self_only_aux = True
+# decode_ntp_weight = 0.0
+decode_ntp_weight = 1.0
+# decode_self_only_weight = 1.0
 data = Path("datasets/enwik8_1M.gz")
-n_bytes = 10000
+n_bytes = 1000
 val_frac = 0.1
 
 steps = 1000

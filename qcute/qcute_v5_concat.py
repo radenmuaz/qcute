@@ -95,6 +95,8 @@ class Config:
     cross_track_source: str = "encode"
     decode_self_only_aux: bool = False
     decode_self_only_weight: float = 1.0
+    decode_self_only_dropout: bool = False
+    decode_self_only_dropout_p: float = 0.5
     decode_code_ste: bool = True
     share_level_weights: bool = True
     quant_type: str = "softmax"   # "softmax" (categorical code_head + gumbel/argmax) or "bsq"
@@ -187,7 +189,6 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        self._warned_dense_fallback = False
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
 
@@ -197,47 +198,20 @@ class CausalSelfAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        if window is not None and T % window == 0 and T > window:
-            y = self._forward_chunked(q, k, v, window)
+        if window is not None:
+            # Exact windowed mask, correct for any T -- the old chunked fast path only worked
+            # when T % window == 0 and T > window, silently falling back to DENSE (unwindowed)
+            # attention otherwise. Training always uses a fixed, window-aligned context_len, so
+            # it never hit that fallback; no-cache generation recomputes this on a growing
+            # sequence length that's window-aligned only by rare coincidence, so it almost always
+            # did -- a genuine train/inference computational mismatch (see docs/status.md).
+            pos = torch.arange(T, device=x.device)
+            ti, tj = pos.unsqueeze(1), pos.unsqueeze(0)
+            attn_mask = ((tj <= ti) & (ti - tj < window)).view(1, 1, T, T)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
-            if window is not None and not self._warned_dense_fallback:
-                print(f"WARNING: CausalSelfAttention window={window} set but T={T} doesn't satisfy "
-                      f"T % window == 0 and T > window -- falling back to DENSE attention for this layer.")
-                self._warned_dense_fallback = True
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.out(y.transpose(1, 2).reshape(B, T, D))
-
-    def _chunk_local_window(self, t: torch.Tensor, B: int, H: int, n_chunks: int, W: int, hd: int) -> torch.Tensor:
-        tc = t.view(B, H, n_chunks, W, hd)
-        zero_chunk = torch.zeros(B, H, 1, W, hd, device=t.device, dtype=t.dtype)
-        t_prev = torch.cat([zero_chunk, tc[:, :, :-1]], dim=2)
-        t_local = torch.cat([t_prev, tc], dim=3)
-        return t_local.permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, 2 * W, hd)
-
-    def _causal_window_mask(self, n_chunks: int, W: int, device: torch.device) -> torch.Tensor:
-        i = torch.arange(W, device=device).view(W, 1)
-        j_prev = torch.arange(W, device=device).view(1, W) - W
-        j_cur = torch.arange(W, device=device).view(1, W)
-        key_offset = torch.cat([j_prev, j_cur], dim=1)
-        diff = i - key_offset
-        causal_window = (diff >= 0) & (diff < W)
-        mask_per_chunk = causal_window.unsqueeze(0).expand(n_chunks, W, 2 * W).clone()
-        mask_per_chunk[0, :, 0:W] = False
-        return mask_per_chunk
-
-    def _forward_chunked(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int) -> torch.Tensor:
-        B, H, T, hd = q.shape
-        W = window
-        n_chunks = T // W
-
-        qb = q.view(B, H, n_chunks, W, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, W, hd)
-        kb = self._chunk_local_window(k, B, H, n_chunks, W, hd)
-        vb = self._chunk_local_window(v, B, H, n_chunks, W, hd)
-        mask_per_chunk = self._causal_window_mask(n_chunks, W, q.device)
-        mask_batched = mask_per_chunk.unsqueeze(0).expand(B, n_chunks, W, 2 * W).reshape(B * n_chunks, 1, W, 2 * W)
-
-        yb = F.scaled_dot_product_attention(qb, kb, vb, attn_mask=mask_batched)
-        return yb.view(B, n_chunks, H, W, hd).permute(0, 2, 1, 3, 4).reshape(B, H, T, hd)
 
 
 class Block(nn.Module):
@@ -391,7 +365,8 @@ class LevelLM(nn.Module):
             he_all = he_all[:, :-1, :]
         return he_all, n_units, query_last
 
-    def _packed_decode_forward(self, x0: torch.Tensor, tracks: list[tuple[torch.Tensor, int, int | None]]) -> torch.Tensor:
+    def _packed_decode_forward(self, x0: torch.Tensor, tracks: list[tuple[torch.Tensor, int, int | None]],
+                                return_debug: bool = False):
         cfg = self.cfg
         B, L, D = x0.shape
         H, hd = cfg.n_heads, D // cfg.n_heads
@@ -467,7 +442,12 @@ class LevelLM(nn.Module):
             xe = xe + block.mlp(block.ln2(xe))
 
         he = self.ln_f(xe)
-        return extract(he)
+        out = extract(he)
+        if return_debug:
+            debug = {"true_pos": true_pos, "is_code": is_code, "window_of_key": window_of_key,
+                     "attn_mask": allow, "n_prefix": Le - L, "Le": Le, "L": L}
+            return out, debug
+        return out
 
     def _packed_decode_forward_banded(self, x0: torch.Tensor, tracks: list[tuple[torch.Tensor, int, int | None]],
                                        margin_extra_chunks: int = 1) -> torch.Tensor:
@@ -707,6 +687,7 @@ class LevelLM(nn.Module):
         head_dim = D // cfg.n_heads
 
         query_last = None
+        query_seq = None
         selfcode_ntp_done = False
         if decode_tracks is not None:
             assert len(decode_tracks) >= 1
@@ -718,6 +699,13 @@ class LevelLM(nn.Module):
                     x0, code_kv0, K, w0, extra_query=extra_query)
                 he_blocks = he.view(B, n_units, K + 1, D)
                 query_h = he_blocks[:, :, :-1, :].reshape(-1, D)
+                # query_seq keeps the batch dim (unlike query_h, flattened for the loss) -- this is
+                # the code-slot representation actually used for NTP at every position, needed by
+                # check_gen_consistency's teacher-forced reference. Plain `h` below is byte-slot
+                # (post byte-attendance) and is the WRONG tensor to compare against for this
+                # single-track path -- see docs/qcute_refine_v4_4_1_v4_5_1_math.md /
+                # docs/status.md's byte-slot-vs-code-slot bug.
+                query_seq = he_blocks[:, :, :-1, :].reshape(B, n_units * K, D)
                 h = torch.cat([x0[:, :K, :], he_blocks[:, :, 1:, :].reshape(B, n_units * K, D)], dim=1)
                 if compute_ntp:
                     ntp_loss, ntp_acc = self._ntp_loss_acc(query_h, seq_repr[:, K:], is_byte_level)
@@ -726,8 +714,17 @@ class LevelLM(nn.Module):
                     ntp_acc = h.new_zeros(())
                 selfcode_ntp_done = True
             else:
-                can_chunk = (k0 == 1 and cfg.decode_chunked and cfg.decode_pack_mode == "interleave"
-                             and w0 is not None and L % w0 == 0)
+                # can_chunk's underlying _packed_decode_forward_chunked only takes ONE code_kv
+                # track -- it silently discards every track beyond decode_tracks[0] (the coarser
+                # tracks this branch exists specifically to condition on). len(decode_tracks) == 1
+                # is unreachable here (that case is handled entirely by the branch above), so this
+                # additional check makes can_chunk permanently False in this branch rather than a
+                # real gate -- previously, whenever L happened to be window0-aligned (which it
+                # always is during training, since context_len is fixed and window-divisible),
+                # decode silently trained/ran as self-track-only, masquerading as full multi-track
+                # cond_full. See docs/status.md.
+                can_chunk = (len(decode_tracks) == 1 and k0 == 1 and cfg.decode_chunked
+                             and cfg.decode_pack_mode == "interleave" and w0 is not None and L % w0 == 0)
                 can_band = (cfg.decode_banded and all(w is not None and w < L for _, _, w in decode_tracks))
                 if can_chunk:
                     h = self._packed_decode_forward_chunked(x0, decode_tracks[0][0], w0)
@@ -770,7 +767,7 @@ class LevelLM(nn.Module):
         pre_q = self._classify(pooled)
         c_i = quantize_code(pre_q, cfg)
 
-        return c_i, ntp_loss, ntp_acc, h, query_last
+        return c_i, ntp_loss, ntp_acc, h, query_last, query_seq
 
 
 class RefineLM(nn.Module):
@@ -837,7 +834,7 @@ class RefineLM(nn.Module):
 
         for i in range(self.n_levels):
             want_ntp = compute_ntp and (i == 0 or cfg.code_ntp_weight > 0)
-            c_i, loss_i, acc_i, h_i, _ = self.encode_lms[i](seq_repr, level=i, window=self.windows[i], compute_ntp=want_ntp)
+            c_i, loss_i, acc_i, h_i, _, _ = self.encode_lms[i](seq_repr, level=i, window=self.windows[i], compute_ntp=want_ntp)
             encode_losses.append(loss_i)
             encode_accs.append(acc_i)
             h_list.append(h_i)
@@ -852,6 +849,7 @@ class RefineLM(nn.Module):
         decode_derived_c: dict[int, torch.Tensor] = {}
         h_out = list(h_list)
         next_query: list[torch.Tensor | None] = [None] * self.n_levels
+        query_seq_out: list[torch.Tensor | None] = [None] * self.n_levels
         for i in reversed(range(self.n_levels)):
             L_i = x_list[i].shape[1]
             tracks: list[tuple[torch.Tensor, int, int | None]] = []
@@ -884,28 +882,30 @@ class RefineLM(nn.Module):
             full_tracks = tracks
             if max_decode_sources is not None:
                 full_tracks = full_tracks[:max_decode_sources]
-            c_i2, loss_i2, acc_i2, h_i2, query_last_i = self.decode_lms[i](
+            c_i2, loss_i2, acc_i2, h_i2, query_last_i, query_seq_i = self.decode_lms[i](
                 x_list[i], level=i, window=self.windows[i], compute_ntp=compute_ntp,
                 decode_tracks=full_tracks, extra_query=(want_next_query and i == 0))
             decode_losses[i] = loss_i2
             decode_accs[i] = acc_i2
             h_out[i] = h_i2
             next_query[i] = query_last_i
+            query_seq_out[i] = query_seq_i
             if max_decode_sources is None:
                 decode_derived_c[i] = c_i2
             if cfg.decode_self_only_aux and self.training and max_decode_sources is None and len(tracks) > 1:
-                _, loss_self, acc_self, _, _ = self.decode_lms[i](x_list[i], level=i, window=self.windows[i],
+                _, loss_self, acc_self, _, _, _ = self.decode_lms[i](x_list[i], level=i, window=self.windows[i],
                                                                     compute_ntp=compute_ntp, decode_tracks=tracks[:1])
                 decode_self_only_losses[i] = loss_self
                 decode_self_only_accs[i] = acc_self
 
         return (encode_losses, encode_accs, decode_losses, decode_accs, h_out, c_list,
-                decode_self_only_losses, decode_self_only_accs, next_query)
+                decode_self_only_losses, decode_self_only_accs, next_query, decode_derived_c, query_seq_out)
 
     def forward(self, byte_ids: torch.Tensor) -> tuple[torch.Tensor, dict]:
         cfg = self.cfg
         (encode_losses, encode_accs, decode_losses, decode_accs, h_list, c_list,
-         decode_self_only_losses, decode_self_only_accs, _next_query) = self._run(byte_ids)
+         decode_self_only_losses, decode_self_only_accs, _next_query, _decode_derived_c,
+         _query_seq) = self._run(byte_ids)
 
         byte_loss = decode_losses[0] if decode_losses[0] is not None else encode_losses[0]
         byte_acc = decode_accs[0] if decode_accs[0] is not None else encode_accs[0]
@@ -922,7 +922,18 @@ class RefineLM(nn.Module):
         decode_self_only_total = (cfg.decode_self_only_weight * torch.stack(self_only_terms).sum()
                                    if self_only_terms else byte_loss.new_zeros(()))
 
-        loss = encode_total + decode_total + decode_self_only_total
+        # decode_self_only_dropout: both terms above are always computed (so metrics/logging stay
+        # complete), but only one of {decode_total, decode_self_only_total} enters the backward
+        # loss this step, chosen by a coin flip -- rather than summing both into every step's
+        # gradient (the decode_self_only_aux default). Dropped term is still in `metrics`, just
+        # not in `loss`, so it gets no gradient this step.
+        if cfg.decode_self_only_aux and cfg.decode_self_only_dropout and self.training and self_only_terms:
+            if torch.rand(()).item() < cfg.decode_self_only_dropout_p:
+                loss = encode_total + decode_self_only_total
+            else:
+                loss = encode_total + decode_total
+        else:
+            loss = encode_total + decode_total + decode_self_only_total
         ntp_total = torch.stack(encode_losses + decode_terms + self_only_terms).sum()
         metrics = {
             "loss": loss, "byte_loss": byte_loss, "byte_acc": byte_acc,
@@ -961,7 +972,7 @@ def generate_no_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
         pad_len = (-L) % decode_K
         padded = (torch.cat([all_bytes, all_bytes.new_zeros(all_bytes.shape[0], pad_len)], dim=1)
                   if pad_len > 0 else all_bytes)
-        _, _, _, _, h_list, _, _, _, next_query = model._run(
+        _, _, _, _, h_list, _, _, _, next_query, _decode_derived_c, _query_seq = model._run(
             padded, compute_ntp=False, max_decode_sources=max_decode_sources, want_next_query=(pad_len == 0))
         # next_query[0] is the actual next-byte-predicting representation (see
         # _packed_decode_forward_selfcode's extra_query docstring); h_list[0][:, L-1, :] has
@@ -991,7 +1002,7 @@ def generate_encode_only(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_by
     all_bytes = prompt_bytes
     enc0 = model.encode_lms[0]
     for _ in range(n_new_bytes):
-        _, _, _, h, _ = enc0(all_bytes, level=0, window=model.windows[0], compute_ntp=False)
+        _, _, _, h, _, _ = enc0(all_bytes, level=0, window=model.windows[0], compute_ntp=False)
         next_byte = _sample_next_byte(enc0.embed.weight, h[:, -1, :])
         all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
     if was_training:
@@ -1007,10 +1018,10 @@ def generate_level1_codes(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_c
     if prompt_bytes.dim() == 1:
         prompt_bytes = prompt_bytes.unsqueeze(0)
     enc0, enc1 = model.encode_lms[0], model.encode_lms[1]
-    codes, _, _, _, _ = enc0(prompt_bytes, level=0, window=model.windows[0], compute_ntp=False)
+    codes, _, _, _, _, _ = enc0(prompt_bytes, level=0, window=model.windows[0], compute_ntp=False)
     n_prompt_codes = codes.shape[1]
     for _ in range(n_new_codes):
-        _, _, _, h1, _ = enc1(codes, level=1, window=model.windows[1], compute_ntp=False)
+        _, _, _, h1, _, _ = enc1(codes, level=1, window=model.windows[1], compute_ntp=False)
         if model.cfg.quant_type == "bsq":
             pred = enc1.code_predict(h1[:, -1, :])
             next_code = bsq_quantize(pred, model.cfg.bsq_bits)
@@ -1031,7 +1042,7 @@ def level1_ground_truth_codes(model: "RefineLM", full_bytes: torch.Tensor, promp
         full_bytes = full_bytes.unsqueeze(0)
     enc0 = model.encode_lms[0]
     K0 = model.cfg.Ks[0]
-    c0, _, _, _, _ = enc0(full_bytes, level=0, window=model.windows[0], compute_ntp=False)
+    c0, _, _, _, _, _ = enc0(full_bytes, level=0, window=model.windows[0], compute_ntp=False)
     ids = code_to_ids(c0[0], model.cfg)
     n_prompt_codes = prompt_len // K0
     return ids[n_prompt_codes:]
@@ -1058,13 +1069,56 @@ def _decode_source_codes(model: "RefineLM", full_bytes: torch.Tensor, device: st
         seq_repr = seq_repr.unsqueeze(0)
     c_list = []
     for i in range(model.n_levels):
-        c_i, _, _, _, _ = model.encode_lms[i](seq_repr, level=i, window=model.windows[i], compute_ntp=False)
+        c_i, _, _, _, _, _ = model.encode_lms[i](seq_repr, level=i, window=model.windows[i], compute_ntp=False)
         c_list.append(c_i)
         seq_repr = c_i
     source_c = c_list[level]
     if was_training:
         model.train()
     return code_to_ids(source_c, model.cfg)[0]
+
+
+@torch.no_grad()
+def check_gen_consistency(model: "RefineLM", full_bytes: torch.Tensor, device: str,
+                           prompt_len: int = 32, tol: float = 1e-3, log=print, label: str = "") -> int:
+    """Cheap, reusable correctness check: the incremental no-cache generation code path and the
+    one-shot teacher-forced training forward pass MUST produce identical logits when both are fed
+    the same ground-truth bytes -- any gap is a genuine generation-vs-training bug (this caught
+    two real ones: the windowed-attention dense-fallback and the can_chunk track-dropping bug, see
+    docs/status.md), not exposure bias or model quality. Returns the mismatch count (0 = pass).
+    """
+    was_training = model.training
+    model.eval()
+    full_bytes = full_bytes.to(device)
+    if full_bytes.dim() == 1:
+        full_bytes = full_bytes.unsqueeze(0)
+    L_total = full_bytes.shape[1]
+    embed0 = model.decode_lms[0].embed.weight
+
+    _, _, _, _, h_list_tf, _, _, _, _, _, query_seq_tf = model._run(
+        full_bytes, compute_ntp=False, max_decode_sources=None, want_next_query=False)
+    # query_seq_tf[0] (code-slot, K=1 assumed) is the tensor training's own NTP loss actually reads
+    # for the single-track selfcode-decode path -- h_list_tf[0] (byte-slot) is WRONG there (see
+    # docs/status.md); for the multi-track path query_seq_tf[0] is None and h IS correct, so fall
+    # back to it.
+    query_ref_tf = query_seq_tf[0] if query_seq_tf[0] is not None else h_list_tf[0]
+    logits_tf_all = F.linear(query_ref_tf[0], embed0)  # (L_total-1, vocab); [i] predicts byte i+1
+
+    n_mismatch = 0
+    for t in range(prompt_len, L_total - 1):
+        padded = full_bytes[:, :t]
+        _, _, _, _, h_list_gen, _, _, _, next_query_gen, _, _ = model._run(
+            padded, compute_ntp=False, max_decode_sources=None, want_next_query=True)
+        query_gen = next_query_gen[0] if next_query_gen[0] is not None else h_list_gen[0][:, t - 1, :]
+        logits_gen = F.linear(query_gen[0], embed0)
+        if (logits_gen - logits_tf_all[t - 1]).abs().max().item() >= tol:
+            n_mismatch += 1
+    if was_training:
+        model.train()
+    prefix = f"gen_consistency_{label}" if label else "gen_consistency"
+    log(f"{prefix}: {n_mismatch}/{L_total - 1 - prompt_len} timesteps mismatched "
+        f"(generation vs teacher-forced logits on ground-truth input)")
+    return n_mismatch
 
 
 def qualitative_generate(model: "RefineLM", prompt_bytes: torch.Tensor, gen_len: int,
@@ -1075,6 +1129,8 @@ def qualitative_generate(model: "RefineLM", prompt_bytes: torch.Tensor, gen_len:
     out_uncond = generate_encode_only(model, prompt_bytes, gen_len, device)
     gen_bytes_uncond = bytes(out_uncond[prompt_bytes.numel():].tolist())
     log(f"{prefix}prompt:              {bytes(prompt_bytes.tolist())!r}")
+    if ground_truth is not None:
+        log(f"{prefix}ground_truth:        {bytes(ground_truth.tolist())!r}")
     log(f"{prefix}level0_uncond:       {gen_bytes_uncond!r}")
     log(f"{prefix}level0_cond_full:    {gen_bytes_cond_full!r}")
     decode_K = 1
@@ -1095,8 +1151,6 @@ def qualitative_generate(model: "RefineLM", prompt_bytes: torch.Tensor, gen_len:
         # gen_code_ids_self = code_ids_self[n_prompt_codes_self:]
         # annotated_self = _annotate_bytes_with_codes(out_cond_self[prompt_bytes.numel():], gen_code_ids_self, self_K)
         # log(f"{prefix}level0_cond_self_codes: {annotated_self}  <{gen_code_ids_self.tolist()}>")
-    if ground_truth is not None:
-        log(f"{prefix}ground_truth:        {bytes(ground_truth.tolist())!r}")
     if model.n_levels > 1:
         K0 = model.cfg.Ks[0]
         n_new_codes = gen_len // K0
@@ -1234,6 +1288,8 @@ def train(model: RefineLM, train_data: torch.Tensor, val_data: torch.Tensor, arg
                     window = src_data[start: start + total_len]
                     qualitative_generate(model, window[: args.qual_prompt_bytes], args.qual_gen_bytes,
                                           window[args.qual_prompt_bytes:], device, log=log, label=label)
+                    check_gen_consistency(model, window, device, prompt_len=args.qual_prompt_bytes,
+                                           log=log, label=label)
 
 
 def _parse_int_tuple(s) -> tuple[int, ...]:
@@ -1270,6 +1326,8 @@ def main():
     p.add_argument("--decode_self_only_aux", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--cross_track_source", type=str, default="encode", choices=["encode", "decode"])
     p.add_argument("--decode_self_only_weight", type=float, default=1.0)
+    p.add_argument("--decode_self_only_dropout", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--decode_self_only_dropout_p", type=float, default=0.5)
     p.add_argument("--decode_code_ste", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--vocab", type=int, default=256)
     p.add_argument("--share_level_weights", type=lambda x: x.lower() != "false", default=True)
@@ -1323,7 +1381,9 @@ def main():
         code_extract_mode=args.code_extract_mode, code_head_tied=args.code_head_tied,
         decode_banded=args.decode_banded, decode_self_only_aux=args.decode_self_only_aux,
         cross_track_source=args.cross_track_source,
-        decode_self_only_weight=args.decode_self_only_weight, decode_code_ste=args.decode_code_ste,
+        decode_self_only_weight=args.decode_self_only_weight,
+        decode_self_only_dropout=args.decode_self_only_dropout,
+        decode_self_only_dropout_p=args.decode_self_only_dropout_p, decode_code_ste=args.decode_code_ste,
         vocab=args.vocab, share_level_weights=args.share_level_weights,
         decode_pack_mode=args.decode_pack_mode, decode_chunked=args.decode_chunked,
         quant_type=args.quant_type, bsq_bits=args.bsq_bits,
