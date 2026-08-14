@@ -3,7 +3,7 @@ level0's self-cond collapse is a K=1-specific artifact (self-code is then a loss
 information the cross-attention query already has in full from h_list[0], since there's no block
 boundary for the code to usefully bridge) rather than a general architectural defect.
 
-    uv run python -m qcute.qcute_v5_stack --config configs/qcute_v5_stack_1_k4.py
+    uv run python -m qcute.qcute_v5_stack --config configs/overfit/qcute_v5_stack_1_k4.py
 """
 from pathlib import Path
 

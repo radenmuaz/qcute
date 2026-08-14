@@ -1,7 +1,7 @@
 """v5_concat, softmax quant_type, single-level K=1, n_layers=1, gumbel disabled, STE on,
 overfit10k testbed. Variant of qcute_v5_concat_overfit10k_k4single.py with Ks=(1,), n_layers=1.
 
-uv run python -m qcute.qcute_v5_stack --config configs/qcute_v5_stack_1.py
+uv run python -m qcute.qcute_v5_stack --config configs/overfit/qcute_v5_stack_1.py
 """
 from pathlib import Path
 

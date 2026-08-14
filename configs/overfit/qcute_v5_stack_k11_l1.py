@@ -3,7 +3,7 @@ overfit10k testbed. All NTP loss weights on (decode_ntp_weight=1.0, the default)
 decode_self_only_aux -- the standard level=2 config, run only after
 qcute_v5_stack_k1_l1.py's level=1 baseline passes (see docs/status.md).
 
-uv run python -m qcute.qcute_v5_stack --config configs/qcute_v5_stack_k11_l1.py
+uv run python -m qcute.qcute_v5_stack --config configs/overfit/qcute_v5_stack_k11_l1.py
 """
 from pathlib import Path
 

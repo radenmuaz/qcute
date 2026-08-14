@@ -79,6 +79,8 @@ class Config:
     context_len: int = 1024
     n_heads: int = 4
     mlp_mult: int = 4
+    # scalar, or per-level tuple; each level entry is scalar or (encode_window, decode_window),
+    # where decode_window is scalar or a per-source tuple [self, +1, ..., top]; -1 = unbounded, 0 = drop that source
     attn_window: int | tuple[int, ...] = 32
     rope_base: float = 10000.0
     byte_ntp_weight: float = 1.0
@@ -714,7 +716,13 @@ class LevelLM(nn.Module):
                 query_seq = he_blocks[:, :, :-1, :].reshape(B, n_units * K, D)
                 h = torch.cat([x0[:, :K, :], he_blocks[:, :, 1:, :].reshape(B, n_units * K, D)], dim=1)
                 if compute_ntp:
-                    ntp_loss, ntp_acc = self._ntp_loss_acc(query_h, seq_repr[:, K:], is_byte_level)
+                    # query_h has n_units*K rows (floor-based -- see _packed_decode_forward_selfcode);
+                    # seq_repr[:, K:] has L-K, which only matches when L is an exact multiple of K
+                    # (always true in training, where L==cfg.context_len by construction). Eval can
+                    # see a shorter/ragged L when data is smaller than context_len -- slice the target
+                    # to the same length query_h actually has instead of assuming exact alignment.
+                    target = seq_repr[:, K:K + n_units * K]
+                    ntp_loss, ntp_acc = self._ntp_loss_acc(query_h, target, is_byte_level)
                 else:
                     ntp_loss = h.new_zeros(())
                     ntp_acc = h.new_zeros(())
@@ -850,8 +858,12 @@ class RefineLM(nn.Module):
 
         decode_losses: list = [None] * self.n_levels
         decode_accs: list = [None] * self.n_levels
-        decode_self_only_losses: list = [None] * self.n_levels
-        decode_self_only_accs: list = [None] * self.n_levels
+        # keyed by k (1..len(tracks)-1): the curriculum of partial-track combos below full
+        # conditioning -- {self}, {self, +1}, ..., {self, +1, ..., top-1} (full itself is
+        # decode_losses[i], not repeated here). For n_levels<=2 there's only one possible k (self
+        # alone), so this is identical to the old single self-only aux in that case.
+        decode_self_only_losses: list[dict[int, torch.Tensor]] = [{} for _ in range(self.n_levels)]
+        decode_self_only_accs: list[dict[int, torch.Tensor]] = [{} for _ in range(self.n_levels)]
         decode_derived_c: dict[int, torch.Tensor] = {}
         h_out = list(h_list)
         next_query: list[torch.Tensor | None] = [None] * self.n_levels
@@ -911,10 +923,11 @@ class RefineLM(nn.Module):
             if max_decode_sources is None:
                 decode_derived_c[i] = c_i2
             if cfg.decode_self_only_aux and self.training and max_decode_sources is None and len(tracks) > 1:
-                _, loss_self, acc_self, _, _, _ = self.decode_lms[i](x_list[i], level=i, window=self.windows[i],
-                                                                    compute_ntp=compute_ntp, decode_tracks=tracks[:1])
-                decode_self_only_losses[i] = loss_self
-                decode_self_only_accs[i] = acc_self
+                for k in range(1, len(tracks)):
+                    _, loss_k, acc_k, _, _, _ = self.decode_lms[i](x_list[i], level=i, window=self.windows[i],
+                                                                    compute_ntp=compute_ntp, decode_tracks=tracks[:k])
+                    decode_self_only_losses[i][k] = loss_k
+                    decode_self_only_accs[i][k] = acc_k
 
         return (encode_losses, encode_accs, decode_losses, decode_accs, h_out, c_list,
                 decode_self_only_losses, decode_self_only_accs, next_query, decode_derived_c, query_seq_out)
@@ -936,8 +949,13 @@ class RefineLM(nn.Module):
         decode_total = (cfg.decode_ntp_weight * torch.stack(decode_terms).sum() if decode_terms
                          else byte_loss.new_zeros(()))
 
-        self_only_terms = [l for l in decode_self_only_losses if l is not None]
-        decode_self_only_total = (cfg.decode_self_only_weight * torch.stack(self_only_terms).sum()
+        # mean, not sum: the curriculum can have a variable number of partial-track combos per
+        # level (n_levels-2 of them at the byte level for a deep stack) -- averaging keeps
+        # decode_self_only_weight's meaning stable across different n_levels instead of the loss
+        # term silently growing with depth. For n_levels<=2 there's exactly one term, so mean==sum
+        # and this is identical to the old behavior.
+        self_only_terms = [l for d in decode_self_only_losses for l in d.values()]
+        decode_self_only_total = (cfg.decode_self_only_weight * torch.stack(self_only_terms).mean()
                                    if self_only_terms else byte_loss.new_zeros(()))
 
         # decode_self_only_dropout: both terms above are always computed (so metrics/logging stay
@@ -961,8 +979,8 @@ class RefineLM(nn.Module):
             **{f"level{i}_ntp_acc_encode": a for i, a in enumerate(encode_accs)},
             **{f"level{i}_ntp_loss_decode": l for i, l in enumerate(decode_losses) if l is not None},
             **{f"level{i}_ntp_acc_decode": a for i, a in enumerate(decode_accs) if a is not None},
-            **{f"level{i}_ntp_loss_decode_self": l for i, l in enumerate(decode_self_only_losses) if l is not None},
-            **{f"level{i}_ntp_acc_decode_self": a for i, a in enumerate(decode_self_only_accs) if a is not None},
+            **{f"level{i}_ntp_loss_decode_self_k{k}": l for i, d in enumerate(decode_self_only_losses) for k, l in d.items()},
+            **{f"level{i}_ntp_acc_decode_self_k{k}": a for i, d in enumerate(decode_self_only_accs) for k, a in d.items()},
         }
 
         return loss, metrics
@@ -1201,7 +1219,17 @@ def split_train_val(data: torch.Tensor, val_frac: float) -> tuple[torch.Tensor, 
     return data[:-n_val], data[-n_val:]
 
 
+_warned_short_data: set[int] = set()
+
+
 def sample_context(data: torch.Tensor, batch_size: int, context_len: int, device: str) -> torch.Tensor:
+    if len(data) < context_len and id(data) not in _warned_short_data:
+        _warned_short_data.add(id(data))
+        print(f"WARNING: sample_context data ({len(data)} bytes) is shorter than context_len "
+              f"({context_len}) -- every batch from this split is silently truncated to {len(data)} "
+              f"bytes (e.g. a val split under a large context_len). Not an error by itself (LevelLM's "
+              f"single-track NTP target now matches whatever length actually comes out), but the "
+              f"resulting bpb/loss numbers reflect a shorter context than configured.")
     n = max(1, len(data) - context_len)
     starts = torch.randint(0, n, (batch_size,))
     return torch.stack([data[s:s + context_len] for s in starts]).to(device)

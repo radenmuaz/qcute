@@ -4,7 +4,7 @@ tests whether the self-only auxiliary loss (which trains cleanly, see docs/statu
 crowding out cond_full's shared decode_lms[0] weights when both terms sum into the same step's
 gradient (decode_self_only_dropout is off here, so both losses always backprop together).
 
-uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_selfw0.1.py
+uv run python -m qcute.qcute_v5_concat --config configs/overfit/qcute_v5_concat_selfw0.1.py
 """
 from pathlib import Path
 

@@ -1,16 +1,15 @@
-"""v5_concat, softmax quant_type, two-level K=(1,1), n_layers=1, gumbel disabled, STE on,
-overfit10k testbed. decode_self_only_aux on -- the standard level=2 config, run only after
-qcute_v5_concat_k1_l1.py's level=1 baseline passes (see docs/status.md).
+"""v5_concat, Ks regression grid step 7/12 (simplest->hardest, see CLAUDE.md), Ks=(4,1), n_layers=1,
+1k-byte testbed (n_bytes=1000), 500 steps.
 
-uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_k11_l1.py
+uv run python -m qcute.qcute_v5_concat --config configs/overfit/qcute_v5_concat_ks41_500.py
 """
 from pathlib import Path
 
-Ks = (1,1)
+Ks = (4, 1)
 d_model = 256
 n_layers = 1
 context_len = 256
-attn_window = (32,32)
+attn_window = (32, 32)
 decode_pack_mode = "interleave"
 decode_chunked = True
 cross_track_source = "decode"
@@ -22,10 +21,10 @@ gumbel_tau = 1.0
 decode_self_only_aux = True
 
 data = Path("datasets/enwik8_1M.gz")
-n_bytes = 10000
+n_bytes = 1000
 val_frac = 0.1
 
-steps = 1000
+steps = 500
 batch_size = 16
 lr_peak = 6e-4
 warmup_steps = 100
