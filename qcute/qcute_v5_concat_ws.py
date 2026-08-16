@@ -1,13 +1,34 @@
-"""qcute_v5_concat_slow: dense-attention reference implementation of the "concat" decode mechanism
-(self track's code is packed/concatenated inline into one self-attention sequence). Superseded as
-the default by qcute_v5_concat.py (chronological merged-interleave packing, precomputed banded
-attention, real KV-cache) -- kept as the O(L^2) ground truth these are checked against. Adds
-Config.quant_type: "softmax" (default, unchanged categorical code_head + gumbel/argmax) or "bsq"
-(binary spherical quantization, Config.bsq_bits-wide sign code, straight-through). See
-docs/qcute_refine_v4_4_1_v4_5_1_math.md for the base mechanism (self-code LM continuation,
-unchanged here).
+"""qcute_v5_concat_ws: the weight-sharing variant of "concat" decode (self track's code is packed/concatenated inline into one
+self-attention sequence) using CHRONOLOGICAL MERGED-INTERLEAVE packing -- every track's codes are
+placed at their true time position (a code lands physically right after the last byte of the block
+it summarizes), merged into ONE physically time-ordered buffer per level's decode, instead of the
+old qcute_v5_concat_slow.py's "prepend" scheme (all track prefixes grouped at the buffer front,
+corrected via a separate true_pos array). Because buffer order now IS time order:
+  - causal masking is a plain buffer-index comparison (i>=j) -- no same-position tie-break needed,
+    since a code always sorts strictly after the byte that produced it, so it's automatically
+    invisible to that byte for free (previously handled by an explicit same_pos_code_excluded mask
+    term).
+  - windowed/banded attention slices CONTIGUOUS buffer ranges directly (see _merged_layout,
+    _merged_decode_forward) -- no runtime argsort (unlike qcute_v5_concat_slow.py's banded path,
+    which grouped-then-corrected and needed an argsort to restore time-adjacency before chunking).
+    The one-time index/address construction is still a sort, but it depends only on shape
+    (L, per-track (K, window)), never on data, so it's built once and cached (self._merged_cache),
+    identically for training (fixed L every step) and generate_kv_cache's fixed-size FIFO window
+    (same L reused every generation step).
+  - every level's window is per-track (attn_window's existing per-level decode_window convention,
+    unchanged) -- NOT a single global scalar. A byte key uses the self/track-0 window; a level-j
+    code key uses that track's own window; each key's visibility is `query_true_pos - key_true_pos
+    < that key's own window`, independently per track (matching qcute_v5_stack.py's attn_window
+    semantics, no factor-of-2 fudge unlike the old "prepend" mask).
+Single- and multi-track decode are now ONE mechanism (no more separate selfcode/dense/banded code
+paths) -- a single track is just the T=1 case. See docs/status.md for the design discussion this
+implements. qcute_v5_concat_slow.py is kept as the O(L^2) dense reference this is checked against
+(scripts/test_v5_concat.py). Adds Config.quant_type: "softmax" (default, unchanged categorical
+code_head + gumbel/argmax) or "bsq" (binary spherical quantization, Config.bsq_bits-wide sign code,
+straight-through). Kept as a reference now that qcute_v5_concat.py has had share_level_weights
+pruned to its always-False default.
 
-    uv run python -m qcute.qcute_v5_concat_slow --config configs/overfit/qcute_v5_concat_ks1_1k.py
+    uv run python -m qcute.qcute_v5_concat_ws --config configs/overfit/qcute_v5_concat_ks1_1k.py
 """
 import argparse
 import gzip
@@ -94,16 +115,7 @@ class Config:
     vocab: int = 256
     code_extract_mode: str = "last_h"
     code_head_tied: bool = False
-    decode_pack_mode: str = "interleave"
-    decode_chunked: bool = False
-    decode_banded: bool = False
-    cross_track_source: str = "encode"
-    decode_self_only_aux: bool = False
-    decode_self_only_weight: float = 1.0
-    decode_self_only_dropout: bool = False
-    decode_self_only_dropout_p: float = 0.5
-    decode_code_ste: bool = True
-    share_level_weights: bool = False  # True: one LevelLM (embed, blocks, code_head, encode+decode) shared by every level
+    share_level_weights: bool = False
     quant_type: str = "softmax"   # "softmax" (categorical code_head + gumbel/argmax) or "bsq"
     bsq_bits: int = 4             # code width in bits when quant_type="bsq"
 
@@ -123,21 +135,6 @@ def gumbel_quantize(logits: torch.Tensor, tau: float, use_gumbel_noise: bool = F
 def bsq_quantize(v: torch.Tensor, dq: int) -> torch.Tensor:
     v_unit = F.normalize(v, dim=-1)
     return (v_unit + (torch.sign(v_unit) - v_unit).detach()) / math.sqrt(dq)
-
-
-def quantize_code(pre_q: torch.Tensor, cfg: "Config") -> torch.Tensor:
-    if cfg.quant_type == "bsq":
-        return bsq_quantize(pre_q, cfg.bsq_bits)
-    return gumbel_quantize(pre_q, cfg.gumbel_tau, cfg.use_gumbel_noise)
-
-
-def code_to_ids(source_c: torch.Tensor, cfg: "Config") -> torch.Tensor:
-    """Display-only: packs a bsq bit-vector into an int; argmax for softmax's one-hot."""
-    if cfg.quant_type == "bsq":
-        bits = (source_c > 0).long()
-        weights = 2 ** torch.arange(bits.shape[-1], device=bits.device)
-        return (bits * weights).sum(-1)
-    return source_c.argmax(-1)
 
 
 MAX_PQ_TABLE_DQ = 16   # 2**16 = 65536 rows -- ceiling bsq_bits this table lookup allows
@@ -165,6 +162,119 @@ class CodeEmbed(nn.Module):
         return proxy + (hard - proxy).detach()
 
 
+class QuantScheme:
+    """Uniform interface for code quantization/embedding/prediction, so LevelLM and generation code
+    dispatch through one polymorphic instance (self.quant / stage_lm.quant) instead of branching on
+    cfg.quant_type at every call site. SoftmaxQuant/BSQQuant below are the only two implementations;
+    Config.quant_type selects which one gets built, once, in make_quant."""
+
+    def init_modules(self, D: int, V: int, code_head_tied: bool) -> tuple:
+        """-> (code_head, code_embed, code_predict) nn.Module|None, assigned onto a fresh LevelLM."""
+        raise NotImplementedError
+
+    def quantize(self, pre_q: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def to_ids(self, source_c: torch.Tensor) -> torch.Tensor:
+        """Display-only: packs a bsq bit-vector into an int; argmax for softmax's one-hot."""
+        raise NotImplementedError
+
+    def embed_for_decode(self, stage_lm: "LevelLM", source_c: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def ntp_loss_acc(self, stage_lm: "LevelLM", h_query: torch.Tensor,
+                      target_repr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError
+
+    def embed_input(self, stage_lm: "LevelLM", seq_repr: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def sample_next(self, stage_lm: "LevelLM", h_query: torch.Tensor, vocab: int) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class SoftmaxQuant(QuantScheme):
+    def __init__(self, tau: float, use_gumbel_noise: bool):
+        self.tau = tau
+        self.use_gumbel_noise = use_gumbel_noise
+
+    def init_modules(self, D, V, code_head_tied):
+        code_head = None if code_head_tied else nn.Linear(D, V, bias=False)
+        if code_head is not None:
+            nn.init.normal_(code_head.weight, std=0.02)
+        return code_head, None, None
+
+    def quantize(self, pre_q):
+        return gumbel_quantize(pre_q, self.tau, self.use_gumbel_noise)
+
+    def to_ids(self, source_c):
+        return source_c.argmax(-1)
+
+    def embed_for_decode(self, stage_lm, source_c):
+        return source_c @ stage_lm.embed.weight
+
+    def ntp_loss_acc(self, stage_lm, h_query, target_repr):
+        target = target_repr.argmax(-1).reshape(-1)
+        logits = F.linear(h_query, stage_lm.embed.weight)
+        loss = F.cross_entropy(logits, target)
+        with torch.no_grad():
+            acc = (logits.argmax(-1) == target).float().mean()
+        return loss, acc
+
+    def embed_input(self, stage_lm, seq_repr):
+        return seq_repr @ stage_lm.embed.weight
+
+    def sample_next(self, stage_lm, h_query, vocab):
+        logits = F.linear(h_query, stage_lm.embed.weight)
+        next_id = logits.argmax(-1)
+        return F.one_hot(next_id, num_classes=vocab).to(h_query.dtype)
+
+
+class BSQQuant(QuantScheme):
+    def __init__(self, bsq_bits: int):
+        self.bsq_bits = bsq_bits
+
+    def init_modules(self, D, V, code_head_tied):
+        code_head = nn.Linear(D, self.bsq_bits, bias=False)
+        nn.init.normal_(code_head.weight, std=0.02)
+        code_embed = CodeEmbed(self.bsq_bits, D)
+        code_predict = nn.Linear(D, self.bsq_bits, bias=False)
+        nn.init.normal_(code_predict.weight, std=0.02)
+        return code_head, code_embed, code_predict
+
+    def quantize(self, pre_q):
+        return bsq_quantize(pre_q, self.bsq_bits)
+
+    def to_ids(self, source_c):
+        bits = (source_c > 0).long()
+        weights = 2 ** torch.arange(bits.shape[-1], device=bits.device)
+        return (bits * weights).sum(-1)
+
+    def embed_for_decode(self, stage_lm, source_c):
+        return stage_lm.code_embed(source_c)
+
+    def ntp_loss_acc(self, stage_lm, h_query, target_repr):
+        target_bits = (target_repr.reshape(-1, self.bsq_bits) > 0).float()
+        pred = stage_lm.code_predict(h_query)
+        loss = F.binary_cross_entropy_with_logits(pred, target_bits)
+        with torch.no_grad():
+            acc = ((pred > 0).float() == target_bits).float().mean()
+        return loss, acc
+
+    def embed_input(self, stage_lm, seq_repr):
+        return stage_lm.code_embed(seq_repr)
+
+    def sample_next(self, stage_lm, h_query, vocab):
+        pred = stage_lm.code_predict(h_query)
+        return bsq_quantize(pred, self.bsq_bits)
+
+
+def make_quant(cfg: "Config") -> QuantScheme:
+    if cfg.quant_type == "bsq":
+        return BSQQuant(cfg.bsq_bits)
+    return SoftmaxQuant(cfg.gumbel_tau, cfg.use_gumbel_noise)
+
+
 def rope_cos_sin(seq_len: int, head_dim: int, base: float, device: torch.device):
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     t = torch.arange(seq_len, device=device).float()
@@ -189,6 +299,60 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return x * cos[None, None] + rotate_half(x) * sin[None, None]
 
 
+def chunked_windowed_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int) -> torch.Tensor:
+    """Causal attention restricted to (i - j < window) for a PLAIN (non-interleaved) sequence,
+    computed via chunking (gather current + previous chunk, O(T*window)) instead of materializing
+    a dense T x T mask (O(T^2)). Produces bit-identical results to the dense
+    causal & (i-j<window) mask -- see docs/status.md's windowed-attention efficiency review.
+
+    Fast path requires T % window == 0 (always true during training, where context_len is built
+    to divide evenly -- see RefineLM.__init__); falls back to the dense mask (correct for any T,
+    same as the original qcute_v5_concat.py) otherwise, which no-cache generation's ragged, growing
+    T can hit.
+    """
+    B, H, T, hd = q.shape
+    w = window
+    device = q.device
+    if T <= w:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    if T % w != 0:
+        pos = torch.arange(T, device=device)
+        ti, tj = pos.unsqueeze(1), pos.unsqueeze(0)
+        attn_mask = ((tj <= ti) & (ti - tj < w)).view(1, 1, T, T)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+
+    n_chunks = T // w
+    qb = q.view(B, H, n_chunks, w, hd)
+    kb = k.view(B, H, n_chunks, w, hd)
+    vb = v.view(B, H, n_chunks, w, hd)
+    pad_k = torch.zeros(B, H, 1, w, hd, device=device, dtype=k.dtype)
+    pad_v = torch.zeros(B, H, 1, w, hd, device=device, dtype=v.dtype)
+    k_ext = torch.cat([pad_k, kb], dim=2)
+    v_ext = torch.cat([pad_v, vb], dim=2)
+
+    idx = torch.arange(n_chunks, device=device).view(n_chunks, 1) + torch.arange(2, device=device).view(1, 2)
+    k_win = k_ext[:, :, idx].reshape(B, H, n_chunks, 2 * w, hd)
+    v_win = v_ext[:, :, idx].reshape(B, H, n_chunks, 2 * w, hd)
+
+    pos = torch.arange(T, device=device)
+    pos_b = pos.view(n_chunks, w)
+    pad_pos = torch.full((1, w), -10 ** 9, device=device, dtype=pos.dtype)
+    pos_ext = torch.cat([pad_pos, pos_b], dim=0)
+    pos_win = pos_ext[idx].reshape(n_chunks, 2 * w)
+
+    ti = pos_b.unsqueeze(-1)
+    tj = pos_win.unsqueeze(1)
+    allow = (tj <= ti) & (ti - tj < w)
+    mask_flat = allow.view(1, n_chunks, 1, w, 2 * w).expand(B, n_chunks, 1, w, 2 * w).reshape(B * n_chunks, 1, w, 2 * w)
+
+    qb_flat = qb.permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, w, hd)
+    k_win_flat = k_win.permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, 2 * w, hd)
+    v_win_flat = v_win.permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, 2 * w, hd)
+
+    y = F.scaled_dot_product_attention(qb_flat, k_win_flat, v_win_flat, attn_mask=mask_flat)
+    return y.view(B, n_chunks, H, w, hd).permute(0, 2, 1, 3, 4).reshape(B, H, T, hd)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
@@ -204,16 +368,7 @@ class CausalSelfAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         if window is not None:
-            # Exact windowed mask, correct for any T -- the old chunked fast path only worked
-            # when T % window == 0 and T > window, silently falling back to DENSE (unwindowed)
-            # attention otherwise. Training always uses a fixed, window-aligned context_len, so
-            # it never hit that fallback; no-cache generation recomputes this on a growing
-            # sequence length that's window-aligned only by rare coincidence, so it almost always
-            # did -- a genuine train/inference computational mismatch (see docs/status.md).
-            pos = torch.arange(T, device=x.device)
-            ti, tj = pos.unsqueeze(1), pos.unsqueeze(0)
-            attn_mask = ((tj <= ti) & (ti - tj < window)).view(1, 1, T, T)
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            y = chunked_windowed_attention(q, k, v, window)
         else:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.out(y.transpose(1, 2).reshape(B, T, D))
@@ -238,28 +393,41 @@ class Block(nn.Module):
         return x
 
 
+_warned_thin_window: set[tuple[int, ...]] = set()
+
+
+def _warn_thin_window(tracks: list[tuple[torch.Tensor, int, int | None]], window: int, min_codes: int = 2) -> None:
+    """Cumulative code coverage a banded decode window actually buys, across all tracks (levels):
+    codes_in_window[j] ~= window // K_j, summed. Below min_codes the window is thinner than the
+    minimum useful conditioning (2 codes = the self-code LM-continuation floor used everywhere
+    else in this codebase) -- almost certainly starving the model of the coarser-level context the
+    multi-track decode exists to provide. Not a correctness check (attention is exact for whatever
+    window is set); this is due diligence the caller owns, same spirit as sample_context's warning."""
+    key = tuple(K for _, K, _ in tracks) + (window,)
+    if key in _warned_thin_window:
+        return
+    total_codes = sum(max(0, window // K) for _, K, _ in tracks)
+    if total_codes < min_codes:
+        _warned_thin_window.add(key)
+        Ks_str = ",".join(str(K) for _, K, _ in tracks)
+        print(f"WARNING: banded decode window={window} covers only ~{total_codes} cumulative code(s) "
+              f"across tracks Ks=({Ks_str}) -- below min_codes={min_codes}. Coarser-level context is "
+              f"likely starved; consider a larger attn_window decode_window for these levels.")
+
+
 class LevelLM(nn.Module):
 
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
+        self.quant = make_quant(cfg)
         D = cfg.d_model
         V = cfg.vocab
         self.embed = nn.Embedding(V, D)
         nn.init.normal_(self.embed.weight, std=0.02)
         self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
         self.ln_f = nn.LayerNorm(D)
-        if cfg.quant_type == "bsq":
-            self.code_head = nn.Linear(D, cfg.bsq_bits, bias=False)
-            nn.init.normal_(self.code_head.weight, std=0.02)
-            self.code_embed = CodeEmbed(cfg.bsq_bits, D)
-            self.code_predict = nn.Linear(D, cfg.bsq_bits, bias=False)
-            nn.init.normal_(self.code_predict.weight, std=0.02)
-        else:
-            self.code_head = None if cfg.code_head_tied else nn.Linear(D, V, bias=False)
-            if self.code_head is not None:
-                nn.init.normal_(self.code_head.weight, std=0.02)
-            self.code_embed = self.code_predict = None
+        self.code_head, self.code_embed, self.code_predict = self.quant.init_modules(D, V, cfg.code_head_tied)
         self.code_query = self.code_out = self.query_embed = None
         if cfg.code_extract_mode == "light_query_attn":
             self.code_query = nn.Parameter(torch.zeros(D))
@@ -270,6 +438,7 @@ class LevelLM(nn.Module):
             nn.init.normal_(self.query_embed, std=0.02)
         self.decode_bos = nn.Parameter(torch.zeros(D))
         nn.init.normal_(self.decode_bos, std=0.02)
+        self._merged_cache: dict = {}   # (L, tracks_meta, device) -> structural tensors, see _merged_layout
 
     def _classify(self, pooled: torch.Tensor) -> torch.Tensor:
         return self.code_head(pooled) if self.code_head is not None else F.linear(pooled, self.embed.weight)
@@ -317,346 +486,209 @@ class LevelLM(nn.Module):
         he_blocks = he.view(B, n_blocks, K + 1, D)
         return he_blocks[:, :, K, :]
 
-    def _packed_decode_forward_selfcode(self, x0: torch.Tensor, code_kv: torch.Tensor, K: int,
-                                         window: int | None, extra_query: bool = False
-                                         ) -> tuple[torch.Tensor, int, torch.Tensor | None]:
-        """code_kv[b] predicts block b+1, not block b -- see docs/qcute_refine_v4_4_1_v4_5_1_math.md.
+    def _merged_layout(self, L: int, tracks_meta: tuple[tuple[int, int | None], ...],
+                        device: torch.device) -> dict:
+        """Chronological merged-interleave layout: every track's codes land at their true time
+        position (right after the last byte of the block they summarize), merged with the raw byte
+        stream into ONE physically time-ordered buffer -- so causal masking is a plain buffer-index
+        comparison (a tied code always sorts strictly after the byte that produced it, so it's
+        automatically invisible to that byte, no same-position exclusion term needed) and windowed
+        attention can slice CONTIGUOUS buffer ranges with no runtime sort. This depends only on
+        shape (L, each track's (K, window)), never on data, so it's built once per signature and
+        cached (self._merged_cache) -- identical cost whether called every training step (fixed L)
+        or every generate_kv_cache step (same fixed FIFO-window L reused every step)."""
+        key = (L, tracks_meta, str(device))
+        cached = self._merged_cache.get(key)
+        if cached is not None:
+            return cached
+        T = len(tracks_meta)
+        byte_true_pos = torch.arange(L, device=device)
+        byte_category = torch.zeros(L, dtype=torch.long, device=device)
 
-        extra_query=True appends code_kv's last (otherwise-unused) code as a bare trailing query
-        token with no following byte block, and returns its post-attention state as query_last --
-        see qcute_v5_stack.py's selfcode_decode docstring for why generate_no_cache needs this
-        instead of sampling from the byte-slot `h`.
-        """
-        cfg = self.cfg
-        B, L, D = x0.shape
-        H, hd = cfg.n_heads, D // cfg.n_heads
-        device = x0.device
-        n_blocks = L // K
-        n_units = n_blocks - 1
-        assert n_units >= 1, f"self-code LM-continuation decode needs at least 2 blocks (n_blocks={n_blocks})"
-        # Floor, not exact-divide: L is a clean multiple of K during training (see RefineLM.__init__),
-        # but generation's growing prefix rarely is. Drop the ragged tail here -- it belongs to a
-        # block that isn't complete yet and can't get a self-code-conditioned representation; the
-        # caller (RefineLM._run) splices the corresponding tail of the plain encode-only h back in.
-        x0 = x0[:, :n_blocks * K, :]
-        x0_blocks = x0.view(B, n_blocks, K, D)
-        codes = code_kv[:, :n_units, :]
-        blocks_ = x0_blocks[:, 1:, :, :]
-        combined = torch.cat([codes.unsqueeze(2), blocks_], dim=2).view(B, n_units * (K + 1), D)
-        Le = n_units * (K + 1)
-        if extra_query:
-            last_code = code_kv[:, n_units:n_units + 1, :]
-            combined = torch.cat([combined, last_code], dim=1)
-            Le += 1
-        true_pos = torch.arange(Le, device=device)
-        cos, sin = rope_cos_sin(Le, hd, cfg.rope_base, device)
-
-        ti = true_pos.unsqueeze(1)
-        tj = true_pos.unsqueeze(0)
-        causal = tj <= ti
-        allow = causal & ((ti - tj) < window) if window is not None else causal
-        attn_mask = allow.view(1, 1, Le, Le)
-
-        xe = combined
-        for block in self.blocks:
-            xn = block.ln1(xe)
-            qkv = block.attn.qkv(xn).reshape(B, Le, 3, H, hd).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
-            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-            a = block.attn.out(y.transpose(1, 2).reshape(B, Le, D))
-            xe = xe + a
-            xe = xe + block.mlp(block.ln2(xe))
-        he_all = self.ln_f(xe)
-
-        query_last = None
-        if extra_query:
-            query_last = he_all[:, -1, :]
-            he_all = he_all[:, :-1, :]
-        return he_all, n_units, query_last
-
-    def _packed_decode_forward(self, x0: torch.Tensor, tracks: list[tuple[torch.Tensor, int, int | None]],
-                                return_debug: bool = False):
-        # Always called with len(tracks) >= 2 (LevelLM.forward routes the single-track case to
-        # _packed_decode_forward_selfcode instead), so there is exactly one code path here -- the
-        # flat "prepend" layout, used regardless of cfg.decode_pack_mode's string value.
-        assert len(tracks) >= 2, "single-track decode must go through _packed_decode_forward_selfcode"
-        cfg = self.cfg
-        B, L, D = x0.shape
-        H, hd = cfg.n_heads, D // cfg.n_heads
-        device = x0.device
-        byte_pos = torch.arange(L, device=device)
-
-        prefix_parts, true_pos_parts, window_parts = [], [], []
-        for code_kv, K, window in tracks:
-            # Floor, not exact-divide: during generation L grows byte-by-byte and is rarely a
-            # multiple of K. n_blocks = L // K is the number of complete blocks currently available
-            # -- a trailing partial block simply isn't given a prefix slot yet, never
-            # padded/fabricated. Training always has L a clean multiple of every track's K (see
-            # RefineLM.__init__ / _run's track-building loop), so the floor is a no-op there.
-            #
-            # n_avail = min(n_blocks, code_kv.shape[1]) prefixes get built, at true_pos
-            # [-1, K-1, 2K-1, ..., n_avail*K-1] with values [bos, code_kv[0], ..., code_kv[n_avail-1]]
-            # -- i.e. one prefix slot PER code, including code_kv[n_avail-1] itself (the freshest
-            # complete block), not code_kv[:-1]. That last slot sits at true_pos = n_avail*K - 1,
-            # right before the next (currently incomplete) block's bytes start -- exactly the
-            # conditioning a mid-block generation query needs and, without it, silently lacked
-            # (invisible in training/one-shot teacher-forcing, where n_blocks is always large enough
-            # that this slot gets built anyway as part of a later, still-unused prefix; only a short,
-            # growing generation prefix exposes the gap). code_kv can be shorter than n_blocks for a
-            # decode-derived coarser track (its own LM-continuation shifts it by one) -- n_avail
-            # simply clamps to what's actually there.
+        code_true_pos_parts, code_category_parts, code_window_parts, n_blocks_list = [], [], [], []
+        for j, (K, window) in enumerate(tracks_meta):
             n_blocks = L // K
-            n_avail = min(n_blocks, code_kv.shape[1])
-            W = window if window is not None else L
-            bos = self.decode_bos.view(1, 1, D).expand(B, 1, D)
-            prefixes = torch.cat([bos, code_kv[:, :n_avail, :]], dim=1)
-            prefix_parts.append(prefixes)
-            true_pos_parts.append(torch.arange(n_avail + 1, device=device) * K - 1)
-            window_parts.append(torch.full((n_avail + 1,), float(W), device=device))
-        prefix_parts, true_pos_parts, window_parts = prefix_parts[::-1], true_pos_parts[::-1], window_parts[::-1]
+            n_blocks_list.append(n_blocks)
+            tp = torch.cat([torch.full((1,), -1, dtype=torch.long, device=device),
+                             (torch.arange(n_blocks, device=device) + 1) * K - 1])
+            code_true_pos_parts.append(tp)
+            code_category_parts.append(torch.full((n_blocks + 1,), j + 1, dtype=torch.long, device=device))
+            wv = float(window) if window is not None else float(L)
+            code_window_parts.append(torch.full((n_blocks + 1,), wv, device=device))
+        code_true_pos = (torch.cat(code_true_pos_parts) if T > 0
+                          else torch.empty(0, dtype=torch.long, device=device))
+        code_category = (torch.cat(code_category_parts) if T > 0
+                          else torch.empty(0, dtype=torch.long, device=device))
+        code_window = torch.cat(code_window_parts) if T > 0 else torch.empty(0, device=device)
 
-        all_prefixes = torch.cat(prefix_parts, dim=1)
-        n_prefix = all_prefixes.shape[1]
-        prefix_true_pos = torch.cat(true_pos_parts, dim=0)
-        prefix_window = torch.cat(window_parts, dim=0)
-        byte_window = tracks[0][2] if tracks[0][2] is not None else L
+        total_true_pos = torch.cat([byte_true_pos, code_true_pos])
+        total_category = torch.cat([byte_category, code_category])
+        # byte (category 0) always sorts before any code (category >=1) at the same true_pos --
+        # this single sort key is what makes the same-position exclusion automatic (see docstring).
+        sort_key = (total_true_pos + 1) * (T + 2) + total_category
+        perm = torch.argsort(sort_key, stable=True)
 
-        combined = torch.cat([all_prefixes, x0], dim=1)
-        true_pos = torch.cat([prefix_true_pos, byte_pos], dim=0)
-        is_code = torch.cat([torch.ones(n_prefix, dtype=torch.bool, device=device),
-                              torch.zeros(L, dtype=torch.bool, device=device)])
-        window_of_key = torch.cat([prefix_window, torch.full((L,), float(byte_window), device=device)])
-        Le = n_prefix + L
-        extract = lambda he: he[:, n_prefix:, :]
+        w0 = tracks_meta[0][1] if tracks_meta[0][1] is not None else L
+        byte_window = torch.full((L,), float(w0), device=device)
+        total_window = torch.cat([byte_window, code_window])
 
-        cos, sin = rope_cos_sin_for_positions(true_pos.clamp(min=0), hd, cfg.rope_base, device)
+        true_pos_sorted = total_true_pos[perm]
+        window_of_slot = total_window[perm]
+        Le = L + code_true_pos.shape[0]
+        # NTP query extraction: byte t's training/generation query is NOT byte t's own buffer slot
+        # -- it's the LAST buffer entry sharing true_pos==t (itself, or a tied code if one
+        # completes exactly there), matching qcute_v5_concat_slow.py's query_seq mechanism (a
+        # just-completed code's own state is what predicts the immediately-following byte, per
+        # docs/qcute_refine_v4_4_1_v4_5_1_math.md's LM-continuation). true_pos_sorted is sorted and
+        # every byte value 0..L-1 is present (bytes alone already cover the full range), so the
+        # last buffer index with true_pos<=t equals the last one with true_pos==t exactly --
+        # searchsorted gives this in one op, no scatter needed.
+        extract_pos = torch.searchsorted(true_pos_sorted, torch.arange(L, device=device), right=True) - 1
+        struct = dict(perm=perm, extract_pos=extract_pos, true_pos_sorted=true_pos_sorted,
+                      window_of_slot=window_of_slot, Le=Le, n_blocks_list=n_blocks_list)
 
-        ti = true_pos.unsqueeze(1)
-        tj = true_pos.unsqueeze(0)
-        key_is_code = is_code.unsqueeze(0)
-        causal = tj <= ti
-        same_pos_code_excluded = ~(key_is_code & (tj == ti))
-        windowed = (ti - tj) < (2 * window_of_key.unsqueeze(0))
-        allow = causal & same_pos_code_excluded & windowed
-        attn_mask = allow.view(1, 1, Le, Le)
+        finite_windows = [w for _, w in tracks_meta if w is not None]
+        if finite_windows:
+            sc = max(1, min(min(finite_windows), Le))
+            n_chunks = -(-Le // sc)
+            Lp = n_chunks * sc
+            pad_len = Lp - Le
+            W_max = max((w if w is not None else Le) for _, w in tracks_meta)
+            n_prev_chunks = min(max(1, -(-W_max // sc)), max(0, n_chunks - 1))
 
-        xe = combined
-        for block in self.blocks:
-            xn = block.ln1(xe)
-            qkv = block.attn.qkv(xn).reshape(B, Le, 3, H, hd).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
-            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-            a = block.attn.out(y.transpose(1, 2).reshape(B, Le, D))
-            xe = xe + a
-            xe = xe + block.mlp(block.ln2(xe))
+            true_pos_p, window_p = true_pos_sorted, window_of_slot
+            if pad_len > 0:
+                true_pos_p = F.pad(true_pos_p, (0, pad_len), value=-10 ** 9)
+                window_p = F.pad(window_p, (0, pad_len), value=0.0)
+            pos_b = true_pos_p.view(n_chunks, sc)
+            win_b = window_p.view(n_chunks, sc)
+            pad_pos = torch.full((n_prev_chunks, sc), -10 ** 9, device=device, dtype=pos_b.dtype)
+            pad_win = torch.zeros((n_prev_chunks, sc), device=device, dtype=win_b.dtype)
+            pos_ext = torch.cat([pad_pos, pos_b], dim=0)
+            win_ext = torch.cat([pad_win, win_b], dim=0)
+            idx = (torch.arange(n_chunks, device=device).view(n_chunks, 1)
+                   + torch.arange(n_prev_chunks + 1, device=device).view(1, n_prev_chunks + 1))
+            Kc = (n_prev_chunks + 1) * sc
+            pos_win = pos_ext[idx].reshape(n_chunks, Kc)
+            win_win = win_ext[idx].reshape(n_chunks, Kc)
 
-        he = self.ln_f(xe)
-        out = extract(he)
-        if return_debug:
-            debug = {"true_pos": true_pos, "is_code": is_code, "window_of_key": window_of_key,
-                     "attn_mask": allow, "n_prefix": Le - L, "Le": Le, "L": L}
-            return out, debug
-        return out
+            ti = pos_b.unsqueeze(-1)
+            tj = pos_win.unsqueeze(1)
+            # Own chunk occupies the LAST sc columns of the gathered Kc range (idx's own-chunk
+            # offset is n_prev_chunks); prior chunks are entirely in the past (always causal) and
+            # entries within the flattened Kc range are already in strict buffer order, so a plain
+            # local column<=row comparison over the own-chunk slice reproduces buffer-index
+            # causality -- no true_pos tie-break needed (see _merged_layout's docstring).
+            local_row = torch.arange(sc, device=device).view(1, sc, 1)
+            local_col = torch.arange(Kc, device=device).view(1, 1, Kc) - n_prev_chunks * sc
+            causal = local_col <= local_row
+            windowed = (ti - tj) < win_win.unsqueeze(1)
+            allow = causal & windowed
+            struct.update(sc=sc, n_chunks=n_chunks, Lp=Lp, pad_len=pad_len,
+                          n_prev_chunks=n_prev_chunks, idx=idx, Kc=Kc,
+                          chunk_mask=allow.view(1, n_chunks, 1, sc, Kc))
+        self._merged_cache[key] = struct
+        return struct
 
-    def _packed_decode_forward_banded(self, x0: torch.Tensor, tracks: list[tuple[torch.Tensor, int, int | None]],
-                                       margin_extra_chunks: int = 1) -> torch.Tensor:
+    def _merged_decode_forward(self, x0: torch.Tensor, tracks: list[tuple[torch.Tensor, int, int | None]],
+                                extra_query: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Chronological merged-interleave decode -- handles 1..N tracks uniformly (no separate
+        single-track code path). Builds the merged buffer via a pure gather using _merged_layout's
+        cached permutation (no sort at forward-call time), runs dense or windowed/banded attention
+        over it, and extracts each byte t's NTP-training query via the cached extract_pos: the
+        LAST buffer entry sharing true_pos==t, which is a just-completed code's state when one
+        ties there (matching qcute_v5_concat_slow.py's query_seq mechanism -- a code's own state
+        is what predicts the immediately-following byte) or the byte's own state otherwise.
+        extra_query=True additionally returns the buffer's chronologically LAST hidden state as
+        query_last -- the same idea applied at the sequence's current end, for generation -- for
+        ANY number of tracks, not just the old single-track case."""
         cfg = self.cfg
         B, L, D = x0.shape
         H, hd = cfg.n_heads, D // cfg.n_heads
         device = x0.device
-        byte_pos = torch.arange(L, device=device)
+        tracks_meta = tuple((K, window) for _, K, window in tracks)
+        struct = self._merged_layout(L, tracks_meta, device)
+        perm, extract_pos, Le = struct["perm"], struct["extract_pos"], struct["Le"]
 
-        prefix_parts, true_pos_parts, window_parts = [], [], []
-        for code_kv, K, window in tracks:
-            assert L % K == 0
-            n_blocks = L // K
-            W = window if window is not None else L
+        code_parts = []
+        for j, (code_kv, K, _window) in enumerate(tracks):
+            n_blocks = struct["n_blocks_list"][j]
             bos = self.decode_bos.view(1, 1, D).expand(B, 1, D)
-            prefixes = torch.cat([bos, code_kv[:, :-1, :]], dim=1)
-            prefix_parts.append(prefixes)
-            true_pos_parts.append(torch.arange(n_blocks, device=device) * K - 1)
-            window_parts.append(torch.full((n_blocks,), float(W), device=device))
-        prefix_parts, true_pos_parts, window_parts = prefix_parts[::-1], true_pos_parts[::-1], window_parts[::-1]
+            code_parts.append(torch.cat([bos, code_kv[:, :n_blocks, :]], dim=1))
+        all_code = torch.cat(code_parts, dim=1) if code_parts else x0.new_zeros(B, 0, D)
+        unordered = torch.cat([x0, all_code], dim=1)
+        combined = unordered[:, perm, :]
 
-        all_prefixes = torch.cat(prefix_parts, dim=1)
-        n_prefix = all_prefixes.shape[1]
-        prefix_true_pos = torch.cat(true_pos_parts, dim=0)
-        prefix_window = torch.cat(window_parts, dim=0)
-        byte_window = tracks[0][2] if tracks[0][2] is not None else L
+        finite_windows = [w for _, w in tracks_meta if w is not None]
+        use_chunked = bool(finite_windows) and "sc" in struct and Le > struct["sc"]
 
-        combined = torch.cat([all_prefixes, x0], dim=1)
-        true_pos = torch.cat([prefix_true_pos, byte_pos], dim=0)
-        is_code = torch.cat([torch.ones(n_prefix, dtype=torch.bool, device=device),
-                              torch.zeros(L, dtype=torch.bool, device=device)])
-        window_of_key = torch.cat([prefix_window, torch.full((L,), float(byte_window), device=device)])
-        Le = n_prefix + L
+        if not use_chunked:
+            cos, sin = rope_cos_sin_for_positions(struct["true_pos_sorted"].clamp(min=0), hd, cfg.rope_base, device)
+            fully_causal = not finite_windows
+            attn_mask = None
+            if not fully_causal:
+                ti = struct["true_pos_sorted"].unsqueeze(1)
+                tj = struct["true_pos_sorted"].unsqueeze(0)
+                buf_i = torch.arange(Le, device=device).unsqueeze(1)
+                buf_j = torch.arange(Le, device=device).unsqueeze(0)
+                causal = buf_j <= buf_i
+                windowed = (ti - tj) < struct["window_of_slot"].unsqueeze(0)
+                attn_mask = (causal & windowed).view(1, 1, Le, Le)
 
-        sort_key = true_pos * 2 + is_code.long()
-        perm = torch.argsort(sort_key)
-        inv_perm = torch.empty_like(perm)
-        inv_perm[perm] = torch.arange(Le, device=device)
+            xe = combined
+            for block in self.blocks:
+                xn = block.ln1(xe)
+                qkv = block.attn.qkv(xn).reshape(B, Le, 3, H, hd).permute(2, 0, 3, 1, 4)
+                q, k, v = qkv[0], qkv[1], qkv[2]
+                q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+                if fully_causal:
+                    y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                else:
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+                a = block.attn.out(y.transpose(1, 2).reshape(B, Le, D))
+                xe = xe + a
+                xe = xe + block.mlp(block.ln2(xe))
+            he = self.ln_f(xe)
+        else:
+            sc, n_chunks, Lp, pad_len = struct["sc"], struct["n_chunks"], struct["Lp"], struct["pad_len"]
+            n_prev_chunks, idx, Kc = struct["n_prev_chunks"], struct["idx"], struct["Kc"]
+            _warn_thin_window(tracks, sc)
+            xe = combined
+            true_pos_p = struct["true_pos_sorted"]
+            if pad_len > 0:
+                xe = F.pad(xe, (0, 0, 0, pad_len))
+                true_pos_p = F.pad(true_pos_p, (0, pad_len), value=0)
+            cos, sin = rope_cos_sin_for_positions(true_pos_p.clamp(min=0), hd, cfg.rope_base, device)
+            for block in self.blocks:
+                xn = block.ln1(xe)
+                qkv = block.attn.qkv(xn).reshape(B, Lp, 3, H, hd).permute(2, 0, 3, 1, 4)
+                q, k, v = qkv[0], qkv[1], qkv[2]
+                q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
 
-        true_pos_s = true_pos[perm]
-        is_code_s = is_code[perm]
-        window_of_key_s = window_of_key[perm]
-        combined_s = combined[:, perm, :]
+                qb = q.view(B, H, n_chunks, sc, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, sc, hd)
+                kb_flat = k.view(B, H, n_chunks, sc, hd)
+                vb_flat = v.view(B, H, n_chunks, sc, hd)
+                pad_k = torch.zeros(B, H, n_prev_chunks, sc, hd, device=device, dtype=k.dtype)
+                pad_v = torch.zeros(B, H, n_prev_chunks, sc, hd, device=device, dtype=v.dtype)
+                k_ext = torch.cat([pad_k, kb_flat], dim=2)
+                v_ext = torch.cat([pad_v, vb_flat], dim=2)
+                k_win = k_ext[:, :, idx].reshape(B, H, n_chunks, Kc, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, Kc, hd)
+                v_win = v_ext[:, :, idx].reshape(B, H, n_chunks, Kc, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, Kc, hd)
 
-        W_max = float(window_of_key.max().item())
-        R = 2.0 * W_max
+                mask_batched = struct["chunk_mask"].expand(B, n_chunks, 1, sc, Kc).reshape(B * n_chunks, 1, sc, Kc)
+                yb = F.scaled_dot_product_attention(qb, k_win, v_win, attn_mask=mask_batched)
+                y = yb.view(B, n_chunks, H, sc, hd).permute(0, 2, 1, 3, 4).reshape(B, H, Lp, hd)
 
-        sc = max(1, int(tracks[0][1]))
-        n_chunks = -(-Le // sc)
-        pad_len = n_chunks * sc - Le
-        if pad_len > 0:
-            combined_s = F.pad(combined_s, (0, 0, 0, pad_len))
-            true_pos_s = F.pad(true_pos_s, (0, pad_len), value=1e9)
-            is_code_s = F.pad(is_code_s, (0, pad_len), value=False)
-            window_of_key_s = F.pad(window_of_key_s, (0, pad_len), value=0.0)
-        Lp = n_chunks * sc
+                a = block.attn.out(y.transpose(1, 2).reshape(B, Lp, D))
+                xe = xe + a
+                xe = xe + block.mlp(block.ln2(xe))
+            he = self.ln_f(xe)[:, :Le, :]
 
-        max_ties_per_pos = len(tracks) + 1
-        n_prev_chunks = max(1, int(math.ceil(max_ties_per_pos * R / sc)) + margin_extra_chunks)
-
-        cos, sin = rope_cos_sin_for_positions(true_pos_s.clamp(min=0), hd, cfg.rope_base, device)
-
-        pos_b = true_pos_s.view(n_chunks, sc)
-        code_b = is_code_s.view(n_chunks, sc)
-        win_b = window_of_key_s.view(n_chunks, sc)
-        pad_pos = torch.full((n_prev_chunks, sc), -1e9, device=device, dtype=pos_b.dtype)
-        pad_code = torch.zeros(n_prev_chunks, sc, dtype=torch.bool, device=device)
-        pad_win = torch.zeros(n_prev_chunks, sc, device=device, dtype=win_b.dtype)
-        pos_ext = torch.cat([pad_pos, pos_b], dim=0)
-        code_ext = torch.cat([pad_code, code_b], dim=0)
-        win_ext = torch.cat([pad_win, win_b], dim=0)
-
-        idx = (torch.arange(n_chunks, device=device).view(n_chunks, 1)
-               + torch.arange(n_prev_chunks + 1, device=device).view(1, n_prev_chunks + 1))
-        Kc = (n_prev_chunks + 1) * sc
-        pos_win = pos_ext[idx].reshape(n_chunks, Kc)
-        code_win = code_ext[idx].reshape(n_chunks, Kc)
-        win_win = win_ext[idx].reshape(n_chunks, Kc)
-
-        ti = pos_b.unsqueeze(-1)
-        tj = pos_win.unsqueeze(1)
-        key_is_code = code_win.unsqueeze(1)
-        key_window = win_win.unsqueeze(1)
-        causal = tj <= ti
-        same_pos_excl = ~(key_is_code & (tj == ti))
-        windowed = (ti - tj) < (2.0 * key_window)
-        allow = causal & same_pos_excl & windowed
-        attn_mask = allow.view(1, n_chunks, 1, sc, Kc)
-
-        xe = combined_s
-        for block in self.blocks:
-            xn = block.ln1(xe)
-            qkv = block.attn.qkv(xn).reshape(B, Lp, 3, H, hd).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
-            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-
-            qb = q.view(B, H, n_chunks, sc, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, sc, hd)
-            kb_flat = k.view(B, H, n_chunks, sc, hd)
-            vb_flat = v.view(B, H, n_chunks, sc, hd)
-            pad_k = torch.zeros(B, H, n_prev_chunks, sc, hd, device=device, dtype=k.dtype)
-            pad_v = torch.zeros(B, H, n_prev_chunks, sc, hd, device=device, dtype=v.dtype)
-            k_ext = torch.cat([pad_k, kb_flat], dim=2)
-            v_ext = torch.cat([pad_v, vb_flat], dim=2)
-            k_win = k_ext[:, :, idx].reshape(B, H, n_chunks, Kc, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, Kc, hd)
-            v_win = v_ext[:, :, idx].reshape(B, H, n_chunks, Kc, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, Kc, hd)
-
-            mask_batched = attn_mask.expand(B, n_chunks, 1, sc, Kc).reshape(B * n_chunks, 1, sc, Kc)
-            yb = F.scaled_dot_product_attention(qb, k_win, v_win, attn_mask=mask_batched)
-            y = yb.view(B, n_chunks, H, sc, hd).permute(0, 2, 1, 3, 4).reshape(B, H, Lp, hd)
-
-            a = block.attn.out(y.transpose(1, 2).reshape(B, Lp, D))
-            xe = xe + a
-            xe = xe + block.mlp(block.ln2(xe))
-
-        he = self.ln_f(xe)
-        he = he[:, :Le, :]
-        he = he[:, inv_perm, :]
-        return he[:, n_prefix:, :]
-
-    def _packed_decode_forward_chunked(self, x0: torch.Tensor, code_kv: torch.Tensor, window: int, n_prev_chunks: int = 2) -> torch.Tensor:
-        cfg = self.cfg
-        assert cfg.decode_pack_mode == "interleave", "chunked decode only implemented for interleave"
-        B, L, D = x0.shape
-        H, hd = cfg.n_heads, D // cfg.n_heads
-        device = x0.device
-        W = window
-        assert W is not None and L % W == 0
-
-        bos = self.decode_bos.view(1, 1, D).expand(B, 1, D)
-        code_shifted = torch.cat([bos, code_kv[:, :-1, :]], dim=1)
-
-        byte_pos = torch.arange(L, device=device)
-        code_true_pos = byte_pos - 1
-
-        combined = torch.stack([code_shifted, x0], dim=2).view(B, 2 * L, D)
-        true_pos = torch.stack([code_true_pos, byte_pos], dim=1).reshape(-1)
-        is_code = torch.tensor([True, False], device=device).repeat(L)
-
-        Le = 2 * L
-        cos, sin = rope_cos_sin_for_positions(true_pos.clamp(min=0), hd, cfg.rope_base, device)
-
-        sc = 2 * W
-        n_chunks = Le // sc
-        R = 2 * W
-
-        pos_b = true_pos.view(n_chunks, sc)
-        code_b = is_code.view(n_chunks, sc)
-        pad_pos = torch.full((n_prev_chunks, sc), -10 ** 9, device=device, dtype=pos_b.dtype)
-        pad_code = torch.zeros(n_prev_chunks, sc, dtype=torch.bool, device=device)
-        pos_ext = torch.cat([pad_pos, pos_b], dim=0)
-        code_ext = torch.cat([pad_code, code_b], dim=0)
-
-        idx = (torch.arange(n_chunks, device=device).view(n_chunks, 1)
-               + torch.arange(n_prev_chunks + 1, device=device).view(1, n_prev_chunks + 1))
-        pos_win = pos_ext[idx].reshape(n_chunks, (n_prev_chunks + 1) * sc)
-        code_win = code_ext[idx].reshape(n_chunks, (n_prev_chunks + 1) * sc)
-
-        ti = pos_b.unsqueeze(-1)
-        tj = pos_win.unsqueeze(1)
-        key_is_code = code_win.unsqueeze(1)
-        causal = tj <= ti
-        same_pos_excl = ~(key_is_code & (tj == ti))
-        windowed = (ti - tj) < R
-        allow = causal & same_pos_excl & windowed
-        Kc = (n_prev_chunks + 1) * sc
-        attn_mask = allow.view(1, n_chunks, 1, sc, Kc)
-
-        xe = combined
-        for block in self.blocks:
-            xn = block.ln1(xe)
-            qkv = block.attn.qkv(xn).reshape(B, Le, 3, H, hd).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
-            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-
-            qb = q.view(B, H, n_chunks, sc, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, sc, hd)
-            kb_flat = k.view(B, H, n_chunks, sc, hd)
-            vb_flat = v.view(B, H, n_chunks, sc, hd)
-            pad_k = torch.zeros(B, H, n_prev_chunks, sc, hd, device=device, dtype=k.dtype)
-            pad_v = torch.zeros(B, H, n_prev_chunks, sc, hd, device=device, dtype=v.dtype)
-            k_ext = torch.cat([pad_k, kb_flat], dim=2)
-            v_ext = torch.cat([pad_v, vb_flat], dim=2)
-            k_win = k_ext[:, :, idx].reshape(B, H, n_chunks, Kc, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, Kc, hd)
-            v_win = v_ext[:, :, idx].reshape(B, H, n_chunks, Kc, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, Kc, hd)
-
-            mask_batched = attn_mask.expand(B, n_chunks, 1, sc, Kc).reshape(B * n_chunks, 1, sc, Kc)
-            yb = F.scaled_dot_product_attention(qb, k_win, v_win, attn_mask=mask_batched)
-            y = yb.view(B, n_chunks, H, sc, hd).permute(0, 2, 1, 3, 4).reshape(B, H, Le, hd)
-
-            a = block.attn.out(y.transpose(1, 2).reshape(B, Le, D))
-            xe = xe + a
-            xe = xe + block.mlp(block.ln2(xe))
-
-        he = self.ln_f(xe)
-        he_pairs = he.view(B, L, 2, D)
-        return he_pairs[:, :, 1, :]
+        h_out = he[:, extract_pos, :]
+        query_last = he[:, -1, :] if extra_query else None
+        return h_out, query_last
 
     def _ntp_loss_acc(self, h_query: torch.Tensor, target_repr: torch.Tensor, is_byte_level: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        cfg = self.cfg
         if is_byte_level:
             target = target_repr.reshape(-1)
             logits = F.linear(h_query, self.embed.weight)
@@ -664,19 +696,7 @@ class LevelLM(nn.Module):
             with torch.no_grad():
                 acc = (logits.argmax(-1) == target).float().mean()
             return loss, acc
-        if cfg.quant_type == "bsq":
-            target_bits = (target_repr.reshape(-1, cfg.bsq_bits) > 0).float()
-            pred = self.code_predict(h_query)
-            loss = F.binary_cross_entropy_with_logits(pred, target_bits)
-            with torch.no_grad():
-                acc = ((pred > 0).float() == target_bits).float().mean()
-            return loss, acc
-        target = target_repr.argmax(-1).reshape(-1)
-        logits = F.linear(h_query, self.embed.weight)
-        loss = F.cross_entropy(logits, target)
-        with torch.no_grad():
-            acc = (logits.argmax(-1) == target).float().mean()
-        return loss, acc
+        return self.quant.ntp_loss_acc(self, h_query, target_repr)
 
     def forward(self, seq_repr: torch.Tensor, level: int, window: int | None, compute_ntp: bool = True,
                 decode_tracks: list[tuple[torch.Tensor, int, int | None]] | None = None,
@@ -691,77 +711,28 @@ class LevelLM(nn.Module):
             x = self.embed(seq_repr)
             B, L = seq_repr.shape
         else:
-            x = self.code_embed(seq_repr) if cfg.quant_type == "bsq" else seq_repr @ self.embed.weight
+            x = self.quant.embed_input(self, seq_repr)
             B, L, _ = seq_repr.shape
 
         x0 = x
         head_dim = D // cfg.n_heads
 
         query_last = None
-        query_seq = None
-        selfcode_ntp_done = False
         if decode_tracks is not None:
             assert len(decode_tracks) >= 1
-            _, k0, w0 = decode_tracks[0]
-            if len(decode_tracks) == 1:
-                code_kv0 = decode_tracks[0][0]
-                n_blocks_sc = L // K
-                he, n_units, query_last = self._packed_decode_forward_selfcode(
-                    x0, code_kv0, K, w0, extra_query=extra_query)
-                he_blocks = he.view(B, n_units, K + 1, D)
-                query_h = he_blocks[:, :, :-1, :].reshape(-1, D)
-                # query_seq keeps the batch dim (unlike query_h, flattened for the loss) -- this is
-                # the code-slot representation actually used for NTP at every position, needed by
-                # check_gen_consistency's teacher-forced reference. Plain `h` below is byte-slot
-                # (post byte-attendance) and is the WRONG tensor to compare against for this
-                # single-track path -- see docs/qcute_refine_v4_4_1_v4_5_1_math.md /
-                # docs/status.md's byte-slot-vs-code-slot bug.
-                query_seq = he_blocks[:, :, :-1, :].reshape(B, n_units * K, D)
-                h = torch.cat([x0[:, :K, :], he_blocks[:, :, 1:, :].reshape(B, n_units * K, D)], dim=1)
-                if compute_ntp:
-                    # query_h has n_units*K rows (floor-based -- see _packed_decode_forward_selfcode);
-                    # seq_repr[:, K:] has L-K, which only matches when L is an exact multiple of K
-                    # (always true in training, where L==cfg.context_len by construction). Eval can
-                    # see a shorter/ragged L when data is smaller than context_len -- slice the target
-                    # to the same length query_h actually has instead of assuming exact alignment.
-                    target = seq_repr[:, K:K + n_units * K]
-                    ntp_loss, ntp_acc = self._ntp_loss_acc(query_h, target, is_byte_level)
-                else:
-                    ntp_loss = h.new_zeros(())
-                    ntp_acc = h.new_zeros(())
-                selfcode_ntp_done = True
-            else:
-                # can_chunk's underlying _packed_decode_forward_chunked only takes ONE code_kv
-                # track -- it silently discards every track beyond decode_tracks[0] (the coarser
-                # tracks this branch exists specifically to condition on). len(decode_tracks) == 1
-                # is unreachable here (that case is handled entirely by the branch above), so this
-                # additional check makes can_chunk permanently False in this branch rather than a
-                # real gate -- previously, whenever L happened to be window0-aligned (which it
-                # always is during training, since context_len is fixed and window-divisible),
-                # decode silently trained/ran as self-track-only, masquerading as full multi-track
-                # cond_full. See docs/status.md.
-                can_chunk = (len(decode_tracks) == 1 and k0 == 1 and cfg.decode_chunked
-                             and cfg.decode_pack_mode == "interleave" and w0 is not None and L % w0 == 0)
-                can_band = (cfg.decode_banded and all(w is not None and w < L for _, _, w in decode_tracks))
-                if can_chunk:
-                    h = self._packed_decode_forward_chunked(x0, decode_tracks[0][0], w0)
-                elif can_band:
-                    h = self._packed_decode_forward_banded(x0, decode_tracks)
-                else:
-                    h = self._packed_decode_forward(x0, decode_tracks)
+            h, query_last = self._merged_decode_forward(x0, decode_tracks, extra_query=extra_query)
         else:
             cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
             for block in self.blocks:
                 x = block(x, cos, sin, window)
             h = self.ln_f(x)
 
-        if not selfcode_ntp_done:
-            if compute_ntp:
-                h_flat = h[:, :-1, :].reshape(-1, D)
-                ntp_loss, ntp_acc = self._ntp_loss_acc(h_flat, seq_repr[:, 1:], is_byte_level)
-            else:
-                ntp_loss = h.new_zeros(())
-                ntp_acc = h.new_zeros(())
+        if compute_ntp:
+            h_flat = h[:, :-1, :].reshape(-1, D)
+            ntp_loss, ntp_acc = self._ntp_loss_acc(h_flat, seq_repr[:, 1:], is_byte_level)
+        else:
+            ntp_loss = h.new_zeros(())
+            ntp_acc = h.new_zeros(())
 
         n_blocks = L // K
         h_blocks = h[:, :n_blocks * K, :].view(B, n_blocks, K, D)
@@ -782,9 +753,9 @@ class LevelLM(nn.Module):
         else:
             raise ValueError(f"unknown code_extract_mode {cfg.code_extract_mode!r}")
         pre_q = self._classify(pooled)
-        c_i = quantize_code(pre_q, cfg)
+        c_i = self.quant.quantize(pre_q)
 
-        return c_i, ntp_loss, ntp_acc, h, query_last, query_seq
+        return c_i, ntp_loss, ntp_acc, h, query_last, None
 
 
 class RefineLM(nn.Module):
@@ -822,6 +793,27 @@ class RefineLM(nn.Module):
                 decode_windows.append([None if dw == -1 else dw] * n_sources)
         self.windows = windows
         self.decode_windows = decode_windows
+        # Effective-codes summary (see _warn_thin_window's formula): for each level's decode, how
+        # much cumulative coarser-level history its configured window(s) actually buy, in code
+        # units. Printed once at construction so this is visible before a step is ever run, not
+        # just as a late warning if it turns out to be thin.
+        for i, dwlist in enumerate(decode_windows):
+            cum_K, per_track, invisible_srcs = 1, [], []
+            for src_offset, dwindow in enumerate(dwlist):
+                cum_K *= cfg.Ks[i + src_offset]
+                if dwindow is None:
+                    per_track.append(f"K={cum_K}:full")
+                else:
+                    n_codes = dwindow // cum_K
+                    per_track.append(f"K={cum_K}:{n_codes}codes")
+                    if dwindow != 0 and n_codes == 0:
+                        invisible_srcs.append(cum_K)
+            print(f"decode effective codes level{i}: " + ", ".join(per_track))
+            if invisible_srcs:
+                print(f"WARNING: level{i} decode_window is too small for cumulative K in "
+                      f"{invisible_srcs} -- 0 codes fit, that source is completely invisible to "
+                      f"this level's decode (not just thin). Increase attn_window[{i}]'s "
+                      f"decode_window or drop that source.")
         for i, (L, window) in enumerate(zip(seq_lens, windows)):
             if window is not None:
                 assert L % window == 0 or L <= window, f"attn_window[{i}] encode window ({window}) must divide level {i}'s sequence length ({L}), or be >= it"
@@ -861,12 +853,6 @@ class RefineLM(nn.Module):
 
         decode_losses: list = [None] * self.n_levels
         decode_accs: list = [None] * self.n_levels
-        # keyed by k (1..len(tracks)-1): the curriculum of partial-track combos below full
-        # conditioning -- {self}, {self, +1}, ..., {self, +1, ..., top-1} (full itself is
-        # decode_losses[i], not repeated here). For n_levels<=2 there's only one possible k (self
-        # alone), so this is identical to the old single self-only aux in that case.
-        decode_self_only_losses: list[dict[int, torch.Tensor]] = [{} for _ in range(self.n_levels)]
-        decode_self_only_accs: list[dict[int, torch.Tensor]] = [{} for _ in range(self.n_levels)]
         decode_derived_c: dict[int, torch.Tensor] = {}
         h_out = list(h_list)
         next_query: list[torch.Tensor | None] = [None] * self.n_levels
@@ -885,22 +871,14 @@ class RefineLM(nn.Module):
                 # there. It only bites during generation, where L_i grows one byte at a time and is
                 # rarely block-aligned -- stop adding tracks (keep whichever finer ones already
                 # collected) rather than discarding everything, so e.g. a self track can still be
-                # used even when a coarser track isn't affordable yet. _packed_decode_forward's own
-                # prefix construction is floor-based too, so a not-yet-complete trailing block is
-                # simply excluded from the code prefix, never fabricated.
+                # used even when a coarser track isn't affordable yet. _merged_layout's own
+                # per-track block-count (L//K, floor) is floor-based too, so a not-yet-complete
+                # trailing block is simply excluded from the buffer, never fabricated.
                 if L_i // cum_K < 1:
                     break
-                if j > i and cfg.cross_track_source == "decode" and j in decode_derived_c:
-                    source_c = decode_derived_c[j]
-                else:
-                    source_c = c_list[j]
-                if cfg.quant_type == "bsq":
-                    code_embeds = self.decode_lms[i].code_embed(
-                        source_c if cfg.decode_code_ste else source_c.detach())
-                elif cfg.decode_code_ste:
-                    code_embeds = source_c @ self.decode_lms[i].embed.weight
-                else:
-                    code_embeds = self.decode_lms[i].embed(source_c.argmax(-1))
+                source_c = decode_derived_c[j] if (j > i and j in decode_derived_c) else c_list[j]
+                dec_lm = self.decode_lms[i]
+                code_embeds = dec_lm.quant.embed_for_decode(dec_lm, source_c)
                 tracks.append((code_embeds, cum_K, window))
             if not tracks:
                 continue
@@ -915,31 +893,24 @@ class RefineLM(nn.Module):
             decode_losses[i] = loss_i2
             decode_accs[i] = acc_i2
             if h_i2.shape[1] < L_i:
-                # Single-track selfcode decode floor-truncates a ragged tail internally (see
-                # _packed_decode_forward_selfcode) -- splice the plain encode-only h back in for
-                # those trailing positions rather than leaving them missing. Never triggered during
-                # training (L_i is always block-aligned there).
+                # _merged_decode_forward always returns exactly L_i byte positions now (h_out is
+                # gathered via extract_pos, one slot per input byte) -- this branch is dead in the
+                # new decode path, kept only because generation can still route through the
+                # encode-only fallback above (decode_tracks is None) for very short/ragged prefixes.
                 h_i2 = torch.cat([h_i2, h_list[i][:, h_i2.shape[1]:, :]], dim=1)
             h_out[i] = h_i2
             next_query[i] = query_last_i
             query_seq_out[i] = query_seq_i
             if max_decode_sources is None:
                 decode_derived_c[i] = c_i2
-            if cfg.decode_self_only_aux and self.training and max_decode_sources is None and len(tracks) > 1:
-                for k in range(1, len(tracks)):
-                    _, loss_k, acc_k, _, _, _ = self.decode_lms[i](x_list[i], level=i, window=self.windows[i],
-                                                                    compute_ntp=compute_ntp, decode_tracks=tracks[:k])
-                    decode_self_only_losses[i][k] = loss_k
-                    decode_self_only_accs[i][k] = acc_k
 
         return (encode_losses, encode_accs, decode_losses, decode_accs, h_out, c_list,
-                decode_self_only_losses, decode_self_only_accs, next_query, decode_derived_c, query_seq_out)
+                next_query, decode_derived_c, query_seq_out)
 
     def forward(self, byte_ids: torch.Tensor) -> tuple[torch.Tensor, dict]:
         cfg = self.cfg
         (encode_losses, encode_accs, decode_losses, decode_accs, h_list, c_list,
-         decode_self_only_losses, decode_self_only_accs, _next_query, _decode_derived_c,
-         _query_seq) = self._run(byte_ids)
+         _next_query, _decode_derived_c, _query_seq) = self._run(byte_ids)
 
         byte_loss = decode_losses[0] if decode_losses[0] is not None else encode_losses[0]
         byte_acc = decode_accs[0] if decode_accs[0] is not None else encode_accs[0]
@@ -952,38 +923,15 @@ class RefineLM(nn.Module):
         decode_total = (cfg.decode_ntp_weight * torch.stack(decode_terms).sum() if decode_terms
                          else byte_loss.new_zeros(()))
 
-        # mean, not sum: the curriculum can have a variable number of partial-track combos per
-        # level (n_levels-2 of them at the byte level for a deep stack) -- averaging keeps
-        # decode_self_only_weight's meaning stable across different n_levels instead of the loss
-        # term silently growing with depth. For n_levels<=2 there's exactly one term, so mean==sum
-        # and this is identical to the old behavior.
-        self_only_terms = [l for d in decode_self_only_losses for l in d.values()]
-        decode_self_only_total = (cfg.decode_self_only_weight * torch.stack(self_only_terms).mean()
-                                   if self_only_terms else byte_loss.new_zeros(()))
-
-        # decode_self_only_dropout: both terms above are always computed (so metrics/logging stay
-        # complete), but only one of {decode_total, decode_self_only_total} enters the backward
-        # loss this step, chosen by a coin flip -- rather than summing both into every step's
-        # gradient (the decode_self_only_aux default). Dropped term is still in `metrics`, just
-        # not in `loss`, so it gets no gradient this step.
-        if cfg.decode_self_only_aux and cfg.decode_self_only_dropout and self.training and self_only_terms:
-            if torch.rand(()).item() < cfg.decode_self_only_dropout_p:
-                loss = encode_total + decode_self_only_total
-            else:
-                loss = encode_total + decode_total
-        else:
-            loss = encode_total + decode_total + decode_self_only_total
-        ntp_total = torch.stack(encode_losses + decode_terms + self_only_terms).sum()
+        loss = encode_total + decode_total
+        ntp_total = torch.stack(encode_losses + decode_terms).sum()
         metrics = {
             "loss": loss, "byte_loss": byte_loss, "byte_acc": byte_acc,
-            "encode_total": encode_total, "decode_total": decode_total,
-            "decode_self_only_total": decode_self_only_total, "ntp_loss_total": ntp_total,
+            "encode_total": encode_total, "decode_total": decode_total, "ntp_loss_total": ntp_total,
             **{f"level{i}_ntp_loss_encode": l for i, l in enumerate(encode_losses)},
             **{f"level{i}_ntp_acc_encode": a for i, a in enumerate(encode_accs)},
             **{f"level{i}_ntp_loss_decode": l for i, l in enumerate(decode_losses) if l is not None},
             **{f"level{i}_ntp_acc_decode": a for i, a in enumerate(decode_accs) if a is not None},
-            **{f"level{i}_ntp_loss_decode_self_k{k}": l for i, d in enumerate(decode_self_only_losses) for k, l in d.items()},
-            **{f"level{i}_ntp_acc_decode_self_k{k}": a for i, d in enumerate(decode_self_only_accs) for k, a in d.items()},
         }
 
         return loss, metrics
@@ -1006,27 +954,81 @@ def generate_no_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
     all_bytes = prompt_bytes
     for _ in range(n_new_bytes):
         L = all_bytes.shape[1]
-        # No padding: _run/_packed_decode_forward are floor-tolerant now, so feeding the true,
+        # No padding: _run/_merged_decode_forward are floor-tolerant now, so feeding the true,
         # growing byte sequence gives exactly the same decode-conditioned (or, below a level's
         # minimum block count, encode-only) representation training would compute at this position
         # -- never a fabricated trailing byte. want_next_query only matters (and is only honored)
-        # on a K0-aligned prefix, where the single-track selfcode path can append a genuine
-        # bare-code extra query; elsewhere it's a no-op and next_query[0] stays None.
+        # on a K0-aligned prefix, where the merged-decode buffer's chronologically last slot can
+        # be returned as a genuine bare-code extra query; elsewhere it's a no-op and
+        # next_query[0] stays None.
         block_aligned = L % K0 == 0
-        _, _, _, _, h_list, _, _, _, next_query, _decode_derived_c, _query_seq = model._run(
+        _, _, _, _, h_list, _, next_query, _decode_derived_c, _query_seq = model._run(
             all_bytes, compute_ntp=False, max_decode_sources=max_decode_sources,
             want_next_query=block_aligned)
-        # next_query[0]: the single-track selfcode path's genuine code-slot query (see
-        # _packed_decode_forward_selfcode's extra_query docstring). h_list[0][:, -1, :]: the
-        # standard byte-slot next-token representation used everywhere else (multi-track decode, or
-        # the encode-only fallback when no track has a complete block yet) -- both are real,
-        # trained-for slots, matching what check_gen_consistency compares against.
+        # next_query[0]: _merged_decode_forward's extra_query -- the buffer's chronologically
+        # last hidden state, which automatically incorporates any code that just became available
+        # (see its docstring). h_list[0][:, -1, :]: the standard byte-slot next-token
+        # representation used when no track has a complete block yet (encode-only fallback) --
+        # both are real, trained-for slots, matching what check_gen_consistency compares against.
         query = next_query[0] if next_query[0] is not None else h_list[0][:, -1, :]
         next_byte = _sample_next_byte(model.decode_lms[0].embed.weight, query)
         all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
     if was_training:
         model.train()
     return all_bytes[0]
+
+
+@torch.no_grad()
+def generate_kv_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
+                       max_decode_sources: int | None = None) -> torch.Tensor:
+    """FIFO-windowed generation: truncate to the trailing cfg.context_len bytes before every step,
+    exactly mirroring training's own windowing (sample_context truncates to context_len the same
+    way, and RoPE positions are always relative to whatever window is fed in, never absolute from
+    generation's start -- so this isn't a new mechanism, it's training's existing window applied at
+    generation time). Not a per-layer K/V tensor cache -- still recomputes the windowed forward each
+    step -- but bounds that recompute to O(context_len) instead of O(current total length), which is
+    what actually matters once generation runs long. New byte pushed on, oldest byte falls off once
+    the window is full, same push-and-drop as any fixed-size FIFO.
+
+    Only guaranteed to match generate_no_cache while prompt_len + n_new_bytes <= context_len (same
+    caveat as qcute.bytelm's own generate_kv_cache/validate_generation pair) -- beyond that point
+    generate_no_cache keeps growing its unbounded context while this one keeps sliding, so the two
+    are expected to diverge by design, not by bug. See validate_generation.
+    """
+    was_training = model.training
+    model.eval()
+    prompt_bytes = prompt_bytes.to(device)
+    if prompt_bytes.dim() == 1:
+        prompt_bytes = prompt_bytes.unsqueeze(0)
+    K0 = model.cfg.Ks[0]
+    context_len = model.cfg.context_len
+    all_bytes = prompt_bytes
+    for _ in range(n_new_bytes):
+        window_bytes = all_bytes[:, -context_len:]   # FIFO: only the trailing context_len bytes ever matter
+        L = window_bytes.shape[1]
+        block_aligned = L % K0 == 0
+        _, _, _, _, h_list, _, next_query, _decode_derived_c, _query_seq = model._run(
+            window_bytes, compute_ntp=False, max_decode_sources=max_decode_sources,
+            want_next_query=block_aligned)
+        query = next_query[0] if next_query[0] is not None else h_list[0][:, -1, :]
+        next_byte = _sample_next_byte(model.decode_lms[0].embed.weight, query)
+        all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
+    if was_training:
+        model.train()
+    return all_bytes[0]
+
+
+def validate_generation(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> bool:
+    """Only meaningful while prompt_len + n_new_bytes <= model.cfg.context_len -- see
+    generate_kv_cache's docstring for why the two are only guaranteed to agree inside that bound."""
+    out_a = generate_no_cache(model, prompt_bytes, n_new_bytes, device)
+    out_b = generate_kv_cache(model, prompt_bytes, n_new_bytes, device)
+    assert torch.equal(out_a, out_b), (
+        f"generate_no_cache and generate_kv_cache diverged:\n"
+        f"  no_cache = {out_a.tolist()}\n"
+        f"  kv_cache = {out_b.tolist()}"
+    )
+    return True
 
 
 @torch.no_grad()
@@ -1064,17 +1066,11 @@ def generate_level1_codes(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_c
     n_prompt_codes = codes.shape[1]
     for _ in range(n_new_codes):
         _, _, _, h1, _, _ = enc1(codes, level=1, window=model.windows[1], compute_ntp=False)
-        if model.cfg.quant_type == "bsq":
-            pred = enc1.code_predict(h1[:, -1, :])
-            next_code = bsq_quantize(pred, model.cfg.bsq_bits)
-        else:
-            logits = F.linear(h1[:, -1, :], enc1.embed.weight)
-            next_id = logits.argmax(-1)
-            next_code = F.one_hot(next_id, num_classes=model.cfg.vocab).to(codes.dtype)
+        next_code = enc1.quant.sample_next(enc1, h1[:, -1, :], model.cfg.vocab)
         codes = torch.cat([codes, next_code.unsqueeze(1)], dim=1)
     if was_training:
         model.train()
-    return code_to_ids(codes[0, n_prompt_codes:], model.cfg)
+    return enc1.quant.to_ids(codes[0, n_prompt_codes:])
 
 
 @torch.no_grad()
@@ -1085,7 +1081,7 @@ def level1_ground_truth_codes(model: "RefineLM", full_bytes: torch.Tensor, promp
     enc0 = model.encode_lms[0]
     K0 = model.cfg.Ks[0]
     c0, _, _, _, _, _ = enc0(full_bytes, level=0, window=model.windows[0], compute_ntp=False)
-    ids = code_to_ids(c0[0], model.cfg)
+    ids = enc0.quant.to_ids(c0[0])
     n_prompt_codes = prompt_len // K0
     return ids[n_prompt_codes:]
 
@@ -1117,7 +1113,7 @@ def _decode_source_codes(model: "RefineLM", full_bytes: torch.Tensor, device: st
     source_c = c_list[level]
     if was_training:
         model.train()
-    return code_to_ids(source_c, model.cfg)[0]
+    return model.encode_lms[level].quant.to_ids(source_c)[0]
 
 
 @torch.no_grad()
@@ -1138,13 +1134,14 @@ def check_gen_consistency(model: "RefineLM", full_bytes: torch.Tensor, device: s
     embed0 = model.decode_lms[0].embed.weight
     K0 = model.cfg.Ks[0]
 
-    _, _, _, _, h_list_tf, _, _, _, _, _, query_seq_tf = model._run(
+    _, _, _, _, h_list_tf, _, _, _, query_seq_tf = model._run(
         full_bytes, compute_ntp=False, max_decode_sources=None, want_next_query=False)
-    # query_seq_tf[0] is the tensor training's own NTP loss actually reads for the single-track
-    # selfcode-decode path -- h_list_tf[0] (byte-slot) is WRONG there (see docs/status.md); for the
-    # multi-track path query_seq_tf[0] is None and h IS correct, so fall back to it. query_seq[j]
-    # predicts byte (K0+j) (it's aligned to seq_repr[:, K0:], not seq_repr[:, 1:]) -- only equal to
-    # "byte j+1" when K0==1, so byte t's reference index is (t-K0) via query_seq but (t-1) via h.
+    # query_seq_tf[0] is always None with the chronological merged-interleave decode --
+    # _merged_decode_forward already extracts each byte's NTP-training query correctly via
+    # extract_pos (the last buffer entry sharing that true_pos, a tied code's state when one
+    # completes there -- see _merged_layout's docstring), so h_list_tf[0] alone is always the
+    # right reference tensor. query_seq stays part of the _run contract only for shape parity
+    # with qcute_v5_concat_slow.py's older, separately-tracked single-track mechanism.
     using_query_seq = query_seq_tf[0] is not None
     query_ref_tf = query_seq_tf[0] if using_query_seq else h_list_tf[0]
     logits_tf_all = F.linear(query_ref_tf[0], embed0)
@@ -1155,7 +1152,7 @@ def check_gen_consistency(model: "RefineLM", full_bytes: torch.Tensor, device: s
         if ref_idx < 0 or ref_idx >= logits_tf_all.shape[0]:
             continue
         padded = full_bytes[:, :t]
-        _, _, _, _, h_list_gen, _, _, _, next_query_gen, _, _ = model._run(
+        _, _, _, _, h_list_gen, _, next_query_gen, _, _ = model._run(
             padded, compute_ntp=False, max_decode_sources=None, want_next_query=True)
         query_gen = next_query_gen[0] if next_query_gen[0] is not None else h_list_gen[0][:, t - 1, :]
         logits_gen = F.linear(query_gen[0], embed0)
@@ -1378,15 +1375,6 @@ def main():
     p.add_argument("--code_extract_mode", type=str, default="last_h",
                     choices=["last_h", "softmax_pool", "light_query_attn", "query_embed"])
     p.add_argument("--code_head_tied", type=lambda x: x.lower() != "false", default=False)
-    p.add_argument("--decode_pack_mode", type=str, default="interleave", choices=["interleave", "prepend"])
-    p.add_argument("--decode_chunked", type=lambda x: x.lower() != "false", default=False)
-    p.add_argument("--decode_banded", type=lambda x: x.lower() != "false", default=False)
-    p.add_argument("--decode_self_only_aux", type=lambda x: x.lower() != "false", default=False)
-    p.add_argument("--cross_track_source", type=str, default="encode", choices=["encode", "decode"])
-    p.add_argument("--decode_self_only_weight", type=float, default=1.0)
-    p.add_argument("--decode_self_only_dropout", type=lambda x: x.lower() != "false", default=False)
-    p.add_argument("--decode_self_only_dropout_p", type=float, default=0.5)
-    p.add_argument("--decode_code_ste", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--vocab", type=int, default=256)
     p.add_argument("--share_level_weights", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--quant_type", type=str, default="softmax", choices=["softmax", "bsq"])
@@ -1437,13 +1425,7 @@ def main():
         byte_ntp_weight=args.byte_ntp_weight, code_ntp_weight=args.code_ntp_weight,
         decode_ntp_weight=args.decode_ntp_weight, gumbel_tau=args.gumbel_tau, use_gumbel_noise=args.use_gumbel_noise,
         code_extract_mode=args.code_extract_mode, code_head_tied=args.code_head_tied,
-        decode_banded=args.decode_banded, decode_self_only_aux=args.decode_self_only_aux,
-        cross_track_source=args.cross_track_source,
-        decode_self_only_weight=args.decode_self_only_weight,
-        decode_self_only_dropout=args.decode_self_only_dropout,
-        decode_self_only_dropout_p=args.decode_self_only_dropout_p, decode_code_ste=args.decode_code_ste,
         vocab=args.vocab, share_level_weights=args.share_level_weights,
-        decode_pack_mode=args.decode_pack_mode, decode_chunked=args.decode_chunked,
         quant_type=args.quant_type, bsq_bits=args.bsq_bits,
     )
     model = RefineLM(cfg).to(device)

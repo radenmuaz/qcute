@@ -19,15 +19,21 @@ uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_ctx1024.py   # nam
                                                  # configs/bytelm_xs_mtp4.py (context=256) is superseded, kept only
                                                  # for historical reproducibility, not a comparison target anymore
 uv run python scripts/plot_run.py logs/<run_name>   # train/val bpb PNG from a run's run.jsonl
-uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_overfit10k_k4single.py
-uv run python -m qcute.qcute_v5_stack --config configs/qcute_v5_stack_overfit10k_k4single.py
-                                                 # the two active qcute prototypes (see Architecture
-                                                 # below) — no version-suffix alias anymore; run
-                                                 # each module directly
+uv run python -m qcute.qcute_v5_concat --config configs/overfit/qcute_v5_concat_ks1_1k.py
+uv run python -m qcute.qcute_v5 --config configs/qcute_v5_stack_overfit10k_k4single.py
+                                                 # the two DEFAULT v5 modules (see Architecture below):
+                                                 # qcute_v5_concat.py (chronological merged-interleave
+                                                 # decode) and qcute_v5.py (staged cross-attention
+                                                 # decode, efficient windowed attention, "query first
+                                                 # byte"/qfb boundary-query fix) — each self-contained,
+                                                 # run directly. Prior-default references kept for
+                                                 # comparison (no qfb fix, still has the boundary gap
+                                                 # qfb fixes): qcute_v5_concat_slow.py, qcute_v5_slow.py,
+                                                 # and its weight-sharing variant qcute_v5_ws_slow.py
 ```
 
 `qcute.bytelm`, `qcute.bpelm`, `qcute.qcute_v5_concat`, and
-`qcute.qcute_v5_stack` all read `--help` for their full flag
+`qcute.qcute_v5` all read `--help` for their full flag
 list; all support `--config path.py` (see `configs/` — every config file
 has its own module docstring explaining what it's testing and its exact
 `uv run` invocation, copy-pasteable directly from the file), `--run_name`
@@ -81,9 +87,91 @@ its `qcute_refine.py` always-latest alias) is now archived** under
 **`qcute/qcute_v5_concat.py` and `qcute/qcute_v5_stack.py` (forked from
 `qcute_refine_v4_4_1.py`/`qcute_refine_v4_5_1.py` respectively, dropping
 the `refine_` prefix and the version-suffix/alias convention entirely)
-are now the two standalone active prototypes** — each is its own
-self-contained module, run directly (no promotion step, no alias file).
-Configs: `configs/qcute_v5_concat_*.py`, `configs/qcute_v5_stack_*.py`.
+were the original two standalone prototypes** — each self-contained, run
+directly (no promotion step, no alias file). Both have since been
+superseded as the *default* module by an efficient-attention/KV-cache-
+friendly rewrite, while being kept themselves as O(L^2) dense references:
+
+- **`qcute_v5_stack.py`** → superseded by **`qcute/qcute_v5.py`**
+  (renamed from an intermediate `qcute_v5_stack_eff.py` fork once it
+  became the default): genuinely sub-quadratic windowed/banded attention
+  (chunked `selfcode_decode`/`cross_attn_stage`, no dense `O(L^2)` mask)
+  and a FIFO-windowed `generate_kv_cache` (truncate to `context_len` each
+  step, cheap and structurally cache-friendly — not yet a true per-layer
+  K/V tensor cache). Verified via `scripts/test_v5.py` against
+  `qcute_v5_stack.py` (bit-identical forward/loss across Ks/window
+  shapes) and `check_gen_consistency`/`validate_generation`.
+  **Superseded again**: weight-sharing logic (`share_level_weights`,
+  `decode_separate_stage0`) pruned to its always-`False` default (the old
+  variant kept as `qcute_v5_ws_slow.py`), then a "query first byte" (qfb)
+  fix folded into `cross_attn_stage` itself, removing `selfcode_decode`
+  entirely — see "qfb boundary-query fix" below. The pre-qfb file is kept
+  as `qcute_v5_slow.py`.
+- **`qcute_v5_concat.py`** → rewritten in place (the old dense
+  implementation is now **`qcute/qcute_v5_concat_slow.py`**): every
+  track's codes are placed at their true chronological time position —
+  merged with the byte stream into ONE physically time-ordered buffer
+  per level's decode — instead of the old "prepend" scheme (all track
+  prefixes grouped at the buffer front, corrected via a separate
+  `true_pos` array + `argsort`). Buffer order now IS time order, so
+  causal masking is a plain buffer-index comparison (no same-position
+  exclusion mask term needed — a tied code always sorts after the byte
+  that produced it, automatically invisible to it) and windowed/banded
+  attention slices CONTIGUOUS buffer ranges with no runtime sort — the
+  index/address construction (`LevelLM._merged_layout`) depends only on
+  shape, never data, so it's built once per signature and cached, same
+  cost whether called every training step or every fixed-size
+  `generate_kv_cache` FIFO-window step. Single- and multi-track decode
+  are now one mechanism (no more separate selfcode/dense/banded code
+  paths). An intermediate fork, `qcute_v5_concat_eff.py` (argsort-based:
+  kept the old "prepend" layout, cached the sort's structural output
+  rather than eliminating it), exists between `qcute_v5_concat_slow.py`
+  and the current `qcute_v5_concat.py` but was never itself promoted/
+  renamed. Verified via `scripts/test_v5_concat.py` (an independent
+  from-scratch dense reference, dense-vs-chunked internal consistency,
+  `check_gen_consistency`, `validate_generation` — not compared against
+  `qcute_v5_concat_slow.py` directly, since window semantics changed by
+  design, see the module's own docstring).
+
+Both `qcute_v5.py` and `qcute_v5_concat.py` also had several `Config`
+flags hardcoded away (`decode_code_ste` always `True`,
+`cross_track_source` always `"decode"`, `decode_self_only_aux` and its
+curriculum loss removed entirely — decode now has exactly one NTP loss
+term) and their `quant_type` dispatch (`"softmax"` vs `"bsq"`) unified
+into a `QuantScheme`/`SoftmaxQuant`/`BSQQuant` strategy-class pair (7
+uniform methods: `init_modules`/`quantize`/`to_ids`/`embed_for_decode`/
+`ntp_loss_acc`/`embed_input`/`sample_next`) — `make_quant(cfg)` is the
+only remaining `quant_type` branch in either file, everywhere else
+dispatches through `self.quant.<method>()`.
+
+**`qcute_v5.py`'s "query first byte" (qfb) fix**: `cross_attn_stage`'s
+strict causal mask (`code_pos < query_pos`) means the row that would
+predict a block's FIRST element from that block's own just-completed
+code is the same row the code was derived from — excluded by
+construction, so a code only ever conditions predictions from a block's
+SECOND element onward. Fixed with one extra, unconditionally-patched
+cross-attention query per block (`LevelLM.decode_boundary_query`, a
+shared fixed vector, sidesteps the chicken-and-egg problem since nothing
+computed it FROM the code it attends to) — applied identically to every
+track at every level (self or coarser), replacing `selfcode_decode`
+entirely; `RefineLM._run`'s decode loop is now one uniform per-level loop
+over every track, no track-index or level special-casing. Two real bugs
+surfaced and fixed while building this (self-referential code extraction;
+a length-dependent internal patch that broke KV-cache append-only
+semantics — every block's boundary row is now patched unconditionally,
+never conditioned on "is this the last block visible in this call", so a
+row's content depends only on its own causal past, never on how much
+sequence follows it within the current call). The old level1-only
+diagnostics (`generate_level1_codes`, `generate_level1_codes_via_decode`,
+`level1_ground_truth_codes`) are generalized to `generate_level_codes`
+etc., parameterized by `level`. Full narrative, the bug hunt, and a
+concrete `n_levels=1/2/3` byte-level walkthrough:
+[docs/status.md](docs/status.md).
+
+Configs: `configs/qcute_v5_concat_*.py`, `configs/overfit/qcute_v5_concat_*.py`
+(now running against `qcute_v5_concat_slow.py`, repointed at rename time),
+`configs/overfit_concat_eff/`, `configs/overfit_stack_eff/`,
+`configs/qcute_v5_stack_*.py`.
 
 Archived lineage summary, oldest to newest:
 - `qcute_refine_v1.py`/`v2.py`/`v3.py`: pre-v4 history — BSQ code
@@ -130,15 +218,16 @@ slow-convergence investigation (a moving-target/cascade effect for
 n_levels=2 configs, compounded in the "stack"/v4.5-style decode by a
 much deeper gradient path back to the code producer — decode is now
 `n_layers * (1 + n_tracks)` deep sequentially, vs. the "concat"/v4.4-style
-decode's flat `n_layers`), and the `decode_code_ste` findings:
+decode's flat `n_layers`), and the `decode_code_ste` findings (predates
+`qcute_v5.py`/current `qcute_v5_concat.py` hardcoding `decode_code_ste`
+to always `True` — see above):
 [docs/status.md](docs/status.md) (reset partway through the v5 work —
 full pre-reset history at
 [docs/archive2/status.md](docs/archive2/status.md)).
 
 **Standing methodology**: use a small (`n_bytes=10000`) slice of the
 corpus with a short step budget as the standard fast-iteration testbed
-for `qcute_v5_concat.py`/`qcute_v5_stack.py` architecture changes — see
-`configs/*_overfit10k_*.py` — until a config can actually fast-overfit
+for v5 architecture changes — see `configs/*_overfit10k_*.py` — until a config can actually fast-overfit
 that slice to a train bpb comparable to `qcute.bytelm`'s own parity
 numbers on the same slice (`n_layers=1`: 0.0212 train bpb at step 1000,
 ~19.7 it/s; `n_layers=2`: 0.0072, ~11.4 it/s — see
@@ -209,7 +298,9 @@ exception — still the active baseline comparison points, not archived.
 
 Original design source-of-truth for the now-archived `qcutelm` lineage:
 [docs/archive/continuous_tokenizer_handover.md](docs/archive/continuous_tokenizer_handover.md)
-(historical — `qcute_refine`'s own design isn't specified by it).
+(historical — `qcute_refine`'s own design isn't specified by it). Chronological one-line summary
+of every fork in both the `qcutelm` (`qcute/archive/`) and `qcute_refine` (`qcute/archive2/`)
+lineages: [docs/archive/lineage_summary.md](docs/archive/lineage_summary.md).
 Current progress: [docs/status.md](docs/status.md).
 
 ## Code style

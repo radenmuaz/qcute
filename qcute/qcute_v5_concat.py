@@ -27,6 +27,10 @@ implements. qcute_v5_concat_slow.py is kept as the O(L^2) dense reference this i
 code_head + gumbel/argmax) or "bsq" (binary spherical quantization, Config.bsq_bits-wide sign code,
 straight-through).
 
+Every encode_lm/decode_lm is its own independent weight instance -- weight-sharing logic
+(share_level_weights) has been pruned entirely; see qcute_v5_concat_ws.py for that variant, kept
+as a reference.
+
     uv run python -m qcute.qcute_v5_concat --config configs/overfit/qcute_v5_concat_ks1_1k.py
 """
 import argparse
@@ -114,7 +118,6 @@ class Config:
     vocab: int = 256
     code_extract_mode: str = "last_h"
     code_head_tied: bool = False
-    share_level_weights: bool = False
     quant_type: str = "softmax"   # "softmax" (categorical code_head + gumbel/argmax) or "bsq"
     bsq_bits: int = 4             # code width in bits when quant_type="bsq"
 
@@ -824,15 +827,8 @@ class RefineLM(nn.Module):
                         f"attn_window[{i}]'s decode_window[{src_offset}] ({dwindow}) must divide "
                         f"level {i}'s sequence length ({L}), or be >= it")
 
-        if cfg.share_level_weights:
-            shared_lm = LevelLM(cfg)
-            encode_lms = [shared_lm for _ in range(self.n_levels)]
-            decode_lms = [shared_lm for _ in range(self.n_levels)]
-        else:
-            encode_lms = [LevelLM(cfg) for _ in range(self.n_levels)]
-            decode_lms = [LevelLM(cfg) for _ in range(self.n_levels)]
-        self.encode_lms = nn.ModuleList(encode_lms)
-        self.decode_lms = nn.ModuleList(decode_lms)
+        self.encode_lms = nn.ModuleList([LevelLM(cfg) for _ in range(self.n_levels)])
+        self.decode_lms = nn.ModuleList([LevelLM(cfg) for _ in range(self.n_levels)])
 
     def _run(self, byte_ids: torch.Tensor, compute_ntp: bool = True, max_decode_sources: int | None = None,
              want_next_query: bool = False):
@@ -1357,7 +1353,7 @@ def main():
     pre.add_argument("--config", type=Path, default=None)
     pre_args, _ = pre.parse_known_args()
 
-    p = argparse.ArgumentParser(description="Packed-sequence decode (prepend/interleave), trainable BOS, correct RoPE timing (qcute_refine_v4_4)", parents=[pre])
+    p = argparse.ArgumentParser(description="Chronological merged-interleave decode, independent per-level weights", parents=[pre])
     p.add_argument("--Ks", default=(32, 32))
     p.add_argument("--d_model", type=int, default=256)
     p.add_argument("--n_layers", type=int, default=2)
@@ -1375,7 +1371,6 @@ def main():
                     choices=["last_h", "softmax_pool", "light_query_attn", "query_embed"])
     p.add_argument("--code_head_tied", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--vocab", type=int, default=256)
-    p.add_argument("--share_level_weights", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--quant_type", type=str, default="softmax", choices=["softmax", "bsq"])
     p.add_argument("--bsq_bits", type=int, default=4)
 
@@ -1424,8 +1419,7 @@ def main():
         byte_ntp_weight=args.byte_ntp_weight, code_ntp_weight=args.code_ntp_weight,
         decode_ntp_weight=args.decode_ntp_weight, gumbel_tau=args.gumbel_tau, use_gumbel_noise=args.use_gumbel_noise,
         code_extract_mode=args.code_extract_mode, code_head_tied=args.code_head_tied,
-        vocab=args.vocab, share_level_weights=args.share_level_weights,
-        quant_type=args.quant_type, bsq_bits=args.bsq_bits,
+        vocab=args.vocab, quant_type=args.quant_type, bsq_bits=args.bsq_bits,
     )
     model = RefineLM(cfg).to(device)
     n_params = sum(p_.numel() for p_ in model.parameters())
