@@ -1,7 +1,7 @@
 """v5_concat, Ks regression grid step 6/12 (simplest->hardest, see CLAUDE.md), Ks=(2,2), n_layers=1,
 1k-byte testbed (n_bytes=1000), 500 steps.
 
-uv run python -m qcute.qcute_v5_concat --config configs/overfit/qcute_v5_concat_ks22_500.py
+uv run python -m qcute.qcute_v5_concat_slow --config configs/overfit/qcute_v5_concat_ks22_500.py
 """
 from pathlib import Path
 

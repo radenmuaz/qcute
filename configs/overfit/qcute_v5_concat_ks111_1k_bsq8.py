@@ -1,7 +1,7 @@
 """v5_concat, bsq quant_type (bsq_bits=8), Ks=(1,1,1), n_layers=1, 1k-byte testbed.
 Clone of qcute_v5_concat_ks111_1k.py with quant_type="bsq" instead of the default "softmax" code.
 
-uv run python -m qcute.qcute_v5_concat --config configs/overfit/qcute_v5_concat_ks111_1k_bsq8.py
+uv run python -m qcute.qcute_v5_concat_slow --config configs/overfit/qcute_v5_concat_ks111_1k_bsq8.py
 """
 from pathlib import Path
 

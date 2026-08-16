@@ -7,7 +7,7 @@ from `encode_lms[1]`'s raw output, but with `cross_track_source="decode"` the re
 conditions on `decode_derived_c[1]` (level 1's own self-decoded/refined output), a different
 tensor. That fed decode_lms[0] out-of-distribution conditioning it was never trained on, so the
 "oracle" result was meaningless. This version calls `model._run` directly on the ground-truth byte
-sequence and reads its real `decode_derived_c[1]` back out (see qcute_v5_concat.py's `_run`, which
+sequence and reads its real `decode_derived_c[1]` back out (see qcute_v5_concat_slow.py's `_run`, which
 now returns it) instead of reimplementing the cross_track_source dispatch by hand -- avoids
 repeating the same class of mistake. Every intermediate tensor is printed so this can be stepped
 through, not just trusted.
@@ -21,7 +21,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from qcute.qcute_v5_concat import (
+from qcute.qcute_v5_concat_slow import (
     Config, RefineLM, generate_no_cache, generate_self_only_cond,
     _sample_next_byte, load_enwik8, split_train_val,
 )

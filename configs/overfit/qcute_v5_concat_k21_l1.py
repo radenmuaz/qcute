@@ -2,7 +2,7 @@
 overfit10k testbed. Stress test #2: unequal Ks (level0 K=2, level1 K=1), unlike the k11_l1
 baseline's K=(1,1) -- run only after qcute_v5_concat_k11_l1.py passes (see docs/status.md).
 
-uv run python -m qcute.qcute_v5_concat --config configs/overfit/qcute_v5_concat_k21_l1.py
+uv run python -m qcute.qcute_v5_concat_slow --config configs/overfit/qcute_v5_concat_k21_l1.py
 """
 from pathlib import Path
 

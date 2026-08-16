@@ -21,7 +21,7 @@ def main():
     assert variant in ("concat", "stack"), "first arg must be 'concat' or 'stack'"
 
     if variant == "concat":
-        from qcute.qcute_v5_concat import (
+        from qcute.qcute_v5_concat_slow import (
             Config, RefineLM, qualitative_generate, check_gen_consistency, load_enwik8, split_train_val,
         )
     else:

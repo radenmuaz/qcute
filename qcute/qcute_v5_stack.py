@@ -95,7 +95,7 @@ class Config:
     decode_self_only_aux: bool = False
     decode_self_only_weight: float = 1.0
     decode_code_ste: bool = True
-    share_level_weights: bool = True
+    share_level_weights: bool = False  # True: one LevelLM (embed, blocks, code_head, encode+decode) shared by every level
     decode_separate_stage0: bool = False
     quant_type: str = "softmax"   # "softmax" (categorical code_head + gumbel/argmax) or "bsq"
     bsq_bits: int = 4             # code width in bits when quant_type="bsq"
@@ -512,6 +512,8 @@ class LevelLM(nn.Module):
     def cross_attn_stage(self, x_in: torch.Tensor, code_kv: torch.Tensor, seq_repr: torch.Tensor, level: int,
                           track_K: int, window: int | None, compute_ntp: bool = True,
                           want_code: bool = False) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dense mask is a staircase, not a triangle: code keys advance one per track_K query
+        steps, so every block of track_K consecutive queries sees the identical key set."""
         cfg = self.cfg
         K = cfg.Ks[level]
         D = cfg.d_model
@@ -1257,7 +1259,7 @@ def main():
     p.add_argument("--decode_self_only_weight", type=float, default=1.0)
     p.add_argument("--decode_code_ste", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--vocab", type=int, default=256)
-    p.add_argument("--share_level_weights", type=lambda x: x.lower() != "false", default=True)
+    p.add_argument("--share_level_weights", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--decode_separate_stage0", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--quant_type", type=str, default="softmax", choices=["softmax", "bsq"])
     p.add_argument("--bsq_bits", type=int, default=4)

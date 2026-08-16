@@ -1,7 +1,7 @@
 """v5_concat, no-aux 200-step rerun 4/12 (simplest->hardest, see CLAUDE.md), Ks=(2,1), n_layers=1,
 1k-byte testbed, val_frac=0.5 (avoids short-val-data truncation), decode_self_only_aux=False.
 
-uv run python -m qcute.qcute_v5_concat --config configs/overfit/qcute_v5_concat_ks21_400_noaux.py
+uv run python -m qcute.qcute_v5_concat_slow --config configs/overfit/qcute_v5_concat_ks21_400_noaux.py
 """
 from pathlib import Path
 

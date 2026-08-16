@@ -4,7 +4,7 @@ corpus, val_frac=0.1, steps=8000, batch_size=16, warmup_steps=500, lr_peak=6e-4.
 decode_code_ste=True, use_gumbel_noise=False, decode_self_only_aux=False (all Config
 defaults, set explicitly here for clarity).
 
-uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_k1_l1.py
+uv run python -m qcute.qcute_v5_concat_slow --config configs/qcute_v5_concat_k1_l1.py
 
     # plot after training:
     uv run python scripts/plot_run.py logs/qcute_v5_concat_k1_l1

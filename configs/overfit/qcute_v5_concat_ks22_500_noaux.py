@@ -3,7 +3,7 @@ Redo of qcute_v5_concat_ks22_500.py (which FAILED: neither cond_full nor cond_se
 ground truth, cond_self badly garbled) with the aux curriculum loss disabled, to check whether it
 was interfering with convergence at this Ks.
 
-uv run python -m qcute.qcute_v5_concat --config configs/overfit/qcute_v5_concat_ks22_500_noaux.py
+uv run python -m qcute.qcute_v5_concat_slow --config configs/overfit/qcute_v5_concat_ks22_500_noaux.py
 """
 from pathlib import Path
 

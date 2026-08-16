@@ -2,7 +2,7 @@
 overfit10k testbed. decode_self_only_aux on -- the standard level=2 config, run only after
 qcute_v5_concat_k1_l1.py's level=1 baseline passes (see docs/status.md).
 
-uv run python -m qcute.qcute_v5_concat --config configs/overfit/qcute_v5_concat_k11_l1.py
+uv run python -m qcute.qcute_v5_concat_slow --config configs/overfit/qcute_v5_concat_k11_l1.py
 """
 from pathlib import Path
 

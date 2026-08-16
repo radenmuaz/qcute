@@ -1,7 +1,7 @@
 """Instrument the REAL `_packed_decode_forward` (2+-track branch, used by cond_full) on a tiny toy
 sequence and print its exact causal-mask bookkeeping (true_pos / is_code / windowing) for manual
 verification -- not a reimplementation, calls the actual production method via return_debug=True
-(qcute_v5_concat.py's LevelLM._packed_decode_forward).
+(qcute_v5_concat_slow.py's LevelLM._packed_decode_forward).
 
 Checks, per byte query position i (true_pos=i):
   - can it see the code key(s) at true_pos=i-1 (its "own" block's prefix, from every track)?
@@ -16,7 +16,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from qcute.qcute_v5_concat import Config, RefineLM
+from qcute.qcute_v5_concat_slow import Config, RefineLM
 
 
 def main():
