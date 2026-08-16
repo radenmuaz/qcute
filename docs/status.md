@@ -508,3 +508,12 @@ own code(s), never on how many more bytes exist beyond it within the current cal
 table (`code_pos`, and which rows get overwritten) is a pure function of `(L, track_K)` shape,
 precomputable and reusable across any window sharing that shape, the property needed for this to
 stay incremental/KV-cache-compatible.
+
+## Code-conditioning ablation on `qcute_v5_concat_1` checkpoint (2026-08-16)
+
+`scripts/ablate_v5_concat.py` measures val bpb under level-0 decode with ground-truth codes,
+randomized codes, and a genuinely autoregressive (not teacher-forced) level-1 code rollout —
+confirms the model actively relies on both code streams (randomizing either is worse than dropping
+conditioning entirely) and that level-1's own code LM has severe exposure bias (AR-rolled-out codes
+are worse than no cross-conditioning at all). Full results and discussion:
+[ablate_v5_concat_1.md](ablate_v5_concat_1.md).

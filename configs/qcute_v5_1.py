@@ -27,5 +27,5 @@ eval_every = 2000
 # eval_every = 100
 eval_batches = 20
 
-qual_gen_bytes = 1024
-qual_prompt_bytes = 128
+qual_gen_bytes = 256
+qual_prompt_bytes = 64
