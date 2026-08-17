@@ -221,12 +221,51 @@ adds it:
   design costs the SAME total compute as `multipass`; its real value is fewer Python/kernel launches
   (batched into one pass), not fewer FLOPs -- a smaller win than originally scoped, worth being
   explicit about. Per-mode losses feed `decode_stage_extra_total`, mirroring `qcute_v5_stack.py`'s
-  field name/semantics for its own staged intermediate losses. Dense (non-chunked) attention only --
-  chunked/banded configs fail loudly via `AssertionError`, not silently wrong.
+  field name/semantics for its own staged intermediate losses. Originally dense (non-chunked)
+  attention only -- chunked/banded configs failed loudly via `AssertionError` rather than silently
+  computing something wrong.
 
 Verified (`scripts/test_v5_concat_modes.py`) across `Ks=(1,)`, `(4,1)`, `(2,2,1)`: `off == plain`
 and `single_pass == multipass` both exact (`torch.allclose`, all per-level metrics). End-to-end
 training smoke-tested for all three (`configs/qcute_v5_concat_modes_ks{1,41,221}.py`, 50 steps):
 `decode_stage_extra_total` correctly `0.0` for `Ks=(1,)` (T=1, no shallower mode exists), non-zero
 for the other two (`Ks=(4,1)`: 1 extra mode at level0; `Ks=(2,2,1)`: 2 extra modes at level0, 1 at
-level1), `check_gen_consistency` clean (0/15) in all three. No real (non-smoke) training queued yet.
+level1), `check_gen_consistency` clean (0/15) in all three.
+
+Also: `qualitative_generate` extended to try every reachable level0 conditioning depth
+(`level0_mode1` .. `level0_modefull`, not just self-only and full), and per-mode val bpb now flows
+through automatically -- `_run` tags each shallower-mode loss with `(level, mode_idx)`,
+`RefineLM.forward`'s metrics dict gains `level{i}_mode{m}_ntp_loss_decode`/`_ntp_acc_decode`, and
+`_add_per_level_bpb`'s existing generic `_ntp_loss_decode` suffix match derives
+`level{i}_mode{m}_bpb_decode` for free -- both `eval_model`/`eval_model_full` pick it up since they
+already iterate the metrics dict generically, so every `--eval_only` run now reports full-val-set
+bpb at every conditioning depth. `configs/qcute_v5_concat_modes_soft.py` (soft-mode clone of
+`qcute_v5_concat_soft.py`, `Ks=(1,)` so multi-mode is a structural no-op there -- included for an
+apples-to-apples number, not to exercise the machinery) and `configs/qcute_v5_concat_modes_1.py`
+(`Ks=(4,1)`, `soft` + `single_pass`, actually exercises it) queued for real training.
+
+**SWA (windowed/chunked attention) compatibility (2026-08-17)**: `single_pass` originally asserted
+against any segment needing the chunked path. Extended with two implementations, both kept
+alongside the existing dense fallback and `multipass` (neither removed/modified):
+- **Option 1** (`_merged_decode_forward_multimode_looped`): literally calls the existing,
+  unmodified `_merged_decode_forward` once per mode -- same compute as `multipass`, but serves as
+  the ground-truth reference for option 2, and as an always-available fallback.
+- **Option 2** (`_merged_decode_forward_multimode_chunked`): a genuinely batched SWA-compatible
+  implementation. `_merged_layout` gained `forced_sc`/`forced_n_chunks`/`forced_n_prev_chunks`
+  params (forcing a grid LARGER than a segment's own natural requirement is always safe -- extra
+  chunks/lookback are pure padding, masked out via the same true_pos=-1e9/window=0 sentinel
+  `_merged_layout` already uses for its own natural `Lp`-padding; forcing smaller is asserted
+  against, since it would silently narrow the real window). `_merged_layout_multimode_chunked`
+  finds the finest `sc` any mode naturally needs, pads every mode's `(n_chunks, n_prev_chunks)` grid
+  onto that shared size, then batches all T modes' chunked attention into one SDPA call per layer
+  (extending the existing single-mode chunked path's own `(B, n_chunks)`-flattened-batch trick with
+  a `mode` axis). Modes stay fully independent (block-diagonal, same as the dense multimode design)
+  so this is exact, not approximate. `_merged_decode_forward_multimode` now auto-dispatches: dense
+  block-diagonal (unchanged) when no segment needs chunking, option 2 when any does.
+
+Verified (`scripts/test_v5_concat_modes.py`, extended): `single_pass == multipass` now also checked
+under real finite windows (`Ks=(1,)` window=4, `(4,1)`/`(2,2,1)` window=8) -- exact match, all
+metrics -- plus a direct cross-check of option 2 against option 1 (bypassing `LevelLM.forward`'s
+own plumbing entirely). End-to-end training smoke-tested with a real finite window
+(`configs/qcute_v5_concat_modes_chunked_smoke.py`, `Ks=(4,1)`, `attn_window=8`): runs cleanly,
+`check_gen_consistency` 0/15.
