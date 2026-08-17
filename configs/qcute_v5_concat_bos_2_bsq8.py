@@ -1,12 +1,12 @@
-"""qcute_v5_concat_2 variant: gumbel-noise softmax quantization (use_gumbel_noise=True) instead of
-plain argmax, otherwise identical to configs/qcute_v5_concat_2.py (Ks=(4,1), context_len=256,
+"""qcute_v5_concat_2 variant: BSQ quantization (bsq_bits=8) instead of the softmax/gumbel
+categorical code, otherwise identical to configs/qcute_v5_concat_bos_2.py (Ks=(4,1), context_len=256,
 attn_window=(16,64)) -- concat-decode (qcute.qcute_v5_concat) counterpart of
-configs/qcute_v5_2_gumbel.py.
+configs/qcute_v5_2_bsq8.py.
 
-uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_2_gumbel.py
+uv run python -m qcute.archive3.qcute_v5_concat_bos --config configs/qcute_v5_concat_bos_2_bsq8.py
 
 # plot after training:
-uv run python scripts/plot_run.py logs/qcute_v5_concat_2_gumbel
+uv run python scripts/plot_run.py logs/qcute_v5_concat_bos_2_bsq8
 """
 from pathlib import Path
 
@@ -15,8 +15,10 @@ d_model = 256
 n_layers = 1
 context_len = 256
 attn_window = (16,64)
-use_gumbel_noise = True
-gumbel_tau = 1.0
+use_gumbel_noise = False
+quant_type = "bsq"
+bsq_bits = 8
+# gumbel_tau = 1.0
 
 data = Path("datasets/enwik8_1M.gz")
 val_frac = 0.1

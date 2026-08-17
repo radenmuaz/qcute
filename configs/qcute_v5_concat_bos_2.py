@@ -4,10 +4,10 @@ for a same-hyperparameters comparison against the staged cross-attention decode 
 Comparison point for qcute_v5_concat_2_gumbel.py (gumbel noise),
 qcute_v5_concat_2_bsq8.py/qcute_v5_concat_2_bsq16.py (BSQ quantization).
 
-uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_2.py
+uv run python -m qcute.archive3.qcute_v5_concat_bos --config configs/qcute_v5_concat_bos_2.py
 
 # plot after training:
-uv run python scripts/plot_run.py logs/qcute_v5_concat_2
+uv run python scripts/plot_run.py logs/qcute_v5_concat_bos_2
 """
 from pathlib import Path
 

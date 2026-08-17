@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
-from qcute.qcute_v5_concat import Config, RefineLM, load_enwik8, split_train_val, sample_context
+from qcute.archive3.qcute_v5_concat_bos import Config, RefineLM, load_enwik8, split_train_val, sample_context
 
 
 def random_onehot_like(source_c: torch.Tensor) -> torch.Tensor:

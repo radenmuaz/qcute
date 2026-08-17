@@ -3,7 +3,7 @@ CLAUDE.md), Ks=(2,2,1), n_layers=1, 1k-byte testbed, val_frac=0.5 (avoids short-
 truncation), decode_self_only_aux=False. Exact-match to qcute_v5_stack is not expected (chunked
 staircase cross-attention differs from dense at chunk boundaries); note qualitatively how close.
 
-uv run python -m qcute.qcute_v5 --config configs/overfit_stack_eff/qcute_v5_stack_eff_ks221_400_noaux.py
+uv run python -m qcute.archive3.qcute_v5_bos --config configs/overfit_stack_eff/qcute_v5_stack_eff_ks221_400_noaux.py
 """
 from pathlib import Path
 

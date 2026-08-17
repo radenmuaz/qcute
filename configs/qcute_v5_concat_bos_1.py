@@ -1,5 +1,5 @@
 """
-uv run python -m qcute.qcute_v5 --config configs/qcute_v5_1.py
+uv run python -m qcute.archive3.qcute_v5_concat_bos --config configs/qcute_v5_concat_bos_1.py
 
 # plot after training:
 uv run python scripts/plot_run.py logs/qcute_v5_1
@@ -10,7 +10,7 @@ Ks = (4,1)
 d_model = 256
 n_layers = 1
 context_len = 1024
-attn_window = (16,256)
+attn_window = (8,256)
 use_gumbel_noise = False
 # gumbel_tau = 1.0
 

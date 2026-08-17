@@ -1,19 +1,19 @@
-"""qcute_v5_3: Ks=(1,) single-level (n_levels=1, no hierarchy -- self-decode only), context_len=256,
-attn_window=(256,) (dense/unbounded). Degenerate-case comparison point against the multi-level
-qcute_v5_2* configs (same context_len=256).
+"""qcute_v5_2 baseline: plain softmax/argmax quantization, Ks=(4,1), context_len=256,
+attn_window=(16,64) -- comparison point for qcute_v5_2_gumbel.py (gumbel noise),
+qcute_v5_2_bsq8.py/qcute_v5_2_bsq16.py (BSQ quantization).
 
-uv run python -m qcute.qcute_v5 --config configs/qcute_v5_3.py
+uv run python -m qcute.archive3.qcute_v5_bos --config configs/qcute_v5_bos_2.py
 
 # plot after training:
-uv run python scripts/plot_run.py logs/qcute_v5_3
+uv run python scripts/plot_run.py logs/qcute_v5_bos_2
 """
 from pathlib import Path
 
-Ks = (1,)
+Ks = (4,1)
 d_model = 256
 n_layers = 1
 context_len = 256
-attn_window = (256,)
+attn_window = (16,64)
 use_gumbel_noise = False
 # gumbel_tau = 1.0
 

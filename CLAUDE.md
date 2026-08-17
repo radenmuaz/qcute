@@ -19,21 +19,28 @@ uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_ctx1024.py   # nam
                                                  # configs/bytelm_xs_mtp4.py (context=256) is superseded, kept only
                                                  # for historical reproducibility, not a comparison target anymore
 uv run python scripts/plot_run.py logs/<run_name>   # train/val bpb PNG from a run's run.jsonl
-uv run python -m qcute.qcute_v5_concat --config configs/overfit/qcute_v5_concat_ks1_1k.py
-uv run python -m qcute.qcute_v5 --config configs/qcute_v5_stack_overfit10k_k4single.py
+uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_3.py
+uv run python -m qcute.qcute_v5_stack --config configs/qcute_v5_stack_3.py
                                                  # the two DEFAULT v5 modules (see Architecture below):
-                                                 # qcute_v5_concat.py (chronological merged-interleave
-                                                 # decode) and qcute_v5.py (staged cross-attention
-                                                 # decode, efficient windowed attention, "query first
-                                                 # byte"/qfb boundary-query fix) — each self-contained,
-                                                 # run directly. Prior-default references kept for
-                                                 # comparison (no qfb fix, still has the boundary gap
-                                                 # qfb fixes): qcute_v5_concat_slow.py, qcute_v5_slow.py,
-                                                 # and its weight-sharing variant qcute_v5_ws_slow.py
+                                                 # qcute_v5_concat.py and qcute_v5_stack.py — both
+                                                 # promoted from their `_skip` forks (buffer-pruning:
+                                                 # once a block's code exists, its raw bytes are
+                                                 # dropped from the decode buffer), which forked from
+                                                 # `_fixblock` (qfb boundary-query mechanism removed,
+                                                 # replaced with decode_bos removal + block-0 target
+                                                 # exclusion) — each self-contained, run directly. The
+                                                 # prior defaults (qfb-based, pre-fixblock/pre-skip) are
+                                                 # ARCHIVED as qcute/archive3/qcute_v5_bos.py and
+                                                 # qcute/archive3/qcute_v5_concat_bos.py, kept for
+                                                 # historical reference only. Intermediate forks kept as
+                                                 # comparison references: qcute_v5_fixblock.py,
+                                                 # qcute_v5_concat_fixblock.py, qcute_v5_slow.py,
+                                                 # qcute_v5_concat_slow.py, and the weight-sharing
+                                                 # variant qcute_v5_ws_slow.py
 ```
 
 `qcute.bytelm`, `qcute.bpelm`, `qcute.qcute_v5_concat`, and
-`qcute.qcute_v5` all read `--help` for their full flag
+`qcute.qcute_v5_stack` all read `--help` for their full flag
 list; all support `--config path.py` (see `configs/` — every config file
 has its own module docstring explaining what it's testing and its exact
 `uv run` invocation, copy-pasteable directly from the file), `--run_name`
@@ -55,19 +62,25 @@ one is still active.
 stdout/stderr to `/dev/null`** — use a file instead (e.g. a scratchpad
 path, or `/tmp/<pid>.log` renamed once the PID is known post-launch),
 since `/dev/null` silently swallows uncaught-exception tracebacks and
-anything not routed through `Logger`, making crashes invisible. Pipe
-through `tr '\r' '\n'` before the redirect (`... 2>&1 | tr '\r' '\n' >
-/tmp/foo.log &`) — tqdm's progress bar uses `\r` for in-place updates,
-which lands as one giant unreadable line in a plain file otherwise; `tr`
-turns each update into its own readable line (e.g. `loss=2.1512`). Note
-`$!` after a pipe gives the last stage's PID (`tr`), not Python's — use
-`pgrep -f "python3 -m qcute.<module>"` to find the actual training
-process if you need its PID (e.g. to kill it). **After launching, give
-the user two `tail -f` commands**: one on that raw stdout/stderr file,
-and one on `logs/<run_name>/run.log` (the structured log `Logger` writes
-to at `--log_every`/`--eval_every` intervals) — so they can watch it live
-themselves rather than relying on being told the outcome later. Long runs
-have shown unpredictable throughput (observed: a
+anything not routed through `Logger`, making crashes invisible. Do NOT
+pipe through `tr '\r' '\n'` to make tqdm's `\r`-updates readable —
+confirmed directly that `tr` itself full-block-buffers its own stdout
+when writing to a non-tty file, so a `tail -f` on the piped-through file
+sits empty for seconds/minutes at a time regardless of how eagerly the
+Python process flushes its side of the pipe; it's not a live view, just a
+deferred dump. Redirect stdout/stderr straight to a file instead (plain
+`... > /tmp/foo.log 2>&1 &`, no pipe) — the tqdm line will look like one
+long `\r`-joined blob when catted, but `tail -f` still shows new bytes
+arriving in real time, which is the actual goal. Use `pgrep -f "python3
+-m qcute.<module>"` to find the training process's PID (e.g. to kill it;
+`$!` after a background launch gives the wrapper/shell PID, not
+necessarily Python's). **After launching, give the user the PID and two
+`tail -f` commands**: one on that raw stdout/stderr file, and one on
+`logs/<run_name>/run.log` (the structured log `Logger` writes to at
+`--log_every`/`--eval_every` intervals, genuinely real-time since
+`Logger` opens and flushes that file directly, no pipe involved) — so
+they can watch it live themselves rather than relying on being told the
+outcome later. Long runs have shown unpredictable throughput (observed: a
 nominal ~30-minute budget taking 2.5-3.5 hours instead) — watch actual
 elapsed time/step rate early on rather than assuming a run will finish on
 schedule.

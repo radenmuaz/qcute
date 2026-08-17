@@ -1,11 +1,11 @@
 """qcute_v5_2 variant: BSQ quantization (bsq_bits=16, the CodeEmbed table-lookup ceiling --
-MAX_PQ_TABLE_DQ in qcute/qcute_v5.py) instead of the softmax/gumbel categorical code, otherwise
-identical to configs/qcute_v5_2.py (Ks=(4,1), context_len=256, attn_window=(16,64)).
+MAX_PQ_TABLE_DQ in qcute/archive3/qcute_v5_bos.py) instead of the softmax/gumbel categorical code, otherwise
+identical to configs/qcute_v5_bos_2.py (Ks=(4,1), context_len=256, attn_window=(16,64)).
 
-uv run python -m qcute.qcute_v5 --config configs/qcute_v5_2_bsq16.py
+uv run python -m qcute.archive3.qcute_v5_bos --config configs/qcute_v5_bos_2_bsq16.py
 
 # plot after training:
-uv run python scripts/plot_run.py logs/qcute_v5_2_bsq16
+uv run python scripts/plot_run.py logs/qcute_v5_bos_2_bsq16
 """
 from pathlib import Path
 

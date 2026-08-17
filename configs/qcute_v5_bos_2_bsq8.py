@@ -1,11 +1,10 @@
-"""qcute_v5_2 baseline: plain softmax/argmax quantization, Ks=(4,1), context_len=256,
-attn_window=(16,64) -- comparison point for qcute_v5_2_gumbel.py (gumbel noise),
-qcute_v5_2_bsq8.py/qcute_v5_2_bsq16.py (BSQ quantization).
+"""qcute_v5_2 variant: BSQ quantization (bsq_bits=8) instead of the softmax/gumbel categorical
+code, otherwise identical to configs/qcute_v5_bos_2.py (Ks=(4,1), context_len=256, attn_window=(16,64)).
 
-uv run python -m qcute.qcute_v5 --config configs/qcute_v5_2.py
+uv run python -m qcute.archive3.qcute_v5_bos --config configs/qcute_v5_bos_2_bsq8.py
 
 # plot after training:
-uv run python scripts/plot_run.py logs/qcute_v5_2
+uv run python scripts/plot_run.py logs/qcute_v5_bos_2_bsq8
 """
 from pathlib import Path
 
@@ -15,6 +14,8 @@ n_layers = 1
 context_len = 256
 attn_window = (16,64)
 use_gumbel_noise = False
+quant_type = "bsq"
+bsq_bits = 8
 # gumbel_tau = 1.0
 
 data = Path("datasets/enwik8_1M.gz")

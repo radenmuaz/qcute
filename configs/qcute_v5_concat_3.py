@@ -1,7 +1,9 @@
 """qcute_v5_concat_3: Ks=(1,) single-level (n_levels=1, no hierarchy -- self-decode only),
-context_len=256, attn_window=(256,) (dense/unbounded) -- concat-decode (qcute.qcute_v5_concat)
-counterpart of configs/qcute_v5_3.py. Degenerate-case comparison point against the multi-level
-qcute_v5_concat_2* configs (same context_len=256).
+context_len=256, attn_window=(256,) (dense/unbounded) -- skip (qcute.qcute_v5_concat)
+counterpart of configs/qcute_v5_concat_fixblock_3.py: same decode_bos removal and block-0 exclusion
+as fixblock, plus _skip's own buffer pruning (a block's raw bytes dropped from the merged buffer
+once that block's code exists). K=1 makes every block a single byte, so this exercises _skip's
+pruning maximally -- roughly halves the effective buffer length vs fixblock.
 
 uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_3.py
 
@@ -15,7 +17,6 @@ d_model = 256
 n_layers = 1
 context_len = 256
 attn_window = (256,)
-use_gumbel_noise = False
 # gumbel_tau = 1.0
 
 data = Path("datasets/enwik8_1M.gz")

@@ -421,6 +421,28 @@ def eval_bpb(model: nn.Module, data_iter, context: int, n_batches: int) -> float
     return total / n_batches
 
 
+@torch.no_grad()
+def eval_bpb_full(model: nn.Module, data: torch.Tensor, batch_size: int, context: int, n_heads: int, device: str) -> float:
+    """Deterministic full-val-set pass: non-overlapping seq_len windows, walked in fixed
+    chronological order starting at byte 0 (never random), each byte scored exactly once --
+    unlike eval_bpb's random-with-replacement batch_iter sampling, this is reproducible and
+    exhaustive (up to a <seq_len remainder at the end, dropped)."""
+    model.eval()
+    seq_len = context + n_heads
+    n_windows = (len(data) - 1) // seq_len
+    total, total_n = 0.0, 0
+    for start in range(0, n_windows, batch_size):
+        idxs = range(start, min(start + batch_size, n_windows))
+        batch = torch.stack([data[i * seq_len:(i + 1) * seq_len] for i in idxs]).to(device)
+        logits = model(batch[:, :context])
+        _, head0_bpb = mtp_loss(logits, batch, context)
+        bsz = batch.size(0)
+        total += head0_bpb.item() * bsz
+        total_n += bsz
+    model.train()
+    return total / total_n
+
+
 def lr_at(step: int, warmup: int, peak: float) -> float:
     """Linear warmup, then constant at peak — same schedule used by both
     qcute.bytelm and qcute.qcutelm, for a fair comparison between the two."""
@@ -789,8 +811,8 @@ def main():
     val_iter = batch_iter(val_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
 
     if args.eval_only:
-        val_bpb = eval_bpb(model, val_iter, cfg.context, args.eval_batches)
-        log(f"eval_only  val_bpb {val_bpb:.4f}", val_bpb=val_bpb)
+        val_bpb = eval_bpb_full(model, val_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
+        log(f"eval_only_full_valset  val_bpb {val_bpb:.4f}", val_bpb=val_bpb)
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(0.9, 0.95), weight_decay=0.1)
         train_iter = batch_iter(train_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
