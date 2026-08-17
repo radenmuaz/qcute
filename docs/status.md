@@ -517,3 +517,34 @@ confirms the model actively relies on both code streams (randomizing either is w
 conditioning entirely) and that level-1's own code LM has severe exposure bias (AR-rolled-out codes
 are worse than no cross-conditioning at all). Full results and discussion:
 [ablate_v5_concat_1.md](ablate_v5_concat_1.md).
+
+## Baseline vs. qcute_v5 family: params/FLOPs/bpb (2026-08-17)
+
+Params, FLOPs (`FlopCounterMode`), and best val bpb for `bytelm_xs1_ctx256`/`bytelm_xs4_ctx256`
+(new layer-count-ablation baselines, context=256) vs. `qcute_v5_concat_1`/`qcute_v5_1` (`Ks=(4,1)`,
+context=1024). Neither hierarchical decoder clearly beats the plain deeper baseline
+(`bytelm_xs4_ctx256`, 2.356 bpb) despite 2-3x the flops/byte. Full table and discussion:
+[baseline_vs_v5_bpb.md](baseline_vs_v5_bpb.md).
+
+**qcute_v5_1 FLOPs vs. bytelm, matched context — with a methodology correction**: `FlopCounterMode`
+(torch 2.13.0) turns out not to count `scaled_dot_product_attention` FLOPs at all (verified: forcing
+`qcute_v5_1` to fully dense attention produces bit-identical flops to its trained `window=16`
+config) — every "flops" number in this doc set is linear/MLP-only, not true total compute. Redone at
+matched context=1024: `qcute_v5_1` costs only 1.034x `bytelm_xs4_ctx1024`'s linear/MLP flops (7213.6M
+vs. 6979.3M), not the 4.13x gap reported earlier against `bytelm_xs4_ctx256` — that gap was almost
+entirely the 4x context-length mismatch, not hierarchy overhead. Full writeup:
+[v5_1_flops_breakdown.md](v5_1_flops_breakdown.md).
+
+## Quantization-scheme + degenerate-case sweep, queued (2026-08-17)
+
+Five `qcute.qcute_v5` runs queued back-to-back (`Ks=(4,1)` except the last, `context_len=256`,
+`attn_window=(16,64)` except the last, 8000 steps each): `qcute_v5_2` (plain softmax/argmax
+quantization, the comparison baseline), `qcute_v5_2_gumbel` (same but `use_gumbel_noise=True`),
+`qcute_v5_2_bsq8`/`qcute_v5_2_bsq16` (BSQ quantization, `bsq_bits=8`/`16` — `16` is
+`MAX_PQ_TABLE_DQ`'s ceiling, the largest `CodeEmbed` table-lookup width the code supports), and
+`qcute_v5_3` (`Ks=(1,)`, single-level/no-hierarchy degenerate case, `attn_window=(256,)` dense, run
+last as an out-of-family sanity point rather than part of the quantization comparison). All five
+configs' docstrings previously pointed at the wrong file (`configs/qcute_v5_1.py`, a stale
+copy-paste artifact) — fixed to reference themselves and their own `logs/<run_name>` plot path.
+Results pending; run via `caffeinate`, queued sequentially since only one training job runs at a
+time (see CLAUDE.md).
