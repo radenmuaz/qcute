@@ -1,6 +1,8 @@
-"""Correctness check for qcute_v5_concat_modes.py's multi_mode_impl:
-(1) "off" reproduces plain qcute_v5_concat.py's forward() bit-for-bit (same weights, same input --
-    the fork must be a true no-op when multi-mode is disabled).
+"""Correctness check for qcute_v5_concat.py's multi_mode_impl (promoted 2026-08-17 from the
+qcute_v5_concat_modes.py fork -- the pre-promotion no-multi-mode module is kept as
+qcute_v5_concat_no_modes.py):
+(1) "off" reproduces qcute_v5_concat_no_modes.py's forward() bit-for-bit (same weights, same input
+    -- multi-mode must be a true no-op when disabled).
 (2) "single_pass" matches "multipass" exactly across Ks=(1,), (4,1), (2,2,1), BOTH with unbounded
     (dense) windows and with a finite window (chunked/banded path -- exercises
     _merged_decode_forward_multimode_chunked, the batched SWA-compatible implementation added
@@ -15,8 +17,8 @@
 """
 import torch
 
-from qcute import qcute_v5_concat as plain
-from qcute import qcute_v5_concat_modes as modes
+from qcute import qcute_v5_concat_no_modes as plain
+from qcute import qcute_v5_concat as modes
 
 DEVICE = "cpu"
 torch.manual_seed(0)

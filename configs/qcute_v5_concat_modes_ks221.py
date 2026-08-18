@@ -3,7 +3,7 @@ richest of the three test shapes: level0 has T=3 tracks (self K=2, +1 K=4, +2 K=
 shallower modes; level1 has T=2 tracks (self K=2, +1 K=2), picking up 1 shallower mode; level2 has
 T=1 (no extra mode). Ks regression grid (CLAUDE.md) #8.
 
-uv run python -m qcute.qcute_v5_concat_modes --config configs/qcute_v5_concat_modes_ks221.py
+uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_modes_ks221.py
 """
 from pathlib import Path
 

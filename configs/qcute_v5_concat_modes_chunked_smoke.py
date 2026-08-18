@@ -2,7 +2,7 @@
 "single_pass" -- exercises _merged_decode_forward_multimode_chunked end-to-end through real
 training, not just isolated forward() calls. Not meant to be trained to convergence.
 
-uv run python -m qcute.qcute_v5_concat_modes --config configs/qcute_v5_concat_modes_chunked_smoke.py
+uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_modes_chunked_smoke.py
 """
 from pathlib import Path
 

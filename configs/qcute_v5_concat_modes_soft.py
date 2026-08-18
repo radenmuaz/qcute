@@ -1,4 +1,4 @@
-"""qcute_v5_concat_modes_soft: qcute_v5_concat_soft.py cloned onto qcute.qcute_v5_concat_modes,
+"""qcute_v5_concat_modes_soft: qcute_v5_concat_soft.py cloned onto qcute.qcute_v5_concat,
 adding multi_mode_impl="single_pass" on top of the same code_sample_mode="soft" (plain
 Gumbel-Softmax relaxation, no hard forward) setup -- otherwise identical (Ks=(1,), context_len=256,
 attn_window=(256,)). Note: Ks=(1,) is n_levels=1, so every level has exactly T=1 track (self only)
@@ -7,7 +7,7 @@ decode_stage_extra_total stays exactly 0), included for a direct apples-to-apple
 against configs/qcute_v5_concat_soft.py's own numbers, not to exercise the multi-mode machinery
 itself (see configs/qcute_v5_concat_modes_ks{41,221}.py for that).
 
-uv run python -m qcute.qcute_v5_concat_modes --config configs/qcute_v5_concat_modes_soft.py
+uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_modes_soft.py
 
 # plot after training:
 uv run python scripts/plot_run.py logs/qcute_v5_concat_modes_soft

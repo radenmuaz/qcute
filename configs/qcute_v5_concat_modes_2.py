@@ -8,7 +8,7 @@ codes are folded into the merged buffer (buffer length exceeds the window), and
 multi_mode_impl="single_pass" only supports the dense path (asserts loudly rather than silently
 computing something wrong) -- -1 stays dense and is equivalent anyway since context_len=256.
 
-uv run python -m qcute.qcute_v5_concat_modes --config configs/qcute_v5_concat_modes_1.py
+uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_modes_1.py
 
 # plot after training:
 uv run python scripts/plot_run.py logs/qcute_v5_concat_modes_1

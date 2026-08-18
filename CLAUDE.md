@@ -146,6 +146,23 @@ friendly rewrite, while being kept themselves as O(L^2) dense references:
   `qcute_v5_concat_slow.py` directly, since window semantics changed by
   design, see the module's own docstring).
 
+**`qcute_v5_concat.py` promoted again (2026-08-17)**, from a
+`qcute_v5_concat_modes.py` fork adding per-conditioning-depth multi-mode
+decode loss (`Config.multi_mode_impl: "off"|"multipass"|"single_pass"`,
+mirroring `qcute_v5_stack.py`'s free `decode_stage_extra_losses`
+byproduct, which flat self-attention decode has no natural equivalent
+of): `"off"` (default) is bit-exact with the pre-fork behavior — that
+version is kept as `qcute/qcute_v5_concat_no_modes.py`, a strict no-op
+reference. `"multipass"` is a naive T-calls-per-level reference;
+`"single_pass"` batches every mode's own independent merged buffer
+(block-diagonal masked, zero cross-mode attention) into one shared pass
+— exact vs. `"multipass"`, supports both the dense and the chunked/
+banded (SWA) attention path (`_merged_layout` extended with
+`forced_sc`/`forced_n_chunks`/`forced_n_prev_chunks`, safe to force a
+chunk grid larger than a segment's own natural need). Verified via
+`scripts/test_v5_concat_modes.py` across `Ks=(1,)`/`(4,1)`/`(2,2,1)`,
+dense and chunked.
+
 Both `qcute_v5.py` and `qcute_v5_concat.py` also had several `Config`
 flags hardcoded away (`decode_code_ste` always `True`,
 `cross_track_source` always `"decode"`, `decode_self_only_aux` and its
@@ -156,6 +173,40 @@ uniform methods: `init_modules`/`quantize`/`to_ids`/`embed_for_decode`/
 `ntp_loss_acc`/`embed_input`/`sample_next`) — `make_quant(cfg)` is the
 only remaining `quant_type` branch in either file, everywhere else
 dispatches through `self.quant.<method>()`.
+
+**`QuantScheme` gains a third implementation, `FSQQuant` (2026-08-17)**,
+in both `qcute_v5_stack.py` and `qcute_v5_concat.py`: `Config.quant_type="fsq"`
+(finite scalar quantization, Mentzer et al. 2023, ported from archived
+`qcute/archive/qcutelm.py`), `Config.fsq_dq`/`fsq_levels` (defaults 6/8).
+`Config.fsq_bound` picks the per-dim squashing nonlinearity applied
+before rounding — `"sigmoid"` (default, iFSQ, matches archived
+`qcutelm_vlt6.py`'s own default) or `"tanh"` (original FSQ) — one quant
+type plus a sub-flag rather than two separate `quant_type` strings,
+since embedding/loss/sampling are identical either way. `BSQQuant` gains
+`Config.bsq_lfq` (default `False`, unchanged behavior): skips the
+L2-normalize-before-sign step, hypercube corners instead of BSQ's
+hypersphere. Also fixed a real pre-existing bug found while touching
+this code: `BSQQuant.sample_next` referenced a nonexistent
+`self.use_bernoulli_sample` (should've been `self.mode`) — would have
+crashed on the first BSQ generation call in either file.
+
+**BSQ entropy regularization (2026-08-17)**, both files: `bsq_entropy_reg`
+(Yu et al. 2023 §3.2 MAGVIT-v2 / BSQ 2024 closed-form, ported from
+archived `qcutelm.py`) via a new `QuantScheme.entropy_reg(pre_q)` hook
+(default `None`; only `BSQQuant` overrides it), weighted by
+`Config.entropy_reg_weight`/`--entropy_reg_weight` (default `0.0`, off).
+Threading the term from each level's raw `pre_q` up to the loss required
+real return-tuple arity changes (not just new optional params): in
+`qcute_v5_concat.py`, `LevelLM.forward` 8-tuple→9-tuple and `RefineLM._run`
+11-tuple→12-tuple; in `qcute_v5_stack.py`, `LevelLM._extract_code` gained a
+second return value, `LevelLM.encode` 4-tuple→5-tuple, and `RefineLM._run`
+12-tuple→13-tuple — every call site of each (generation/diagnostic
+functions included, ~13 per file) updated to match. Deliberately did NOT
+reuse `qcute_v5_concat.py`'s existing always-`None` 6th `LevelLM.forward`
+slot even though it looked unused — `check_gen_consistency` branches on
+it via `is not None`, so overloading it would have silently mis-routed
+that check whenever entropy_reg was non-None; a new trailing tuple
+element was added instead.
 
 **`qcute_v5.py`'s "query first byte" (qfb) fix**: `cross_attn_stage`'s
 strict causal mask (`code_pos < query_pos`) means the row that would

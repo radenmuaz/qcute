@@ -76,8 +76,7 @@ def test_dense_reference_mask_shape():
 
 def build_model(Ks, context_len, attn_window, n_layers=2, d_model=32, n_heads=2, share=True):
     cfg = m.Config(Ks=Ks, d_model=d_model, n_layers=n_layers, context_len=context_len,
-                    n_heads=n_heads, attn_window=attn_window, use_gumbel_noise=False,
-                    share_level_weights=share)
+                    n_heads=n_heads, attn_window=attn_window, code_sample_mode="ste")
     model = m.RefineLM(cfg).to(DEVICE)
     model.eval()
     return model

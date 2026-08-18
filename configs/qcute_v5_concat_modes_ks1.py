@@ -3,7 +3,7 @@ single-track case (T=1 at the only level), so decode_stage_extra_total should st
 shallower mode exists below the single self track). Sanity floor of the Ks regression grid
 (CLAUDE.md's simplest-to-hardest table, #1).
 
-uv run python -m qcute.qcute_v5_concat_modes --config configs/qcute_v5_concat_modes_ks1.py
+uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_modes_ks1.py
 """
 from pathlib import Path
 

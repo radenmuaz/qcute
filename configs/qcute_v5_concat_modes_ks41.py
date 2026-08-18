@@ -3,7 +3,7 @@ has T=2 tracks (self K=4, +1 K=4 since Ks[1]=1 doesn't widen the span), so decod
 picks up exactly one shallower mode (self-only) at level0; level1 stays T=1 (no extra mode).
 Ks regression grid (CLAUDE.md) #7.
 
-uv run python -m qcute.qcute_v5_concat_modes --config configs/qcute_v5_concat_modes_ks41.py
+uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_modes_ks41.py
 """
 from pathlib import Path
 

@@ -129,8 +129,23 @@ class Config:
     vocab: int = 256
     code_extract_mode: str = "last_h"
     code_head_tied: bool = False
-    quant_type: str = "softmax"   # "softmax" (categorical code_head + gumbel/argmax) or "bsq"
+    quant_type: str = "softmax"   # "softmax" (categorical code_head + gumbel/argmax), "bsq", or "fsq"
     bsq_bits: int = 4             # code width in bits when quant_type="bsq"
+    bsq_lfq: bool = False          # True regresses BSQ to plain LFQ (no L2-normalize before sign,
+                                    # no 1/sqrt(dq) rescale -- hypercube corners, not hypersphere).
+                                    # Default False = unchanged BSQ behavior.
+    entropy_reg_weight: float = 0.0   # bsq/softmax only (see bsq_entropy_reg/softmax_entropy_reg):
+                                       # weight on the code-usage entropy regularization term,
+                                       # summed over levels and added to the total loss. 0.0
+                                       # (default, matches archived qcutelm.py's own default) = off.
+                                       # No-op for quant_type="fsq" (QuantScheme.entropy_reg
+                                       # defaults to None, not implemented for FSQ).
+    fsq_dq: int = 6                # code width in dims when quant_type="fsq" (archived qcutelm.py default)
+    fsq_levels: int = 8            # levels per dim when quant_type="fsq" (archived qcutelm.py default)
+    fsq_bound: str = "sigmoid"     # "sigmoid" (default -- iFSQ, 2*sigmoid(1.6*v)-1, archived
+                                    # qcutelm_vlt6.py's default) or "tanh" (original FSQ, Mentzer
+                                    # et al. 2023) -- the bounding nonlinearity fsq_quantize applies
+                                    # before rounding
     code_sample_mode: str = "ste"   # "ste" (deterministic hard forward, plain softmax/sign(),
                                      # straight-through backward -- default), "sample" (stochastic
                                      # hard forward -- Gumbel noise for softmax, Bernoulli(sigmoid)
@@ -153,17 +168,88 @@ def gumbel_quantize(logits: torch.Tensor, tau: float, mode: str = "ste") -> torc
     return soft + (hard - soft).detach()
 
 
-def bsq_quantize(v: torch.Tensor, dq: int, mode: str = "ste") -> torch.Tensor:
-    v_unit = F.normalize(v, dim=-1)
+def bsq_quantize(v: torch.Tensor, dq: int, mode: str = "ste", lfq: bool = False) -> torch.Tensor:
+    """lfq=True regresses BSQ to plain LFQ: skips the L2-normalize-to-unit-sphere step, signing the
+    raw projection directly (hypercube corners {-1,+1}^dq instead of BSQ's hypersphere corners
+    ||z_hat||=1) and skips the 1/sqrt(dq) rescale (only meaningful once normalized) -- ported from
+    archived qcute/archive/qcutelm.py's bsq_quantize. Sign bits (used by to_ids/CodeEmbed/
+    ntp_loss_acc's targets) are unaffected by normalization either way, only z_hat's geometry/scale
+    changes. Default (lfq=False) is unchanged BSQ behavior."""
+    v_eff = v if lfq else F.normalize(v, dim=-1)
+    scale = 1.0 if lfq else 1.0 / math.sqrt(dq)
     if mode == "soft":
-        return v_unit / math.sqrt(dq)
+        return v_eff * scale
     if mode == "sample":
-        probs = torch.sigmoid(v_unit)
-        u = torch.rand_like(v_unit)
-        hard = torch.where(u < probs, torch.ones_like(v_unit), -torch.ones_like(v_unit))
+        probs = torch.sigmoid(v_eff)
+        u = torch.rand_like(v_eff)
+        hard = torch.where(u < probs, torch.ones_like(v_eff), -torch.ones_like(v_eff))
     else:
-        hard = torch.sign(v_unit)
-    return (v_unit + (hard - v_unit).detach()) / math.sqrt(dq)
+        hard = torch.sign(v_eff)
+    return (v_eff + (hard - v_eff).detach()) * scale
+
+
+def bernoulli_entropy(p: torch.Tensor) -> torch.Tensor:
+    p = p.clamp(1e-6, 1 - 1e-6)
+    return -(p * p.log() + (1 - p) * (1 - p).log())
+
+
+def bsq_entropy_reg(v: torch.Tensor) -> torch.Tensor:
+    """LFQ/BSQ-style entropy regularization (Yu et al. 2023 SS3.2, MAGVIT-v2; also BSQ 2024's
+    closed-form version), ported from archived qcute/archive/qcutelm.py -- both papers' recipes
+    lean on this to keep code usage spread out; without it BSQ is prone to collapsing onto a
+    dominant code. Two opposing pressures on the per-bit Bernoulli probabilities p=sigmoid(v):
+    (1) minimize each *example's* bit entropy -- push predictions toward confident/decisive
+    corners, matching the hard quantization boundary; (2) maximize the *batch-averaged* bit-usage
+    entropy -- spread which corners get used across examples, directly countering collapse onto
+    one dominant code. Returns E_batch[H(p)] - H(E_batch[p]) (minimize this: pulls per-example
+    entropy down, batch-average entropy up). Applied to the RAW pre-quantization projection (v,
+    before normalize/sign), matching the archived usage."""
+    probs = torch.sigmoid(v)
+    per_example = bernoulli_entropy(probs).sum(-1).mean()
+    batch_avg = probs.reshape(-1, probs.size(-1)).mean(0)
+    batch = bernoulli_entropy(batch_avg).sum()
+    return per_example - batch
+
+
+def softmax_entropy_reg(logits: torch.Tensor) -> torch.Tensor:
+    """Same E_batch[H(p)] - H(E_batch[p]) structure as bsq_entropy_reg, generalized to a single
+    V-way categorical code instead of dq independent Bernoulli bits -- exact categorical entropy
+    here (one joint distribution), not a per-bit marginal proxy. Minimize this: pulls each
+    example's softmax toward a confident/decisive one-hot (matching the hard
+    argmax/gumbel-one-hot boundary) while pushing the batch-averaged category usage toward
+    uniform, countering collapse onto a dominant code."""
+    probs = F.softmax(logits, dim=-1)
+    logp = F.log_softmax(logits, dim=-1)
+    per_example = -(probs * logp).sum(-1).mean()
+    batch_avg = probs.reshape(-1, probs.size(-1)).mean(0)
+    batch = -(batch_avg * batch_avg.clamp_min(1e-9).log()).sum()
+    return per_example - batch
+
+
+def fsq_quantize(v: torch.Tensor, L: int, mode: str = "ste", bound: str = "sigmoid") -> torch.Tensor:
+    """Finite scalar quantization, ported from archived qcute/archive/qcutelm*.py. `bound` selects
+    the squashing nonlinearity applied to v's dq dims before rounding to one of L integer levels
+    (half_l=(L-1)/2 either way), STE backward -- same idiom as bsq_quantize/gumbel_quantize above:
+      - "sigmoid" (default): iFSQ, half_l*(2*sigmoid(1.6*v)-1) -- archived qcutelm_vlt6.py's
+        default variant.
+      - "tanh": original FSQ (Mentzer et al. 2023), half_l*tanh(v).
+    "sample" adds uniform dequantization-style dithering noise before rounding (FSQ has no natural
+    stochastic analogue to Gumbel/Bernoulli sampling, since there's no softmax/sigmoid probability
+    to sample from -- this is the closest equivalent, letting the rounding boundary itself vary).
+    "soft" skips rounding/STE entirely, returning the bounded continuous value. Output normalized
+    to roughly [-1, 1] (divided by half_l) to match bsq_quantize's unit-ish output scale, so
+    code_sample_mode's STE/proxy idioms stay comparable in magnitude across quant_type."""
+    half_l = (L - 1) / 2
+    z_bounded = half_l * (torch.tanh(v) if bound == "tanh" else (2 * torch.sigmoid(1.6 * v) - 1))
+    if mode == "soft":
+        return z_bounded / half_l
+    if mode == "sample":
+        noise = torch.rand_like(z_bounded) - 0.5
+        z_rounded = torch.round(z_bounded + noise).clamp(-half_l, half_l)
+    else:
+        z_rounded = torch.round(z_bounded)
+    z_hat = z_bounded + (z_rounded - z_bounded).detach()
+    return z_hat / half_l
 
 
 MAX_PQ_TABLE_DQ = 16   # 2**16 = 65536 rows -- ceiling bsq_bits this table lookup allows
@@ -187,6 +273,31 @@ class CodeEmbed(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         idx = ((x > 0).long() * self._powers).sum(-1)
         hard = self.table(idx)
+        proxy = self.proxy(x)
+        return proxy + (hard - proxy).detach()
+
+
+class FSQEmbed(nn.Module):
+    """Maps an FSQ code (dq per-dim level indices in [0, L)) to a D-dim vector via a per-dim
+    embedding table summed across dims -- compositional (PQ-style), generalizes to any of the
+    L**dq combinations for free, unlike a per-whole-code table (which for FSQ's typical L=8,
+    dq=6 would need 8**6=262144 rows -- ported from archived qcute/archive/qcutelm.py's
+    FactorizedCodeEmbedding, generalizing CodeEmbed's binary/BSQ-only table lookup above to L
+    levels). x is fsq_quantize's normalized [-1,1] output; STE via the same proxy idiom CodeEmbed
+    uses, since the per-dim level lookup is non-differentiable in x."""
+
+    def __init__(self, dq: int, L: int, D: int):
+        super().__init__()
+        self.dq, self.L = dq, L
+        self.table = nn.Parameter(torch.zeros(dq, L, D))
+        nn.init.normal_(self.table, std=0.02)
+        self.proxy = nn.Linear(dq, D)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bound = (self.L - 1) / 2
+        levels = (x * bound + bound).round().long().clamp(0, self.L - 1)
+        dq_idx = torch.arange(self.dq, device=x.device)
+        hard = self.table[dq_idx, levels].sum(dim=-2)
         proxy = self.proxy(x)
         return proxy + (hard - proxy).detach()
 
@@ -220,6 +331,12 @@ class QuantScheme:
 
     def sample_next(self, stage_lm: "LevelLM", h_query: torch.Tensor, vocab: int) -> torch.Tensor:
         raise NotImplementedError
+
+    def entropy_reg(self, pre_q: torch.Tensor) -> torch.Tensor | None:
+        """Optional code-usage entropy regularization term computed from the raw pre-quantization
+        projection (before quantize()'s normalize/round/sign). None (default -- no term) for
+        schemes that don't have one; only BSQQuant overrides this."""
+        return None
 
 
 class SoftmaxQuant(QuantScheme):
@@ -258,11 +375,15 @@ class SoftmaxQuant(QuantScheme):
         next_id = logits.argmax(-1)
         return F.one_hot(next_id, num_classes=vocab).to(h_query.dtype)
 
+    def entropy_reg(self, pre_q):
+        return softmax_entropy_reg(pre_q)
+
 
 class BSQQuant(QuantScheme):
-    def __init__(self, bsq_bits: int, mode: str = "ste"):
+    def __init__(self, bsq_bits: int, mode: str = "ste", lfq: bool = False):
         self.bsq_bits = bsq_bits
         self.mode = mode
+        self.lfq = lfq
 
     def init_modules(self, D, V, code_head_tied):
         code_head = nn.Linear(D, self.bsq_bits, bias=False)
@@ -273,7 +394,7 @@ class BSQQuant(QuantScheme):
         return code_head, code_embed, code_predict
 
     def quantize(self, pre_q):
-        return bsq_quantize(pre_q, self.bsq_bits, self.mode)
+        return bsq_quantize(pre_q, self.bsq_bits, self.mode, self.lfq)
 
     def to_ids(self, source_c):
         bits = (source_c > 0).long()
@@ -296,12 +417,64 @@ class BSQQuant(QuantScheme):
 
     def sample_next(self, stage_lm, h_query, vocab):
         pred = stage_lm.code_predict(h_query)
-        return bsq_quantize(pred, self.bsq_bits, self.use_bernoulli_sample)
+        return bsq_quantize(pred, self.bsq_bits, self.mode, self.lfq)
+
+    def entropy_reg(self, pre_q):
+        return bsq_entropy_reg(pre_q)
+
+
+class FSQQuant(QuantScheme):
+    def __init__(self, dq: int, L: int, mode: str = "ste", bound: str = "sigmoid"):
+        self.dq, self.L, self.mode, self.bound = dq, L, mode, bound
+
+    def init_modules(self, D, V, code_head_tied):
+        code_head = nn.Linear(D, self.dq, bias=False)
+        nn.init.normal_(code_head.weight, std=0.02)
+        code_embed = FSQEmbed(self.dq, self.L, D)
+        code_predict = nn.Linear(D, self.dq * self.L)
+        nn.init.normal_(code_predict.weight, std=0.02)
+        return code_head, code_embed, code_predict
+
+    def quantize(self, pre_q):
+        return fsq_quantize(pre_q, self.L, self.mode, self.bound)
+
+    def to_ids(self, source_c):
+        bound = (self.L - 1) / 2
+        levels = (source_c * bound + bound).round().long().clamp(0, self.L - 1)
+        weights = self.L ** torch.arange(self.dq, device=levels.device)
+        return (levels * weights).sum(-1)
+
+    def embed_for_decode(self, stage_lm, source_c):
+        return stage_lm.code_embed(source_c)
+
+    def ntp_loss_acc(self, stage_lm, h_query, target_repr):
+        bound = (self.L - 1) / 2
+        target_levels = (target_repr.reshape(-1, self.dq) * bound + bound).round().long().clamp(0, self.L - 1)
+        pred = stage_lm.code_predict(h_query).reshape(-1, self.dq, self.L)
+        loss = F.cross_entropy(pred.reshape(-1, self.L), target_levels.reshape(-1))
+        with torch.no_grad():
+            acc = (pred.argmax(-1) == target_levels).float().mean()
+        return loss, acc
+
+    def embed_input(self, stage_lm, seq_repr):
+        return stage_lm.code_embed(seq_repr)
+
+    def sample_next(self, stage_lm, h_query, vocab):
+        bound = (self.L - 1) / 2
+        pred = stage_lm.code_predict(h_query).reshape(*h_query.shape[:-1], self.dq, self.L)
+        if self.mode == "sample":
+            probs = F.softmax(pred, dim=-1)
+            levels = torch.multinomial(probs.reshape(-1, self.L), 1).reshape(pred.shape[:-1])
+        else:
+            levels = pred.argmax(-1)
+        return (levels.float() - bound) / bound
 
 
 def make_quant(cfg: "Config") -> QuantScheme:
     if cfg.quant_type == "bsq":
-        return BSQQuant(cfg.bsq_bits, cfg.code_sample_mode)
+        return BSQQuant(cfg.bsq_bits, cfg.code_sample_mode, cfg.bsq_lfq)
+    if cfg.quant_type == "fsq":
+        return FSQQuant(cfg.fsq_dq, cfg.fsq_levels, cfg.code_sample_mode, cfg.fsq_bound)
     return SoftmaxQuant(cfg.gumbel_tau, cfg.code_sample_mode)
 
 
@@ -557,7 +730,9 @@ class LevelLM(nn.Module):
             ntp_acc = h.new_zeros(())
         return ntp_loss, ntp_acc
 
-    def _extract_code(self, h: torch.Tensor, x0: torch.Tensor, K: int, window: int | None) -> torch.Tensor:
+    def _extract_code(self, h: torch.Tensor, x0: torch.Tensor, K: int, window: int | None
+                       ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """-> (c_i, entropy_reg). entropy_reg is quant.entropy_reg(pre_q) -- None unless BSQQuant."""
         cfg = self.cfg
         B, L, D = h.shape
         n_blocks = L // K
@@ -579,7 +754,7 @@ class LevelLM(nn.Module):
         else:
             raise ValueError(f"unknown code_extract_mode {cfg.code_extract_mode!r}")
         pre_q = self._classify(pooled)
-        return self.quant.quantize(pre_q)
+        return self.quant.quantize(pre_q), self.quant.entropy_reg(pre_q)
 
     def _embed_input(self, seq_repr: torch.Tensor, is_byte_level: bool) -> torch.Tensor:
         if is_byte_level:
@@ -815,13 +990,14 @@ class LevelLM(nn.Module):
 
         c_i = None
         if want_code:
-            c_i = self._extract_code(h, x0, K, window)
+            c_i, _ = self._extract_code(h, x0, K, window)
 
         query_seq = h[:, :-1, :]
         return c_i, ntp_loss, ntp_acc, h, query_last, query_seq
 
     def encode(self, seq_repr: torch.Tensor, level: int, window: int | None,
-               compute_ntp: bool = True) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+               compute_ntp: bool = True
+               ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         cfg = self.cfg
         K = cfg.Ks[level]
         D = cfg.d_model
@@ -835,8 +1011,8 @@ class LevelLM(nn.Module):
             x = block(x, cos, sin, window)
         h = self.ln_f(x)
         ntp_loss, ntp_acc = self._ntp(h, seq_repr, is_byte_level, D, compute_ntp)
-        c_i = self._extract_code(h, x0, K, window)
-        return c_i, ntp_loss, ntp_acc, h
+        c_i, entropy_reg = self._extract_code(h, x0, K, window)
+        return c_i, ntp_loss, ntp_acc, h, entropy_reg
 
     def cross_attn_stage(self, x_in: torch.Tensor, code_kv: torch.Tensor, seq_repr: torch.Tensor, level: int,
                           track_K: int, window: int | None, compute_ntp: bool = True, want_code: bool = False
@@ -991,7 +1167,7 @@ class LevelLM(nn.Module):
             # from the original, since c_i is this LEVEL's own code regardless of which track's
             # code_kv this particular stage cross-attended against.
             x0 = self._embed_input(seq_repr, is_byte_level)
-            c_i = self._extract_code(h, x0, K, window)
+            c_i, _ = self._extract_code(h, x0, K, window)
 
         query_last = h[:, -1, :]   # only meaningful to a caller when L is an exact multiple of
         # track_K (block_aligned) -- same caveat as before, just now a plain byproduct of h itself.
@@ -1067,15 +1243,17 @@ class RefineLM(nn.Module):
         cfg = self.cfg
         seq_repr = byte_ids
         encode_losses, encode_accs, h_list, c_list, x_list = [], [], [], [], []
+        encode_entropy_regs: list = []
 
         for i in range(self.n_levels):
             want_ntp = compute_ntp and (i == 0 or cfg.code_ntp_weight > 0)
-            c_i, loss_i, acc_i, h_i = self.encode_lms[i].encode(seq_repr, level=i, window=self.windows[i], compute_ntp=want_ntp)
+            c_i, loss_i, acc_i, h_i, entropy_reg_i = self.encode_lms[i].encode(seq_repr, level=i, window=self.windows[i], compute_ntp=want_ntp)
             encode_losses.append(loss_i)
             encode_accs.append(acc_i)
             h_list.append(h_i)
             c_list.append(c_i)
             x_list.append(seq_repr)
+            encode_entropy_regs.append(entropy_reg_i)
             seq_repr = c_i
 
         decode_losses: list = [None] * self.n_levels
@@ -1156,13 +1334,14 @@ class RefineLM(nn.Module):
 
         return (encode_losses, encode_accs, decode_losses, decode_accs, h_out, c_list,
                 decode_stage_extra_losses, final_embed_weight,
-                next_query, decode_derived_c, query_seq_out, h_list[0])
+                next_query, decode_derived_c, query_seq_out, h_list[0], encode_entropy_regs)
 
     def forward(self, byte_ids: torch.Tensor) -> tuple[torch.Tensor, dict]:
         cfg = self.cfg
         (encode_losses, encode_accs, decode_losses, decode_accs, h_list, c_list,
          decode_stage_extra_losses,
-         _final_embed_weight, _next_query, _decode_derived_c, _query_seq, h0_encode) = self._run(byte_ids)
+         _final_embed_weight, _next_query, _decode_derived_c, _query_seq, h0_encode,
+         encode_entropy_regs) = self._run(byte_ids)
 
         byte_loss = decode_losses[0] if decode_losses[0] is not None else encode_losses[0]
         byte_acc = decode_accs[0] if decode_accs[0] is not None else encode_accs[0]
@@ -1202,17 +1381,25 @@ class RefineLM(nn.Module):
         decode_stage_extra_total = (decode_stage_extra_weight * torch.stack(decode_stage_extra_losses).sum()
                                      if decode_stage_extra_losses else byte_loss.new_zeros(()))
 
-        loss = encode_total + decode_total + decode_stage_extra_total
+        # entropy_reg (BSQQuant only, see bsq_entropy_reg): sum across levels, weighted by
+        # cfg.entropy_reg_weight (default 0.0 -- opt-in, matches archived qcutelm.py's default).
+        entropy_reg_terms = [r for r in encode_entropy_regs if r is not None]
+        entropy_reg_total = (torch.stack(entropy_reg_terms).sum() if entropy_reg_terms
+                              else byte_loss.new_zeros(()))
+
+        loss = encode_total + decode_total + decode_stage_extra_total + cfg.entropy_reg_weight * entropy_reg_total
         ntp_total = torch.stack(encode_losses + [l for l in decode_losses if l is not None]
                                  + decode_stage_extra_losses).sum()
         metrics = {
             "loss": loss, "byte_loss": byte_loss, "byte_loss_full": byte_loss_full, "byte_acc": byte_acc,
             "encode_total": encode_total, "decode_total": decode_total,
             "decode_stage_extra_total": decode_stage_extra_total, "ntp_loss_total": ntp_total,
+            "entropy_reg_total": entropy_reg_total,
             **{f"level{i}_ntp_loss_encode": l for i, l in enumerate(encode_losses)},
             **{f"level{i}_ntp_acc_encode": a for i, a in enumerate(encode_accs)},
             **{f"level{i}_ntp_loss_decode": l for i, l in enumerate(decode_losses) if l is not None},
             **{f"level{i}_ntp_acc_decode": a for i, a in enumerate(decode_accs) if a is not None},
+            **{f"level{i}_entropy_reg": r for i, r in enumerate(encode_entropy_regs) if r is not None},
         }
 
         return loss, metrics
@@ -1243,7 +1430,7 @@ def generate_no_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
         # boundary-query patch reaches the sequence's trailing row too (see its docstring);
         # elsewhere it's a no-op and next_query[0] stays None.
         block_aligned = L % K0 == 0
-        _, _, _, _, h_list, _, _, final_embed_weight, next_query, _decode_derived_c, _query_seq, _ = model._run(
+        _, _, _, _, h_list, _, _, final_embed_weight, next_query, _decode_derived_c, _query_seq, _, _ = model._run(
             all_bytes, compute_ntp=False, max_decode_sources=max_decode_sources,
             want_next_query=block_aligned)
         embed_w = final_embed_weight[0] if final_embed_weight[0] is not None else model.encode_lms[0].embed.weight
@@ -1284,7 +1471,7 @@ def generate_kv_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
         window_bytes = all_bytes[:, -context_len:]   # FIFO: only the trailing context_len bytes ever matter
         L = window_bytes.shape[1]
         block_aligned = L % K0 == 0
-        _, _, _, _, h_list, _, _, final_embed_weight, next_query, _decode_derived_c, _query_seq, _ = model._run(
+        _, _, _, _, h_list, _, _, final_embed_weight, next_query, _decode_derived_c, _query_seq, _, _ = model._run(
             window_bytes, compute_ntp=False, max_decode_sources=max_decode_sources,
             want_next_query=block_aligned)
         embed_w = final_embed_weight[0] if final_embed_weight[0] is not None else model.encode_lms[0].embed.weight
@@ -1471,7 +1658,7 @@ def generate_encode_only(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_by
     all_bytes = prompt_bytes
     enc0 = model.encode_lms[0]
     for _ in range(n_new_bytes):
-        _, _, _, h = enc0.encode(all_bytes, level=0, window=model.windows[0], compute_ntp=False)
+        _, _, _, h, _ = enc0.encode(all_bytes, level=0, window=model.windows[0], compute_ntp=False)
         next_byte = _sample_next_byte(enc0.embed.weight, h[:, -1, :])
         all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
     if was_training:
@@ -1484,7 +1671,7 @@ def _encode_up_to(model: "RefineLM", seq_repr: torch.Tensor, level: int) -> torc
     level (level-1)'s own code sequence -- the input sequence level `level`'s own LM consumes.
     level=0 returns seq_repr unchanged (bytes themselves)."""
     for j in range(level):
-        seq_repr, _, _, _ = model.encode_lms[j].encode(seq_repr, level=j, window=model.windows[j], compute_ntp=False)
+        seq_repr, _, _, _, _ = model.encode_lms[j].encode(seq_repr, level=j, window=model.windows[j], compute_ntp=False)
     return seq_repr
 
 
@@ -1506,7 +1693,7 @@ def generate_level_codes(model: "RefineLM", prompt_bytes: torch.Tensor, level: i
     n_prompt_codes = codes.shape[1]
     enc_level = model.encode_lms[level]
     for _ in range(n_new_codes):
-        _, _, _, h = enc_level.encode(codes, level=level, window=model.windows[level], compute_ntp=False)
+        _, _, _, h, _ = enc_level.encode(codes, level=level, window=model.windows[level], compute_ntp=False)
         next_code = enc_level.quant.sample_next(enc_level, h[:, -1, :], model.cfg.vocab)
         codes = torch.cat([codes, next_code.unsqueeze(1)], dim=1)
     if was_training:
@@ -1546,7 +1733,7 @@ def generate_level_codes_via_decode(model: "RefineLM", prompt_bytes: torch.Tenso
         pad_len = (-L) % K
         padded = (torch.cat([codes, codes.new_zeros(codes.shape[0], pad_len, codes.shape[2])], dim=1)
                   if pad_len > 0 else codes)
-        c_lvl, _, _, h_lvl = enc_level.encode(padded, level=level, window=model.windows[level], compute_ntp=False)
+        c_lvl, _, _, h_lvl, _ = enc_level.encode(padded, level=level, window=model.windows[level], compute_ntp=False)
         code_embeds = stage_lm.quant.embed_for_decode(stage_lm, c_lvl)
         _, _, _, _, query_last, _ = stage_lm.cross_attn_stage(
             h_lvl, code_embeds, padded, level, K, window, compute_ntp=False, want_code=False)
@@ -1603,7 +1790,7 @@ def _decode_source_codes(model: "RefineLM", full_bytes: torch.Tensor, device: st
         seq_repr = seq_repr.unsqueeze(0)
     c_list = []
     for i in range(model.n_levels):
-        c_i, _, _, _ = model.encode_lms[i].encode(seq_repr, level=i, window=model.windows[i], compute_ntp=False)
+        c_i, _, _, _, _ = model.encode_lms[i].encode(seq_repr, level=i, window=model.windows[i], compute_ntp=False)
         c_list.append(c_i)
         seq_repr = c_i
     source_c = c_list[level]
@@ -1628,7 +1815,7 @@ def check_gen_consistency(model: "RefineLM", full_bytes: torch.Tensor, device: s
         full_bytes = full_bytes.unsqueeze(0)
     L_total = full_bytes.shape[1]
 
-    _, _, _, _, h_list_tf, _, _, final_embed_weight_tf, _, _, query_seq_tf, _ = model._run(
+    _, _, _, _, h_list_tf, _, _, final_embed_weight_tf, _, _, query_seq_tf, _, _ = model._run(
         full_bytes, compute_ntp=False, max_decode_sources=None, want_next_query=False)
     embed_tf = (final_embed_weight_tf[0] if final_embed_weight_tf[0] is not None
                 else model.encode_lms[0].embed.weight)
@@ -1646,7 +1833,7 @@ def check_gen_consistency(model: "RefineLM", full_bytes: torch.Tensor, device: s
         if ref_idx < 0 or ref_idx >= logits_tf_all.shape[0]:
             continue
         prefix = full_bytes[:, :t]
-        _, _, _, _, h_list_gen, _, _, final_embed_weight_gen, next_query_gen, _, _, _ = model._run(
+        _, _, _, _, h_list_gen, _, _, final_embed_weight_gen, next_query_gen, _, _, _, _ = model._run(
             prefix, compute_ntp=False, max_decode_sources=None, want_next_query=True)
         embed_gen = (final_embed_weight_gen[0] if final_embed_weight_gen[0] is not None
                      else model.encode_lms[0].embed.weight)
@@ -1904,8 +2091,13 @@ def main():
                     choices=["last_h", "softmax_pool", "light_query_attn", "query_embed"])
     p.add_argument("--code_head_tied", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--vocab", type=int, default=256)
-    p.add_argument("--quant_type", type=str, default="softmax", choices=["softmax", "bsq"])
+    p.add_argument("--quant_type", type=str, default="softmax", choices=["softmax", "bsq", "fsq"])
     p.add_argument("--bsq_bits", type=int, default=4)
+    p.add_argument("--bsq_lfq", action="store_true")
+    p.add_argument("--entropy_reg_weight", type=float, default=0.0)
+    p.add_argument("--fsq_dq", type=int, default=6)
+    p.add_argument("--fsq_levels", type=int, default=8)
+    p.add_argument("--fsq_bound", type=str, default="sigmoid", choices=["sigmoid", "tanh"])
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -1957,7 +2149,9 @@ def main():
         byte_ntp_weight=args.byte_ntp_weight, code_ntp_weight=args.code_ntp_weight,
         decode_ntp_weight=args.decode_ntp_weight, gumbel_tau=args.gumbel_tau,
         code_extract_mode=args.code_extract_mode, code_head_tied=args.code_head_tied,
-        vocab=args.vocab, quant_type=args.quant_type, bsq_bits=args.bsq_bits,
+        vocab=args.vocab, quant_type=args.quant_type, bsq_bits=args.bsq_bits, bsq_lfq=args.bsq_lfq,
+        entropy_reg_weight=args.entropy_reg_weight,
+        fsq_dq=args.fsq_dq, fsq_levels=args.fsq_levels, fsq_bound=args.fsq_bound,
         code_sample_mode=args.code_sample_mode,
     )
     model = RefineLM(cfg).to(device)

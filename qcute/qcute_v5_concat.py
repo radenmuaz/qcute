@@ -1,5 +1,7 @@
-"""qcute_v5_concat: now the default v5 concat module (promoted from qcute_v5_concat_skip), forked
-from qcute_v5_concat_fixblock.py, adding one more pruning on top of
+"""qcute_v5_concat: now the default v5 concat module (promoted from qcute_v5_concat_modes.py, which
+itself forked from this file to add multi-mode decode loss -- see that section below; the
+pre-multi-mode version is kept as qcute_v5_concat_no_modes.py). Originally promoted from
+qcute_v5_concat_skip, forked from qcute_v5_concat_fixblock.py, adding one more pruning on top of
 the fixblock changes (decode_bos removed, block 0's first K-1 targets excluded from decode's loss --
 see qcute_v5_concat_fixblock.py's own docstring for that).
 
@@ -51,7 +53,56 @@ Every encode_lm/decode_lm is its own independent weight instance -- weight-shari
 (share_level_weights) has been pruned entirely; see qcute_v5_concat_ws.py for that variant, kept
 as a reference.
 
+**Multi-mode decode loss (promoted from the qcute_v5_concat_modes.py fork)** --
+qcute_v5_stack.py's staged cross-attention decode gets a loss at every conditioning depth (self
+only, self+track1, self+track1+track2, ...) for free, as a byproduct of its sequential per-track
+stages (decode_stage_extra_losses). This module's decode has no such byproduct on its own -- it's
+ONE flat self-attention pass over a merged buffer holding every track's codes at once, so there's
+no natural intermediate readout to tap. Config.multi_mode_impl selects how (or whether) to get
+those same per-depth losses:
+  - "off" (default): one loss per level (the full/deepest mode only), zero overhead -- bit-exact
+    with the pre-multi-mode behavior (qcute_v5_concat_no_modes.py, kept as that no-op reference,
+    checked in scripts/test_v5_concat_modes.py).
+  - "multipass": naive reference -- calls _merged_decode_forward once per mode m=1..T (T = number
+    of available tracks), each with tracks[:m], literally re-running the whole per-level decode
+    forward T times. Correct by construction (identical to calling max_decode_sources=m T times),
+    used only to verify "single_pass" below.
+  - "single_pass": every mode m=1..T gets its OWN independent merged buffer (its own
+    _merged_layout(L, tracks_meta[:m], device) segment, built from tracks[:m] exactly as a
+    standalone max_decode_sources=m call would), concatenated along the sequence dim with the
+    other modes' segments and run through one shared self-attention pass per layer, using a
+    block-diagonal mask (zero cross-segment attention -- no mode's keys/queries ever see another
+    mode's entries). This is mathematically identical to "multipass" (T independent calls), just
+    batched into fewer kernel launches; a duplicate-query-reading-a-shared-backbone design was
+    tried first and rejected -- it doesn't preserve exactness at same-timestep code ties across
+    modes, since a shallower mode's own hidden state at a tied position needs to be computed from
+    scratch, not read off the (already more-contaminated) shared backbone.
+    Supports both the dense and the chunked/banded (SWA) attention path:
+      - dense: _merged_layout_multimode builds the block-diagonal structure once (cached per
+        (L, tracks_meta, device)) and _merged_decode_forward_multimode runs it directly.
+      - chunked: _merged_layout extended with forced_sc/forced_n_chunks/forced_n_prev_chunks
+        (forcing a chunk grid larger than a segment's own natural need is always safe, pure
+        padding via the same true_pos=-1e9/window=0 sentinel scheme already used for Lp padding;
+        forcing smaller is asserted against). _merged_layout_multimode_chunked finds the shared
+        grid every mode's segment can be padded onto, and _merged_decode_forward_multimode_chunked
+        batches all T modes into one SDPA call per layer -- the chunked path's own
+        (B, n_chunks)-flattened-batch trick extended with an added "mode" axis.
+        _merged_decode_forward_multimode auto-dispatches between the two based on whether any
+        segment needs chunking.
+      - _merged_decode_forward_multimode_looped (option 1): trivial per-mode reference -- T calls
+        to the existing, unmodified _merged_decode_forward -- used to verify the chunked batched
+        path (option 2) directly, independent of "multipass"'s own LevelLM.forward plumbing.
+    Verified exact (scripts/test_v5_concat_modes.py) against "multipass" across Ks=(1,), (4,1),
+    (2,2,1), both dense (attn_window=-1) and chunked (real finite window) -- all-mode logits/
+    losses match under quant_type="softmax" code_sample_mode="ste" (the only combination that's
+    deterministic enough for an exact per-mode comparison).
+Per-mode losses for m<T are collected the same way qcute_v5_stack.py's decode_stage_extra_losses
+are -- summed into decode_stage_extra_total, weighted by mean(decode_ntp_weight), added to the
+total loss -- so RefineLM.forward barely changes; it already had this field's plumbing designed to
+be shared with qcute_v5_stack.py's per-level metrics dict shape.
+
     uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_3.py
+    uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_modes_ks221.py
 """
 import argparse
 import gzip
@@ -137,14 +188,33 @@ class Config:
     vocab: int = 256
     code_extract_mode: str = "last_h"
     code_head_tied: bool = False
-    quant_type: str = "softmax"   # "softmax" (categorical code_head + gumbel/argmax) or "bsq"
+    quant_type: str = "softmax"   # "softmax" (categorical code_head + gumbel/argmax), "bsq", or "fsq"
     bsq_bits: int = 4             # code width in bits when quant_type="bsq"
+    bsq_lfq: bool = False          # True regresses BSQ to plain LFQ (no L2-normalize before sign,
+                                    # no 1/sqrt(dq) rescale -- hypercube corners, not hypersphere).
+                                    # Default False = unchanged BSQ behavior.
+    entropy_reg_weight: float = 0.0   # bsq/softmax only (see bsq_entropy_reg/softmax_entropy_reg):
+                                       # weight on the code-usage entropy regularization term,
+                                       # summed over levels and added to the total loss. 0.0
+                                       # (default, matches archived qcutelm.py's own default) = off.
+                                       # No-op for quant_type="fsq" (QuantScheme.entropy_reg
+                                       # defaults to None, not implemented for FSQ).
+    fsq_dq: int = 6                # code width in dims when quant_type="fsq" (archived qcutelm.py default)
+    fsq_levels: int = 8            # levels per dim when quant_type="fsq" (archived qcutelm.py default)
+    fsq_bound: str = "sigmoid"     # "sigmoid" (default -- iFSQ, 2*sigmoid(1.6*v)-1, archived
+                                    # qcutelm_vlt6.py's default) or "tanh" (original FSQ, Mentzer
+                                    # et al. 2023) -- the bounding nonlinearity fsq_quantize applies
+                                    # before rounding
     code_sample_mode: str = "ste"   # "ste" (deterministic hard forward, plain softmax/sign(),
                                      # straight-through backward -- default), "sample" (stochastic
                                      # hard forward -- Gumbel noise for softmax, Bernoulli(sigmoid)
                                      # for bsq -- still straight-through backward), or "soft" (no
                                      # hard forward at all: plain Gumbel-Softmax relaxation for
                                      # softmax, raw normalized vector for bsq -- Jang et al. 2016)
+    multi_mode_impl: str = "off"    # "off" (default, unchanged qcute_v5_concat.py behavior),
+                                     # "multipass" (naive T-separate-forward-calls reference), or
+                                     # "single_pass" (one shared pass, query-copy trick -- dense
+                                     # attention path only, see module docstring)
 
 
 def gumbel_quantize(logits: torch.Tensor, tau: float, mode: str = "ste") -> torch.Tensor:
@@ -161,17 +231,88 @@ def gumbel_quantize(logits: torch.Tensor, tau: float, mode: str = "ste") -> torc
     return soft + (hard - soft).detach()
 
 
-def bsq_quantize(v: torch.Tensor, dq: int, mode: str = "ste") -> torch.Tensor:
-    v_unit = F.normalize(v, dim=-1)
+def bsq_quantize(v: torch.Tensor, dq: int, mode: str = "ste", lfq: bool = False) -> torch.Tensor:
+    """lfq=True regresses BSQ to plain LFQ: skips the L2-normalize-to-unit-sphere step, signing the
+    raw projection directly (hypercube corners {-1,+1}^dq instead of BSQ's hypersphere corners
+    ||z_hat||=1) and skips the 1/sqrt(dq) rescale (only meaningful once normalized) -- ported from
+    archived qcute/archive/qcutelm.py's bsq_quantize. Sign bits (used by to_ids/CodeEmbed/
+    ntp_loss_acc's targets) are unaffected by normalization either way, only z_hat's geometry/scale
+    changes. Default (lfq=False) is unchanged BSQ behavior."""
+    v_eff = v if lfq else F.normalize(v, dim=-1)
+    scale = 1.0 if lfq else 1.0 / math.sqrt(dq)
     if mode == "soft":
-        return v_unit / math.sqrt(dq)
+        return v_eff * scale
     if mode == "sample":
-        probs = torch.sigmoid(v_unit)
-        u = torch.rand_like(v_unit)
-        hard = torch.where(u < probs, torch.ones_like(v_unit), -torch.ones_like(v_unit))
+        probs = torch.sigmoid(v_eff)
+        u = torch.rand_like(v_eff)
+        hard = torch.where(u < probs, torch.ones_like(v_eff), -torch.ones_like(v_eff))
     else:
-        hard = torch.sign(v_unit)
-    return (v_unit + (hard - v_unit).detach()) / math.sqrt(dq)
+        hard = torch.sign(v_eff)
+    return (v_eff + (hard - v_eff).detach()) * scale
+
+
+def bernoulli_entropy(p: torch.Tensor) -> torch.Tensor:
+    p = p.clamp(1e-6, 1 - 1e-6)
+    return -(p * p.log() + (1 - p) * (1 - p).log())
+
+
+def bsq_entropy_reg(v: torch.Tensor) -> torch.Tensor:
+    """LFQ/BSQ-style entropy regularization (Yu et al. 2023 SS3.2, MAGVIT-v2; also BSQ 2024's
+    closed-form version), ported from archived qcute/archive/qcutelm.py -- both papers' recipes
+    lean on this to keep code usage spread out; without it BSQ is prone to collapsing onto a
+    dominant code. Two opposing pressures on the per-bit Bernoulli probabilities p=sigmoid(v):
+    (1) minimize each *example's* bit entropy -- push predictions toward confident/decisive
+    corners, matching the hard quantization boundary; (2) maximize the *batch-averaged* bit-usage
+    entropy -- spread which corners get used across examples, directly countering collapse onto
+    one dominant code. Returns E_batch[H(p)] - H(E_batch[p]) (minimize this: pulls per-example
+    entropy down, batch-average entropy up). Applied to the RAW pre-quantization projection (v,
+    before normalize/sign), matching the archived usage."""
+    probs = torch.sigmoid(v)
+    per_example = bernoulli_entropy(probs).sum(-1).mean()
+    batch_avg = probs.reshape(-1, probs.size(-1)).mean(0)
+    batch = bernoulli_entropy(batch_avg).sum()
+    return per_example - batch
+
+
+def softmax_entropy_reg(logits: torch.Tensor) -> torch.Tensor:
+    """Same E_batch[H(p)] - H(E_batch[p]) structure as bsq_entropy_reg, generalized to a single
+    V-way categorical code instead of dq independent Bernoulli bits -- exact categorical entropy
+    here (one joint distribution), not a per-bit marginal proxy. Minimize this: pulls each
+    example's softmax toward a confident/decisive one-hot (matching the hard
+    argmax/gumbel-one-hot boundary) while pushing the batch-averaged category usage toward
+    uniform, countering collapse onto a dominant code."""
+    probs = F.softmax(logits, dim=-1)
+    logp = F.log_softmax(logits, dim=-1)
+    per_example = -(probs * logp).sum(-1).mean()
+    batch_avg = probs.reshape(-1, probs.size(-1)).mean(0)
+    batch = -(batch_avg * batch_avg.clamp_min(1e-9).log()).sum()
+    return per_example - batch
+
+
+def fsq_quantize(v: torch.Tensor, L: int, mode: str = "ste", bound: str = "sigmoid") -> torch.Tensor:
+    """Finite scalar quantization, ported from archived qcute/archive/qcutelm*.py. `bound` selects
+    the squashing nonlinearity applied to v's dq dims before rounding to one of L integer levels
+    (half_l=(L-1)/2 either way), STE backward -- same idiom as bsq_quantize/gumbel_quantize above:
+      - "sigmoid" (default): iFSQ, half_l*(2*sigmoid(1.6*v)-1) -- archived qcutelm_vlt6.py's
+        default variant.
+      - "tanh": original FSQ (Mentzer et al. 2023), half_l*tanh(v).
+    "sample" adds uniform dequantization-style dithering noise before rounding (FSQ has no natural
+    stochastic analogue to Gumbel/Bernoulli sampling, since there's no softmax/sigmoid probability
+    to sample from -- this is the closest equivalent, letting the rounding boundary itself vary).
+    "soft" skips rounding/STE entirely, returning the bounded continuous value. Output normalized
+    to roughly [-1, 1] (divided by half_l) to match bsq_quantize's unit-ish output scale, so
+    code_sample_mode's STE/proxy idioms stay comparable in magnitude across quant_type."""
+    half_l = (L - 1) / 2
+    z_bounded = half_l * (torch.tanh(v) if bound == "tanh" else (2 * torch.sigmoid(1.6 * v) - 1))
+    if mode == "soft":
+        return z_bounded / half_l
+    if mode == "sample":
+        noise = torch.rand_like(z_bounded) - 0.5
+        z_rounded = torch.round(z_bounded + noise).clamp(-half_l, half_l)
+    else:
+        z_rounded = torch.round(z_bounded)
+    z_hat = z_bounded + (z_rounded - z_bounded).detach()
+    return z_hat / half_l
 
 
 MAX_PQ_TABLE_DQ = 16   # 2**16 = 65536 rows -- ceiling bsq_bits this table lookup allows
@@ -195,6 +336,31 @@ class CodeEmbed(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         idx = ((x > 0).long() * self._powers).sum(-1)
         hard = self.table(idx)
+        proxy = self.proxy(x)
+        return proxy + (hard - proxy).detach()
+
+
+class FSQEmbed(nn.Module):
+    """Maps an FSQ code (dq per-dim level indices in [0, L)) to a D-dim vector via a per-dim
+    embedding table summed across dims -- compositional (PQ-style), generalizes to any of the
+    L**dq combinations for free, unlike a per-whole-code table (which for FSQ's typical L=8,
+    dq=6 would need 8**6=262144 rows -- ported from archived qcute/archive/qcutelm.py's
+    FactorizedCodeEmbedding, generalizing CodeEmbed's binary/BSQ-only table lookup above to L
+    levels). x is fsq_quantize's normalized [-1,1] output; STE via the same proxy idiom CodeEmbed
+    uses, since the per-dim level lookup is non-differentiable in x."""
+
+    def __init__(self, dq: int, L: int, D: int):
+        super().__init__()
+        self.dq, self.L = dq, L
+        self.table = nn.Parameter(torch.zeros(dq, L, D))
+        nn.init.normal_(self.table, std=0.02)
+        self.proxy = nn.Linear(dq, D)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bound = (self.L - 1) / 2
+        levels = (x * bound + bound).round().long().clamp(0, self.L - 1)
+        dq_idx = torch.arange(self.dq, device=x.device)
+        hard = self.table[dq_idx, levels].sum(dim=-2)
         proxy = self.proxy(x)
         return proxy + (hard - proxy).detach()
 
@@ -228,6 +394,12 @@ class QuantScheme:
 
     def sample_next(self, stage_lm: "LevelLM", h_query: torch.Tensor, vocab: int) -> torch.Tensor:
         raise NotImplementedError
+
+    def entropy_reg(self, pre_q: torch.Tensor) -> torch.Tensor | None:
+        """Optional code-usage entropy regularization term computed from the raw pre-quantization
+        projection (before quantize()'s normalize/round/sign). None (default -- no term) for
+        schemes that don't have one; only BSQQuant overrides this."""
+        return None
 
 
 class SoftmaxQuant(QuantScheme):
@@ -266,11 +438,15 @@ class SoftmaxQuant(QuantScheme):
         next_id = logits.argmax(-1)
         return F.one_hot(next_id, num_classes=vocab).to(h_query.dtype)
 
+    def entropy_reg(self, pre_q):
+        return softmax_entropy_reg(pre_q)
+
 
 class BSQQuant(QuantScheme):
-    def __init__(self, bsq_bits: int, mode: str = "ste"):
+    def __init__(self, bsq_bits: int, mode: str = "ste", lfq: bool = False):
         self.bsq_bits = bsq_bits
         self.mode = mode
+        self.lfq = lfq
 
     def init_modules(self, D, V, code_head_tied):
         code_head = nn.Linear(D, self.bsq_bits, bias=False)
@@ -281,7 +457,7 @@ class BSQQuant(QuantScheme):
         return code_head, code_embed, code_predict
 
     def quantize(self, pre_q):
-        return bsq_quantize(pre_q, self.bsq_bits, self.mode)
+        return bsq_quantize(pre_q, self.bsq_bits, self.mode, self.lfq)
 
     def to_ids(self, source_c):
         bits = (source_c > 0).long()
@@ -304,12 +480,64 @@ class BSQQuant(QuantScheme):
 
     def sample_next(self, stage_lm, h_query, vocab):
         pred = stage_lm.code_predict(h_query)
-        return bsq_quantize(pred, self.bsq_bits, self.use_bernoulli_sample)
+        return bsq_quantize(pred, self.bsq_bits, self.mode, self.lfq)
+
+    def entropy_reg(self, pre_q):
+        return bsq_entropy_reg(pre_q)
+
+
+class FSQQuant(QuantScheme):
+    def __init__(self, dq: int, L: int, mode: str = "ste", bound: str = "sigmoid"):
+        self.dq, self.L, self.mode, self.bound = dq, L, mode, bound
+
+    def init_modules(self, D, V, code_head_tied):
+        code_head = nn.Linear(D, self.dq, bias=False)
+        nn.init.normal_(code_head.weight, std=0.02)
+        code_embed = FSQEmbed(self.dq, self.L, D)
+        code_predict = nn.Linear(D, self.dq * self.L)
+        nn.init.normal_(code_predict.weight, std=0.02)
+        return code_head, code_embed, code_predict
+
+    def quantize(self, pre_q):
+        return fsq_quantize(pre_q, self.L, self.mode, self.bound)
+
+    def to_ids(self, source_c):
+        bound = (self.L - 1) / 2
+        levels = (source_c * bound + bound).round().long().clamp(0, self.L - 1)
+        weights = self.L ** torch.arange(self.dq, device=levels.device)
+        return (levels * weights).sum(-1)
+
+    def embed_for_decode(self, stage_lm, source_c):
+        return stage_lm.code_embed(source_c)
+
+    def ntp_loss_acc(self, stage_lm, h_query, target_repr):
+        bound = (self.L - 1) / 2
+        target_levels = (target_repr.reshape(-1, self.dq) * bound + bound).round().long().clamp(0, self.L - 1)
+        pred = stage_lm.code_predict(h_query).reshape(-1, self.dq, self.L)
+        loss = F.cross_entropy(pred.reshape(-1, self.L), target_levels.reshape(-1))
+        with torch.no_grad():
+            acc = (pred.argmax(-1) == target_levels).float().mean()
+        return loss, acc
+
+    def embed_input(self, stage_lm, seq_repr):
+        return stage_lm.code_embed(seq_repr)
+
+    def sample_next(self, stage_lm, h_query, vocab):
+        bound = (self.L - 1) / 2
+        pred = stage_lm.code_predict(h_query).reshape(*h_query.shape[:-1], self.dq, self.L)
+        if self.mode == "sample":
+            probs = F.softmax(pred, dim=-1)
+            levels = torch.multinomial(probs.reshape(-1, self.L), 1).reshape(pred.shape[:-1])
+        else:
+            levels = pred.argmax(-1)
+        return (levels.float() - bound) / bound
 
 
 def make_quant(cfg: "Config") -> QuantScheme:
     if cfg.quant_type == "bsq":
-        return BSQQuant(cfg.bsq_bits, cfg.code_sample_mode)
+        return BSQQuant(cfg.bsq_bits, cfg.code_sample_mode, cfg.bsq_lfq)
+    if cfg.quant_type == "fsq":
+        return FSQQuant(cfg.fsq_dq, cfg.fsq_levels, cfg.code_sample_mode, cfg.fsq_bound)
     return SoftmaxQuant(cfg.gumbel_tau, cfg.code_sample_mode)
 
 
@@ -475,6 +703,8 @@ class LevelLM(nn.Module):
             self.query_embed = nn.Parameter(torch.zeros(D))
             nn.init.normal_(self.query_embed, std=0.02)
         self._merged_cache: dict = {}   # (L, tracks_meta, device) -> structural tensors, see _merged_layout
+        self._merged_multimode_cache: dict = {}   # (L, tracks_meta, device) -> extended-mask tensors, see _merged_layout_multimode
+        self._merged_multimode_chunked_cache: dict = {}   # (L, tracks_meta, device) -> shared chunk-grid tensors, see _merged_layout_multimode_chunked
 
     def _classify(self, pooled: torch.Tensor) -> torch.Tensor:
         return self.code_head(pooled) if self.code_head is not None else F.linear(pooled, self.embed.weight)
@@ -523,7 +753,8 @@ class LevelLM(nn.Module):
         return he_blocks[:, :, K, :]
 
     def _merged_layout(self, L: int, tracks_meta: tuple[tuple[int, int | None], ...],
-                        device: torch.device) -> dict:
+                        device: torch.device, forced_sc: int | None = None,
+                        forced_n_chunks: int | None = None, forced_n_prev_chunks: int | None = None) -> dict:
         """Chronological merged-interleave layout: every track's codes land at their true time
         position (right after the last byte of the block they summarize), merged with the raw byte
         stream into ONE physically time-ordered buffer -- so causal masking is a plain buffer-index
@@ -532,8 +763,16 @@ class LevelLM(nn.Module):
         attention can slice CONTIGUOUS buffer ranges with no runtime sort. This depends only on
         shape (L, each track's (K, window)), never on data, so it's built once per signature and
         cached (self._merged_cache) -- identical cost whether called every training step (fixed L)
-        or every generate_kv_cache step (same fixed FIFO-window L reused every step)."""
-        key = (L, tracks_meta, str(device))
+        or every generate_kv_cache step (same fixed FIFO-window L reused every step).
+
+        forced_sc/forced_n_chunks/forced_n_prev_chunks: only used by
+        _merged_layout_multimode_chunked (multi_mode_impl='single_pass' under a finite window) --
+        override the naturally-computed chunk grid so every mode's own segment can be padded onto
+        ONE shared (sc, n_chunks, n_prev_chunks) grid and batched together. Forcing a value larger
+        than what this (L, tracks_meta) would naturally need is always safe (extra chunks/lookback
+        are pure padding, masked out the same sentinel way Lp-padding already is below); forcing
+        smaller is not (asserted against) -- it would silently narrow the real window."""
+        key = (L, tracks_meta, str(device), forced_sc, forced_n_chunks, forced_n_prev_chunks)
         cached = self._merged_cache.get(key)
         if cached is not None:
             return cached
@@ -588,12 +827,21 @@ class LevelLM(nn.Module):
                       Le=Le, n_blocks_list=n_blocks_list)
 
         finite_windows = [w for _, w in tracks_meta if w is not None]
-        if finite_windows:
-            sc = max(1, min(min(finite_windows), Le))
-            n_chunks = -(-Le // sc)
+        if finite_windows or forced_sc is not None:
+            sc_natural = max(1, min(min(finite_windows), Le)) if finite_windows else Le
+            sc = forced_sc if forced_sc is not None else sc_natural
+            assert forced_sc is None or forced_sc <= sc_natural, (
+                f"_merged_layout: forced_sc={forced_sc} > this segment's own natural sc={sc_natural} "
+                f"-- forcing a LARGER chunk size than natural would silently narrow the effective "
+                f"window (fewer, coarser chunks); only forcing SMALLER (finer) is safe.")
+            n_chunks_natural = -(-Le // sc)
+            n_chunks = forced_n_chunks if forced_n_chunks is not None else n_chunks_natural
+            assert n_chunks >= n_chunks_natural, (
+                f"_merged_layout: forced_n_chunks={forced_n_chunks} < natural requirement "
+                f"{n_chunks_natural} -- would drop real buffer entries.")
             Lp = n_chunks * sc
             pad_len = Lp - Le
-            W_max = max((w if w is not None else Le) for _, w in tracks_meta)
+            W_max = max((w if w is not None else Le) for _, w in tracks_meta) if tracks_meta else 0
             # Chunk lookback must be counted in BUFFER-INDEX units, not true_pos units: each
             # true_pos value can hold up to (1 byte + one code per track) buffer entries when
             # tracks' blocks tie there, so a window of W_max true_pos units can require looking
@@ -602,7 +850,11 @@ class LevelLM(nn.Module):
             # effective attention window whenever chunking triggered, most severely at small K
             # where every true_pos gets a byte+code pair).
             density = len(tracks_meta) + 1
-            n_prev_chunks = min(max(1, -(-(W_max * density) // sc)), max(0, n_chunks - 1))
+            n_prev_natural = min(max(1, -(-(W_max * density) // sc)), max(0, n_chunks - 1))
+            n_prev_chunks = forced_n_prev_chunks if forced_n_prev_chunks is not None else n_prev_natural
+            assert n_prev_chunks >= n_prev_natural, (
+                f"_merged_layout: forced_n_prev_chunks={forced_n_prev_chunks} < natural requirement "
+                f"{n_prev_natural} -- would silently narrow the effective window.")
 
             true_pos_p, window_p = true_pos_sorted, window_of_slot
             cat_p = category_sorted
@@ -764,6 +1016,271 @@ class LevelLM(nn.Module):
         query_last = he[:, -1, :] if extra_query else None
         return h_out, query_last
 
+    def _merged_layout_multimode(self, L: int, tracks_meta: tuple[tuple[int, int | None], ...],
+                                  device: torch.device) -> dict:
+        """Cached (per (L, tracks_meta, device), same convention as _merged_layout) block-diagonal
+        layout for multi_mode_impl='single_pass': T=len(tracks_meta) independent segments, one per
+        mode m=1..T (segment m == the SAME buffer _merged_layout(L, tracks_meta[:m], device) would
+        build on its own), concatenated along the sequence dim with a block-diagonal attention mask
+        -- zero cross-segment visibility, each segment's own causal/window/_skip mask reused
+        VERBATIM from _merged_decode_forward's dense path. Because segments never attend to each
+        other, this is mathematically identical to T separate _merged_decode_forward calls (the
+        'multipass' reference) -- same total buffer size/compute, just one shared pass through
+        self.blocks instead of T separate Python-level re-entries. Dense-only (each segment must
+        itself stay off the chunked path -- checked by the caller)."""
+        key = (L, tracks_meta, str(device))
+        cached = self._merged_multimode_cache.get(key)
+        if cached is not None:
+            return cached
+        T = len(tracks_meta)
+        seg_structs = [self._merged_layout(L, tracks_meta[:m], device) for m in range(1, T + 1)]
+
+        offsets, off = [], 0
+        for s in seg_structs:
+            offsets.append(off)
+            off += s["Le"]
+        Lm = off
+
+        allow = torch.zeros(Lm, Lm, dtype=torch.bool, device=device)
+        true_pos_parts = []
+        for o, s in zip(offsets, seg_structs):
+            Le_m = s["Le"]
+            ti = s["true_pos_sorted"].unsqueeze(1)
+            tj = s["true_pos_sorted"].unsqueeze(0)
+            buf_i = torch.arange(Le_m, device=device).unsqueeze(1)
+            buf_j = torch.arange(Le_m, device=device).unsqueeze(0)
+            causal = buf_j <= buf_i
+            allow_m = causal & ((ti - tj) < s["window_of_slot"].unsqueeze(0))
+            K0 = s["K0"]
+            is_byte_key = (s["category_sorted"] == 0).unsqueeze(0)
+            same_block = (ti // K0) == (tj // K0)
+            allow_m = allow_m & ((~is_byte_key) | same_block)
+            allow[o:o + Le_m, o:o + Le_m] = allow_m
+            true_pos_parts.append(s["true_pos_sorted"])
+
+        multi = dict(Lm=Lm, allow=allow, total_true_pos=torch.cat(true_pos_parts), offsets=offsets,
+                     Le_list=[s["Le"] for s in seg_structs], extract_pos_list=[s["extract_pos"] for s in seg_structs])
+        self._merged_multimode_cache[key] = multi
+        return multi
+
+    def _merged_decode_forward_multimode(self, x0: torch.Tensor,
+                                          tracks: list[tuple[torch.Tensor, int, int | None]]
+                                          ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Returns (h_full, h_modes): h_full is IDENTICAL to _merged_decode_forward's own h_out
+        (the deepest/T-track mode); h_modes[m-1] (m=1..T-1) is the same hidden states
+        _merged_decode_forward(x0, tracks[:m]) would produce on its own -- see
+        _merged_layout_multimode's docstring for why this is exact, not approximate.
+
+        Dense (this method) is used when every segment stays off the chunked path; if any segment
+        would need chunking, dispatches to _merged_decode_forward_multimode_chunked (a genuinely
+        batched chunked implementation) instead -- see that method's docstring. Both are exact
+        (verified against _merged_decode_forward_multimode_looped, scripts/test_v5_concat_modes.py)."""
+        cfg = self.cfg
+        B, L, D = x0.shape
+        H, hd = cfg.n_heads, D // cfg.n_heads
+        device = x0.device
+        T = len(tracks)
+        if T <= 1:
+            h_out, _ = self._merged_decode_forward(x0, tracks, extra_query=False)
+            return h_out, []
+
+        tracks_meta_full = tuple((K, window) for _, K, window in tracks)
+        any_chunked = False
+        for m in range(1, T + 1):
+            tracks_meta_m = tuple((K, window) for _, K, window in tracks[:m])
+            struct_m = self._merged_layout(L, tracks_meta_m, device)
+            finite_windows_m = [w for _, w in tracks_meta_m if w is not None]
+            if bool(finite_windows_m) and "sc" in struct_m and struct_m["Le"] > struct_m["sc"]:
+                any_chunked = True
+                break
+        if any_chunked:
+            return self._merged_decode_forward_multimode_chunked(x0, tracks)
+
+        multi = self._merged_layout_multimode(L, tracks_meta_full, device)
+        Lm, allow, total_true_pos = multi["Lm"], multi["allow"], multi["total_true_pos"]
+        offsets, Le_list, extract_pos_list = multi["offsets"], multi["Le_list"], multi["extract_pos_list"]
+
+        combined_parts = []
+        for m in range(1, T + 1):
+            tracks_m = tracks[:m]
+            tracks_meta_m = tuple((K, window) for _, K, window in tracks_m)
+            struct_m = self._merged_layout(L, tracks_meta_m, device)
+            code_parts = []
+            for j, (code_kv, K, _window) in enumerate(tracks_m):
+                n_blocks = struct_m["n_blocks_list"][j]
+                code_parts.append(code_kv[:, :n_blocks, :])
+            all_code = torch.cat(code_parts, dim=1) if code_parts else x0.new_zeros(B, 0, D)
+            unordered = torch.cat([x0, all_code], dim=1)
+            combined_parts.append(unordered[:, struct_m["perm"], :])
+
+        xe = torch.cat(combined_parts, dim=1)
+        cos, sin = rope_cos_sin_for_positions(total_true_pos.clamp(min=0), hd, cfg.rope_base, device)
+        attn_mask = allow.view(1, 1, Lm, Lm)
+
+        for block in self.blocks:
+            xn = block.ln1(xe)
+            qkv = block.attn.qkv(xn).reshape(B, Lm, 3, H, hd).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            a = block.attn.out(y.transpose(1, 2).reshape(B, Lm, D))
+            xe = xe + a
+            xe = xe + block.mlp(block.ln2(xe))
+        he = self.ln_f(xe)
+
+        h_list = []
+        for o, Le_m, ep in zip(offsets, Le_list, extract_pos_list):
+            h_list.append(he[:, o:o + Le_m, :][:, ep, :])
+        return h_list[-1], h_list[:-1]
+
+    def _merged_decode_forward_multimode_looped(self, x0: torch.Tensor,
+                                                  tracks: list[tuple[torch.Tensor, int, int | None]]
+                                                  ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Option 1 (simplest SWA-compatible path): literally calls the existing, unmodified
+        _merged_decode_forward once per mode m=1..T (dense OR chunked, whichever that mode's own
+        window config needs -- _merged_decode_forward already supports both). Same compute as
+        multi_mode_impl='multipass' (not a single-kernel win), but implemented here so it can serve
+        as the correctness reference for _merged_decode_forward_multimode_chunked's batched version,
+        and as an always-available fallback."""
+        T = len(tracks)
+        if T <= 1:
+            h_out, _ = self._merged_decode_forward(x0, tracks, extra_query=False)
+            return h_out, []
+        h_list = [self._merged_decode_forward(x0, tracks[:m], extra_query=False)[0] for m in range(1, T + 1)]
+        return h_list[-1], h_list[:-1]
+
+    def _merged_layout_multimode_chunked(self, L: int, tracks_meta: tuple[tuple[int, int | None], ...],
+                                          device: torch.device) -> dict:
+        """Option 2's structural precompute: pads every mode's own (sc, n_chunks, n_prev_chunks)
+        chunk grid (see _merged_layout's forced_* params) onto ONE shared grid so all T modes can
+        run as a single batched SDPA call per layer -- the chunked-path counterpart of
+        _merged_layout_multimode's dense block-diagonal design. sc_shared is the FINEST (smallest)
+        chunk size any mode naturally needs (forcing a smaller-than-natural sc is always safe --
+        more, thinner chunks still cover the same causal/window/_skip visibility, just less
+        efficiently); n_chunks/n_prev_chunks are then the largest any mode needs at that shared sc.
+        Once sc/n_chunks/n_prev_chunks are identical across modes, the gather index `idx`
+        (a pure function of (n_chunks, n_prev_chunks), never of data) is ALSO identical across
+        modes -- only chunk_mask (which depends on each mode's own true_pos/category/window
+        content) differs per mode and needs its own stack. Cached per (L, tracks_meta, device)."""
+        key = (L, tracks_meta, str(device))
+        cached = self._merged_multimode_chunked_cache.get(key)
+        if cached is not None:
+            return cached
+        T = len(tracks_meta)
+
+        def natural_sc(s: dict) -> int:
+            return s["sc"] if "sc" in s else s["Le"]
+
+        natural_structs = [self._merged_layout(L, tracks_meta[:m], device) for m in range(1, T + 1)]
+        sc_shared = max(1, min(natural_sc(s) for s in natural_structs))
+
+        at_shared_sc = [self._merged_layout(L, tracks_meta[:m], device, forced_sc=sc_shared) for m in range(1, T + 1)]
+        n_chunks_max = max(s["n_chunks"] for s in at_shared_sc)
+        n_prev_max = max(s["n_prev_chunks"] for s in at_shared_sc)
+
+        structs = [self._merged_layout(L, tracks_meta[:m], device, forced_sc=sc_shared,
+                                        forced_n_chunks=n_chunks_max, forced_n_prev_chunks=n_prev_max)
+                   for m in range(1, T + 1)]
+        chunk_masks = torch.stack([s["chunk_mask"].view(n_chunks_max, sc_shared, (n_prev_max + 1) * sc_shared)
+                                    for s in structs], dim=0)   # (T, n_chunks, sc, Kc)
+        idx = structs[0]["idx"]   # identical across modes once sc/n_chunks/n_prev_chunks are shared
+
+        multi = dict(sc=sc_shared, n_chunks=n_chunks_max, n_prev_chunks=n_prev_max,
+                     Kc=(n_prev_max + 1) * sc_shared, Lp=n_chunks_max * sc_shared,
+                     chunk_masks=chunk_masks, idx=idx,
+                     Le_list=[s["Le"] for s in structs], extract_pos_list=[s["extract_pos"] for s in structs],
+                     true_pos_sorted_list=[s["true_pos_sorted"] for s in structs],
+                     perm_list=[s["perm"] for s in structs], n_blocks_lists=[s["n_blocks_list"] for s in structs])
+        self._merged_multimode_chunked_cache[key] = multi
+        return multi
+
+    def _merged_decode_forward_multimode_chunked(self, x0: torch.Tensor,
+                                                   tracks: list[tuple[torch.Tensor, int, int | None]]
+                                                   ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Option 2: genuinely batched SWA-compatible multi-mode decode -- extends the existing
+        single-mode chunked path's own (B, n_chunks) -> flattened-batch trick with a 'mode' axis,
+        using _merged_layout_multimode_chunked's shared chunk grid. Every mode's own segment is
+        independent (block-diagonal across modes, same as the dense multimode path -- modes never
+        attend to each other, only within their own padded buffer), so this is exact, not
+        approximate -- verified against _merged_decode_forward_multimode_looped."""
+        cfg = self.cfg
+        B, L, D = x0.shape
+        H, hd = cfg.n_heads, D // cfg.n_heads
+        device = x0.device
+        T = len(tracks)
+        tracks_meta_full = tuple((K, window) for _, K, window in tracks)
+        multi = self._merged_layout_multimode_chunked(L, tracks_meta_full, device)
+        sc, n_chunks, n_prev_chunks, Kc, Lp = multi["sc"], multi["n_chunks"], multi["n_prev_chunks"], multi["Kc"], multi["Lp"]
+        chunk_masks, idx = multi["chunk_masks"], multi["idx"]
+        Le_list, extract_pos_list = multi["Le_list"], multi["extract_pos_list"]
+        true_pos_list, perm_list, n_blocks_lists = multi["true_pos_sorted_list"], multi["perm_list"], multi["n_blocks_lists"]
+
+        xe_parts, true_pos_p_parts = [], []
+        for m in range(1, T + 1):
+            tracks_m = tracks[:m]
+            perm_m, n_blocks_list_m = perm_list[m - 1], n_blocks_lists[m - 1]
+            code_parts = []
+            for j, (code_kv, K, _window) in enumerate(tracks_m):
+                n_blocks = n_blocks_list_m[j]
+                code_parts.append(code_kv[:, :n_blocks, :])
+            all_code = torch.cat(code_parts, dim=1) if code_parts else x0.new_zeros(B, 0, D)
+            unordered = torch.cat([x0, all_code], dim=1)
+            combined_m = unordered[:, perm_m, :]
+            Le_m = Le_list[m - 1]
+            pad_len_m = Lp - Le_m
+            if pad_len_m > 0:
+                combined_m = F.pad(combined_m, (0, 0, 0, pad_len_m))
+            xe_parts.append(combined_m)
+            tp = true_pos_list[m - 1]
+            if pad_len_m > 0:
+                tp = F.pad(tp, (0, pad_len_m), value=0)
+            true_pos_p_parts.append(tp)
+
+        xe = torch.stack(xe_parts, dim=1)          # (B, T, Lp, D)
+        true_pos_p = torch.stack(true_pos_p_parts, dim=0)   # (T, Lp)
+        cos_flat, sin_flat = rope_cos_sin_for_positions(true_pos_p.clamp(min=0).reshape(-1), hd, cfg.rope_base, device)
+        cos = cos_flat.view(1, T, 1, Lp, hd)
+        sin = sin_flat.view(1, T, 1, Lp, hd)
+
+        pad_k = torch.zeros(B, T, H, n_prev_chunks, sc, hd, device=device)
+        pad_v = torch.zeros(B, T, H, n_prev_chunks, sc, hd, device=device)
+        mask_batched = (chunk_masks.view(1, T, n_chunks, 1, sc, Kc).expand(B, T, n_chunks, 1, sc, Kc)
+                         .reshape(B * T * n_chunks, 1, sc, Kc))
+
+        for block in self.blocks:
+            xn = block.ln1(xe)
+            qkv = block.attn.qkv(xn).reshape(B, T, Lp, 3, H, hd).permute(3, 0, 1, 4, 2, 5)   # (3,B,T,H,Lp,hd)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            q = q * cos + rotate_half(q) * sin
+            k = k * cos + rotate_half(k) * sin
+
+            q_c = q.view(B, T, H, n_chunks, sc, hd)
+            k_c = k.view(B, T, H, n_chunks, sc, hd)
+            v_c = v.view(B, T, H, n_chunks, sc, hd)
+            k_ext = torch.cat([pad_k.to(k.dtype), k_c], dim=3)
+            v_ext = torch.cat([pad_v.to(v.dtype), v_c], dim=3)
+            k_win = k_ext[:, :, :, idx].reshape(B, T, H, n_chunks, Kc, hd)
+            v_win = v_ext[:, :, :, idx].reshape(B, T, H, n_chunks, Kc, hd)
+
+            qb = q_c.permute(0, 1, 3, 2, 4, 5).reshape(B * T * n_chunks, H, sc, hd)
+            kb = k_win.permute(0, 1, 3, 2, 4, 5).reshape(B * T * n_chunks, H, Kc, hd)
+            vb = v_win.permute(0, 1, 3, 2, 4, 5).reshape(B * T * n_chunks, H, Kc, hd)
+
+            yb = F.scaled_dot_product_attention(qb, kb, vb, attn_mask=mask_batched)
+            y = yb.view(B, T, n_chunks, H, sc, hd).permute(0, 1, 3, 2, 4, 5).reshape(B, T, H, Lp, hd)
+            y = y.permute(0, 1, 3, 2, 4).reshape(B, T, Lp, D)
+
+            a = block.attn.out(y)
+            xe = xe + a
+            xe = xe + block.mlp(block.ln2(xe))
+        he = self.ln_f(xe)   # (B, T, Lp, D)
+
+        h_list = []
+        for m in range(1, T + 1):
+            Le_m, ep = Le_list[m - 1], extract_pos_list[m - 1]
+            h_list.append(he[:, m - 1, :Le_m, :][:, ep, :])
+        return h_list[-1], h_list[:-1]
+
     def _ntp_loss_acc(self, h_query: torch.Tensor, target_repr: torch.Tensor, is_byte_level: bool) -> tuple[torch.Tensor, torch.Tensor]:
         if is_byte_level:
             target = target_repr.reshape(-1)
@@ -776,8 +1293,9 @@ class LevelLM(nn.Module):
 
     def forward(self, seq_repr: torch.Tensor, level: int, window: int | None, compute_ntp: bool = True,
                 decode_tracks: list[tuple[torch.Tensor, int, int | None]] | None = None,
-                extra_query: bool = False
-                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+                extra_query: bool = False, multi_mode: str = "off"
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None,
+                           torch.Tensor | None, list, list, torch.Tensor | None]:
         cfg = self.cfg
         K = cfg.Ks[level]
         D = cfg.d_model
@@ -794,9 +1312,20 @@ class LevelLM(nn.Module):
         head_dim = D // cfg.n_heads
 
         query_last = None
+        h_modes: list[torch.Tensor] = []
         if decode_tracks is not None:
             assert len(decode_tracks) >= 1
-            h, query_last = self._merged_decode_forward(x0, decode_tracks, extra_query=extra_query)
+            if multi_mode != "off" and len(decode_tracks) > 1:
+                if multi_mode == "single_pass":
+                    h, h_modes = self._merged_decode_forward_multimode(x0, decode_tracks)
+                elif multi_mode == "multipass":
+                    h, query_last = self._merged_decode_forward(x0, decode_tracks, extra_query=extra_query)
+                    h_modes = [self._merged_decode_forward(x0, decode_tracks[:m], extra_query=False)[0]
+                               for m in range(1, len(decode_tracks))]
+                else:
+                    raise ValueError(f"unknown multi_mode {multi_mode!r}")
+            else:
+                h, query_last = self._merged_decode_forward(x0, decode_tracks, extra_query=extra_query)
         else:
             cos, sin = rope_cos_sin(L, head_dim, cfg.rope_base, x.device)
             for block in self.blocks:
@@ -812,12 +1341,20 @@ class LevelLM(nn.Module):
                 # metric that adds encode's own loss back in for this excluded range.
                 h_flat = h[:, K - 1:-1, :].reshape(-1, D)
                 ntp_loss, ntp_acc = self._ntp_loss_acc(h_flat, seq_repr[:, K:], is_byte_level)
+                mode_losses, mode_accs = [], []
+                for h_m in h_modes:
+                    h_m_flat = h_m[:, K - 1:-1, :].reshape(-1, D)
+                    l_m, a_m = self._ntp_loss_acc(h_m_flat, seq_repr[:, K:], is_byte_level)
+                    mode_losses.append(l_m)
+                    mode_accs.append(a_m)
             else:
                 h_flat = h[:, :-1, :].reshape(-1, D)
                 ntp_loss, ntp_acc = self._ntp_loss_acc(h_flat, seq_repr[:, 1:], is_byte_level)
+                mode_losses, mode_accs = [], []
         else:
             ntp_loss = h.new_zeros(())
             ntp_acc = h.new_zeros(())
+            mode_losses, mode_accs = [], []
 
         n_blocks = L // K
         h_blocks = h[:, :n_blocks * K, :].view(B, n_blocks, K, D)
@@ -839,8 +1376,9 @@ class LevelLM(nn.Module):
             raise ValueError(f"unknown code_extract_mode {cfg.code_extract_mode!r}")
         pre_q = self._classify(pooled)
         c_i = self.quant.quantize(pre_q)
+        entropy_reg = self.quant.entropy_reg(pre_q)
 
-        return c_i, ntp_loss, ntp_acc, h, query_last, None
+        return c_i, ntp_loss, ntp_acc, h, query_last, None, mode_losses, mode_accs, entropy_reg
 
 
 class RefineLM(nn.Module):
@@ -918,15 +1456,17 @@ class RefineLM(nn.Module):
         cfg = self.cfg
         seq_repr = byte_ids
         encode_losses, encode_accs, h_list, c_list, x_list = [], [], [], [], []
+        encode_entropy_regs: list = []
 
         for i in range(self.n_levels):
             want_ntp = compute_ntp and (i == 0 or cfg.code_ntp_weight > 0)
-            c_i, loss_i, acc_i, h_i, _, _ = self.encode_lms[i](seq_repr, level=i, window=self.windows[i], compute_ntp=want_ntp)
+            c_i, loss_i, acc_i, h_i, _, _, _, _, entropy_reg_i = self.encode_lms[i](seq_repr, level=i, window=self.windows[i], compute_ntp=want_ntp)
             encode_losses.append(loss_i)
             encode_accs.append(acc_i)
             h_list.append(h_i)
             c_list.append(c_i)
             x_list.append(seq_repr)
+            encode_entropy_regs.append(entropy_reg_i)
             seq_repr = c_i
 
         decode_losses: list = [None] * self.n_levels
@@ -935,6 +1475,7 @@ class RefineLM(nn.Module):
         h_out = list(h_list)
         next_query: list[torch.Tensor | None] = [None] * self.n_levels
         query_seq_out: list[torch.Tensor | None] = [None] * self.n_levels
+        decode_stage_extra_losses: list = []
         for i in reversed(range(self.n_levels)):
             L_i = x_list[i].shape[1]
             tracks: list[tuple[torch.Tensor, int, int | None]] = []
@@ -966,11 +1507,19 @@ class RefineLM(nn.Module):
             full_tracks = tracks
             if max_decode_sources is not None:
                 full_tracks = full_tracks[:max_decode_sources]
-            c_i2, loss_i2, acc_i2, h_i2, query_last_i, query_seq_i = self.decode_lms[i](
+            # multi_mode only applies to the un-truncated (max_decode_sources=None) call -- an
+            # explicit max_decode_sources override (e.g. generate_self_only_cond) already IS a
+            # single specific mode, nothing to expand further.
+            multi_mode = cfg.multi_mode_impl if max_decode_sources is None else "off"
+            c_i2, loss_i2, acc_i2, h_i2, query_last_i, query_seq_i, mode_losses_i, mode_accs_i, _entropy_reg_i2 = self.decode_lms[i](
                 x_list[i], level=i, window=self.windows[i], compute_ntp=compute_ntp,
-                decode_tracks=full_tracks, extra_query=(want_next_query and i == 0))
+                decode_tracks=full_tracks, extra_query=(want_next_query and i == 0), multi_mode=multi_mode)
             decode_losses[i] = loss_i2
             decode_accs[i] = acc_i2
+            # (level, mode_index, loss, acc) -- mode_index 1..T-1 (T = len(full_tracks), the final
+            # mode T's own loss/acc is decode_losses[i]/decode_accs[i] above, not duplicated here).
+            for m_idx, (l_m, a_m) in enumerate(zip(mode_losses_i, mode_accs_i), start=1):
+                decode_stage_extra_losses.append((i, m_idx, l_m, a_m))
             if h_i2.shape[1] < L_i:
                 # _merged_decode_forward always returns exactly L_i byte positions now (h_out is
                 # gathered via extract_pos, one slot per input byte) -- this branch is dead in the
@@ -984,12 +1533,14 @@ class RefineLM(nn.Module):
                 decode_derived_c[i] = c_i2
 
         return (encode_losses, encode_accs, decode_losses, decode_accs, h_out, c_list,
-                next_query, decode_derived_c, query_seq_out, h_list[0])
+                next_query, decode_derived_c, query_seq_out, h_list[0], decode_stage_extra_losses,
+                encode_entropy_regs)
 
     def forward(self, byte_ids: torch.Tensor) -> tuple[torch.Tensor, dict]:
         cfg = self.cfg
         (encode_losses, encode_accs, decode_losses, decode_accs, h_list, c_list,
-         _next_query, _decode_derived_c, _query_seq, h0_encode) = self._run(byte_ids)
+         _next_query, _decode_derived_c, _query_seq, h0_encode,
+         decode_stage_extra_losses, encode_entropy_regs) = self._run(byte_ids)
 
         byte_loss = decode_losses[0] if decode_losses[0] is not None else encode_losses[0]
         byte_acc = decode_accs[0] if decode_accs[0] is not None else encode_accs[0]
@@ -1021,15 +1572,36 @@ class RefineLM(nn.Module):
         decode_total = (cfg.decode_ntp_weight * torch.stack(decode_terms).sum() if decode_terms
                          else byte_loss.new_zeros(()))
 
-        loss = encode_total + decode_total
-        ntp_total = torch.stack(encode_losses + decode_terms).sum()
+        # decode_stage_extra_total: shallower-mode losses (self-only, self+track1, ...), mirroring
+        # qcute_v5_stack.py's own decode_stage_extra_losses/-total for its staged cross-attention
+        # intermediate stages -- only non-empty when Config.multi_mode_impl != "off" and a level has
+        # more than one available track. Each entry is (level, mode_idx, loss, acc); mode_idx=1 is
+        # self-only, mode_idx=2 is self+track1, etc. (mode T -- the deepest/full mode -- is
+        # decode_losses[level]/decode_accs[level] above, not duplicated here).
+        extra_loss_terms = [l for (_i, _m, l, _a) in decode_stage_extra_losses]
+        decode_stage_extra_total = (cfg.decode_ntp_weight * torch.stack(extra_loss_terms).sum()
+                                     if extra_loss_terms else byte_loss.new_zeros(()))
+
+        # entropy_reg (BSQQuant only, see bsq_entropy_reg): sum across levels, weighted by
+        # cfg.entropy_reg_weight (default 0.0 -- opt-in, matches archived qcutelm.py's default).
+        entropy_reg_terms = [r for r in encode_entropy_regs if r is not None]
+        entropy_reg_total = (torch.stack(entropy_reg_terms).sum() if entropy_reg_terms
+                              else byte_loss.new_zeros(()))
+
+        loss = encode_total + decode_total + decode_stage_extra_total + cfg.entropy_reg_weight * entropy_reg_total
+        ntp_total = torch.stack(encode_losses + decode_terms + extra_loss_terms).sum()
         metrics = {
             "loss": loss, "byte_loss": byte_loss, "byte_loss_full": byte_loss_full, "byte_acc": byte_acc,
-            "encode_total": encode_total, "decode_total": decode_total, "ntp_loss_total": ntp_total,
+            "encode_total": encode_total, "decode_total": decode_total,
+            "decode_stage_extra_total": decode_stage_extra_total, "ntp_loss_total": ntp_total,
+            "entropy_reg_total": entropy_reg_total,
             **{f"level{i}_ntp_loss_encode": l for i, l in enumerate(encode_losses)},
             **{f"level{i}_ntp_acc_encode": a for i, a in enumerate(encode_accs)},
             **{f"level{i}_ntp_loss_decode": l for i, l in enumerate(decode_losses) if l is not None},
             **{f"level{i}_ntp_acc_decode": a for i, a in enumerate(decode_accs) if a is not None},
+            **{f"level{lvl}_mode{m}_ntp_loss_decode": l for (lvl, m, l, _a) in decode_stage_extra_losses},
+            **{f"level{lvl}_mode{m}_ntp_acc_decode": a for (lvl, m, _l, a) in decode_stage_extra_losses},
+            **{f"level{i}_entropy_reg": r for i, r in enumerate(encode_entropy_regs) if r is not None},
         }
 
         return loss, metrics
@@ -1060,7 +1632,7 @@ def generate_no_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
         # be returned as a genuine bare-code extra query; elsewhere it's a no-op and
         # next_query[0] stays None.
         block_aligned = L % K0 == 0
-        _, _, _, _, h_list, _, next_query, _decode_derived_c, _query_seq, _ = model._run(
+        _, _, _, _, h_list, _, next_query, _decode_derived_c, _query_seq, _, _, _ = model._run(
             all_bytes, compute_ntp=False, max_decode_sources=max_decode_sources,
             want_next_query=block_aligned)
         # next_query[0]: _merged_decode_forward's extra_query -- the buffer's chronologically
@@ -1105,7 +1677,7 @@ def generate_kv_cache(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_bytes
         window_bytes = all_bytes[:, -context_len:]   # FIFO: only the trailing context_len bytes ever matter
         L = window_bytes.shape[1]
         block_aligned = L % K0 == 0
-        _, _, _, _, h_list, _, next_query, _decode_derived_c, _query_seq, _ = model._run(
+        _, _, _, _, h_list, _, next_query, _decode_derived_c, _query_seq, _, _, _ = model._run(
             window_bytes, compute_ntp=False, max_decode_sources=max_decode_sources,
             want_next_query=block_aligned)
         query = next_query[0] if next_query[0] is not None else h_list[0][:, -1, :]
@@ -1297,7 +1869,7 @@ def generate_encode_only(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_by
     all_bytes = prompt_bytes
     enc0 = model.encode_lms[0]
     for _ in range(n_new_bytes):
-        _, _, _, h, _, _ = enc0(all_bytes, level=0, window=model.windows[0], compute_ntp=False)
+        _, _, _, h, _, _, _, _, _ = enc0(all_bytes, level=0, window=model.windows[0], compute_ntp=False)
         next_byte = _sample_next_byte(enc0.embed.weight, h[:, -1, :])
         all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
     if was_training:
@@ -1313,10 +1885,10 @@ def generate_level1_codes(model: "RefineLM", prompt_bytes: torch.Tensor, n_new_c
     if prompt_bytes.dim() == 1:
         prompt_bytes = prompt_bytes.unsqueeze(0)
     enc0, enc1 = model.encode_lms[0], model.encode_lms[1]
-    codes, _, _, _, _, _ = enc0(prompt_bytes, level=0, window=model.windows[0], compute_ntp=False)
+    codes, _, _, _, _, _, _, _, _ = enc0(prompt_bytes, level=0, window=model.windows[0], compute_ntp=False)
     n_prompt_codes = codes.shape[1]
     for _ in range(n_new_codes):
-        _, _, _, h1, _, _ = enc1(codes, level=1, window=model.windows[1], compute_ntp=False)
+        _, _, _, h1, _, _, _, _, _ = enc1(codes, level=1, window=model.windows[1], compute_ntp=False)
         next_code = enc1.quant.sample_next(enc1, h1[:, -1, :], model.cfg.vocab)
         codes = torch.cat([codes, next_code.unsqueeze(1)], dim=1)
     if was_training:
@@ -1331,7 +1903,7 @@ def level1_ground_truth_codes(model: "RefineLM", full_bytes: torch.Tensor, promp
         full_bytes = full_bytes.unsqueeze(0)
     enc0 = model.encode_lms[0]
     K0 = model.cfg.Ks[0]
-    c0, _, _, _, _, _ = enc0(full_bytes, level=0, window=model.windows[0], compute_ntp=False)
+    c0, _, _, _, _, _, _, _, _ = enc0(full_bytes, level=0, window=model.windows[0], compute_ntp=False)
     ids = enc0.quant.to_ids(c0[0])
     n_prompt_codes = prompt_len // K0
     return ids[n_prompt_codes:]
@@ -1358,7 +1930,7 @@ def _decode_source_codes(model: "RefineLM", full_bytes: torch.Tensor, device: st
         seq_repr = seq_repr.unsqueeze(0)
     c_list = []
     for i in range(model.n_levels):
-        c_i, _, _, _, _, _ = model.encode_lms[i](seq_repr, level=i, window=model.windows[i], compute_ntp=False)
+        c_i, _, _, _, _, _, _, _, _ = model.encode_lms[i](seq_repr, level=i, window=model.windows[i], compute_ntp=False)
         c_list.append(c_i)
         seq_repr = c_i
     source_c = c_list[level]
@@ -1385,7 +1957,7 @@ def check_gen_consistency(model: "RefineLM", full_bytes: torch.Tensor, device: s
     embed0 = model.decode_lms[0].embed.weight
     K0 = model.cfg.Ks[0]
 
-    _, _, _, _, h_list_tf, _, _, _, query_seq_tf, _ = model._run(
+    _, _, _, _, h_list_tf, _, _, _, query_seq_tf, _, _, _ = model._run(
         full_bytes, compute_ntp=False, max_decode_sources=None, want_next_query=False)
     # query_seq_tf[0] is always None with the chronological merged-interleave decode --
     # _merged_decode_forward already extracts each byte's NTP-training query correctly via
@@ -1403,7 +1975,7 @@ def check_gen_consistency(model: "RefineLM", full_bytes: torch.Tensor, device: s
         if ref_idx < 0 or ref_idx >= logits_tf_all.shape[0]:
             continue
         padded = full_bytes[:, :t]
-        _, _, _, _, h_list_gen, _, next_query_gen, _, _, _ = model._run(
+        _, _, _, _, h_list_gen, _, next_query_gen, _, _, _, _, _ = model._run(
             padded, compute_ntp=False, max_decode_sources=None, want_next_query=True)
         query_gen = next_query_gen[0] if next_query_gen[0] is not None else h_list_gen[0][:, t - 1, :]
         logits_gen = F.linear(query_gen[0], embed0)
@@ -1420,15 +1992,25 @@ def check_gen_consistency(model: "RefineLM", full_bytes: torch.Tensor, device: s
 def qualitative_generate(model: "RefineLM", prompt_bytes: torch.Tensor, gen_len: int,
                           ground_truth: torch.Tensor | None, device: str, log=print, label: str = "") -> None:
     prefix = f"qual_{label}_" if label else "qual_"
-    out_cond_full = generate_no_cache(model, prompt_bytes, gen_len, device)
-    gen_bytes_cond_full = bytes(out_cond_full[prompt_bytes.numel():].tolist())
     out_uncond = generate_encode_only(model, prompt_bytes, gen_len, device)
     gen_bytes_uncond = bytes(out_uncond[prompt_bytes.numel():].tolist())
     log(f"{prefix}prompt:              {bytes(prompt_bytes.tolist())!r}")
     if ground_truth is not None:
         log(f"{prefix}ground_truth:        {bytes(ground_truth.tolist())!r}")
     log(f"{prefix}level0_uncond:       {gen_bytes_uncond!r}")
-    log(f"{prefix}level0_cond_full:    {gen_bytes_cond_full!r}")
+    # Every possible level0 conditioning depth, m=1 (self-only) .. n_levels (self+every coarser
+    # track, == the old "cond_full"/max_decode_sources=None) -- generate_no_cache's own tracks
+    # loop stops early (fewer than n_levels tracks) if a coarser block isn't affordable yet within
+    # gen_len, so m beyond what's actually reachable just re-runs the deepest available mode; still
+    # correct, just redundant with the previous m's output in that case.
+    out_cond_full = None
+    for m in range(1, model.n_levels + 1):
+        out_m = generate_no_cache(model, prompt_bytes, gen_len, device, max_decode_sources=m)
+        gen_bytes_m = bytes(out_m[prompt_bytes.numel():].tolist())
+        tag = "full" if m == model.n_levels else str(m)
+        log(f"{prefix}level0_mode{tag}:      {gen_bytes_m!r}")
+        if m == model.n_levels:
+            out_cond_full = out_m
     decode_K = 1
     for k in model.cfg.Ks:
         decode_K *= k
@@ -1437,16 +2019,6 @@ def qualitative_generate(model: "RefineLM", prompt_bytes: torch.Tensor, gen_len:
     # gen_code_ids = code_ids_full[n_prompt_codes:]
     # annotated = _annotate_bytes_with_codes(out_cond_full[prompt_bytes.numel():], gen_code_ids, decode_K)
     # log(f"{prefix}level0_cond_full_codes: {annotated}  <{gen_code_ids.tolist()}>")
-    if model.n_levels > 1:
-        out_cond_self = generate_self_only_cond(model, prompt_bytes, gen_len, device)
-        gen_bytes_cond_self = bytes(out_cond_self[prompt_bytes.numel():].tolist())
-        log(f"{prefix}level0_cond_self:    {gen_bytes_cond_self!r}")
-        # self_K = model.cfg.Ks[0]
-        # code_ids_self = _decode_source_codes(model, out_cond_self, device, level=0)
-        # n_prompt_codes_self = prompt_bytes.numel() // self_K
-        # gen_code_ids_self = code_ids_self[n_prompt_codes_self:]
-        # annotated_self = _annotate_bytes_with_codes(out_cond_self[prompt_bytes.numel():], gen_code_ids_self, self_K)
-        # log(f"{prefix}level0_cond_self_codes: {annotated_self}  <{gen_code_ids_self.tolist()}>")
     if model.n_levels > 1:
         K0 = model.cfg.Ks[0]
         n_new_codes = gen_len // K0
@@ -1653,8 +2225,14 @@ def main():
                     choices=["last_h", "softmax_pool", "light_query_attn", "query_embed"])
     p.add_argument("--code_head_tied", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--vocab", type=int, default=256)
-    p.add_argument("--quant_type", type=str, default="softmax", choices=["softmax", "bsq"])
+    p.add_argument("--quant_type", type=str, default="softmax", choices=["softmax", "bsq", "fsq"])
     p.add_argument("--bsq_bits", type=int, default=4)
+    p.add_argument("--bsq_lfq", action="store_true")
+    p.add_argument("--entropy_reg_weight", type=float, default=0.0)
+    p.add_argument("--fsq_dq", type=int, default=6)
+    p.add_argument("--fsq_levels", type=int, default=8)
+    p.add_argument("--fsq_bound", type=str, default="sigmoid", choices=["sigmoid", "tanh"])
+    p.add_argument("--multi_mode_impl", type=str, default="off", choices=["off", "multipass", "single_pass"])
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -1706,8 +2284,10 @@ def main():
         byte_ntp_weight=args.byte_ntp_weight, code_ntp_weight=args.code_ntp_weight,
         decode_ntp_weight=args.decode_ntp_weight, gumbel_tau=args.gumbel_tau,
         code_extract_mode=args.code_extract_mode, code_head_tied=args.code_head_tied,
-        vocab=args.vocab, quant_type=args.quant_type, bsq_bits=args.bsq_bits,
-        code_sample_mode=args.code_sample_mode,
+        vocab=args.vocab, quant_type=args.quant_type, bsq_bits=args.bsq_bits, bsq_lfq=args.bsq_lfq,
+        entropy_reg_weight=args.entropy_reg_weight,
+        fsq_dq=args.fsq_dq, fsq_levels=args.fsq_levels, fsq_bound=args.fsq_bound,
+        code_sample_mode=args.code_sample_mode, multi_mode_impl=args.multi_mode_impl,
     )
     model = RefineLM(cfg).to(device)
     n_params = sum(p_.numel() for p_ in model.parameters())
