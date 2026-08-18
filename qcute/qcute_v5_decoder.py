@@ -5,11 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from qcute.qcute_v5_common import (
-    Backbone, Config, apply_rope, make_dict, pack_words, rope_cos_sin_for_positions, warn_thin_window,
+    LM, Config, apply_rope, make_dict, pack_words, rope_cos_sin_for_positions, warn_thin_window,
 )
 
 
-def merged_layout(bb: Backbone, L: int, tracks_meta: tuple, device: torch.device) -> dict:
+def merged_layout(bb: LM, L: int, tracks_meta: tuple, device: torch.device) -> dict:
     key = (L, tracks_meta, str(device))
     cached = bb.merged_cache.get(key)
     if cached is not None:
@@ -98,7 +98,7 @@ def merged_layout(bb: Backbone, L: int, tracks_meta: tuple, device: torch.device
     return struct
 
 
-def merged_decode_forward(bb: Backbone, x0: torch.Tensor, tracks: list, extra_query: bool = False) -> tuple:
+def merged_decode_forward(bb: LM, x0: torch.Tensor, tracks: list, extra_query: bool = False) -> tuple:
     cfg = bb.cfg
     B, L, D = x0.shape
     H, hd = cfg.n_heads, D // cfg.n_heads
@@ -189,7 +189,7 @@ def merged_decode_forward(bb: Backbone, x0: torch.Tensor, tracks: list, extra_qu
     return h_out, query_last
 
 
-def cross_attn_stage(bb: Backbone, x_in: torch.Tensor, code_kv: torch.Tensor, seq_repr: torch.Tensor,
+def cross_attn_stage(bb: LM, x_in: torch.Tensor, code_kv: torch.Tensor, seq_repr: torch.Tensor,
                       level: int, track_K: int, window: int | None, compute_ntp: bool, want_code: bool) -> dict:
     cfg = bb.cfg
     K = cfg.Ks[level]
@@ -440,7 +440,7 @@ class Decoder(nn.Module):
         enc_level = model.encoders[level]
         for _ in range(n_new_codes):
             out = enc_level(codes, level=level, window=model.windows[level], compute_ntp=False)
-            next_code = enc_level.quant.sample_next(enc_level.backbone, out["hidden"][:, -1, :], model.cfg.vocab)
+            next_code = enc_level.quant.sample_next(enc_level.lm, out["hidden"][:, -1, :], model.cfg.vocab)
             codes = torch.cat([codes, next_code.unsqueeze(1)], dim=1)
         if was_training:
             model.train()
@@ -493,8 +493,8 @@ class Decoder(nn.Module):
 class ConcatDecoder(Decoder):
     def __init__(self, cfg: Config, n_levels: int, encoders, d_models, n_layers_list, vocabs):
         super().__init__(cfg, n_levels)
-        self.stage_backbones = nn.ModuleList([Backbone(cfg, d_models[i], n_layers_list[i], vocabs[i]) for i in range(n_levels)])
-        for bb in self.stage_backbones:
+        self.stage_lms = nn.ModuleList([LM(cfg, d_models[i], n_layers_list[i], vocabs[i]) for i in range(n_levels)])
+        for bb in self.stage_lms:
             bb.merged_cache = {}
 
     def decode_level(self, model, i, x_list, c_list, decode_derived_c, compute_ntp, max_decode_sources, want_next_query):
@@ -502,7 +502,7 @@ class ConcatDecoder(Decoder):
         L_i = x_list[i].shape[1]
         tracks = []
         cum_K = 1
-        bb = self.stage_backbones[i]
+        bb = self.stage_lms[i]
         for j in range(i, self.n_levels):
             cum_K *= cfg.Ks[j]
             window = model.decode_windows[i][j - i]
@@ -540,15 +540,15 @@ class StackDecoder(Decoder):
 
         def make_stage(i, t):
             if t == 0:
-                bb = encoders[i].backbone if cfg.share_encode_decode_self else Backbone(cfg, d_models[i], n_layers_list[i], vocabs[i])
+                bb = encoders[i].lm if cfg.share_encode_decode_self else LM(cfg, d_models[i], n_layers_list[i], vocabs[i])
             else:
                 cross_layers = cfg.decode_cross_stage_layers if cfg.decode_cross_stage_layers is not None else n_layers_list[i]
-                bb = Backbone(cfg, d_models[i], cross_layers, vocabs[i])
+                bb = LM(cfg, d_models[i], cross_layers, vocabs[i])
             if not hasattr(bb, "merged_cache"):
                 bb.merged_cache = {}
             return bb
 
-        self.stage_backbones = nn.ModuleList([
+        self.stage_lms = nn.ModuleList([
             nn.ModuleList([make_stage(i, t) for t in range(n_levels - i)])
             for i in range(n_levels)
         ])
@@ -573,8 +573,8 @@ class StackDecoder(Decoder):
 
         is_byte_level = i == 0
         K = cfg.Ks[i]
-        D = self.stage_backbones[i][0].d_model
-        stage_bbs = self.stage_backbones[i]
+        D = self.stage_lms[i][0].d_model
+        stage_bbs = self.stage_lms[i]
         x = None
         extra_losses = []
         loss_final = acc_final = code_final = query_last_final = embed_weight_final = None

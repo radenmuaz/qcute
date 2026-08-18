@@ -1,26 +1,26 @@
 import torch
 import torch.nn as nn
 
-from qcute.qcute_v5_common import Backbone, Config, apply_rope, make_dict, rope_cos_sin
+from qcute.qcute_v5_common import LM, Config, apply_rope, make_dict, rope_cos_sin
 
 
 class Encoder(nn.Module):
     def __init__(self, cfg: Config, d_model: int, n_layers: int, vocab: int):
         super().__init__()
         self.cfg = cfg
-        self.backbone = Backbone(cfg, d_model, n_layers, vocab)
+        self.lm = LM(cfg, d_model, n_layers, vocab)
 
     @property
     def embed(self):
-        return self.backbone.embed
+        return self.lm.embed
 
     @property
     def quant(self):
-        return self.backbone.quant
+        return self.lm.quant
 
     def forward(self, seq_repr: torch.Tensor, level: int, window: int | None, compute_ntp: bool = True) -> dict:
         cfg = self.cfg
-        bb = self.backbone
+        bb = self.lm
         K = cfg.Ks[level]
         D = bb.d_model
         is_byte_level = level == 0

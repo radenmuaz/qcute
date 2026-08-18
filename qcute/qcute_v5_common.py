@@ -538,7 +538,7 @@ def warn_thin_window(tracks: list, window: int, min_codes: int = 2) -> None:
               f"across tracks Ks=({Ks_str}) -- below min_codes={min_codes}.")
 
 
-class Backbone(nn.Module):
+class LM(nn.Module):
     def __init__(self, cfg: Config, d_model: int, n_layers: int, vocab: int):
         super().__init__()
         self.cfg = cfg
