@@ -1,4 +1,4 @@
-"""qcute_v5_stack_noreg/ks221: Ks=(2,2,1), context_len=256, attn_window=-1, code_sample_mode="ste",
+"""qcute_v5_stack_noreg/ks221: Ks=(2,2,1), context_len=256, attn_window=-1, code_hard=True/code_sample=False,
 entropy_reg_weight=0.0 (disabled) -- see ks1.py's docstring for this folder's shared rationale
 (no-regularization baseline grid, sibling to ks1/ks21). Same Ks/hyperparams as
 configs/qcute_v5_stack_ks221_ste_entropyreg.py except entropy_reg_weight=0.0 here vs 0.1 there --
@@ -21,8 +21,9 @@ d_model = 256
 n_layers = 1
 context_len = 256
 attn_window = -1
-code_sample_mode = "ste"
-quant_type = "softmax"
+code_hard = True
+code_sample = False
+quant_type = "simplex"
 vocab = 256
 input_preset = 8
 output_preset = 8

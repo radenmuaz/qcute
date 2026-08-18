@@ -474,7 +474,8 @@ class Decoder(nn.Module):
             out_m = self.generate_no_cache(model, prompt_bytes, gen_len, device, max_decode_sources=m)
             gen_bytes_m = pack_words(out_m[prompt_bytes.numel():].tolist(), bits)
             tag = "full" if m == model.n_levels else str(m)
-            log(f"{prefix}level0_mode{tag}:      {gen_bytes_m!r}")
+            pad = " " * 5 if tag == "full" else " " * 6
+            log(f"{prefix}level0_mode{tag}:{pad}{gen_bytes_m!r}")
         for level in range(1, model.n_levels):
             cum_K = 1
             for k in model.cfg.Ks[:level]:

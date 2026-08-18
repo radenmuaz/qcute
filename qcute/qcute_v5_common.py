@@ -81,9 +81,9 @@ WORD_PRESET_BITS = (1, 4, 8)
 class Config:
     quant_type: str
     vocab: int
-    bsq_bits: int
-    fsq_dq: int
-    fsq_levels: int
+    binary_bits: int
+    grid_dq: int
+    grid_levels: int
     input_preset: int
     output_preset: int
     decoder_type: str = "concat"
@@ -102,40 +102,41 @@ class Config:
     code_extract_mode: str = "last_h"
     code_head_tied: bool = False
     ntp_head_tied: bool = False
-    bsq_lfq: bool = False
+    binary_lfq: bool = False
     entropy_reg_weight: float = 0.0
-    fsq_bound: str = "sigmoid"
-    code_sample_mode: str = "ste"
+    grid_bound: str = "sigmoid"
+    code_hard: bool = True
+    code_sample: bool = False
     decode_cross_stage_layers: int | None = None
     share_encode_decode_self: bool = False
 
 
-def gumbel_quantize(logits: torch.Tensor, tau: float, mode: str = "ste") -> torch.Tensor:
-    if mode in ("sample", "soft"):
+def gumbel_quantize(logits: torch.Tensor, tau: float, hard: bool = True, sample: bool = False) -> torch.Tensor:
+    if sample:
         eps = torch.finfo(logits.dtype).tiny
         u = torch.rand_like(logits).clamp(min=eps, max=1.0 - eps)
         gumbel_noise = -torch.log(-torch.log(u))
         soft = F.softmax((logits + gumbel_noise) / tau, dim=-1)
     else:
         soft = F.softmax(logits / tau, dim=-1)
-    if mode == "soft":
+    if not hard:
         return soft
-    hard = F.one_hot(soft.argmax(-1), num_classes=logits.shape[-1]).to(soft.dtype)
-    return soft + (hard - soft).detach()
+    hard_oh = F.one_hot(soft.argmax(-1), num_classes=logits.shape[-1]).to(soft.dtype)
+    return soft + (hard_oh - soft).detach()
 
 
-def bsq_quantize(v: torch.Tensor, dq: int, mode: str = "ste", lfq: bool = False) -> torch.Tensor:
+def bsq_quantize(v: torch.Tensor, dq: int, hard: bool = True, sample: bool = False, lfq: bool = False) -> torch.Tensor:
     v_eff = v if lfq else F.normalize(v, dim=-1)
     scale = 1.0 if lfq else 1.0 / math.sqrt(dq)
-    if mode == "soft":
+    if not hard:
         return v_eff * scale
-    if mode == "sample":
+    if sample:
         probs = torch.sigmoid(v_eff)
         u = torch.rand_like(v_eff)
-        hard = torch.where(u < probs, torch.ones_like(v_eff), -torch.ones_like(v_eff))
+        hard_v = torch.where(u < probs, torch.ones_like(v_eff), -torch.ones_like(v_eff))
     else:
-        hard = torch.sign(v_eff)
-    return (v_eff + (hard - v_eff).detach()) * scale
+        hard_v = torch.sign(v_eff)
+    return (v_eff + (hard_v - v_eff).detach()) * scale
 
 
 def bernoulli_entropy(p: torch.Tensor) -> torch.Tensor:
@@ -160,12 +161,12 @@ def softmax_entropy_reg(logits: torch.Tensor) -> torch.Tensor:
     return per_example - batch
 
 
-def fsq_quantize(v: torch.Tensor, L: int, mode: str = "ste", bound: str = "sigmoid") -> torch.Tensor:
+def fsq_quantize(v: torch.Tensor, L: int, hard: bool = True, sample: bool = False, bound: str = "sigmoid") -> torch.Tensor:
     half_l = (L - 1) / 2
     z_bounded = half_l * (torch.tanh(v) if bound == "tanh" else (2 * torch.sigmoid(1.6 * v) - 1))
-    if mode == "soft":
+    if not hard:
         return z_bounded / half_l
-    if mode == "sample":
+    if sample:
         noise = torch.rand_like(z_bounded) - 0.5
         z_rounded = torch.round(z_bounded + noise).clamp(-half_l, half_l)
     else:
@@ -235,10 +236,11 @@ class QuantScheme:
         return None
 
 
-class SoftmaxQuant(QuantScheme):
-    def __init__(self, tau: float, mode: str = "ste", ntp_head_tied: bool = False):
+class SimplexQuant(QuantScheme):
+    def __init__(self, tau: float, hard: bool = True, sample: bool = False, ntp_head_tied: bool = False):
         self.tau = tau
-        self.mode = mode
+        self.hard = hard
+        self.sample = sample
         self.ntp_head_tied = ntp_head_tied
 
     def init_modules(self, D, V, code_head_tied):
@@ -259,7 +261,7 @@ class SoftmaxQuant(QuantScheme):
         return code_head, code_embed, ntp_head
 
     def quantize(self, pre_q):
-        return gumbel_quantize(pre_q, self.tau, self.mode)
+        return gumbel_quantize(pre_q, self.tau, self.hard, self.sample)
 
     def to_ids(self, source_c):
         return source_c.argmax(-1)
@@ -292,22 +294,23 @@ class SoftmaxQuant(QuantScheme):
         return softmax_entropy_reg(pre_q)
 
 
-class BSQQuant(QuantScheme):
-    def __init__(self, bsq_bits: int, mode: str = "ste", lfq: bool = False):
-        self.bsq_bits = bsq_bits
-        self.mode = mode
+class BinaryQuant(QuantScheme):
+    def __init__(self, binary_bits: int, hard: bool = True, sample: bool = False, lfq: bool = False):
+        self.binary_bits = binary_bits
+        self.hard = hard
+        self.sample = sample
         self.lfq = lfq
 
     def init_modules(self, D, V, code_head_tied):
-        code_head = nn.Linear(D, self.bsq_bits, bias=False)
+        code_head = nn.Linear(D, self.binary_bits, bias=False)
         nn.init.normal_(code_head.weight, std=0.02)
-        code_embed = CodeEmbed(self.bsq_bits, D)
-        code_predict = nn.Linear(D, self.bsq_bits, bias=False)
+        code_embed = CodeEmbed(self.binary_bits, D)
+        code_predict = nn.Linear(D, self.binary_bits, bias=False)
         nn.init.normal_(code_predict.weight, std=0.02)
         return code_head, code_embed, code_predict
 
     def quantize(self, pre_q):
-        return bsq_quantize(pre_q, self.bsq_bits, self.mode, self.lfq)
+        return bsq_quantize(pre_q, self.binary_bits, self.hard, self.sample, self.lfq)
 
     def to_ids(self, source_c):
         bits = (source_c > 0).long()
@@ -318,7 +321,7 @@ class BSQQuant(QuantScheme):
         return stage_lm.code_embed(source_c)
 
     def ntp_loss_acc(self, stage_lm, h_query, target_repr):
-        target_bits = (target_repr.reshape(-1, self.bsq_bits) > 0).float()
+        target_bits = (target_repr.reshape(-1, self.binary_bits) > 0).float()
         pred = stage_lm.code_predict(h_query)
         loss = F.binary_cross_entropy_with_logits(pred, target_bits)
         with torch.no_grad():
@@ -330,15 +333,15 @@ class BSQQuant(QuantScheme):
 
     def sample_next(self, stage_lm, h_query, vocab):
         pred = stage_lm.code_predict(h_query)
-        return bsq_quantize(pred, self.bsq_bits, self.mode, self.lfq)
+        return bsq_quantize(pred, self.binary_bits, self.hard, self.sample, self.lfq)
 
     def entropy_reg(self, pre_q):
         return bsq_entropy_reg(pre_q)
 
 
-class FSQQuant(QuantScheme):
-    def __init__(self, dq: int, L: int, mode: str = "ste", bound: str = "sigmoid"):
-        self.dq, self.L, self.mode, self.bound = dq, L, mode, bound
+class GridQuant(QuantScheme):
+    def __init__(self, dq: int, L: int, hard: bool = True, sample: bool = False, bound: str = "sigmoid"):
+        self.dq, self.L, self.hard, self.sample, self.bound = dq, L, hard, sample, bound
 
     def init_modules(self, D, V, code_head_tied):
         code_head = nn.Linear(D, self.dq, bias=False)
@@ -349,7 +352,7 @@ class FSQQuant(QuantScheme):
         return code_head, code_embed, code_predict
 
     def quantize(self, pre_q):
-        return fsq_quantize(pre_q, self.L, self.mode, self.bound)
+        return fsq_quantize(pre_q, self.L, self.hard, self.sample, self.bound)
 
     def to_ids(self, source_c):
         bound = (self.L - 1) / 2
@@ -375,7 +378,7 @@ class FSQQuant(QuantScheme):
     def sample_next(self, stage_lm, h_query, vocab):
         bound = (self.L - 1) / 2
         pred = stage_lm.code_predict(h_query).reshape(*h_query.shape[:-1], self.dq, self.L)
-        if self.mode == "sample":
+        if self.sample:
             probs = F.softmax(pred, dim=-1)
             levels = torch.multinomial(probs.reshape(-1, self.L), 1).reshape(pred.shape[:-1])
         else:
@@ -384,11 +387,11 @@ class FSQQuant(QuantScheme):
 
 
 def make_quant(cfg: Config) -> QuantScheme:
-    if cfg.quant_type == "bsq":
-        return BSQQuant(cfg.bsq_bits, cfg.code_sample_mode, cfg.bsq_lfq)
-    if cfg.quant_type == "fsq":
-        return FSQQuant(cfg.fsq_dq, cfg.fsq_levels, cfg.code_sample_mode, cfg.fsq_bound)
-    return SoftmaxQuant(cfg.gumbel_tau, cfg.code_sample_mode, cfg.ntp_head_tied)
+    if cfg.quant_type == "binary":
+        return BinaryQuant(cfg.binary_bits, cfg.code_hard, cfg.code_sample, cfg.binary_lfq)
+    if cfg.quant_type == "grid":
+        return GridQuant(cfg.grid_dq, cfg.grid_levels, cfg.code_hard, cfg.code_sample, cfg.grid_bound)
+    return SimplexQuant(cfg.gumbel_tau, cfg.code_hard, cfg.code_sample, cfg.ntp_head_tied)
 
 
 def rope_cos_sin(seq_len: int, head_dim: int, base: float, device: torch.device):
@@ -800,7 +803,7 @@ def parse_scalar_or_tuple(s):
 
 def train(model, train_data: torch.Tensor, val_data: torch.Tensor, args, log, run_name: str, device: str) -> None:
     opt = torch.optim.AdamW(build_param_groups(model), lr=args.lr_peak, betas=(0.9, 0.95), weight_decay=args.weight_decay)
-    checkpointer = Checkpointer(args.checkpoint_dir / run_name, args.save_every_n_evals, minimize=True)
+    checkpointer = Checkpointer(args.logs_dir / run_name, args.save_every_n_evals, minimize=True)
 
     model.train()
     pbar = tqdm(range(1, args.steps + 1), desc="train", dynamic_ncols=True)
@@ -869,7 +872,10 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--code_ntp_weight", type=float, default=1.0)
     p.add_argument("--decode_ntp_weight", type=float, default=1.0)
     p.add_argument("--gumbel_tau", type=float, default=1.0)
-    p.add_argument("--code_sample_mode", type=str, default="ste", choices=["ste", "sample", "soft"])
+    p.add_argument("--code_hard", type=lambda x: x.lower() != "false", default=True,
+                    help="True: hard code with straight-through (round/argmax/sign). False: continuous relaxed code")
+    p.add_argument("--code_sample", action="store_true",
+                    help="inject stochastic noise before quantizing (gumbel for simplex, bernoulli/uniform dither for binary/grid)")
     p.add_argument("--code_extract_mode", type=str, default="last_h",
                     choices=["last_h", "softmax_pool", "light_query_attn", "query_embed"])
     p.add_argument("--code_head_tied", type=lambda x: x.lower() != "false", default=False)
@@ -879,16 +885,16 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--output_preset", type=int, default=None, choices=list(WORD_PRESET_BITS),
                     help="level0 output/generation word width in bits: 1 (bit), 4 (nibble), or 8 (byte) -- "
                          "must currently equal --input_preset, asymmetric presets not yet implemented")
-    p.add_argument("--quant_type", type=str, default=None, choices=["softmax", "bsq", "fsq"])
-    p.add_argument("--bsq_bits", type=int, default=None)
-    p.add_argument("--bsq_lfq", action="store_true")
+    p.add_argument("--quant_type", type=str, default=None, choices=["simplex", "binary", "grid"])
+    p.add_argument("--binary_bits", type=int, default=None)
+    p.add_argument("--binary_lfq", action="store_true")
     p.add_argument("--entropy_reg_weight", type=float, default=0.0)
     p.add_argument("--ntp_head_tied", action="store_true")
     p.add_argument("--decode_cross_stage_layers", type=int, default=None)
     p.add_argument("--share_encode_decode_self", action="store_true")
-    p.add_argument("--fsq_dq", type=int, default=None)
-    p.add_argument("--fsq_levels", type=int, default=None)
-    p.add_argument("--fsq_bound", type=str, default="sigmoid", choices=["sigmoid", "tanh"])
+    p.add_argument("--grid_dq", type=int, default=None)
+    p.add_argument("--grid_levels", type=int, default=None)
+    p.add_argument("--grid_bound", type=str, default="sigmoid", choices=["sigmoid", "tanh"])
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -912,7 +918,6 @@ def build_argparser(description: str) -> tuple:
 
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--logs_dir", type=Path, default=Path("logs"))
-    p.add_argument("--checkpoint_dir", type=Path, default=Path("checkpoints"))
     p.add_argument("--save_every_n_evals", type=int, default=1)
     p.add_argument("--device", type=str, default=None, choices=["cpu", "mps", "cuda"])
     p.add_argument("--compile", type=lambda x: x.lower() != "false", default=False)
@@ -930,15 +935,15 @@ def build_argparser(description: str) -> tuple:
     if args.eval_only and args.checkpoint_path is None:
         p.error("--eval_only requires --checkpoint_path")
     if args.quant_type is None:
-        p.error("--quant_type has no default -- set it explicitly (--quant_type or config file: softmax|bsq|fsq)")
+        p.error("--quant_type has no default -- set it explicitly (--quant_type or config file: simplex|binary|grid)")
     if args.vocab is None:
         p.error("--vocab has no default -- set it explicitly (--vocab or config file)")
-    if args.quant_type == "bsq" and args.bsq_bits is None:
-        p.error("--bsq_bits has no default -- set it explicitly when --quant_type bsq")
-    if args.quant_type == "fsq" and args.fsq_dq is None:
-        p.error("--fsq_dq has no default -- set it explicitly when --quant_type fsq")
-    if args.quant_type == "fsq" and args.fsq_levels is None:
-        p.error("--fsq_levels has no default -- set it explicitly when --quant_type fsq")
+    if args.quant_type == "binary" and args.binary_bits is None:
+        p.error("--binary_bits has no default -- set it explicitly when --quant_type binary")
+    if args.quant_type == "grid" and args.grid_dq is None:
+        p.error("--grid_dq has no default -- set it explicitly when --quant_type grid")
+    if args.quant_type == "grid" and args.grid_levels is None:
+        p.error("--grid_levels has no default -- set it explicitly when --quant_type grid")
     if args.input_preset is None:
         p.error("--input_preset has no default -- set it explicitly (--input_preset or config file: 1|4|8)")
     if args.output_preset is None:
@@ -953,13 +958,14 @@ def config_from_args(args) -> Config:
         rope_base=args.rope_base, byte_ntp_weight=args.byte_ntp_weight, code_ntp_weight=args.code_ntp_weight,
         decode_ntp_weight=args.decode_ntp_weight, gumbel_tau=args.gumbel_tau,
         code_extract_mode=args.code_extract_mode, code_head_tied=args.code_head_tied,
-        vocab=args.vocab, quant_type=args.quant_type, bsq_bits=args.bsq_bits, bsq_lfq=args.bsq_lfq,
+        vocab=args.vocab, quant_type=args.quant_type, binary_bits=args.binary_bits, binary_lfq=args.binary_lfq,
         input_preset=args.input_preset, output_preset=args.output_preset,
         entropy_reg_weight=args.entropy_reg_weight, ntp_head_tied=args.ntp_head_tied,
         decode_cross_stage_layers=args.decode_cross_stage_layers,
         share_encode_decode_self=args.share_encode_decode_self,
-        fsq_dq=args.fsq_dq, fsq_levels=args.fsq_levels, fsq_bound=args.fsq_bound,
-        code_sample_mode=args.code_sample_mode,
+        grid_dq=args.grid_dq, grid_levels=args.grid_levels, grid_bound=args.grid_bound,
+        code_hard=args.code_hard,
+        code_sample=args.code_sample,
     )
 
 

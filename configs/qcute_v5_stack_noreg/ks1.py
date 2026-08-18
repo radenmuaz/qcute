@@ -1,4 +1,4 @@
-"""qcute_v5_stack_noreg/ks1: Ks=(1,), context_len=256, attn_window=-1, code_sample_mode="ste",
+"""qcute_v5_stack_noreg/ks1: Ks=(1,), context_len=256, attn_window=-1, code_hard=True/code_sample=False,
 entropy_reg_weight=0.0 (disabled) -- simplest rung of the Ks grid, sibling to ks21/ks221 in this
 folder, all three sharing entropy_reg_weight=0 as the no-regularization baseline counterpart to
 configs/qcute_v5_stack_ks221_ste_entropyreg.py (entropy_reg_weight=0.1). full_val_eval=True: every
@@ -18,8 +18,9 @@ d_model = 256
 n_layers = 1
 context_len = 256
 attn_window = -1
-code_sample_mode = "ste"
-quant_type = "softmax"
+code_hard = True
+code_sample = False
+quant_type = "simplex"
 vocab = 256
 input_preset = 8
 output_preset = 8
