@@ -430,6 +430,7 @@ def eval_bpb_full(model: nn.Module, data: torch.Tensor, batch_size: int, context
     model.eval()
     seq_len = context + n_heads
     n_windows = (len(data) - 1) // seq_len
+    batch_size = n_windows if batch_size == -1 else batch_size
     total, total_n = 0.0, 0
     for start in range(0, n_windows, batch_size):
         idxs = range(start, min(start + batch_size, n_windows))
@@ -736,6 +737,8 @@ def main():
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--eval_every", type=int, default=200)
     p.add_argument("--eval_batches", type=int, default=10)
+    p.add_argument("--full_val_eval", action="store_true",
+                    help="each --eval_every round runs eval_bpb_full over the whole val set (batch_size=-1) instead of eval_bpb's sampled batches")
     p.add_argument(
         "--benchmark_generate_bytes", type=int, default=0,
         help="if >0, after training benchmark plain-AR vs. self-speculative (MTP-head draft) generation latency"
@@ -748,6 +751,7 @@ def main():
     p.add_argument("--checkpoint_dir", type=Path, default=Path("checkpoints"))
     p.add_argument("--save_every_n_evals", type=int, default=1, help="write the 'last' checkpoint every N eval() calls")
     p.add_argument("--eval_only", action="store_true", help="skip training; load --checkpoint_path and just evaluate")
+    p.add_argument("--eval_split", choices=["train", "val"], default="val", help="split to evaluate with --eval_only")
     p.add_argument("--checkpoint_path", type=Path, default=None, help="required with --eval_only; also usable to warm-start training")
     p.add_argument(
         "--qual_gen_bytes", type=int, default=0,
@@ -811,8 +815,10 @@ def main():
     val_iter = batch_iter(val_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
 
     if args.eval_only:
-        val_bpb = eval_bpb_full(model, val_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
-        log(f"eval_only_full_valset  val_bpb {val_bpb:.4f}", val_bpb=val_bpb)
+        eval_data = train_data if args.eval_split == "train" else val_data
+        eval_bpb_val = eval_bpb_full(model, eval_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
+        log(f"eval_only_full_{args.eval_split}set  {args.eval_split}_bpb {eval_bpb_val:.4f}",
+            **{f"{args.eval_split}_bpb": eval_bpb_val})
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(0.9, 0.95), weight_decay=0.1)
         train_iter = batch_iter(train_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
@@ -841,7 +847,10 @@ def main():
             if step % args.log_every == 0:
                 log(f"{pbar}", step=step, lr=lr, mtp_loss=loss.item(), bpb=head0_bpb.item())
             if step % args.eval_every == 0 or step == args.steps:
-                val_bpb = eval_bpb(model, val_iter, cfg.context, args.eval_batches)
+                if args.full_val_eval:
+                    val_bpb = eval_bpb_full(model, val_data, -1, cfg.context, cfg.mtp_heads, device)
+                else:
+                    val_bpb = eval_bpb(model, val_iter, cfg.context, args.eval_batches)
                 log(f"step {step:5d}  val_bpb {val_bpb:.4f}", step=step, val_bpb=val_bpb)
                 checkpointer.step(
                     {"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "cfg": asdict(cfg), "val_bpb": val_bpb},

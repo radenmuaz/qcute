@@ -17,7 +17,7 @@ qcute_v5_concat_no_modes.py):
 """
 import torch
 
-from qcute import qcute_v5_concat_no_modes as plain
+from qcute.archive3 import qcute_v5_concat_no_modes as plain
 from qcute import qcute_v5_concat as modes
 
 DEVICE = "cpu"
@@ -25,14 +25,21 @@ torch.manual_seed(0)
 
 
 def make_models(Ks, context_len, attn_window=-1, n_layers=2, d_model=32, n_heads=4):
+    # ntp_head_tied=True on every modes.Config below: the archived `plain` reference predates the
+    # ntp_head_tied feature (always tied, no flag) -- pinning modes' configs to the same tied
+    # behavior keeps this test about multi_mode_impl correctness, not confounded by the unrelated
+    # untied-by-default change.
     cfg_plain = plain.Config(Ks=Ks, d_model=d_model, n_layers=n_layers, context_len=context_len,
                               n_heads=n_heads, attn_window=attn_window, vocab=256)
     cfg_modes_off = modes.Config(Ks=Ks, d_model=d_model, n_layers=n_layers, context_len=context_len,
-                                  n_heads=n_heads, attn_window=attn_window, vocab=256, multi_mode_impl="off")
+                                  n_heads=n_heads, attn_window=attn_window, vocab=256, multi_mode_impl="off",
+                                  ntp_head_tied=True)
     cfg_multipass = modes.Config(Ks=Ks, d_model=d_model, n_layers=n_layers, context_len=context_len,
-                                  n_heads=n_heads, attn_window=attn_window, vocab=256, multi_mode_impl="multipass")
+                                  n_heads=n_heads, attn_window=attn_window, vocab=256, multi_mode_impl="multipass",
+                                  ntp_head_tied=True)
     cfg_single = modes.Config(Ks=Ks, d_model=d_model, n_layers=n_layers, context_len=context_len,
-                               n_heads=n_heads, attn_window=attn_window, vocab=256, multi_mode_impl="single_pass")
+                               n_heads=n_heads, attn_window=attn_window, vocab=256, multi_mode_impl="single_pass",
+                               ntp_head_tied=True)
 
     m_plain = plain.RefineLM(cfg_plain).to(DEVICE).eval()
     m_off = modes.RefineLM(cfg_modes_off).to(DEVICE).eval()

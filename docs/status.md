@@ -391,3 +391,149 @@ either, level1's OWN generation is just bad). Root cause not yet investigated --
 check: level1 undertrained relative to level0 (its bpb sits ~1.4-1.5 higher than level0's
 throughout both runs, own encode acc only ~20-25%), or a level1-specific generation-loop bug
 distinct from the level0 multi-mode machinery this ablation was actually testing.
+
+**qcute_v5_stack.py's qualitative_generate generalized to all conditioning depths (2026-08-18)**:
+previously hardcoded two calls (`cond_full`=max_decode_sources=None, `cond_self`=max_decode_sources=1,
+via `generate_self_only_cond`) -- correct for Ks configs where level0 only ever has T=2 tracks, but
+would silently skip intermediate depths for deeper configs (e.g. Ks=(2,2,1), T=3). Replaced with the
+same loop `qcute_v5_concat_modes.py` uses: `for m in range(1, model.n_levels+1):
+generate_no_cache(..., max_decode_sources=m)`, logging `level0_mode{m}`/`level0_modefull` --
+mechanism (`max_decode_sources`) was already there, only the qualitative logging wasn't generalized.
+`generate_self_only_cond` kept defined (unused internally now, same as concat's own copy) as a
+standalone max_decode_sources=1 convenience. Verified via a Ks=(4,1) smoke run: level0_mode1/
+level0_modefull both print correctly, gen_consistency 0/15.
+
+**qcute_v5_stack_ks41_ste results (2026-08-18)**: best_val_bpb=2.6848 (2.7295->2.7037->2.6848, still
+improving at step 8000) -- beats the concat counterpart qcute_v5_concat_modes_1_ste (2.7679).
+gen_consistency 0/127 clean, confirming stack's staged decode (self stage + full/deepest stage,
+already trained "for free" per the multi-path discussion above) is exactly correct under ste.
+
+**level1 generation collapse confirmed cross-architecture**: same failure as
+qcute_v5_concat_modes_1(_ste) -- level1_gen collapses into a short repeating cycle
+([89,232,217,...] train, [234,253,...] val) instead of tracking level1_gt, here too. Now observed
+in BOTH qcute_v5_concat.py and qcute_v5_stack.py under both soft and ste determinism -- strengthens
+the "generic/undertrained level1" hypothesis over an architecture-specific bug. level1_ntp_acc_decode
+~18% here, similar to concat's ~22-25%. Root cause still not investigated.
+
+**Code-usage entropy measurement on trained checkpoints (2026-08-18)**: new diagnostic script
+`scripts/measure_code_entropy.py` -- loads a checkpoint, samples N_BATCHES train/val batches, and
+reports per-level `entropy_reg` (the same `E_batch[H(p)] - H(E_batch[p])` metric already exposed by
+`RefineLM.forward`, see [docs/bsq_entropy_reg_math.md](bsq_entropy_reg_math.md)) plus a more directly
+interpretable **distinct-codes-used / possible-ids** count (via `quant.to_ids()` on the actually-
+quantized codes). Purpose: decide whether `Config.entropy_reg_weight` (still 0.0/off in every
+checkpoint measured) is worth turning on -- all checkpoints below were trained without it.
+`--only <substring>` filters which checkpoints to run; `N_BATCHES=20`, `batch_size=16` for all rows.
+
+| checkpoint | Ks | quant | level | entropy_reg (train / val) | distinct codes used (train / val) |
+|---|---|---|---|---|---|
+| `qcute_v5_concat_bsq16_ste` | (1,) | bsq16 | 0 | -5.5348 / -5.4753 | 2331/65536 (3.6%) / 2186/65536 (3.3%) |
+| `qcute_v5_stack_bsq16_ste` | (1,) | bsq16 | 0 | -5.5800 / -5.6410 | 2222/65536 (3.4%) / 2202/65536 (3.4%) |
+| `qcute_v5_concat_modes_1_ste` | (4,1) | softmax | 0 | -2.0327 / -2.0305 | 105/256 (41.0%) / 108/256 (42.2%) |
+| | | | 1 | -1.1941 / -1.2715 | 56/256 (21.9%) / 53/256 (20.7%) |
+| `qcute_v5_stack_ks41_ste` | (4,1) | softmax | 0 | -2.3347 / -2.2789 | 151/256 (59.0%) / 141/256 (55.1%) |
+| | | | 1 | -1.1634 / -1.1870 | 72/256 (28.1%) / 68/256 (26.6%) |
+
+Caveats: `positions_seen` differs by config (81920 for Ks=(1,), 20480 for Ks=(4,1) level0, since
+block count per sample scales with context_len/K) -- percentages are comparable across rows, raw
+counts aren't. "distinct codes used" is cumulative over however many batches are sampled (grows
+with more data), not a steady-state rate -- only compare runs measured with the same N_BATCHES.
+
+Also checked for Ks=(4,1) BSQ checkpoints to fill out the table properly:
+`qcute_v5_2_bsq16`/`bsq8` (stack) and `qcute_v5_concat_2_bsq16`/`bsq8` exist but predate the
+`code_sample_mode` unification (`use_gumbel_noise` schema) and the qfb fix/`_skip` promotion --
+`Config(**ckpt['cfg'])` fails outright (unexpected kwarg), and even patched, the state_dict likely
+wouldn't load against the current architecture. Not usable without a fresh training run.
+
+**Reading**: BSQ's 16-bit (65536-corner) codebook looks the most collapsed in absolute terms (only
+~3.3-3.6% of corners ever used) -- the more plausible candidate for `entropy_reg_weight>0` to help,
+though this is still just an unregularized baseline, not an A/B result. Softmax's much smaller
+256-way vocab is already far better utilized without any regularization. Consistently across both
+quant schemes measured, **stack uses more of its codebook than concat** (softmax level0: 55-59%
+stack vs 41-42% concat; level1: 26-28% vs 21-22%; bsq: roughly tied) -- stack also had the better
+`best_val_bpb` in the Ks=(4,1)/softmax/ste pair (2.6848 vs 2.7679, see above), consistent with (not
+proof of) higher code diversity correlating with better compression here.
+
+**Same-prompt uncond/cond_self/cond_full comparison, `qcute_v5_stack_ks41_ste`**: all three
+degenerate into repetition within ~60-90 generated bytes at this scale, but differ in HOW: `uncond`
+loops the exact same short phrase verbatim (`[[sr:Algeria]]` repeated, or `...and the state of the
+control...`); `cond_self` stays lexically varied longest before repeating; `cond_full` on the val
+prompt degenerates into a numeric-token loop (`14, 14, 14, ...`), the least readable of the three --
+matches the earlier concat finding that self-only conditioning can read more coherent than
+full-depth conditioning, even though full/deepest is what `decode_total` optimizes hardest.
+
+**bytelm baseline rerun (2026-08-18)**: `bytelm_xs1_ctx256`/`bytelm_xs2_ctx256`/`bytelm_xs4_ctx256`
+(4000 steps each, context=256) rerun fresh for an up-to-date comparison point against this
+session's v5 stack/concat Ks=(4,1)/(2,2,1) runs (also context_len=256). best val_bpb:
+xs1 (n_layers=1) 2.5539, xs2 (n_layers=2) 2.4371, xs4 (n_layers=4) 2.4083. Plain deeper baselines
+still beat every v5 stack/concat run measured this session (best so far: qcute_v5_stack_ks41_ste
+2.6848) -- v5's hierarchical decode has not yet closed this gap at this training scale.
+
+**Softmax NTP head untied from embed by default (2026-08-18)**, both `qcute_v5_concat.py` and
+`qcute_v5_stack.py`: `SoftmaxQuant`'s decode NTP head (`ntp_loss_acc`/`sample_next`) previously
+always computed logits via `F.linear(h_query, stage_lm.embed.weight)` -- classic weight tying
+between the input embedding and the output softmax head, no flag to disable it. Now
+`Config.ntp_head_tied`/`--ntp_head_tied` (default `False`) gives it its own separate
+`nn.Linear(D, V, bias=False)` head instead (reusing the `code_predict` module slot, unused by
+softmax otherwise -- BSQ/FSQ already always use a dedicated `code_predict` head, unaffected by this
+flag). `ntp_head_tied=True` restores the old always-tied behavior. `embed_for_decode`/`embed_input`
+(the INPUT-side usage of `embed.weight`, embedding a produced code back into the residual stream)
+are unchanged -- only the OUTPUT-side NTP prediction head is affected. Verified: trains/backprops
+cleanly both ways in both modules, `generate_no_cache`/`check_gen_consistency` clean (0 mismatches)
+under the new default, and both full test suites (`test_v5_concat.py`, `test_v5_concat_modes.py`)
+pass -- the latter's `make_models` helper pinned to `ntp_head_tied=True` since its frozen archived
+`qcute_v5_concat_no_modes.py` reference predates this feature and only ever had tied behavior.
+
+**Thin cross-attention fuse stages, qcute_v5_stack.py only (2026-08-18)**: implements the
+self-stays-LM / upper-stages-become-thin-fuse-layers design discussed above, scoped conservatively
+-- rather than a new `Fuser` module (would need to duplicate LevelLM's embed/quant-head/pooling
+machinery to keep `want_code` chaining, `ntp_head_tied`, and entropy_reg all working), `LevelLM`
+gained an optional `n_layers_override` constructor param, and `Config.decode_cross_stage_layers:
+int | None = None` (`--decode_cross_stage_layers`). `None` (default): every decode stage (self AND
+every cross-attention stage) still uses `cfg.n_layers`, byte-for-byte unchanged from before this
+change. Set to an int (e.g. `1`): stage 0 (self, `self_merged_stage`) keeps its full `cfg.n_layers`
+depth unconditionally; stages 1+ (`cross_attn_stage`, one per coarser track) are constructed at
+that depth instead, regardless of `cfg.n_layers` -- e.g. `n_layers=2,
+decode_cross_stage_layers=1` gives self+mlp (2 layers) -> cross(L+1)+mlp (1 layer) ->
+cross(L+2)+mlp (1 layer) for a Ks=(2,2,1) level0 decode, matching the originally-requested shape.
+Each stage is still its own fully independent `LevelLM` instance (no new weight sharing introduced
+by this flag) -- only its own depth changes. No-op whenever `cfg.n_layers` already equals the
+override (e.g. every `n_layers=1` config used throughout this session). Verified: correct per-stage
+depth via direct inspection, trains/backprops cleanly, `generate_no_cache`/`check_gen_consistency`
+clean (0 mismatches) under both the dense and chunked/SWA attention paths, full end-to-end training
+smoke test (checkpointing + qualitative generation) clean. `generate_true_kv_cache` is unaffected
+(scoped to `n_levels==1`, self stage only, no cross stages exist there to override).
+
+Still pending from the same discussion: the encoder/decoder-self weight-sharing flag (item 1) was
+not implemented this session -- only the fuse-depth change (item 2) landed.
+
+**Weight-sharing audit (2026-08-18)**, both files, in response to a "check again any weight reuse"
+request: found and ruled out one false alarm, confirmed one real always-on tie:
+- **Level0's NTP head is unconditionally tied to that stage's own embed.weight**, regardless of
+  quant_type/ntp_head_tied/code_head_tied -- `_ntp_loss_acc` has a separate `is_byte_level` branch
+  (`F.linear(h_query, self.embed.weight)`) that bypasses `self.quant.ntp_loss_acc` entirely, for
+  encode AND every decode stage. So `ntp_head_tied` (added earlier this session) only ever affects
+  level1+ (non-byte, code-predicting levels) -- initially mis-scoped this in a live check (worried
+  `_sample_next_byte`/`check_gen_consistency`'s hardcoded embed.weight usage had silently diverged
+  from training after adding ntp_head_tied); confirmed it's actually still exactly consistent with
+  level0's real (always-tied) path. Fixed the `Config.ntp_head_tied` comment in both files to state
+  the level1+-only scope explicitly, since the original comment didn't make this clear.
+- No other cross-instance weight sharing exists anywhere: every `encode_lms[i]` and every
+  `decode_stage_lms[i][t]` is fully independent; `CausalSelfAttention.qkv/out` supports both self-
+  and cross-attention math but per-instance only (a self-stage's blocks only ever call `forward`,
+  a cross-stage's only ever call `forward_cross` -- no runtime dual-role conflict).
+
+**Encoder/decoder-self weight-sharing flag, qcute_v5_stack.py only (2026-08-18)**: implements item 1
+from the design discussion above. `Config.share_encode_decode_self: bool = False`
+(`--share_encode_decode_self`). False (default, unchanged): `encode_lms[i]` and
+`decode_stage_lms[i][0]` (the self stage, `self_merged_stage`) are separate `LevelLM` instances, as
+always. True: `decode_stage_lms[i][0]` literally IS `encode_lms[i]` (same Python object, same
+`nn.Parameter`s -- standard PyTorch weight-tying via object aliasing in `RefineLM.__init__`, not a
+copy). Explicitly NOT a clean no-op tie -- `self_merged_stage`'s forward differs from plain
+`encode()` (it additionally merges this level's own just-produced code into the same self-attention
+buffer alongside the raw bytes, which `encode()` never sees), so the shared weights do a genuinely
+different job depending on call site. Verified: `decode_stage_lms[0][0] is encode_lms[0]` when
+enabled, total param count drops by exactly one level0 `LevelLM`'s worth (448128->298752 in a
+Ks=(2,2,1) test config), state_dict round-trips correctly (duplicate keys under both paths, as
+expected for a tied module -- larger checkpoint, still correct), trains/backprops cleanly,
+`check_gen_consistency` clean (0 mismatches), full end-to-end training smoke test (combined with
+`decode_cross_stage_layers=1`) clean.

@@ -208,6 +208,53 @@ it via `is not None`, so overloading it would have silently mis-routed
 that check whenever entropy_reg was non-None; a new trailing tuple
 element was added instead.
 
+**Entropy reg generalized to the softmax quantizer (2026-08-18)**, both
+files: `softmax_entropy_reg` (same `E_batch[H(p)] - H(E_batch[p])`
+structure, exact categorical entropy over the V-way softmax instead of
+BSQ's per-bit marginal proxy), wired via `SoftmaxQuant.entropy_reg` (no
+new plumbing needed — `entropy_reg_weight` was already generic). Still
+0.0/off by default; `quant_type="fsq"` still has no entropy_reg override.
+
+**`qcute_v5_stack.py`'s `qualitative_generate` generalized (2026-08-18)**
+to loop every level0 conditioning depth (`for m in range(1,
+model.n_levels+1): generate_no_cache(..., max_decode_sources=m)`,
+logging `level0_mode{m}`/`level0_modefull`) instead of two hardcoded
+calls (`cond_full`/`cond_self` via `generate_self_only_cond`) — matches
+`qcute_v5_concat_modes.py`'s convention; `max_decode_sources` itself
+already supported arbitrary depth, only the logging wasn't generalized.
+
+**New `Ks=(4,1)`/`ste` ablation pair** (isolates whether multi-mode/
+staged decode is architecturally correct independent of `code_sample_
+mode="soft"`'s Gumbel-noise-driven `check_gen_consistency` mismatches):
+`configs/qcute_v5_concat_modes_1_ste.py` and
+`configs/qcute_v5_stack_ks41_ste.py`. Both trained clean, `0/127`
+`gen_consistency` mismatches at every eval (vs. `127/127` under `soft`)
+— confirms `single_pass` multi-mode decode and stack's staged decode are
+both exactly correct, not just correct modulo sampling noise. `stack`
+beat `concat` on `best_val_bpb` (2.6848 vs 2.7679) and on codebook
+utilization (see below). Both runs also share a real, unresolved,
+architecture-independent finding: level1's own generation collapses
+into a short repeating token cycle regardless of `code_sample_mode` —
+not yet root-caused (see docs/status.md).
+
+**New diagnostic: `scripts/measure_code_entropy.py`** (2026-08-18) —
+loads a checkpoint, samples `N_BATCHES` train/val batches, reports each
+level's `entropy_reg` (already exposed in `RefineLM.forward`'s metrics
+dict) plus a directly interpretable **distinct-codes-used / possible-ids**
+count via `quant.to_ids()`. `--only <substring>` filters by checkpoint
+name. Used to decide whether `entropy_reg_weight>0` is worth trying:
+BSQ's 65536-corner codebook sits at only ~3.3-3.6% utilization
+(unregularized) — the more plausible target — vs. softmax's much
+smaller 256-way vocab already reaching 20-59% without any regularization.
+Full table and caveats (position-count normalization, cumulative-count
+semantics): docs/status.md's 2026-08-18 entries. Old checkpoints
+predating the `code_sample_mode`/`quant_type` unification (e.g.
+`qcute_v5_2_bsq16`, `qcute_v5_concat_2_bsq16` — the only existing
+`Ks=(4,1)` BSQ checkpoints) are NOT usable with this script or any
+current code — `Config(**ckpt['cfg'])` fails outright on the
+since-removed `use_gumbel_noise` field, and even patched, the state_dict
+predates the qfb fix/`_skip` promotion so it likely won't load either.
+
 **`qcute_v5.py`'s "query first byte" (qfb) fix**: `cross_attn_stage`'s
 strict causal mask (`code_pos < query_pos`) means the row that would
 predict a block's FIRST element from that block's own just-completed
