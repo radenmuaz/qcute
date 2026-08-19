@@ -121,7 +121,7 @@ No-regularization (`entropy_reg_weight=0.0`) baseline grid on the new modular `q
 | `ks1.py` | `(1,)` | `True`/`False` (ste-equivalent) | 2.7246 |
 | `ks21.py` | `(2,1)` | `True`/`False` | 2.8105 |
 | `ks221.py` | `(2,2,1)` | `True`/`False` | 2.8414 |
-| `ks1_soft.py` | `(1,)` | `False`/`False` (new noise-free-soft combo) | running, 2.4597 at step ~5200/8000 and still improving |
+| `ks1_soft.py` | `(1,)` | `False`/`False` (new noise-free-soft combo) | 2.4597 (finished) |
 
 (A stale, incomplete `ks21` attempt from an earlier interrupted session — killed mid-run around
 step 4000, never reached `best_val_bpb`-worthy convergence — is kept at
@@ -159,3 +159,91 @@ hierarchy/cross-attention structure itself).
 `qcute_v5_stack_noreg/ks1_overfit1k.py` (n_bytes=1000, val_frac=0.5, 1000 steps) is a fast-
 iteration smoke config, not a real training run — best val_bpb 5.3602, not comparable to the table
 above.
+
+### GMM/GMMDiag quantizer, bigger FSQ grids, full leaderboard (2026-08-19)
+
+Added two new `QuantScheme`s to `qcute_v5_common.py`: **`GMMQuant`**/**`GMMDiagQuant`**
+(`quant_type="gmm"`/`"gmm_diag"`, new required `Config.gmm_k`/`gmm_dq` fields) — a genuine
+**shared codebook** (`GMMCodebook`/`GMMDiagCodebook`, `mu`/covariance are `nn.Parameter`s, not
+per-token predictions), selected via posterior responsibility (`softmax_k[log π_k + log
+N(query;μ_k,Σ_k)]`) rather than plain `argmin` — a direct generalization of VQ-VAE's nearest-
+neighbor rule (reduces to it when every `Σ_k` is isotropic and `π_k` uniform). No VQ-style
+commitment/codebook losses needed (the mixture NLL is already differentiable in `μ_k`/`Σ_k`
+through the `logsumexp`, unlike VQ-VAE's non-differentiable `argmin`) — component collapse is
+still a risk, mitigated the same way as BSQ/softmax via `entropy_reg` reusing
+`softmax_entropy_reg` on the posterior logits, zero new plumbing.
+
+`GMMQuant` (full covariance) parameterizes each component's covariance via its **precision**
+Cholesky factor `A` (`Λ=AAᵀ`) instead of the covariance Cholesky — makes the NLL's Mahalanobis
+term a plain matmul (`y=Aᵀ(x-μ)`, no solve/inverse) at the cost of needing one small **manual**
+triangular solve (`solve_upper_triangular`, plain elementwise back-substitution, no
+`torch.linalg.*` call) only on the reparameterized-sampling path — deliberate, since
+`torch.linalg.solve_triangular`/`cholesky` have historically poor/no MPS support (this project
+trains on `device="mps"`) and would risk a silent CPU fallback every token every step if used
+directly. `GMMDiagQuant` needs no solve anywhere (elementwise both directions), `O(dq)` vs full
+covariance's `O(dq²)` per component.
+
+**Real perf bug found and fixed**: `_GMMQuantBase._select`'s `code_hard=False` branch originally
+looped over all `K` components calling `codebook.sample(k)` individually — each call redundantly
+recomputed the full `precision_chol()` (over all `K` components) internally, making the whole
+branch `O(K²)` instead of `O(K)`. At `K=128` this was ~4x slower per step than it should've been
+(confirmed via a `code_hard=False/code_sample=True` smoke test: 48s/15 steps before the fix on
+CPU). Fixed by adding `GMMCodebook.sample_all`/`GMMDiagCodebook.sample_all` (one
+`precision_chol()` call, one batched solve broadcasting over `K`, no Python loop) — same
+`K=128` config: 21.5s/15 steps after.
+
+**`gmm_k=8192` sizing was rejected before training**: unlike FSQ/BSQ, whose head width is
+decoupled from their combinatorial code count (`dq·L`/`bits`, small regardless of total codes),
+GMM's gating head has to emit one logit per component, so head width scales `∝K` directly —
+`K·(1+dq+dq(dq+1)/2)` for full covariance. At `K=8192,dq=4` that's a `256→122880` linear, ~63M
+params for the two heads alone, dwarfing the rest of a `d_model=256` model. Settled on **`K=256,
+dq=4`** instead — same order of magnitude as `SimplexQuant`'s 256-way vocab, a fair comparison
+point, head width only 3840.
+
+**`v5_stack_gmm_ks1_256` (full covariance) was too slow to finish and was stopped**: ~4.9 min per
+100 steps on MPS (799/8000 steps in ~65 min, no eval reached, so no `best_val_bpb`) — not yet
+root-caused (possibly `qualitative_generate`'s autoregressive loop repeatedly rebuilding
+`precision_chol()` per step; not yet profiled). `v5_stack_gmm_ks1_256_diag` (diagonal covariance,
+same `K`/`dq`) is running as of this entry; expect it to be substantially faster given the `O(dq)`
+vs `O(dq²)` gap already measured above.
+
+**New diagnostic, not wired into training**: `_GMMQuantBase.bpb_bound(stage_lm, h_query,
+target_repr, precision_bits)` — `ntp_loss_acc`'s `K`-way cross-entropy against `to_ids()` is only
+an *exact* bpb when `code_hard=True` (the emitted code is genuinely just "which of `K`
+components", fully determined by the id). Under `code_hard=False`/`code_sample=True` the actual
+emitted code is a continuous vector carrying strictly more information than that id, so the
+existing loss **undercounts** — not a valid bound in either direction. `bpb_bound` fixes this by
+scoring the true mixture density's NLL of the exact continuous `target_repr` (not its
+discretized id) and adding a stated per-dim quantization-precision correction (`Config.
+gmm_bpb_precision_bits`, default 8 bits/dim — same role as the `+8` constant RealNVP/Glow-style
+bits/dim reporting adds for pixel dequantization; differential entropy alone isn't bits without
+one). Gives a genuine, achievable upper bound. Verified via isolated test (`K=16,dq=4,
+hard=False/sample=True`): naive undercounted CE ~3.9/~3.4 bits (GMM/GMMDiag) vs `bpb_bound`
+~40.8/~40.4 bits (dominated by the `dq·precision_bits=32` bit correction) — confirms the fix
+charges honestly instead of silently underreporting.
+
+**Full leaderboard, all `Ks=(1,)`-scale results to date** (enwik8_1M, `ctx256`/`context_len=256`,
+sorted best to worst; bytelm's `4000`-step schedule vs the v5-stack configs' `8000`-step schedule
+— not perfectly step-matched, kept as-is since both are each config's own converged/near-converged
+number):
+
+| rank | config | mechanism | best val_bpb |
+|---|---|---|---|
+| 1 | `bytelm_xs4_ctx256_fullval` | byte-level baseline (no hierarchy/quantizer at all) | 2.4235 |
+| 2 | `bytelm_xs2_ctx256_fullval` | byte-level baseline | 2.4502 |
+| 3 | `qcute_v5_stack_noreg/ks1_soft` | simplex, `code_hard=False/code_sample=False` | 2.4597 |
+| 4 | `v5_stack_fsq_ks1_8x8` | grid/FSQ, dq=8/levels=8 | 2.5523 |
+| 5 | `bytelm_xs1_ctx256_fullval` | byte-level baseline | 2.5846 |
+| 6 | `v5_stack_fsq_ks1` | grid/FSQ, dq=4/levels=8 | 2.6114 |
+| 7 | `v5_stack_fsq_ks1_4x8` | grid/FSQ, dq=8/levels=4 | 2.6651 |
+| 8 | `qcute_v5_stack_noreg/ks1` | simplex, `code_hard=True` | 2.7246 |
+| 9 | `qcute_v5_stack_noreg/ks21` | simplex, Ks=(2,1) | 2.8105 |
+| 10 | `qcute_v5_stack_noreg/ks221` | simplex, Ks=(2,2,1) | 2.8414 |
+| — | `v5_stack_gmm_ks1_256` | gmm full-cov, K=256/dq=4 | stopped early (step 799/8000), no eval reached |
+| — | `v5_stack_gmm_ks1_256_diag` | gmm diag, K=256/dq=4 | running |
+
+Patterns holding so far: every non-hardened/continuous config (`ks1_soft`, `bytelm`'s own
+no-quantizer baseline) clusters at the top; among genuinely discrete `code_hard=True` schemes,
+FSQ/grid beats simplex at every grid size tried, and going deeper in the hierarchy (`ks21`,
+`ks221`) consistently hurts rather than helps. GMM hasn't produced a comparable number yet (full
+covariance too slow to finish; diag pending).

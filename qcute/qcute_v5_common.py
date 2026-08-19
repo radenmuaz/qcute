@@ -63,6 +63,8 @@ class Checkpointer:
         self._eval_count = 0
 
     def is_better(self, metric: float) -> bool:
+        if not math.isfinite(metric) or metric <= 0:
+            return False
         return metric < self.best_metric if self.minimize else metric > self.best_metric
 
     def step(self, state: dict, metric: float) -> None:
@@ -109,6 +111,7 @@ class Config:
     grid_bound: str = "sigmoid"
     code_hard: bool = True
     code_sample: bool = False
+    gmm_bpb_precision_bits: int = 8
     decode_cross_stage_layers: int | None = None
     share_encode_decode_self: bool = False
 
@@ -438,6 +441,16 @@ class GMMCodebook(nn.Module):
         y = solve_upper_triangular(A.transpose(-1, -2), eps)
         return self.mu[k_idx] + y
 
+    def sample_all(self, batch_shape: tuple) -> torch.Tensor:
+        """Reparam-sample every component at once -- one precision_chol() call and one
+        batched triangular solve (K,dq,dq broadcasting against batch_shape+(K,dq)),
+        instead of calling sample() K times (each redundantly recomputing precision_chol()
+        over all K components -- O(K^2) work for what should be O(K))."""
+        A = self.precision_chol()
+        eps = torch.randn(*batch_shape, self.K, self.dq, device=self.mu.device, dtype=self.mu.dtype)
+        y = solve_upper_triangular(A.transpose(-1, -2), eps)
+        return self.mu + y
+
 
 class GMMDiagCodebook(nn.Module):
     """Shared diagonal-covariance GMM codebook -- same interface as GMMCodebook, plain
@@ -462,6 +475,11 @@ class GMMDiagCodebook(nn.Module):
     def sample(self, k_idx: torch.Tensor) -> torch.Tensor:
         std = (0.5 * self.logvar[k_idx]).exp()
         return self.mu[k_idx] + std * torch.randn_like(std)
+
+    def sample_all(self, batch_shape: tuple) -> torch.Tensor:
+        std = (0.5 * self.logvar).exp()
+        eps = torch.randn(*batch_shape, self.K, self.dq, device=self.mu.device, dtype=self.mu.dtype)
+        return self.mu + std * eps
 
 
 class GMMHead(nn.Module):
@@ -508,9 +526,7 @@ class _GMMQuantBase(QuantScheme):
         else:
             weights = r
         if not self.hard:
-            shape = query.shape[:-1]
-            samples = torch.stack([cb.sample(torch.full(shape, k, device=query.device, dtype=torch.long))
-                                    for k in range(self.K)], dim=-2)
+            samples = cb.sample_all(query.shape[:-1])
             return (weights.unsqueeze(-1) * samples).sum(-2)
         k_star = weights.argmax(-1)
         hard_code = cb.sample(k_star) if self.sample else cb.mu[k_star]
@@ -542,6 +558,21 @@ class _GMMQuantBase(QuantScheme):
     def sample_next(self, stage_lm, h_query, vocab):
         query_pred, gating_pred = stage_lm.code_predict(h_query)
         return self._select(query_pred, gating_pred)
+
+    def bpb_bound(self, stage_lm, h_query, target_repr, precision_bits: int) -> torch.Tensor:
+        """Achievable bpb bound for code_hard=False / code_sample=True, where ntp_loss_acc's
+        K-way cross-entropy against to_ids() undercounts (it only charges for "which of K
+        components", discarding the continuous residual those modes actually emit). Uses the
+        true mixture density's NLL of the exact target_repr (nats -> bits) plus a stated
+        per-dim quantization-precision correction (differential entropy alone isn't bits without
+        one, same reason RealNVP/Glow-style bits/dim reporting adds a fixed dequantization
+        constant) -- an honest, achievable upper bound, not exact."""
+        query_pred, gating_pred = stage_lm.code_predict(h_query)
+        cb = self._codebook
+        log_pi = F.log_softmax(gating_pred.reshape(-1, self.K), dim=-1)
+        log_lik = cb.log_prob(target_repr.reshape(-1, self.dq))
+        nll_nats = -torch.logsumexp(log_pi + log_lik, dim=-1).mean()
+        return nll_nats / math.log(2) + self.dq * precision_bits
 
     def entropy_reg(self, pre_q):
         query, gating_logits = pre_q
@@ -1071,6 +1102,9 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--grid_bound", type=str, default="sigmoid", choices=["sigmoid", "tanh"])
     p.add_argument("--gmm_k", type=int, default=None, help="number of shared GMM codebook components")
     p.add_argument("--gmm_dq", type=int, default=None, help="GMM code dimensionality")
+    p.add_argument("--gmm_bpb_precision_bits", type=int, default=8,
+                    help="per-dim quantization-precision correction added to the achievable bpb bound "
+                         "reported for code_hard=False/code_sample=True (differential NLL alone isn't bits)")
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -1144,7 +1178,7 @@ def config_from_args(args) -> Config:
         decode_cross_stage_layers=args.decode_cross_stage_layers,
         share_encode_decode_self=args.share_encode_decode_self,
         grid_dq=args.grid_dq, grid_levels=args.grid_levels, grid_bound=args.grid_bound,
-        gmm_k=args.gmm_k, gmm_dq=args.gmm_dq,
+        gmm_k=args.gmm_k, gmm_dq=args.gmm_dq, gmm_bpb_precision_bits=args.gmm_bpb_precision_bits,
         code_hard=args.code_hard,
         code_sample=args.code_sample,
     )
