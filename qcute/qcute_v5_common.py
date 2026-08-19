@@ -84,6 +84,8 @@ class Config:
     binary_bits: int
     grid_dq: int
     grid_levels: int
+    gmm_k: int
+    gmm_dq: int
     input_preset: int
     output_preset: int
     decoder_type: str = "concat"
@@ -386,11 +388,183 @@ class GridQuant(QuantScheme):
         return (levels.float() - bound) / bound
 
 
+def solve_upper_triangular(U: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Solve U y = b for upper-triangular U via manual back-substitution -- plain
+    elementwise ops only, no torch.linalg call (those have poor/no MPS support)."""
+    dq = U.shape[-1]
+    ys = [None] * dq
+    for i in reversed(range(dq)):
+        acc = b[..., i]
+        for j in range(i + 1, dq):
+            acc = acc - U[..., i, j] * ys[j]
+        ys[i] = acc / U[..., i, i]
+    return torch.stack(ys, dim=-1)
+
+
+class GMMCodebook(nn.Module):
+    """Shared full-covariance GMM codebook: K components over a dq-dim code space.
+    Covariance parameterized via its precision Cholesky factor A (Lambda = A A^T) so the
+    NLL's Mahalanobis term is a plain matmul (y = A^T(x-mu)) -- no solve/inverse needed.
+    Sampling (z = mu + A^-T eps) needs one small manual triangular solve instead."""
+
+    def __init__(self, K: int, dq: int, D: int):
+        super().__init__()
+        self.K, self.dq = K, dq
+        self.mu = nn.Parameter(torch.empty(K, dq).normal_(std=1.0))
+        self.chol_raw = nn.Parameter(torch.empty(K, dq, dq).normal_(std=0.1))
+        self.proj = nn.Linear(dq, D, bias=False)
+        nn.init.normal_(self.proj.weight, std=0.02)
+        self.register_buffer("_tril_off", torch.tril(torch.ones(dq, dq), diagonal=-1), persistent=False)
+        self.register_buffer("_eye", torch.eye(dq), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+    def precision_chol(self) -> torch.Tensor:
+        diag = F.softplus(self.chol_raw.diagonal(dim1=-2, dim2=-1)) + 1e-4
+        return self.chol_raw * self._tril_off + diag.unsqueeze(-1) * self._eye
+
+    def log_prob(self, x: torch.Tensor) -> torch.Tensor:
+        A = self.precision_chol()
+        diff = x.unsqueeze(-2) - self.mu
+        y = torch.einsum("...kd,kde->...ke", diff, A)
+        maha = (y * y).sum(-1)
+        log_diag_sum = A.diagonal(dim1=-2, dim2=-1).clamp_min(1e-8).log().sum(-1)
+        return log_diag_sum - 0.5 * (self.dq * math.log(2 * math.pi) + maha)
+
+    def sample(self, k_idx: torch.Tensor) -> torch.Tensor:
+        A = self.precision_chol()[k_idx]
+        eps = torch.randn(*k_idx.shape, self.dq, device=self.mu.device, dtype=self.mu.dtype)
+        y = solve_upper_triangular(A.transpose(-1, -2), eps)
+        return self.mu[k_idx] + y
+
+
+class GMMDiagCodebook(nn.Module):
+    """Shared diagonal-covariance GMM codebook -- same interface as GMMCodebook, plain
+    elementwise NLL/reparam (no triangular solve needed either direction)."""
+
+    def __init__(self, K: int, dq: int, D: int):
+        super().__init__()
+        self.K, self.dq = K, dq
+        self.mu = nn.Parameter(torch.empty(K, dq).normal_(std=1.0))
+        self.logvar = nn.Parameter(torch.zeros(K, dq))
+        self.proj = nn.Linear(dq, D, bias=False)
+        nn.init.normal_(self.proj.weight, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+    def log_prob(self, x: torch.Tensor) -> torch.Tensor:
+        diff = x.unsqueeze(-2) - self.mu
+        maha = (diff * diff * (-self.logvar).exp()).sum(-1)
+        return -0.5 * (self.dq * math.log(2 * math.pi) + self.logvar.sum(-1) + maha)
+
+    def sample(self, k_idx: torch.Tensor) -> torch.Tensor:
+        std = (0.5 * self.logvar[k_idx]).exp()
+        return self.mu[k_idx] + std * torch.randn_like(std)
+
+
+class GMMHead(nn.Module):
+    def __init__(self, D: int, dq: int, K: int):
+        super().__init__()
+        self.dq = dq
+        self.proj = nn.Linear(D, dq + K, bias=False)
+        nn.init.normal_(self.proj.weight, std=0.02)
+
+    def forward(self, h: torch.Tensor) -> tuple:
+        out = self.proj(h)
+        return out[..., :self.dq], out[..., self.dq:]
+
+
+class _GMMQuantBase(QuantScheme):
+    codebook_cls = None
+
+    def __init__(self, K: int, dq: int, hard: bool = True, sample: bool = False):
+        self.K, self.dq = K, dq
+        self.hard = hard
+        self.sample = sample
+        self._codebook = None
+
+    def init_modules(self, D, V, code_head_tied):
+        code_head = GMMHead(D, self.dq, self.K)
+        code_predict = GMMHead(D, self.dq, self.K)
+        self._codebook = self.codebook_cls(self.K, self.dq, D)
+        return code_head, self._codebook, code_predict
+
+    def _posterior_logits(self, query, gating_logits):
+        return F.log_softmax(gating_logits, dim=-1) + self._codebook.log_prob(query)
+
+    def _select(self, query, gating_logits):
+        cb = self._codebook
+        log_post = self._posterior_logits(query, gating_logits)
+        r = F.softmax(log_post, dim=-1)
+        soft = torch.einsum("...k,kd->...d", r, cb.mu)
+        if not self.hard and not self.sample:
+            return soft
+        if self.sample:
+            eps = torch.finfo(log_post.dtype).tiny
+            u = torch.rand_like(log_post).clamp(min=eps, max=1.0 - eps)
+            weights = F.softmax(log_post - torch.log(-torch.log(u)), dim=-1)
+        else:
+            weights = r
+        if not self.hard:
+            shape = query.shape[:-1]
+            samples = torch.stack([cb.sample(torch.full(shape, k, device=query.device, dtype=torch.long))
+                                    for k in range(self.K)], dim=-2)
+            return (weights.unsqueeze(-1) * samples).sum(-2)
+        k_star = weights.argmax(-1)
+        hard_code = cb.sample(k_star) if self.sample else cb.mu[k_star]
+        return soft + (hard_code - soft).detach()
+
+    def quantize(self, pre_q):
+        query, gating_logits = pre_q
+        return self._select(query, gating_logits)
+
+    def to_ids(self, source_c):
+        dists = ((source_c.unsqueeze(-2) - self._codebook.mu) ** 2).sum(-1)
+        return dists.argmin(-1)
+
+    def embed_for_decode(self, stage_lm, source_c):
+        return stage_lm.code_embed(source_c)
+
+    def embed_input(self, stage_lm, seq_repr):
+        return stage_lm.code_embed(seq_repr)
+
+    def ntp_loss_acc(self, stage_lm, h_query, target_repr):
+        query_pred, gating_pred = stage_lm.code_predict(h_query)
+        logits = self._posterior_logits(query_pred, gating_pred).reshape(-1, self.K)
+        target_id = self.to_ids(target_repr.reshape(-1, self.dq))
+        loss = F.cross_entropy(logits, target_id)
+        with torch.no_grad():
+            acc = (logits.argmax(-1) == target_id).float().mean()
+        return loss, acc
+
+    def sample_next(self, stage_lm, h_query, vocab):
+        query_pred, gating_pred = stage_lm.code_predict(h_query)
+        return self._select(query_pred, gating_pred)
+
+    def entropy_reg(self, pre_q):
+        query, gating_logits = pre_q
+        return softmax_entropy_reg(self._posterior_logits(query, gating_logits))
+
+
+class GMMQuant(_GMMQuantBase):
+    codebook_cls = GMMCodebook
+
+
+class GMMDiagQuant(_GMMQuantBase):
+    codebook_cls = GMMDiagCodebook
+
+
 def make_quant(cfg: Config) -> QuantScheme:
     if cfg.quant_type == "binary":
         return BinaryQuant(cfg.binary_bits, cfg.code_hard, cfg.code_sample, cfg.binary_lfq)
     if cfg.quant_type == "grid":
         return GridQuant(cfg.grid_dq, cfg.grid_levels, cfg.code_hard, cfg.code_sample, cfg.grid_bound)
+    if cfg.quant_type == "gmm":
+        return GMMQuant(cfg.gmm_k, cfg.gmm_dq, cfg.code_hard, cfg.code_sample)
+    if cfg.quant_type == "gmm_diag":
+        return GMMDiagQuant(cfg.gmm_k, cfg.gmm_dq, cfg.code_hard, cfg.code_sample)
     return SimplexQuant(cfg.gumbel_tau, cfg.code_hard, cfg.code_sample, cfg.ntp_head_tied)
 
 
@@ -885,7 +1059,7 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--output_preset", type=int, default=None, choices=list(WORD_PRESET_BITS),
                     help="level0 output/generation word width in bits: 1 (bit), 4 (nibble), or 8 (byte) -- "
                          "must currently equal --input_preset, asymmetric presets not yet implemented")
-    p.add_argument("--quant_type", type=str, default=None, choices=["simplex", "binary", "grid"])
+    p.add_argument("--quant_type", type=str, default=None, choices=["simplex", "binary", "grid", "gmm", "gmm_diag"])
     p.add_argument("--binary_bits", type=int, default=None)
     p.add_argument("--binary_lfq", action="store_true")
     p.add_argument("--entropy_reg_weight", type=float, default=0.0)
@@ -895,6 +1069,8 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--grid_dq", type=int, default=None)
     p.add_argument("--grid_levels", type=int, default=None)
     p.add_argument("--grid_bound", type=str, default="sigmoid", choices=["sigmoid", "tanh"])
+    p.add_argument("--gmm_k", type=int, default=None, help="number of shared GMM codebook components")
+    p.add_argument("--gmm_dq", type=int, default=None, help="GMM code dimensionality")
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -935,7 +1111,7 @@ def build_argparser(description: str) -> tuple:
     if args.eval_only and args.checkpoint_path is None:
         p.error("--eval_only requires --checkpoint_path")
     if args.quant_type is None:
-        p.error("--quant_type has no default -- set it explicitly (--quant_type or config file: simplex|binary|grid)")
+        p.error("--quant_type has no default -- set it explicitly (--quant_type or config file: simplex|binary|grid|gmm|gmm_diag)")
     if args.vocab is None:
         p.error("--vocab has no default -- set it explicitly (--vocab or config file)")
     if args.quant_type == "binary" and args.binary_bits is None:
@@ -944,6 +1120,10 @@ def build_argparser(description: str) -> tuple:
         p.error("--grid_dq has no default -- set it explicitly when --quant_type grid")
     if args.quant_type == "grid" and args.grid_levels is None:
         p.error("--grid_levels has no default -- set it explicitly when --quant_type grid")
+    if args.quant_type in ("gmm", "gmm_diag") and args.gmm_k is None:
+        p.error("--gmm_k has no default -- set it explicitly when --quant_type gmm|gmm_diag")
+    if args.quant_type in ("gmm", "gmm_diag") and args.gmm_dq is None:
+        p.error("--gmm_dq has no default -- set it explicitly when --quant_type gmm|gmm_diag")
     if args.input_preset is None:
         p.error("--input_preset has no default -- set it explicitly (--input_preset or config file: 1|4|8)")
     if args.output_preset is None:
@@ -964,6 +1144,7 @@ def config_from_args(args) -> Config:
         decode_cross_stage_layers=args.decode_cross_stage_layers,
         share_encode_decode_self=args.share_encode_decode_self,
         grid_dq=args.grid_dq, grid_levels=args.grid_levels, grid_bound=args.grid_bound,
+        gmm_k=args.gmm_k, gmm_dq=args.gmm_dq,
         code_hard=args.code_hard,
         code_sample=args.code_sample,
     )
