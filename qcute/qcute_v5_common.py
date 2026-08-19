@@ -109,9 +109,13 @@ class Config:
     binary_lfq: bool = False
     entropy_reg_weight: float = 0.0
     grid_bound: str = "sigmoid"
+    grid_logistic_scale: float = 0.5
     code_hard: bool = True
     code_sample: bool = False
     gmm_bpb_precision_bits: int = 8
+    quant_dropout_p0: float = 0.0
+    quant_dropout_decay_steps: int | None = None
+    quant_dropout_schedule: str = "linear"
     decode_cross_stage_layers: int | None = None
     share_encode_decode_self: bool = False
 
@@ -166,16 +170,24 @@ def softmax_entropy_reg(logits: torch.Tensor) -> torch.Tensor:
     return per_example - batch
 
 
-def fsq_quantize(v: torch.Tensor, L: int, hard: bool = True, sample: bool = False, bound: str = "sigmoid") -> torch.Tensor:
+def fsq_quantize(v: torch.Tensor, L: int, hard: bool = True, sample: bool = False, bound: str = "sigmoid",
+                  logistic_scale: float = 0.5) -> torch.Tensor:
+    """sample=True injects reparameterized logistic noise (PixelCNN++-style discretized-logistic
+    dequantization) around z_bounded before either rounding (hard=True) or returning directly
+    (hard=False) -- gives hard=False/sample=True a genuine stochastic soft sample, previously
+    dead code (fsq_quantize used to return the deterministic z_bounded/half_l for any hard=False
+    call, ignoring sample entirely)."""
     half_l = (L - 1) / 2
     z_bounded = half_l * (torch.tanh(v) if bound == "tanh" else (2 * torch.sigmoid(1.6 * v) - 1))
-    if not hard:
-        return z_bounded / half_l
+    z_eff = z_bounded
     if sample:
-        noise = torch.rand_like(z_bounded) - 0.5
-        z_rounded = torch.round(z_bounded + noise).clamp(-half_l, half_l)
-    else:
-        z_rounded = torch.round(z_bounded)
+        eps = torch.finfo(v.dtype).tiny
+        u = torch.rand_like(z_bounded).clamp(min=eps, max=1.0 - eps)
+        noise = logistic_scale * (torch.log(u) - torch.log(1.0 - u))
+        z_eff = (z_bounded + noise).clamp(-half_l, half_l)
+    if not hard:
+        return z_eff / half_l
+    z_rounded = torch.round(z_eff).clamp(-half_l, half_l)
     z_hat = z_bounded + (z_rounded - z_bounded).detach()
     return z_hat / half_l
 
@@ -216,6 +228,21 @@ class FSQEmbed(nn.Module):
 
 
 class QuantScheme:
+    def __init__(self):
+        self.quant_dropout_p = 0.0
+
+    def _effective_hard_sample(self) -> tuple:
+        """Quant Noise (Fan et al. 2020): with probability quant_dropout_p, take the plain
+        continuous identity/soft pass (hard=False, sample=False -- exact gradient, no STE bias,
+        no injected noise) instead of the configured hard/sample setting, but ONLY during real
+        training forward passes (torch.is_grad_enabled()) -- every eval/generation call in this
+        codebase already runs under torch.no_grad(), so this is a no-op there regardless of
+        quant_dropout_p, guaranteeing deployment always sees the true self.hard/self.sample
+        behavior. Schedule (quant_dropout_p itself) is driven externally by the training loop."""
+        if self.quant_dropout_p > 0 and torch.is_grad_enabled() and torch.rand(()).item() < self.quant_dropout_p:
+            return False, False
+        return self.hard, self.sample
+
     def init_modules(self, D: int, V: int, code_head_tied: bool) -> tuple:
         raise NotImplementedError
 
@@ -243,6 +270,7 @@ class QuantScheme:
 
 class SimplexQuant(QuantScheme):
     def __init__(self, tau: float, hard: bool = True, sample: bool = False, ntp_head_tied: bool = False):
+        super().__init__()
         self.tau = tau
         self.hard = hard
         self.sample = sample
@@ -266,7 +294,8 @@ class SimplexQuant(QuantScheme):
         return code_head, code_embed, ntp_head
 
     def quantize(self, pre_q):
-        return gumbel_quantize(pre_q, self.tau, self.hard, self.sample)
+        hard, sample = self._effective_hard_sample()
+        return gumbel_quantize(pre_q, self.tau, hard, sample)
 
     def to_ids(self, source_c):
         return source_c.argmax(-1)
@@ -301,6 +330,7 @@ class SimplexQuant(QuantScheme):
 
 class BinaryQuant(QuantScheme):
     def __init__(self, binary_bits: int, hard: bool = True, sample: bool = False, lfq: bool = False):
+        super().__init__()
         self.binary_bits = binary_bits
         self.hard = hard
         self.sample = sample
@@ -315,7 +345,8 @@ class BinaryQuant(QuantScheme):
         return code_head, code_embed, code_predict
 
     def quantize(self, pre_q):
-        return bsq_quantize(pre_q, self.binary_bits, self.hard, self.sample, self.lfq)
+        hard, sample = self._effective_hard_sample()
+        return bsq_quantize(pre_q, self.binary_bits, hard, sample, self.lfq)
 
     def to_ids(self, source_c):
         bits = (source_c > 0).long()
@@ -338,15 +369,19 @@ class BinaryQuant(QuantScheme):
 
     def sample_next(self, stage_lm, h_query, vocab):
         pred = stage_lm.code_predict(h_query)
-        return bsq_quantize(pred, self.binary_bits, self.hard, self.sample, self.lfq)
+        hard, sample = self._effective_hard_sample()
+        return bsq_quantize(pred, self.binary_bits, hard, sample, self.lfq)
 
     def entropy_reg(self, pre_q):
         return bsq_entropy_reg(pre_q)
 
 
 class GridQuant(QuantScheme):
-    def __init__(self, dq: int, L: int, hard: bool = True, sample: bool = False, bound: str = "sigmoid"):
+    def __init__(self, dq: int, L: int, hard: bool = True, sample: bool = False, bound: str = "sigmoid",
+                 logistic_scale: float = 0.5):
+        super().__init__()
         self.dq, self.L, self.hard, self.sample, self.bound = dq, L, hard, sample, bound
+        self.logistic_scale = logistic_scale
 
     def init_modules(self, D, V, code_head_tied):
         code_head = nn.Linear(D, self.dq, bias=False)
@@ -357,7 +392,8 @@ class GridQuant(QuantScheme):
         return code_head, code_embed, code_predict
 
     def quantize(self, pre_q):
-        return fsq_quantize(pre_q, self.L, self.hard, self.sample, self.bound)
+        hard, sample = self._effective_hard_sample()
+        return fsq_quantize(pre_q, self.L, hard, sample, self.bound, self.logistic_scale)
 
     def to_ids(self, source_c):
         bound = (self.L - 1) / 2
@@ -498,6 +534,7 @@ class _GMMQuantBase(QuantScheme):
     codebook_cls = None
 
     def __init__(self, K: int, dq: int, hard: bool = True, sample: bool = False):
+        super().__init__()
         self.K, self.dq = K, dq
         self.hard = hard
         self.sample = sample
@@ -512,29 +549,30 @@ class _GMMQuantBase(QuantScheme):
     def _posterior_logits(self, query, gating_logits):
         return F.log_softmax(gating_logits, dim=-1) + self._codebook.log_prob(query)
 
-    def _select(self, query, gating_logits):
+    def _select(self, query, gating_logits, hard, sample):
         cb = self._codebook
         log_post = self._posterior_logits(query, gating_logits)
         r = F.softmax(log_post, dim=-1)
         soft = torch.einsum("...k,kd->...d", r, cb.mu)
-        if not self.hard and not self.sample:
+        if not hard and not sample:
             return soft
-        if self.sample:
+        if sample:
             eps = torch.finfo(log_post.dtype).tiny
             u = torch.rand_like(log_post).clamp(min=eps, max=1.0 - eps)
             weights = F.softmax(log_post - torch.log(-torch.log(u)), dim=-1)
         else:
             weights = r
-        if not self.hard:
+        if not hard:
             samples = cb.sample_all(query.shape[:-1])
             return (weights.unsqueeze(-1) * samples).sum(-2)
         k_star = weights.argmax(-1)
-        hard_code = cb.sample(k_star) if self.sample else cb.mu[k_star]
+        hard_code = cb.sample(k_star) if sample else cb.mu[k_star]
         return soft + (hard_code - soft).detach()
 
     def quantize(self, pre_q):
         query, gating_logits = pre_q
-        return self._select(query, gating_logits)
+        hard, sample = self._effective_hard_sample()
+        return self._select(query, gating_logits, hard, sample)
 
     def to_ids(self, source_c):
         dists = ((source_c.unsqueeze(-2) - self._codebook.mu) ** 2).sum(-1)
@@ -557,7 +595,8 @@ class _GMMQuantBase(QuantScheme):
 
     def sample_next(self, stage_lm, h_query, vocab):
         query_pred, gating_pred = stage_lm.code_predict(h_query)
-        return self._select(query_pred, gating_pred)
+        hard, sample = self._effective_hard_sample()
+        return self._select(query_pred, gating_pred, hard, sample)
 
     def bpb_bound(self, stage_lm, h_query, target_repr, precision_bits: int) -> torch.Tensor:
         """Achievable bpb bound for code_hard=False / code_sample=True, where ntp_loss_acc's
@@ -591,7 +630,8 @@ def make_quant(cfg: Config) -> QuantScheme:
     if cfg.quant_type == "binary":
         return BinaryQuant(cfg.binary_bits, cfg.code_hard, cfg.code_sample, cfg.binary_lfq)
     if cfg.quant_type == "grid":
-        return GridQuant(cfg.grid_dq, cfg.grid_levels, cfg.code_hard, cfg.code_sample, cfg.grid_bound)
+        return GridQuant(cfg.grid_dq, cfg.grid_levels, cfg.code_hard, cfg.code_sample, cfg.grid_bound,
+                          cfg.grid_logistic_scale)
     if cfg.quant_type == "gmm":
         return GMMQuant(cfg.gmm_k, cfg.gmm_dq, cfg.code_hard, cfg.code_sample)
     if cfg.quant_type == "gmm_diag":
@@ -926,6 +966,53 @@ def lr_at_warmup_constant_cosine(step: int, warmup: int, constant_steps: int, pe
     return min_lr + 0.5 * (peak - min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def quant_dropout_p_at(step: int, p0: float, decay_steps: int, schedule: str = "linear") -> float:
+    """schedule="step": AE-Warm-Up style (Zhao et al. 2026, "Continuous First, Discrete Later") --
+    quantization fully disabled (p=p0, typically 1.0) for decay_steps, then instantly fully
+    enabled (p=0) -- a hard phase switch, not a ramp. schedule="linear" (default, unchanged):
+    the original gradual Quant Noise-style decay."""
+    if p0 <= 0 or decay_steps <= 0:
+        return 0.0
+    if schedule == "step":
+        return p0 if step < decay_steps else 0.0
+    return max(0.0, p0 * (1.0 - step / decay_steps))
+
+
+def _walk_lms(obj):
+    if hasattr(obj, "quant"):
+        yield obj
+    else:
+        for item in obj:
+            yield from _walk_lms(item)
+
+
+def compute_effective_dim(x: torch.Tensor) -> float:
+    """Participation ratio (sum(eigvals)^2 / sum(eigvals^2)) of x's (N, D) covariance -- a
+    standard "effective rank" proxy for the dimensional-collapse diagnostic in Zhao et al. 2026
+    ("Continuous First, Discrete Later"): ranges [1, D], 1 for a fully collapsed (rank-1)
+    representation, D for an isotropic one. Their own criterion (a water-filling capacity bound
+    from their Theorem 1) needs the exact target rate/codebook size and isn't reproduced here --
+    this is a lighter, standard stand-in for MONITORING ONLY (see train()'s
+    --monitor_effective_dim: prints when it plateaus, does not drive any schedule). Runs on CPU
+    (torch.linalg.eigvalsh has poor/no MPS support) -- fine since this is called at most once per
+    --eval_every, not in the hot per-step path."""
+    x = x.detach().to("cpu", dtype=torch.float64)
+    x = x - x.mean(dim=0, keepdim=True)
+    cov = (x.T @ x) / max(1, x.shape[0] - 1)
+    eigvals = torch.linalg.eigvalsh(cov).clamp_min(0)
+    s = eigvals.sum().item()
+    if s <= 0:
+        return 0.0
+    return (s ** 2) / (eigvals ** 2).sum().item()
+
+
+def set_quant_dropout_p(model, p: float) -> None:
+    for enc in model.encoders:
+        enc.quant.quant_dropout_p = p
+    for lm in _walk_lms(model.decoder.stage_lms):
+        lm.quant.quant_dropout_p = p
+
+
 def load_config_module(path: Path) -> dict:
     import importlib.util
 
@@ -958,16 +1045,31 @@ def eval_model(model, data: torch.Tensor, batch_size: int, n_batches: int, devic
     return add_per_level_bpb(result)
 
 
+def parse_eval_sample(s):
+    if isinstance(s, (int, float)):
+        return s
+    s = str(s)
+    return float(s) if "." in s else int(s)
+
+
 @torch.no_grad()
-def eval_model_full(model, data: torch.Tensor, batch_size: int, device: str) -> dict:
+def eval_model_full(model, data: torch.Tensor, batch_size: int, device: str, sample: float | int = 1.0) -> dict:
+    """Iterates the whole val set by default (sample=1.0). sample: float -> fraction of windows,
+    int -> absolute window count (e.g. sample=0.1 or sample=500 for a faster partial full-eval).
+    batch_size is the per-forward-pass CHUNK size within that selection -- -1 means no chunking
+    (single giant batch, the old default): full_val_eval's own single-shot giant-batch forward
+    pass was implicated in a recurring MPS eval glitch (decode-side metrics silently coming back
+    as exact 0.0 on some eval rounds, confirmed via clean CPU replay of the same checkpoint/data --
+    not a logic bug), so callers should pass a bounded chunk size by default, not -1."""
     model.eval()
     context_len = model.cfg.context_len
-    n_windows = len(data) // context_len
-    batch_size = n_windows if batch_size == -1 else batch_size
+    n_windows_total = len(data) // context_len
+    n_windows = max(1, round(n_windows_total * sample)) if isinstance(sample, float) else max(1, min(sample, n_windows_total))
+    step_batch = n_windows if batch_size == -1 else batch_size
     accum: dict = {}
     total_n = 0
-    for start in range(0, n_windows, batch_size):
-        idxs = range(start, min(start + batch_size, n_windows))
+    for start in range(0, n_windows, step_batch):
+        idxs = range(start, min(start + step_batch, n_windows))
         ctx = torch.stack([data[i * context_len:(i + 1) * context_len] for i in idxs]).to(device)
         _, metrics = model(ctx)
         bsz = ctx.size(0)
@@ -1011,6 +1113,7 @@ def train(model, train_data: torch.Tensor, val_data: torch.Tensor, args, log, ru
     checkpointer = Checkpointer(args.logs_dir / run_name, args.save_every_n_evals, minimize=True)
 
     model.train()
+    last_effective_dim = None
     pbar = tqdm(range(1, args.steps + 1), desc="train", dynamic_ncols=True)
     for step in pbar:
         if args.cosine_decay:
@@ -1019,6 +1122,9 @@ def train(model, train_data: torch.Tensor, val_data: torch.Tensor, args, log, ru
             lr = lr_at(step, args.warmup_steps, args.lr_peak)
         for g in opt.param_groups:
             g["lr"] = lr
+        set_quant_dropout_p(model, quant_dropout_p_at(step, args.quant_dropout_p0,
+                                                        args.quant_dropout_decay_steps or args.steps,
+                                                        args.quant_dropout_schedule))
 
         ctx = sample_context(train_data, args.batch_size, model.cfg.context_len, device)
         loss, metrics = model(ctx)
@@ -1039,13 +1145,27 @@ def train(model, train_data: torch.Tensor, val_data: torch.Tensor, args, log, ru
 
         if step % args.eval_every == 0 or step == args.steps:
             if args.full_val_eval:
-                val = eval_model_full(model, val_data, -1, device)
+                val = eval_model_full(model, val_data, args.eval_chunk_size, device, args.eval_sample)
             else:
                 val = eval_model(model, val_data, args.batch_size, args.eval_batches, device)
             val_str = "  ".join(f"val_{k}={v:.4f}" for k, v in val.items())
             checkpointer.step({"model": model.state_dict(), "cfg": asdict(model.cfg), "step": step}, val["bpb"])
             log(f"{pbar}  {val_str}  best_val_bpb={checkpointer.best_metric:.4f}",
                 step=step, **{f"val_{k}": v for k, v in val.items()}, best_val_bpb=checkpointer.best_metric)
+
+            if args.monitor_effective_dim:
+                with torch.no_grad():
+                    dim_ctx = sample_context(val_data, args.batch_size, model.cfg.context_len, device)
+                    dim_result = model._run(dim_ctx, compute_ntp=False)
+                code0 = dim_result["c_list"][0].reshape(-1, dim_result["c_list"][0].shape[-1])
+                effective_dim = compute_effective_dim(code0)
+                plateaued = (last_effective_dim is not None
+                             and abs(effective_dim - last_effective_dim) / max(last_effective_dim, 1e-8)
+                             < args.dim_monitor_plateau_tol)
+                plateau_note = "  PLATEAU (consider switching quant on now, AE-Warm-Up style)" if plateaued else ""
+                log(f"{pbar}  effective_dim={effective_dim:.4f}{plateau_note}",
+                    step=step, effective_dim=effective_dim)
+                last_effective_dim = effective_dim
 
             if args.qual_gen_bytes > 0:
                 total_len = args.qual_prompt_bytes + args.qual_gen_bytes
@@ -1100,11 +1220,34 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--grid_dq", type=int, default=None)
     p.add_argument("--grid_levels", type=int, default=None)
     p.add_argument("--grid_bound", type=str, default="sigmoid", choices=["sigmoid", "tanh"])
+    p.add_argument("--grid_logistic_scale", type=float, default=0.5,
+                    help="scale of the reparameterized logistic dequantization noise used when "
+                         "quant_type=grid and code_sample=True")
     p.add_argument("--gmm_k", type=int, default=None, help="number of shared GMM codebook components")
     p.add_argument("--gmm_dq", type=int, default=None, help="GMM code dimensionality")
     p.add_argument("--gmm_bpb_precision_bits", type=int, default=8,
                     help="per-dim quantization-precision correction added to the achievable bpb bound "
                          "reported for code_hard=False/code_sample=True (differential NLL alone isn't bits)")
+    p.add_argument("--quant_dropout_p0", type=float, default=0.0,
+                    help="Quant Noise (Fan et al. 2020): probability of taking a plain continuous "
+                         "identity/soft quantize pass instead of the configured hard/sample setting, "
+                         "during training only (torch.is_grad_enabled()) -- linearly decayed to 0 over "
+                         "--quant_dropout_decay_steps. 0.0 (default) is a no-op.")
+    p.add_argument("--quant_dropout_decay_steps", type=int, default=None,
+                    help="steps to decay --quant_dropout_p0 to 0 over (schedule=linear) or steps to hold "
+                         "it fully on before an instant switch to 0 (schedule=step); defaults to --steps")
+    p.add_argument("--quant_dropout_schedule", type=str, default="linear", choices=["linear", "step"],
+                    help="linear: gradual Quant Noise-style decay (default). step: AE-Warm-Up-style hard "
+                         "switch (Zhao et al. 2026) -- quant_dropout_p0=1.0 with schedule=step reproduces "
+                         "their 'train as plain unquantized autoencoder for T_wu steps, then quantize' scheme")
+    p.add_argument("--monitor_effective_dim", action="store_true",
+                    help="print level0 code's effective dimension (participation ratio) each --eval_every "
+                         "round, and flag when it plateaus -- diagnostic only, does not affect training. "
+                         "Off by default: needs an extra forward pass + CPU eigendecomposition, heavier "
+                         "than the rest of eval.")
+    p.add_argument("--dim_monitor_plateau_tol", type=float, default=0.01,
+                    help="relative change in effective_dim below which two consecutive --eval_every "
+                         "measurements are flagged as a plateau")
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -1122,7 +1265,14 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--eval_every", type=int, default=100)
     p.add_argument("--eval_batches", type=int, default=20)
     p.add_argument("--full_val_eval", action="store_true",
-                    help="each --eval_every round runs eval_model_full over the whole val set (batch_size=-1) instead of eval_model's sampled batches")
+                    help="each --eval_every round runs eval_model_full over the whole val set instead of eval_model's sampled batches")
+    p.add_argument("--eval_chunk_size", type=int, default=64,
+                    help="per-forward-pass chunk size for eval_model_full -- -1 means no chunking (single "
+                         "giant batch covering the whole selection at once, the old default, implicated in "
+                         "a recurring MPS eval glitch on larger configs)")
+    p.add_argument("--eval_sample", type=parse_eval_sample, default=1.0,
+                    help="fraction (float, e.g. 0.1) or absolute count (int, e.g. 500) of val windows "
+                         "eval_model_full evaluates -- default 1.0 iterates the whole val set")
     p.add_argument("--qual_gen_bytes", type=int, default=0)
     p.add_argument("--qual_prompt_bytes", type=int, default=64)
 
@@ -1178,7 +1328,10 @@ def config_from_args(args) -> Config:
         decode_cross_stage_layers=args.decode_cross_stage_layers,
         share_encode_decode_self=args.share_encode_decode_self,
         grid_dq=args.grid_dq, grid_levels=args.grid_levels, grid_bound=args.grid_bound,
+        grid_logistic_scale=args.grid_logistic_scale,
         gmm_k=args.gmm_k, gmm_dq=args.gmm_dq, gmm_bpb_precision_bits=args.gmm_bpb_precision_bits,
+        quant_dropout_p0=args.quant_dropout_p0, quant_dropout_decay_steps=args.quant_dropout_decay_steps,
+        quant_dropout_schedule=args.quant_dropout_schedule,
         code_hard=args.code_hard,
         code_sample=args.code_sample,
     )
@@ -1208,7 +1361,7 @@ def run_main(QCuteLM) -> None:
         ckpt = torch.load(args.checkpoint_path, map_location=device)
         model.load_state_dict(ckpt["model"])
         eval_data = train_data if args.eval_split == "train" else val_data
-        result = eval_model_full(model, eval_data, args.batch_size, device)
+        result = eval_model_full(model, eval_data, args.eval_chunk_size, device, args.eval_sample)
         result_str = "  ".join(f"{args.eval_split}_{k}={v:.4f}" for k, v in result.items())
         log(f"eval_only_full_{args.eval_split}set  {result_str}",
             **{f"{args.eval_split}_{k}": v for k, v in result.items()})

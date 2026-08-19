@@ -222,28 +222,74 @@ hard=False/sample=True`): naive undercounted CE ~3.9/~3.4 bits (GMM/GMMDiag) vs 
 ~40.8/~40.4 bits (dominated by the `dq·precision_bits=32` bit correction) — confirms the fix
 charges honestly instead of silently underreporting.
 
-**Full leaderboard, all `Ks=(1,)`-scale results to date** (enwik8_1M, `ctx256`/`context_len=256`,
-sorted best to worst; bytelm's `4000`-step schedule vs the v5-stack configs' `8000`-step schedule
-— not perfectly step-matched, kept as-is since both are each config's own converged/near-converged
-number):
+### Recurring MPS full-val-eval glitch, chunked `eval_model_full` fix (2026-08-19)
 
-| rank | config | mechanism | best val_bpb |
-|---|---|---|---|
-| 1 | `bytelm_xs4_ctx256_fullval` | byte-level baseline (no hierarchy/quantizer at all) | 2.4235 |
-| 2 | `bytelm_xs2_ctx256_fullval` | byte-level baseline | 2.4502 |
-| 3 | `qcute_v5_stack_noreg/ks1_soft` | simplex, `code_hard=False/code_sample=False` | 2.4597 |
-| 4 | `v5_stack_fsq_ks1_8x8` | grid/FSQ, dq=8/levels=8 | 2.5523 |
-| 5 | `bytelm_xs1_ctx256_fullval` | byte-level baseline | 2.5846 |
-| 6 | `v5_stack_fsq_ks1` | grid/FSQ, dq=4/levels=8 | 2.6114 |
-| 7 | `v5_stack_fsq_ks1_4x8` | grid/FSQ, dq=8/levels=4 | 2.6651 |
-| 8 | `qcute_v5_stack_noreg/ks1` | simplex, `code_hard=True` | 2.7246 |
-| 9 | `qcute_v5_stack_noreg/ks21` | simplex, Ks=(2,1) | 2.8105 |
-| 10 | `qcute_v5_stack_noreg/ks221` | simplex, Ks=(2,2,1) | 2.8414 |
-| — | `v5_stack_gmm_ks1_256` | gmm full-cov, K=256/dq=4 | stopped early (step 799/8000), no eval reached |
-| — | `v5_stack_gmm_ks1_256_diag` | gmm diag, K=256/dq=4 | running |
+Found across three separate runs (`gmm_256_diag`, `fsq_ks1_4x8`, `fsq_ks1_16x16`): decode-side
+metrics (`byte_loss`, `decode_total`, `level0_ntp_loss_decode`) occasionally come back as a
+literal `0.0` during a live `--full_val_eval` round on `device=mps` -- not NaN, not a display
+artifact, confirmed via `run.jsonl`. Ruled out as a logic bug: reloading the exact same checkpoint
++ data and replaying the identical `eval_model_full` computation on CPU always gives correct, sane
+numbers (e.g. `fsq_ks1_16x16`'s live-logged `best_val_bpb=5.9001` was actually **2.4915** on clean
+CPU replay of its final checkpoint). Ruled out concurrent-job contention too -- reproduced with
+zero other processes running. Most likely culprit: `eval_model_full`'s old default packed the
+*entire* val set into one giant single-shot forward pass (`batch_size=-1` -> `batch_size=
+n_windows`, e.g. ~390 windows at once) -- bigger than anything training itself ever does in one
+call, plausibly triggering an MPS-backend numerical/synchronization issue under sustained memory
+pressure.
 
-Patterns holding so far: every non-hardened/continuous config (`ks1_soft`, `bytelm`'s own
-no-quantizer baseline) clusters at the top; among genuinely discrete `code_hard=True` schemes,
-FSQ/grid beats simplex at every grid size tried, and going deeper in the hierarchy (`ks21`,
-`ks221`) consistently hurts rather than helps. GMM hasn't produced a comparable number yet (full
-covariance too slow to finish; diag pending).
+**Fix**: `eval_model_full` now takes `sample: float | int = 1.0` (fraction or absolute window
+count of the val set to evaluate, default the whole set -- unchanged coverage) and `batch_size`
+is repurposed as a **chunk size** for internal batching within that selection, no longer "how much
+of the val set." New CLI: `--eval_chunk_size` (default `64`, bounds each forward pass) and
+`--eval_sample` (default `1.0`). `--eval_chunk_size -1` restores the old single-giant-batch
+behavior for explicit opt-back-in. Also fixed `Checkpointer.is_better` to reject non-finite/
+non-positive metrics outright (`qcute_v5_common.py:70-72`), so a future occurrence of this glitch
+can no longer permanently freeze `best_val_bpb`/`best.pt` the way it did before this session found
+it (confirmed: a `0.0` eval now correctly loses to any later real value instead of winning forever).
+Verified via smoke test across default/`-1`/`--eval_sample 0.5` -- all produce sane nonzero
+metrics, no crashes.
+
+**Practical fallout**: any `best_val_bpb` logged by a run that predates this fix should be treated
+as a floor, not a ground truth, if a `val_byte_loss=0.0000` line appears anywhere in its
+`run.jsonl` -- the true number needs a clean CPU replay of the final checkpoint (see
+`v5_stack_fsq_ks1_16x16`'s corrected entry in the leaderboard below). `v5_stack_gmm_ks1_256`
+(stopped early, step 799/8000, no eval reached) and `v5_stack_gmm_ks1_256_diag` (stopped at step
+7399/8000, and its logged `best_val_bpb=0.0000` is exactly this glitch, pre-fix) never produced a
+trustworthy number -- need a clean rerun with the fixed `eval_model_full` before either GMM variant
+gets a real leaderboard entry.
+
+### Full leaderboard, params, FLOPs (2026-08-19)
+
+All `Ks=(1,)`-scale, enwik8_1M, `ctx256`/`context_len=256`, sorted best to worst. `bytelm`'s
+`4000`-step schedule vs. the v5-stack configs' `8000`-step schedule aren't perfectly step-matched,
+kept as-is since both are each config's own converged/near-converged number. FLOPs/token is the
+standard `2×params` forward-pass approximation (Kaplan et al. convention -- ignores attention's
+quadratic term, negligible at `context_len=256` for these small models); FLOPs/ctx multiplies by
+the full `256`-token context.
+
+| rank | config | mechanism | best val_bpb | params | FLOPs/token | FLOPs/ctx |
+|---|---|---|---|---|---|---|
+| 1 | `bytelm_xs4_ctx256_fullval` | byte-level baseline (no hierarchy/quantizer at all) | 2.4235 | 3.400M | 6.80M | 1740.8M |
+| 2 | `bytelm_xs2_ctx256_fullval` | byte-level baseline | 2.4502 | 1.800M | 3.60M | 921.6M |
+| 3 | `qcute_v5_stack_noreg/ks1_soft` | simplex, `code_hard=False/code_sample=False` | 2.4597 | 2.103M | 4.21M | 1076.7M |
+| 4 | `v5_stack_fsq_ks1_16x16` | grid/FSQ, dq=16/levels=16 | 2.4915† | 1.989M | 3.98M | 1018.4M |
+| 5 | `v5_stack_fsq_ks1_16x4` | grid/FSQ, dq=16/levels=4 | 2.5229 | 1.792M | 3.58M | 917.5M |
+| 6 | `v5_stack_fsq_ks1_8x8` | grid/FSQ, dq=8/levels=8 | 2.5523 | 1.784M | 3.57M | 913.4M |
+| 7 | `bytelm_xs1_ctx256_fullval` | byte-level baseline | 2.5846 | 1.100M | 2.20M | 563.2M |
+| 8 | `v5_stack_fsq_ks1` | grid/FSQ, dq=4/levels=8 | 2.6114 | 1.747M | 3.49M | 894.5M |
+| 9 | `v5_stack_fsq_ks1_4x8` | grid/FSQ, dq=8/levels=4 | 2.6651 | 1.751M | 3.50M | 896.5M |
+| 10 | `qcute_v5_stack_noreg/ks1` | simplex, `code_hard=True` | 2.7246 | 1.972M | 3.94M | 1009.7M |
+| 11 | `qcute_v5_stack_noreg/ks21` | simplex, Ks=(2,1) | 2.8105 | 5.257M | 10.51M | 2691.6M |
+| 12 | `qcute_v5_stack_noreg/ks221` | simplex, Ks=(2,2,1) | 2.8414 | 9.463M | 18.93M | 4845.1M |
+| — | `v5_stack_gmm_ks1_256` | gmm full-cov, K=256/dq=4 | not trustworthy, see above | 1.988M | 3.98M | 1018.5M |
+| — | `v5_stack_gmm_ks1_256_diag` | gmm diag, K=256/dq=4 | not trustworthy, see above | 1.982M | 3.96M | 1014.6M |
+
+† `v5_stack_fsq_ks1_16x16`'s live-logged number was corrupted by the MPS glitch above; this is the
+corrected value from a clean CPU replay of its final (step 8000) checkpoint.
+
+Patterns holding: every non-hardened/continuous config (`ks1_soft`, `bytelm`'s own no-quantizer
+baseline) clusters at the top, `bytelm_xs4` still wins outright; among genuinely discrete
+`code_hard=True` schemes, FSQ/grid beats simplex at every grid size tried and the biggest grid
+(`16x16`) is now the best discrete-code config overall; going deeper in the hierarchy (`ks21`,
+`ks221`) consistently hurts, and costs more params/FLOPs for it. GMM still has no trustworthy
+number -- both runs need a clean rerun with the fixed `eval_model_full` before ranking.
