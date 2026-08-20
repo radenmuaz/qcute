@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from qcute.qcute_v5_common import Config, WORD_PRESET_BITS, make_dict, resolve_per_level, run_main
-from qcute.qcute_v5_decoder import make_decoder
-from qcute.qcute_v5_encoder import Encoder
+from qcute.v5_old.qcute_v5_common import Config, WORD_PRESET_BITS, make_dict, resolve_per_level, run_main
+from qcute.v5_old.qcute_v5_decoder import make_decoder
+from qcute.v5_old.qcute_v5_encoder import Encoder
 
 
 class QCuteLM(nn.Module):

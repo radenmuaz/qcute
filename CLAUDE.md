@@ -19,28 +19,22 @@ uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_ctx1024.py   # nam
                                                  # configs/bytelm_xs_mtp4.py (context=256) is superseded, kept only
                                                  # for historical reproducibility, not a comparison target anymore
 uv run python scripts/plot_run.py logs/<run_name>   # train/val bpb PNG from a run's run.jsonl
-uv run python -m qcute.qcute_v5_concat --config configs/qcute_v5_concat_3.py
-uv run python -m qcute.qcute_v5_stack --config configs/qcute_v5_stack_3.py
-                                                 # the two DEFAULT v5 modules (see Architecture below):
-                                                 # qcute_v5_concat.py and qcute_v5_stack.py — both
-                                                 # promoted from their `_skip` forks (buffer-pruning:
-                                                 # once a block's code exists, its raw bytes are
-                                                 # dropped from the decode buffer), which forked from
-                                                 # `_fixblock` (qfb boundary-query mechanism removed,
-                                                 # replaced with decode_bos removal + block-0 target
-                                                 # exclusion) — each self-contained, run directly. The
-                                                 # prior defaults (qfb-based, pre-fixblock/pre-skip) are
-                                                 # ARCHIVED as qcute/archive3/qcute_v5_bos.py and
-                                                 # qcute/archive3/qcute_v5_concat_bos.py, kept for
-                                                 # historical reference only. Intermediate forks kept as
-                                                 # comparison references: qcute_v5_fixblock.py,
-                                                 # qcute_v5_concat_fixblock.py, qcute_v5_slow.py,
-                                                 # qcute_v5_concat_slow.py, and the weight-sharing
-                                                 # variant qcute_v5_ws_slow.py
+uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks21_v256_pq1.py
+                                                 # ACTIVE lineage: qcute_v1 (qcute/qcute_v1/) is where the
+                                                 # latent-AR / parallel-block-local-decode rewrite (see below)
+                                                 # is actually implemented -- forked from a verbatim copy of
+                                                 # qcute_v5, diverging as of the BOS-interleaved-decode rewrite.
+                                                 # Full design doc: docs/qcute_v1_plan.md.
+uv run python -m qcute.v5_old.qcute_v5 --decoder_type stack --config configs/v5_stack_fsq/ks1_16x8.py
+                                                 # ARCHIVED: qcute_v5 (formerly qcute/qcute_v5*.py, moved to
+                                                 # qcute/v5_old/ once qcute_v1 became the active lineage) --
+                                                 # still the leaderboard's source of truth for everything
+                                                 # already run (docs/status.md), frozen, not receiving further
+                                                 # architecture work. `--decoder_type concat` also still works.
 ```
 
-`qcute.bytelm`, `qcute.bpelm`, `qcute.qcute_v5_concat`, and
-`qcute.qcute_v5_stack` all read `--help` for their full flag
+`qcute.bytelm`, `qcute.bpelm`, `qcute.qcute_v1.qcute_v1`, and
+`qcute.v5_old.qcute_v5` all read `--help` for their full flag
 list; all support `--config path.py` (see `configs/` — every config file
 has its own module docstring explaining what it's testing and its exact
 `uv run` invocation, copy-pasteable directly from the file), `--run_name`
@@ -50,6 +44,11 @@ it: `logs/<run_name>/`, `checkpoints/<run_name>/`), and `--eval_only
 `--qual_gen_bytes` for qualitative generation. Tiny-corpus-scale defaults
 (`xs` preset) target ~4 bytes/timestep — see `qcute/bytelm.py`'s
 `PRESETS` comment for why. No test suite, linter, or CI config exists yet.
+Existing `configs/v5_stack_*/`, `configs/v5_word/`, etc. docstrings still say
+`qcute.qcute_v5`/`qcute.qcute_v5_wordlm` (pre-move path) in their copy-pasteable
+`uv run` line — substitute `qcute.v5_old.qcute_v5`/`qcute.v5_old.qcute_v5_wordlm`
+when actually running them; left as-is rather than bulk-edited, matching how
+other archived lineages' configs keep their original invocation text.
 
 **Only ever run one training job at a time.** All four modules train on
 MPS; two concurrent training processes contend for the same GPU and both

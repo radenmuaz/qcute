@@ -1,20 +1,20 @@
-"""qcute.qcute_v5_wordlm — plain unconditional next-word LM baseline (the bytelm.py job),
-ported to run through qcute_v5's own shared training infra instead of a standalone module, so
-its logs/checkpoints/run.jsonl are directly comparable to every other qcute_v5 config with no
+"""qcute.qcute_v1.qcute_v1_wordlm — plain unconditional next-word LM baseline (the bytelm.py job),
+ported to run through qcute_v1's own shared training infra instead of a standalone module, so
+its logs/checkpoints/run.jsonl are directly comparable to every other qcute_v1 config with no
 format adapter. Reuses Encoder/LM as-is (RoPE, Block, embed, ntp_loss_acc) via
 Encoder.forward(..., compute_code=False), which skips the quantize/extract_code pass entirely
 (not just discards its output) -- no decode stage, no bottleneck, no wasted quantize FLOPs, i.e.
 "encode pass, unconditional". quant_type is irrelevant to correctness here (never invoked);
 configs should set quant_type="simplex" since it needs no extra required fields.
 
-uv run python -m qcute.qcute_v5_wordlm --config configs/v5_word/xs.py
+uv run python -m qcute.qcute_v1.qcute_v1_wordlm --config configs/v1_word/xs.py
 """
 from types import SimpleNamespace
 
 import torch.nn as nn
 
-from qcute.qcute_v5_common import Config, resolve_per_level, run_main
-from qcute.qcute_v5_encoder import Encoder
+from qcute.qcute_v1.qcute_v1_common import Config, resolve_per_level, run_main
+from qcute.qcute_v1.qcute_v1_encoder import Encoder
 
 
 class WordLM(nn.Module):

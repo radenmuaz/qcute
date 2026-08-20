@@ -122,6 +122,7 @@ class Config:
     track_dropout_p0: float = 0.0
     track_dropout_ramp_steps: int | None = None
     track_dropout_schedule: str = "linear"
+    use_self_code: bool = False
 
 
 def gumbel_quantize(logits: torch.Tensor, tau: float, hard: bool = True, sample: bool = False) -> torch.Tensor:
@@ -886,6 +887,11 @@ class LM(nn.Module):
         V = vocab
         self.embed = nn.Embedding(V, D)
         nn.init.normal_(self.embed.weight, std=0.02)
+        # trainable stand-in for this level's self-code when cfg.use_self_code=False (see
+        # self_code_active) -- occupies the same fused self-attention "code position" slot real
+        # self-code would, but as a fixed seed with no dependency on the previous block's output,
+        # breaking the cross-block recurrence that self-code otherwise creates.
+        self.self_code_const = nn.Parameter(torch.zeros(D))
         self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(D)
         # code_head/code_predict always produce/consume cfg.vocab-wide codes (the categorical code
@@ -1100,6 +1106,28 @@ def apply_track_dropout(tracks: list, p: float) -> list:
 
 def set_track_dropout_p(model, p: float) -> None:
     model.track_dropout_p = p
+
+
+def self_code_active(level: int, n_levels: int, use_self_code: bool) -> bool:
+    """Top level of a real (n_levels>=2) hierarchy always keeps genuine self-code -- it's the
+    only cross-block memory a level with nothing above it has, irreplaceable. Every other level
+    (including the sole level of an n_levels==1 config) follows cfg.use_self_code (default
+    False): inactive self-code is replaced by a trainable constant seed (LM.self_code_const),
+    NOT dropped -- except at n_levels==1, where there's no coarser track to fall back on either,
+    so decode_level returns None and the model falls back to the encoder's own unconditioned
+    NTP loss (see qcute_v5.QCuteLM.forward's decode_losses[0] fallback)."""
+    return use_self_code or (n_levels >= 2 and level == n_levels - 1)
+
+
+_warned_no_self_code: set = set()
+
+
+def warn_degenerate_self_code(level: int) -> None:
+    if level in _warned_no_self_code:
+        return
+    _warned_no_self_code.add(level)
+    print(f"WARNING: level{level} use_self_code=False with n_levels==1 -- decode degenerates to "
+          f"an unconditioned LM (encode-only fallback, equivalent to qcute_v5_wordlm). Confirm intended.")
 
 
 def _walk_lms(obj):
@@ -1391,6 +1419,11 @@ def build_argparser(description: str) -> tuple:
                          "single table, standard product-quantization convention. 1 (default) is the "
                          "original single-table behavior. No effect on grid/binary, which are already "
                          "fully per-dimension factorized.")
+    p.add_argument("--use_self_code", type=lambda x: x.lower() != "false", default=False,
+                    help="False (default): non-top decode levels use a trainable constant seed instead "
+                         "of real self-code (breaks cross-block recurrence, see self_code_active); the "
+                         "top level of a multi-level hierarchy always keeps real self-code regardless. "
+                         "n_levels==1 with this False degenerates decode to an unconditioned LM (warns).")
     p.add_argument("--dim_monitor_plateau_tol", type=float, default=0.01,
                     help="relative change in effective_dim below which two consecutive --eval_every "
                          "measurements are flagged as a plateau")
@@ -1488,6 +1521,7 @@ def config_from_args(args) -> Config:
         track_dropout_p0=args.track_dropout_p0,
         track_dropout_ramp_steps=args.track_dropout_ramp_steps,
         track_dropout_schedule=args.track_dropout_schedule,
+        use_self_code=args.use_self_code,
     )
 
 

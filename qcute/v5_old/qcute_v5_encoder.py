@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from qcute.qcute_v5_common import LM, Config, apply_rope, make_dict, rope_cos_sin
+from qcute.v5_old.qcute_v5_common import LM, Config, apply_rope, make_dict, rope_cos_sin
 
 
 class Encoder(nn.Module):
