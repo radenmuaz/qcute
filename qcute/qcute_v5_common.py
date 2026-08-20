@@ -118,6 +118,10 @@ class Config:
     quant_dropout_schedule: str = "linear"
     decode_cross_stage_layers: int | None = None
     share_encode_decode_self: bool = False
+    pq_chunks: int = 1
+    track_dropout_p0: float = 0.0
+    track_dropout_ramp_steps: int | None = None
+    track_dropout_schedule: str = "linear"
 
 
 def gumbel_quantize(logits: torch.Tensor, tau: float, hard: bool = True, sample: bool = False) -> torch.Tensor:
@@ -269,18 +273,32 @@ class QuantScheme:
 
 
 class SimplexQuant(QuantScheme):
-    def __init__(self, tau: float, hard: bool = True, sample: bool = False, ntp_head_tied: bool = False):
+    """pq_chunks > 1: product-quantized categorical code, standard PQ-literature convention
+    (matches GMMQuant/GMMDiagQuant's own pq_chunks semantics) -- vocab (V) is the FIXED
+    per-chunk codebook size, pq_chunks is a pure multiplier: total code width is V * pq_chunks
+    (pq_chunks independent V-way softmaxes concatenated), combinatorial capacity V^pq_chunks.
+    pq_chunks=1 (default) is exactly the original single V-way softmax."""
+
+    def __init__(self, tau: float, hard: bool = True, sample: bool = False, ntp_head_tied: bool = False,
+                 pq_chunks: int = 1):
         super().__init__()
         self.tau = tau
         self.hard = hard
         self.sample = sample
         self.ntp_head_tied = ntp_head_tied
+        self.pq_chunks = pq_chunks
 
     def init_modules(self, D, V, code_head_tied):
-        code_head = None if code_head_tied else nn.Linear(D, V, bias=False)
+        if code_head_tied and self.pq_chunks > 1:
+            raise NotImplementedError(
+                "code_head_tied=True is not supported with pq_chunks>1 (the tied embedding "
+                "table is V-wide, not the V*pq_chunks-wide total code)")
+        self.V_sub = V  # fixed per-chunk width, matches GMM's gmm_k role
+        self.V = V * self.pq_chunks  # total code width
+        code_head = None if code_head_tied else nn.Linear(D, self.V, bias=False)
         if code_head is not None:
             nn.init.normal_(code_head.weight, std=0.02)
-        ntp_head = None if self.ntp_head_tied else nn.Linear(D, V, bias=False)
+        ntp_head = None if self.ntp_head_tied else nn.Linear(D, self.V, bias=False)
         if ntp_head is not None:
             nn.init.normal_(ntp_head.weight, std=0.02)
         # code_embed: dedicated categorical-code embedding table (V=cfg.vocab, matching code_head's
@@ -289,16 +307,26 @@ class SimplexQuant(QuantScheme):
         # non-byte input_preset diverges). BSQ/FSQ already carry their own dedicated code_embed
         # module for the same reason; softmax previously reused stage_lm.embed.weight as a shortcut,
         # safe only when every level shared one global vocab.
-        code_embed = nn.Linear(V, D, bias=False)
+        code_embed = nn.Linear(self.V, D, bias=False)
         nn.init.normal_(code_embed.weight, std=0.02)
         return code_head, code_embed, ntp_head
 
+    def _chunked(self, x: torch.Tensor) -> torch.Tensor:
+        """(..., V*pq_chunks) -> (..., pq_chunks, V) -- pure reshape, no data movement."""
+        return x.reshape(*x.shape[:-1], self.pq_chunks, self.V_sub)
+
     def quantize(self, pre_q):
         hard, sample = self._effective_hard_sample()
-        return gumbel_quantize(pre_q, self.tau, hard, sample)
+        if self.pq_chunks == 1:
+            return gumbel_quantize(pre_q, self.tau, hard, sample)
+        return gumbel_quantize(self._chunked(pre_q), self.tau, hard, sample).reshape(pre_q.shape)
 
     def to_ids(self, source_c):
-        return source_c.argmax(-1)
+        chunk_ids = self._chunked(source_c).argmax(-1)  # (..., pq_chunks)
+        if self.pq_chunks == 1:
+            return chunk_ids[..., 0]
+        weights = self.V_sub ** torch.arange(self.pq_chunks, device=source_c.device)
+        return (chunk_ids * weights).sum(-1)
 
     def embed_for_decode(self, stage_lm, source_c):
         return stage_lm.code_embed(source_c)
@@ -309,8 +337,8 @@ class SimplexQuant(QuantScheme):
         return stage_lm.code_predict(h_query)
 
     def ntp_loss_acc(self, stage_lm, h_query, target_repr):
-        target = target_repr.argmax(-1).reshape(-1)
-        logits = self._ntp_logits(stage_lm, h_query)
+        logits = self._chunked(self._ntp_logits(stage_lm, h_query)).reshape(-1, self.V_sub)
+        target = self._chunked(target_repr).argmax(-1).reshape(-1)
         loss = F.cross_entropy(logits, target)
         with torch.no_grad():
             acc = (logits.argmax(-1) == target).float().mean()
@@ -320,12 +348,20 @@ class SimplexQuant(QuantScheme):
         return stage_lm.code_embed(seq_repr)
 
     def sample_next(self, stage_lm, h_query, vocab):
-        logits = self._ntp_logits(stage_lm, h_query)
-        next_id = logits.argmax(-1)
-        return F.one_hot(next_id, num_classes=vocab).to(h_query.dtype)
+        # `vocab` (cfg.vocab, the caller-passed per-chunk width) is unused here -- self.V
+        # (the true total code width, V_sub * pq_chunks) is what the returned code must match.
+        logits = self._chunked(self._ntp_logits(stage_lm, h_query))  # (..., pq_chunks, V_sub)
+        next_id = logits.argmax(-1)  # (..., pq_chunks)
+        onehot = F.one_hot(next_id, num_classes=self.V_sub).to(h_query.dtype)  # (..., pq_chunks, V_sub)
+        return onehot.reshape(*h_query.shape[:-1], self.V)
 
     def entropy_reg(self, pre_q):
-        return softmax_entropy_reg(pre_q)
+        chunked = self._chunked(pre_q)
+        if self.pq_chunks == 1:
+            return softmax_entropy_reg(chunked[..., 0, :])
+        # per-chunk regularization -- each chunk is an independent codebook, so its own usage
+        # marginal (the H(E[p]) anti-collapse term) must stay separate, not pooled across chunks.
+        return torch.stack([softmax_entropy_reg(chunked[..., m, :]) for m in range(self.pq_chunks)]).sum()
 
 
 class BinaryQuant(QuantScheme):
@@ -441,20 +477,28 @@ def solve_upper_triangular(U: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 class GMMCodebook(nn.Module):
-    """Shared full-covariance GMM codebook: K components over a dq-dim code space.
-    Covariance parameterized via its precision Cholesky factor A (Lambda = A A^T) so the
-    NLL's Mahalanobis term is a plain matmul (y = A^T(x-mu)) -- no solve/inverse needed.
+    """Full-covariance GMM codebook, optionally product-quantized: pq_chunks independent
+    K-component codebooks, each over its own dq/pq_chunks-dim sub-vector, instead of one shared
+    K-component codebook over the whole dq-dim code -- combinatorial capacity K^pq_chunks
+    instead of a flat K (same PQ-VAE-style chunking as GridQuant/BSQ already get for free from
+    their own per-dimension factorization; GMM's shared table doesn't factorize on its own,
+    hence this explicit chunking). pq_chunks=1 (default) is exactly the original single-table
+    behavior. Covariance parameterized via its precision Cholesky factor A (Lambda = A A^T) so
+    the NLL's Mahalanobis term is a plain matmul (y = A^T(x-mu)) -- no solve/inverse needed.
     Sampling (z = mu + A^-T eps) needs one small manual triangular solve instead."""
 
-    def __init__(self, K: int, dq: int, D: int):
+    def __init__(self, K: int, dq: int, D: int, pq_chunks: int = 1):
         super().__init__()
-        self.K, self.dq = K, dq
-        self.mu = nn.Parameter(torch.empty(K, dq).normal_(std=1.0))
-        self.chol_raw = nn.Parameter(torch.empty(K, dq, dq).normal_(std=0.1))
+        assert dq % pq_chunks == 0, f"gmm_dq ({dq}) must be divisible by pq_chunks ({pq_chunks})"
+        self.K, self.dq, self.pq_chunks = K, dq, pq_chunks
+        self.dq_sub = dq // pq_chunks
+        M, dqs = pq_chunks, self.dq_sub
+        self.mu = nn.Parameter(torch.empty(M, K, dqs).normal_(std=1.0))
+        self.chol_raw = nn.Parameter(torch.empty(M, K, dqs, dqs).normal_(std=0.1))
         self.proj = nn.Linear(dq, D, bias=False)
         nn.init.normal_(self.proj.weight, std=0.02)
-        self.register_buffer("_tril_off", torch.tril(torch.ones(dq, dq), diagonal=-1), persistent=False)
-        self.register_buffer("_eye", torch.eye(dq), persistent=False)
+        self.register_buffer("_tril_off", torch.tril(torch.ones(dqs, dqs), diagonal=-1), persistent=False)
+        self.register_buffer("_eye", torch.eye(dqs), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(x)
@@ -464,39 +508,47 @@ class GMMCodebook(nn.Module):
         return self.chol_raw * self._tril_off + diag.unsqueeze(-1) * self._eye
 
     def log_prob(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (..., pq_chunks, dq_sub) -> (..., pq_chunks, K)."""
         A = self.precision_chol()
         diff = x.unsqueeze(-2) - self.mu
-        y = torch.einsum("...kd,kde->...ke", diff, A)
+        y = torch.einsum("...mkd,mkde->...mke", diff, A)
         maha = (y * y).sum(-1)
         log_diag_sum = A.diagonal(dim1=-2, dim2=-1).clamp_min(1e-8).log().sum(-1)
-        return log_diag_sum - 0.5 * (self.dq * math.log(2 * math.pi) + maha)
+        return log_diag_sum - 0.5 * (self.dq_sub * math.log(2 * math.pi) + maha)
 
     def sample(self, k_idx: torch.Tensor) -> torch.Tensor:
-        A = self.precision_chol()[k_idx]
-        eps = torch.randn(*k_idx.shape, self.dq, device=self.mu.device, dtype=self.mu.dtype)
-        y = solve_upper_triangular(A.transpose(-1, -2), eps)
-        return self.mu[k_idx] + y
+        """k_idx: (..., pq_chunks) per-chunk selected component -> (..., pq_chunks, dq_sub)."""
+        A = self.precision_chol()
+        M = self.pq_chunks
+        A_sel = torch.stack([A[m][k_idx[..., m]] for m in range(M)], dim=-3)
+        mu_sel = torch.stack([self.mu[m][k_idx[..., m]] for m in range(M)], dim=-2)
+        eps = torch.randn(*k_idx.shape, self.dq_sub, device=self.mu.device, dtype=self.mu.dtype)
+        y = solve_upper_triangular(A_sel.transpose(-1, -2), eps)
+        return mu_sel + y
 
     def sample_all(self, batch_shape: tuple) -> torch.Tensor:
-        """Reparam-sample every component at once -- one precision_chol() call and one
-        batched triangular solve (K,dq,dq broadcasting against batch_shape+(K,dq)),
-        instead of calling sample() K times (each redundantly recomputing precision_chol()
-        over all K components -- O(K^2) work for what should be O(K))."""
+        """Reparam-sample every component of every chunk at once -- one precision_chol() call
+        and one batched triangular solve, instead of calling sample() K times per chunk (each
+        redundantly recomputing precision_chol() -- O(K^2) work for what should be O(K))."""
         A = self.precision_chol()
-        eps = torch.randn(*batch_shape, self.K, self.dq, device=self.mu.device, dtype=self.mu.dtype)
+        eps = torch.randn(*batch_shape, self.pq_chunks, self.K, self.dq_sub,
+                           device=self.mu.device, dtype=self.mu.dtype)
         y = solve_upper_triangular(A.transpose(-1, -2), eps)
         return self.mu + y
 
 
 class GMMDiagCodebook(nn.Module):
-    """Shared diagonal-covariance GMM codebook -- same interface as GMMCodebook, plain
+    """Diagonal-covariance GMM codebook -- same PQ chunking / interface as GMMCodebook, plain
     elementwise NLL/reparam (no triangular solve needed either direction)."""
 
-    def __init__(self, K: int, dq: int, D: int):
+    def __init__(self, K: int, dq: int, D: int, pq_chunks: int = 1):
         super().__init__()
-        self.K, self.dq = K, dq
-        self.mu = nn.Parameter(torch.empty(K, dq).normal_(std=1.0))
-        self.logvar = nn.Parameter(torch.zeros(K, dq))
+        assert dq % pq_chunks == 0, f"gmm_dq ({dq}) must be divisible by pq_chunks ({pq_chunks})"
+        self.K, self.dq, self.pq_chunks = K, dq, pq_chunks
+        self.dq_sub = dq // pq_chunks
+        M, dqs = pq_chunks, self.dq_sub
+        self.mu = nn.Parameter(torch.empty(M, K, dqs).normal_(std=1.0))
+        self.logvar = nn.Parameter(torch.zeros(M, K, dqs))
         self.proj = nn.Linear(dq, D, bias=False)
         nn.init.normal_(self.proj.weight, std=0.02)
 
@@ -506,56 +558,73 @@ class GMMDiagCodebook(nn.Module):
     def log_prob(self, x: torch.Tensor) -> torch.Tensor:
         diff = x.unsqueeze(-2) - self.mu
         maha = (diff * diff * (-self.logvar).exp()).sum(-1)
-        return -0.5 * (self.dq * math.log(2 * math.pi) + self.logvar.sum(-1) + maha)
+        return -0.5 * (self.dq_sub * math.log(2 * math.pi) + self.logvar.sum(-1) + maha)
 
     def sample(self, k_idx: torch.Tensor) -> torch.Tensor:
-        std = (0.5 * self.logvar[k_idx]).exp()
-        return self.mu[k_idx] + std * torch.randn_like(std)
+        M = self.pq_chunks
+        mu_sel = torch.stack([self.mu[m][k_idx[..., m]] for m in range(M)], dim=-2)
+        logvar_sel = torch.stack([self.logvar[m][k_idx[..., m]] for m in range(M)], dim=-2)
+        std = (0.5 * logvar_sel).exp()
+        return mu_sel + std * torch.randn_like(std)
 
     def sample_all(self, batch_shape: tuple) -> torch.Tensor:
         std = (0.5 * self.logvar).exp()
-        eps = torch.randn(*batch_shape, self.K, self.dq, device=self.mu.device, dtype=self.mu.dtype)
+        eps = torch.randn(*batch_shape, self.pq_chunks, self.K, self.dq_sub,
+                           device=self.mu.device, dtype=self.mu.dtype)
         return self.mu + std * eps
 
 
 class GMMHead(nn.Module):
-    def __init__(self, D: int, dq: int, K: int):
+    def __init__(self, D: int, dq: int, K: int, pq_chunks: int = 1):
         super().__init__()
-        self.dq = dq
-        self.proj = nn.Linear(D, dq + K, bias=False)
+        assert dq % pq_chunks == 0
+        self.dq, self.pq_chunks, self.K = dq, pq_chunks, K
+        self.proj = nn.Linear(D, dq + pq_chunks * K, bias=False)
         nn.init.normal_(self.proj.weight, std=0.02)
 
     def forward(self, h: torch.Tensor) -> tuple:
         out = self.proj(h)
-        return out[..., :self.dq], out[..., self.dq:]
+        query = out[..., :self.dq]
+        gating = out[..., self.dq:].reshape(*h.shape[:-1], self.pq_chunks, self.K)
+        return query, gating
 
 
 class _GMMQuantBase(QuantScheme):
     codebook_cls = None
 
-    def __init__(self, K: int, dq: int, hard: bool = True, sample: bool = False):
+    def __init__(self, K: int, dq: int, hard: bool = True, sample: bool = False, pq_chunks: int = 1):
         super().__init__()
-        self.K, self.dq = K, dq
+        assert dq % pq_chunks == 0, f"gmm_dq ({dq}) must be divisible by pq_chunks ({pq_chunks})"
+        self.K, self.dq, self.pq_chunks = K, dq, pq_chunks
+        self.dq_sub = dq // pq_chunks
         self.hard = hard
         self.sample = sample
         self._codebook = None
 
     def init_modules(self, D, V, code_head_tied):
-        code_head = GMMHead(D, self.dq, self.K)
-        code_predict = GMMHead(D, self.dq, self.K)
-        self._codebook = self.codebook_cls(self.K, self.dq, D)
+        code_head = GMMHead(D, self.dq, self.K, self.pq_chunks)
+        code_predict = GMMHead(D, self.dq, self.K, self.pq_chunks)
+        self._codebook = self.codebook_cls(self.K, self.dq, D, self.pq_chunks)
         return code_head, self._codebook, code_predict
 
+    def _reshape_query(self, query: torch.Tensor) -> torch.Tensor:
+        return query.reshape(*query.shape[:-1], self.pq_chunks, self.dq_sub)
+
+    def _flatten_code(self, code_chunks: torch.Tensor) -> torch.Tensor:
+        return code_chunks.reshape(*code_chunks.shape[:-2], self.dq)
+
     def _posterior_logits(self, query, gating_logits):
-        return F.log_softmax(gating_logits, dim=-1) + self._codebook.log_prob(query)
+        """query: (..., dq) flat; gating_logits: (..., pq_chunks, K) -> (..., pq_chunks, K)."""
+        return F.log_softmax(gating_logits, dim=-1) + self._codebook.log_prob(self._reshape_query(query))
 
     def _select(self, query, gating_logits, hard, sample):
         cb = self._codebook
-        log_post = self._posterior_logits(query, gating_logits)
+        M = self.pq_chunks
+        log_post = self._posterior_logits(query, gating_logits)  # (..., M, K)
         r = F.softmax(log_post, dim=-1)
-        soft = torch.einsum("...k,kd->...d", r, cb.mu)
+        soft = torch.einsum("...mk,mkd->...md", r, cb.mu)  # (..., M, dq_sub)
         if not hard and not sample:
-            return soft
+            return self._flatten_code(soft)
         if sample:
             eps = torch.finfo(log_post.dtype).tiny
             u = torch.rand_like(log_post).clamp(min=eps, max=1.0 - eps)
@@ -563,20 +632,33 @@ class _GMMQuantBase(QuantScheme):
         else:
             weights = r
         if not hard:
-            samples = cb.sample_all(query.shape[:-1])
-            return (weights.unsqueeze(-1) * samples).sum(-2)
-        k_star = weights.argmax(-1)
-        hard_code = cb.sample(k_star) if sample else cb.mu[k_star]
-        return soft + (hard_code - soft).detach()
+            samples = cb.sample_all(query.shape[:-1])  # (..., M, K, dq_sub)
+            return self._flatten_code((weights.unsqueeze(-1) * samples).sum(-2))
+        k_star = weights.argmax(-1)  # (..., M)
+        if sample:
+            hard_code = cb.sample(k_star)
+        else:
+            hard_code = torch.stack([cb.mu[m][k_star[..., m]] for m in range(M)], dim=-2)
+        code = soft + (hard_code - soft).detach()
+        return self._flatten_code(code)
 
     def quantize(self, pre_q):
         query, gating_logits = pre_q
         hard, sample = self._effective_hard_sample()
         return self._select(query, gating_logits, hard, sample)
 
-    def to_ids(self, source_c):
-        dists = ((source_c.unsqueeze(-2) - self._codebook.mu) ** 2).sum(-1)
+    def _chunk_ids(self, chunks: torch.Tensor) -> torch.Tensor:
+        """chunks: (..., pq_chunks, dq_sub) -> (..., pq_chunks) nearest-component id per chunk
+        (uncombined -- used directly for per-chunk cross-entropy in ntp_loss_acc)."""
+        dists = ((chunks.unsqueeze(-2) - self._codebook.mu) ** 2).sum(-1)
         return dists.argmin(-1)
+
+    def to_ids(self, source_c):
+        chunk_ids = self._chunk_ids(self._reshape_query(source_c))
+        if self.pq_chunks == 1:
+            return chunk_ids[..., 0]
+        weights = self.K ** torch.arange(self.pq_chunks, device=source_c.device)
+        return (chunk_ids * weights).sum(-1)
 
     def embed_for_decode(self, stage_lm, source_c):
         return stage_lm.code_embed(source_c)
@@ -586,9 +668,9 @@ class _GMMQuantBase(QuantScheme):
 
     def ntp_loss_acc(self, stage_lm, h_query, target_repr):
         query_pred, gating_pred = stage_lm.code_predict(h_query)
-        logits = self._posterior_logits(query_pred, gating_pred).reshape(-1, self.K)
-        target_id = self.to_ids(target_repr.reshape(-1, self.dq))
-        loss = F.cross_entropy(logits, target_id)
+        logits = self._posterior_logits(query_pred, gating_pred).reshape(-1, self.pq_chunks, self.K)
+        target_id = self._chunk_ids(self._reshape_query(target_repr.reshape(-1, self.dq)))
+        loss = F.cross_entropy(logits.reshape(-1, self.K), target_id.reshape(-1))
         with torch.no_grad():
             acc = (logits.argmax(-1) == target_id).float().mean()
         return loss, acc
@@ -602,20 +684,27 @@ class _GMMQuantBase(QuantScheme):
         """Achievable bpb bound for code_hard=False / code_sample=True, where ntp_loss_acc's
         K-way cross-entropy against to_ids() undercounts (it only charges for "which of K
         components", discarding the continuous residual those modes actually emit). Uses the
-        true mixture density's NLL of the exact target_repr (nats -> bits) plus a stated
+        true mixture density's NLL of the exact target_repr (nats -> bits), summed over
+        independent chunks (log joint = sum of per-chunk log-likelihoods), plus a stated
         per-dim quantization-precision correction (differential entropy alone isn't bits without
         one, same reason RealNVP/Glow-style bits/dim reporting adds a fixed dequantization
         constant) -- an honest, achievable upper bound, not exact."""
         query_pred, gating_pred = stage_lm.code_predict(h_query)
         cb = self._codebook
-        log_pi = F.log_softmax(gating_pred.reshape(-1, self.K), dim=-1)
-        log_lik = cb.log_prob(target_repr.reshape(-1, self.dq))
-        nll_nats = -torch.logsumexp(log_pi + log_lik, dim=-1).mean()
+        log_pi = F.log_softmax(gating_pred.reshape(-1, self.pq_chunks, self.K), dim=-1)
+        log_lik = cb.log_prob(self._reshape_query(target_repr.reshape(-1, self.dq)))
+        nll_nats_per_chunk = -torch.logsumexp(log_pi + log_lik, dim=-1)  # (-1, pq_chunks)
+        nll_nats = nll_nats_per_chunk.sum(-1).mean()
         return nll_nats / math.log(2) + self.dq * precision_bits
 
     def entropy_reg(self, pre_q):
         query, gating_logits = pre_q
-        return softmax_entropy_reg(self._posterior_logits(query, gating_logits))
+        logits = self._posterior_logits(query, gating_logits)  # (..., M, K)
+        if self.pq_chunks == 1:
+            return softmax_entropy_reg(logits[..., 0, :])
+        # per-chunk regularization -- same reasoning as SimplexQuant.entropy_reg's pq_chunks
+        # branch: each chunk is an independent codebook, must not be pooled with the others.
+        return torch.stack([softmax_entropy_reg(logits[..., m, :]) for m in range(self.pq_chunks)]).sum()
 
 
 class GMMQuant(_GMMQuantBase):
@@ -633,10 +722,10 @@ def make_quant(cfg: Config) -> QuantScheme:
         return GridQuant(cfg.grid_dq, cfg.grid_levels, cfg.code_hard, cfg.code_sample, cfg.grid_bound,
                           cfg.grid_logistic_scale)
     if cfg.quant_type == "gmm":
-        return GMMQuant(cfg.gmm_k, cfg.gmm_dq, cfg.code_hard, cfg.code_sample)
+        return GMMQuant(cfg.gmm_k, cfg.gmm_dq, cfg.code_hard, cfg.code_sample, cfg.pq_chunks)
     if cfg.quant_type == "gmm_diag":
-        return GMMDiagQuant(cfg.gmm_k, cfg.gmm_dq, cfg.code_hard, cfg.code_sample)
-    return SimplexQuant(cfg.gumbel_tau, cfg.code_hard, cfg.code_sample, cfg.ntp_head_tied)
+        return GMMDiagQuant(cfg.gmm_k, cfg.gmm_dq, cfg.code_hard, cfg.code_sample, cfg.pq_chunks)
+    return SimplexQuant(cfg.gumbel_tau, cfg.code_hard, cfg.code_sample, cfg.ntp_head_tied, cfg.pq_chunks)
 
 
 def rope_cos_sin(seq_len: int, head_dim: int, base: float, device: torch.device):
@@ -978,6 +1067,41 @@ def quant_dropout_p_at(step: int, p0: float, decay_steps: int, schedule: str = "
     return max(0.0, p0 * (1.0 - step / decay_steps))
 
 
+def track_dropout_p_at(step: int, p0: float, ramp_steps: int, schedule: str = "linear") -> float:
+    """Dense->sparse curriculum for decode's cross-level tracks (see CLAUDE.md's "Latent-AR /
+    parallel-block-local-decode investigation") -- the OPPOSITE ramp direction from
+    quant_dropout_p_at: starts at 0 (fully dense, today's behavior, eases early training the
+    same way DenseNet's dense skips do) and ramps UP toward p0 (probability of pruning every
+    track except self+topmost) over ramp_steps. schedule="step": AE-Warm-Up-style hard switch
+    (dense until ramp_steps, then instantly p0). schedule="linear" (default): gradual ramp."""
+    if p0 <= 0 or ramp_steps <= 0:
+        return 0.0
+    if schedule == "step":
+        return 0.0 if step < ramp_steps else p0
+    return min(p0, p0 * step / ramp_steps)
+
+
+def apply_track_dropout(tracks: list, p: float) -> list:
+    """Returns a list of (original_index, track) pairs -- ALWAYS, even when nothing is pruned --
+    since StackDecoder's per-track stage weights (self.stage_lms[i][t]) are keyed by each
+    track's ORIGINAL position (0=self, n_sources-1=topmost), not its position within whatever
+    survives pruning; losing that would run topmost-track data through the wrong stage's
+    weights. With probability p, prunes every track except the first (self, j==i) and the last
+    (topmost coarser level) -- one flip per call (matches quant_dropout's own per-call
+    granularity), not per-track. No-op when there are <=2 tracks already (nothing "middle" to
+    drop) or the flip doesn't fire. Caller gates this to training only via torch.is_grad_enabled()."""
+    indexed = list(enumerate(tracks))
+    if len(tracks) <= 2 or p <= 0:
+        return indexed
+    if torch.rand(()).item() < p:
+        return [indexed[0], indexed[-1]]
+    return indexed
+
+
+def set_track_dropout_p(model, p: float) -> None:
+    model.track_dropout_p = p
+
+
 def _walk_lms(obj):
     if hasattr(obj, "quant"):
         yield obj
@@ -1125,6 +1249,9 @@ def train(model, train_data: torch.Tensor, val_data: torch.Tensor, args, log, ru
         set_quant_dropout_p(model, quant_dropout_p_at(step, args.quant_dropout_p0,
                                                         args.quant_dropout_decay_steps or args.steps,
                                                         args.quant_dropout_schedule))
+        set_track_dropout_p(model, track_dropout_p_at(step, args.track_dropout_p0,
+                                                        args.track_dropout_ramp_steps or args.steps,
+                                                        args.track_dropout_schedule))
 
         ctx = sample_context(train_data, args.batch_size, model.cfg.context_len, device)
         loss, metrics = model(ctx)
@@ -1245,6 +1372,25 @@ def build_argparser(description: str) -> tuple:
                          "round, and flag when it plateaus -- diagnostic only, does not affect training. "
                          "Off by default: needs an extra forward pass + CPU eigendecomposition, heavier "
                          "than the rest of eval.")
+    p.add_argument("--track_dropout_p0", type=float, default=0.0,
+                    help="dense->sparse decode-track curriculum: target probability (reached by "
+                         "--track_dropout_ramp_steps) of pruning every decode track except self + "
+                         "topmost. Ramps UP from 0 (opposite direction from --quant_dropout_p0) -- "
+                         "0.0 (default) is a no-op, always dense (today's behavior).")
+    p.add_argument("--track_dropout_ramp_steps", type=int, default=None,
+                    help="steps to ramp --track_dropout_p0 up from 0 over (schedule=linear) or "
+                         "steps to hold fully dense before an instant switch to p0 (schedule=step); "
+                         "defaults to --steps")
+    p.add_argument("--track_dropout_schedule", type=str, default="linear", choices=["linear", "step"],
+                    help="linear: gradual ramp (default). step: AE-Warm-Up-style hard switch -- "
+                         "fully dense for track_dropout_ramp_steps, then instantly sparse")
+    p.add_argument("--pq_chunks", type=int, default=1,
+                    help="product-quantize simplex/gmm/gmm_diag codes: a pure multiplier on top of a "
+                         "FIXED per-chunk codebook size (--vocab for simplex, --gmm_k for gmm/gmm_diag) "
+                         "-- combinatorial capacity is (per-chunk size)^pq_chunks instead of a flat "
+                         "single table, standard product-quantization convention. 1 (default) is the "
+                         "original single-table behavior. No effect on grid/binary, which are already "
+                         "fully per-dimension factorized.")
     p.add_argument("--dim_monitor_plateau_tol", type=float, default=0.01,
                     help="relative change in effective_dim below which two consecutive --eval_every "
                          "measurements are flagged as a plateau")
@@ -1308,6 +1454,10 @@ def build_argparser(description: str) -> tuple:
         p.error("--gmm_k has no default -- set it explicitly when --quant_type gmm|gmm_diag")
     if args.quant_type in ("gmm", "gmm_diag") and args.gmm_dq is None:
         p.error("--gmm_dq has no default -- set it explicitly when --quant_type gmm|gmm_diag")
+    if args.quant_type in ("gmm", "gmm_diag") and args.gmm_dq is not None and args.gmm_dq % args.pq_chunks != 0:
+        p.error(f"--gmm_dq ({args.gmm_dq}) must be divisible by --pq_chunks ({args.pq_chunks})")
+    if args.quant_type == "simplex" and args.code_head_tied and args.pq_chunks > 1:
+        p.error("--code_head_tied is not supported with --pq_chunks > 1 for quant_type simplex")
     if args.input_preset is None:
         p.error("--input_preset has no default -- set it explicitly (--input_preset or config file: 1|4|8)")
     if args.output_preset is None:
@@ -1334,6 +1484,10 @@ def config_from_args(args) -> Config:
         quant_dropout_schedule=args.quant_dropout_schedule,
         code_hard=args.code_hard,
         code_sample=args.code_sample,
+        pq_chunks=args.pq_chunks,
+        track_dropout_p0=args.track_dropout_p0,
+        track_dropout_ramp_steps=args.track_dropout_ramp_steps,
+        track_dropout_schedule=args.track_dropout_schedule,
     )
 
 

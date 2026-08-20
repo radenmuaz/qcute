@@ -5,7 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from qcute.qcute_v5_common import (
-    LM, Config, apply_rope, make_dict, pack_words, rope_cos_sin_for_positions, warn_thin_window,
+    LM, Config, apply_rope, apply_track_dropout, make_dict, pack_words, rope_cos_sin_for_positions,
+    warn_thin_window,
 )
 
 
@@ -516,6 +517,10 @@ class ConcatDecoder(Decoder):
             tracks += [(code_embeds, cum_K, window)]
         if not tracks:
             return None
+        if torch.is_grad_enabled():
+            # ConcatDecoder shares one LM per level across every track (no per-track weights),
+            # so original-index bookkeeping doesn't matter here -- just drop the indices.
+            tracks = [t for _, t in apply_track_dropout(tracks, getattr(model, "track_dropout_p", 0.0))]
         full_tracks = tracks[:max_decode_sources] if max_decode_sources is not None else tracks
 
         is_byte_level = i == 0
@@ -570,7 +575,15 @@ class StackDecoder(Decoder):
             track_specs += [(source_c, cum_K, window)]
         if not track_specs:
             return None
-        full_track_specs = track_specs[:max_decode_sources] if max_decode_sources is not None else track_specs
+        # StackDecoder has per-track-position weights (stage_lms[i][t]), so pruned tracks must
+        # keep their ORIGINAL index (0=self, n_sources-1=topmost) -- topmost data must still run
+        # through the stage built for "topmost", not whichever position it ends up at after
+        # pruning drops the tracks in between.
+        if torch.is_grad_enabled():
+            indexed = apply_track_dropout(track_specs, getattr(model, "track_dropout_p", 0.0))
+        else:
+            indexed = list(enumerate(track_specs))
+        full_track_specs = indexed[:max_decode_sources] if max_decode_sources is not None else indexed
 
         is_byte_level = i == 0
         K = cfg.Ks[i]
@@ -579,8 +592,8 @@ class StackDecoder(Decoder):
         x = None
         extra_losses = []
         loss_final = acc_final = code_final = query_last_final = embed_weight_final = None
-        for t, (source_c, track_K, window) in enumerate(full_track_specs):
-            bb = stage_bbs[t]
+        for t, (orig_idx, (source_c, track_K, window)) in enumerate(full_track_specs):
+            bb = stage_bbs[orig_idx]
             code_embeds = bb.quant.embed_for_decode(bb, source_c)
             is_last = t == len(full_track_specs) - 1
             if t == 0:
@@ -603,7 +616,8 @@ class StackDecoder(Decoder):
             else:
                 extra_losses += [loss_stage]
 
-        valid_next_query = want_next_query and i == 0 and L_i % full_track_specs[-1][1] == 0
+        last_track_K = full_track_specs[-1][1][1]
+        valid_next_query = want_next_query and i == 0 and L_i % last_track_K == 0
         return make_dict(hidden=x, query_last=(query_last_final if valid_next_query else None),
                           loss=loss_final, acc=acc_final, code=code_final,
                           extra_losses=extra_losses, embed_weight=embed_weight_final)

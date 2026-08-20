@@ -87,238 +87,6 @@ schedule.
 
 ## Architecture
 
-`qcute/bytelm.py` and `qcute/bpelm.py` are self-contained baseline
-modules — none import each other, deliberately not factored further yet.
-Full details: [docs/architecture.md](docs/architecture.md) (also covers
-`qcutelm.py`, now archived — see below).
-
-**The entire `qcute_refine` lineage (`v1.py` through `v4_5_1.py`, plus
-its `qcute_refine.py` always-latest alias) is now archived** under
-`qcute/archive2/` (configs under `configs/archive2/`; its docs —
-`qcute_refine_math.md`, `kv_contribution.md`, `bpe_like_boundaries.md`,
-`bitpredict_heads.md`, `torch_compile.md` — under `docs/archive2/`).
-**`qcute/qcute_v5_concat.py` and `qcute/qcute_v5_stack.py` (forked from
-`qcute_refine_v4_4_1.py`/`qcute_refine_v4_5_1.py` respectively, dropping
-the `refine_` prefix and the version-suffix/alias convention entirely)
-were the original two standalone prototypes** — each self-contained, run
-directly (no promotion step, no alias file). Both have since been
-superseded as the *default* module by an efficient-attention/KV-cache-
-friendly rewrite, while being kept themselves as O(L^2) dense references:
-
-- **`qcute_v5_stack.py`** → superseded by **`qcute/qcute_v5.py`**
-  (renamed from an intermediate `qcute_v5_stack_eff.py` fork once it
-  became the default): genuinely sub-quadratic windowed/banded attention
-  (chunked `selfcode_decode`/`cross_attn_stage`, no dense `O(L^2)` mask)
-  and a FIFO-windowed `generate_kv_cache` (truncate to `context_len` each
-  step, cheap and structurally cache-friendly — not yet a true per-layer
-  K/V tensor cache). Verified via `scripts/test_v5.py` against
-  `qcute_v5_stack.py` (bit-identical forward/loss across Ks/window
-  shapes) and `check_gen_consistency`/`validate_generation`.
-  **Superseded again**: weight-sharing logic (`share_level_weights`,
-  `decode_separate_stage0`) pruned to its always-`False` default (the old
-  variant kept as `qcute_v5_ws_slow.py`), then a "query first byte" (qfb)
-  fix folded into `cross_attn_stage` itself, removing `selfcode_decode`
-  entirely — see "qfb boundary-query fix" below. The pre-qfb file is kept
-  as `qcute_v5_slow.py`.
-- **`qcute_v5_concat.py`** → rewritten in place (the old dense
-  implementation is now **`qcute/qcute_v5_concat_slow.py`**): every
-  track's codes are placed at their true chronological time position —
-  merged with the byte stream into ONE physically time-ordered buffer
-  per level's decode — instead of the old "prepend" scheme (all track
-  prefixes grouped at the buffer front, corrected via a separate
-  `true_pos` array + `argsort`). Buffer order now IS time order, so
-  causal masking is a plain buffer-index comparison (no same-position
-  exclusion mask term needed — a tied code always sorts after the byte
-  that produced it, automatically invisible to it) and windowed/banded
-  attention slices CONTIGUOUS buffer ranges with no runtime sort — the
-  index/address construction (`LevelLM._merged_layout`) depends only on
-  shape, never data, so it's built once per signature and cached, same
-  cost whether called every training step or every fixed-size
-  `generate_kv_cache` FIFO-window step. Single- and multi-track decode
-  are now one mechanism (no more separate selfcode/dense/banded code
-  paths). An intermediate fork, `qcute_v5_concat_eff.py` (argsort-based:
-  kept the old "prepend" layout, cached the sort's structural output
-  rather than eliminating it), exists between `qcute_v5_concat_slow.py`
-  and the current `qcute_v5_concat.py` but was never itself promoted/
-  renamed. Verified via `scripts/test_v5_concat.py` (an independent
-  from-scratch dense reference, dense-vs-chunked internal consistency,
-  `check_gen_consistency`, `validate_generation` — not compared against
-  `qcute_v5_concat_slow.py` directly, since window semantics changed by
-  design, see the module's own docstring).
-
-**`qcute_v5_concat.py` promoted again (2026-08-17)**, from a
-`qcute_v5_concat_modes.py` fork adding per-conditioning-depth multi-mode
-decode loss (`Config.multi_mode_impl: "off"|"multipass"|"single_pass"`,
-mirroring `qcute_v5_stack.py`'s free `decode_stage_extra_losses`
-byproduct, which flat self-attention decode has no natural equivalent
-of): `"off"` (default) is bit-exact with the pre-fork behavior — that
-version is kept as `qcute/qcute_v5_concat_no_modes.py`, a strict no-op
-reference. `"multipass"` is a naive T-calls-per-level reference;
-`"single_pass"` batches every mode's own independent merged buffer
-(block-diagonal masked, zero cross-mode attention) into one shared pass
-— exact vs. `"multipass"`, supports both the dense and the chunked/
-banded (SWA) attention path (`_merged_layout` extended with
-`forced_sc`/`forced_n_chunks`/`forced_n_prev_chunks`, safe to force a
-chunk grid larger than a segment's own natural need). Verified via
-`scripts/test_v5_concat_modes.py` across `Ks=(1,)`/`(4,1)`/`(2,2,1)`,
-dense and chunked.
-
-Both `qcute_v5.py` and `qcute_v5_concat.py` also had several `Config`
-flags hardcoded away (`decode_code_ste` always `True`,
-`cross_track_source` always `"decode"`, `decode_self_only_aux` and its
-curriculum loss removed entirely — decode now has exactly one NTP loss
-term) and their `quant_type` dispatch (`"softmax"` vs `"bsq"`) unified
-into a `QuantScheme`/`SoftmaxQuant`/`BSQQuant` strategy-class pair (7
-uniform methods: `init_modules`/`quantize`/`to_ids`/`embed_for_decode`/
-`ntp_loss_acc`/`embed_input`/`sample_next`) — `make_quant(cfg)` is the
-only remaining `quant_type` branch in either file, everywhere else
-dispatches through `self.quant.<method>()`.
-
-**`QuantScheme` gains a third implementation, `FSQQuant` (2026-08-17)**,
-in both `qcute_v5_stack.py` and `qcute_v5_concat.py`: `Config.quant_type="fsq"`
-(finite scalar quantization, Mentzer et al. 2023, ported from archived
-`qcute/archive/qcutelm.py`), `Config.fsq_dq`/`fsq_levels` (defaults 6/8).
-`Config.fsq_bound` picks the per-dim squashing nonlinearity applied
-before rounding — `"sigmoid"` (default, iFSQ, matches archived
-`qcutelm_vlt6.py`'s own default) or `"tanh"` (original FSQ) — one quant
-type plus a sub-flag rather than two separate `quant_type` strings,
-since embedding/loss/sampling are identical either way. `BSQQuant` gains
-`Config.bsq_lfq` (default `False`, unchanged behavior): skips the
-L2-normalize-before-sign step, hypercube corners instead of BSQ's
-hypersphere. Also fixed a real pre-existing bug found while touching
-this code: `BSQQuant.sample_next` referenced a nonexistent
-`self.use_bernoulli_sample` (should've been `self.mode`) — would have
-crashed on the first BSQ generation call in either file.
-
-**BSQ entropy regularization (2026-08-17)**, both files: `bsq_entropy_reg`
-(Yu et al. 2023 §3.2 MAGVIT-v2 / BSQ 2024 closed-form, ported from
-archived `qcutelm.py`) via a new `QuantScheme.entropy_reg(pre_q)` hook
-(default `None`; only `BSQQuant` overrides it), weighted by
-`Config.entropy_reg_weight`/`--entropy_reg_weight` (default `0.0`, off).
-Threading the term from each level's raw `pre_q` up to the loss required
-real return-tuple arity changes (not just new optional params): in
-`qcute_v5_concat.py`, `LevelLM.forward` 8-tuple→9-tuple and `RefineLM._run`
-11-tuple→12-tuple; in `qcute_v5_stack.py`, `LevelLM._extract_code` gained a
-second return value, `LevelLM.encode` 4-tuple→5-tuple, and `RefineLM._run`
-12-tuple→13-tuple — every call site of each (generation/diagnostic
-functions included, ~13 per file) updated to match. Deliberately did NOT
-reuse `qcute_v5_concat.py`'s existing always-`None` 6th `LevelLM.forward`
-slot even though it looked unused — `check_gen_consistency` branches on
-it via `is not None`, so overloading it would have silently mis-routed
-that check whenever entropy_reg was non-None; a new trailing tuple
-element was added instead.
-
-**Entropy reg generalized to the softmax quantizer (2026-08-18)**, both
-files: `softmax_entropy_reg` (same `E_batch[H(p)] - H(E_batch[p])`
-structure, exact categorical entropy over the V-way softmax instead of
-BSQ's per-bit marginal proxy), wired via `SoftmaxQuant.entropy_reg` (no
-new plumbing needed — `entropy_reg_weight` was already generic). Still
-0.0/off by default; `quant_type="fsq"` still has no entropy_reg override.
-
-**`qcute_v5_stack.py`'s `qualitative_generate` generalized (2026-08-18)**
-to loop every level0 conditioning depth (`for m in range(1,
-model.n_levels+1): generate_no_cache(..., max_decode_sources=m)`,
-logging `level0_mode{m}`/`level0_modefull`) instead of two hardcoded
-calls (`cond_full`/`cond_self` via `generate_self_only_cond`) — matches
-`qcute_v5_concat_modes.py`'s convention; `max_decode_sources` itself
-already supported arbitrary depth, only the logging wasn't generalized.
-
-**New `Ks=(4,1)`/`ste` ablation pair** (isolates whether multi-mode/
-staged decode is architecturally correct independent of `code_sample_
-mode="soft"`'s Gumbel-noise-driven `check_gen_consistency` mismatches):
-`configs/qcute_v5_concat_modes_1_ste.py` and
-`configs/qcute_v5_stack_ks41_ste.py`. Both trained clean, `0/127`
-`gen_consistency` mismatches at every eval (vs. `127/127` under `soft`)
-— confirms `single_pass` multi-mode decode and stack's staged decode are
-both exactly correct, not just correct modulo sampling noise. `stack`
-beat `concat` on `best_val_bpb` (2.6848 vs 2.7679) and on codebook
-utilization (see below). Both runs also share a real, unresolved,
-architecture-independent finding: level1's own generation collapses
-into a short repeating token cycle regardless of `code_sample_mode` —
-not yet root-caused (see docs/status.md).
-
-**New diagnostic: `scripts/measure_code_entropy.py`** (2026-08-18) —
-loads a checkpoint, samples `N_BATCHES` train/val batches, reports each
-level's `entropy_reg` (already exposed in `RefineLM.forward`'s metrics
-dict) plus a directly interpretable **distinct-codes-used / possible-ids**
-count via `quant.to_ids()`. `--only <substring>` filters by checkpoint
-name. Used to decide whether `entropy_reg_weight>0` is worth trying:
-BSQ's 65536-corner codebook sits at only ~3.3-3.6% utilization
-(unregularized) — the more plausible target — vs. softmax's much
-smaller 256-way vocab already reaching 20-59% without any regularization.
-Full table and caveats (position-count normalization, cumulative-count
-semantics): docs/status.md's 2026-08-18 entries. Old checkpoints
-predating the `code_sample_mode`/`quant_type` unification (e.g.
-`qcute_v5_2_bsq16`, `qcute_v5_concat_2_bsq16` — the only existing
-`Ks=(4,1)` BSQ checkpoints) are NOT usable with this script or any
-current code — `Config(**ckpt['cfg'])` fails outright on the
-since-removed `use_gumbel_noise` field, and even patched, the state_dict
-predates the qfb fix/`_skip` promotion so it likely won't load either.
-
-**`qcute_v5.py`'s "query first byte" (qfb) fix**: `cross_attn_stage`'s
-strict causal mask (`code_pos < query_pos`) means the row that would
-predict a block's FIRST element from that block's own just-completed
-code is the same row the code was derived from — excluded by
-construction, so a code only ever conditions predictions from a block's
-SECOND element onward. Fixed with one extra, unconditionally-patched
-cross-attention query per block (`LevelLM.decode_boundary_query`, a
-shared fixed vector, sidesteps the chicken-and-egg problem since nothing
-computed it FROM the code it attends to) — applied identically to every
-track at every level (self or coarser), replacing `selfcode_decode`
-entirely; `RefineLM._run`'s decode loop is now one uniform per-level loop
-over every track, no track-index or level special-casing. Two real bugs
-surfaced and fixed while building this (self-referential code extraction;
-a length-dependent internal patch that broke KV-cache append-only
-semantics — every block's boundary row is now patched unconditionally,
-never conditioned on "is this the last block visible in this call", so a
-row's content depends only on its own causal past, never on how much
-sequence follows it within the current call). The old level1-only
-diagnostics (`generate_level1_codes`, `generate_level1_codes_via_decode`,
-`level1_ground_truth_codes`) are generalized to `generate_level_codes`
-etc., parameterized by `level`. Full narrative, the bug hunt, and a
-concrete `n_levels=1/2/3` byte-level walkthrough:
-[docs/status.md](docs/status.md).
-
-Configs: `configs/qcute_v5_concat_*.py`, `configs/overfit/qcute_v5_concat_*.py`
-(now running against `qcute_v5_concat_slow.py`, repointed at rename time),
-`configs/overfit_concat_eff/`, `configs/overfit_stack_eff/`,
-`configs/qcute_v5_stack_*.py`.
-
-Archived lineage summary, oldest to newest:
-- `qcute_refine_v1.py`/`v2.py`/`v3.py`: pre-v4 history — BSQ code
-  hand-off with a joint-chain-MTP detokenizer, then a cross-attending
-  `DecoderLevel`, then EncoderLevel fusion.
-- `qcute_refine_v4.py`: removes `DecoderLevel` entirely — it turned out
-  to do the literal same job as fusion (predict a level's own next
-  token, optionally conditioned on the coarser code) and never
-  contributed to `byte_loss` even in v3. `EncoderLevel` renamed to
-  `LevelLM` (the class now does both the "encode" job — PASS 1, produce
-  the code — and the "decode" job — PASS 2, fused/conditioned
-  prediction — so "Encoder" alone was misleading). Generation
-  (`generate_no_cache`/`generate_kv_cache`) is fusion-aware — v3's own
-  generation functions were copied unchanged from v2 and never touched
-  cross-attention at all, a real train/inference mismatch v4 fixes.
-  `qcute.bytelm`/`qcute.bpelm` also gained matching `generate_kv_cache`/
-  `validate_generation` this session, same pattern.
-- `qcute_refine_v4_4.py`/`qcute_refine_v4_5.py`: v4.4 adds
-  packed-sequence multi-track cumulative decode (self + every coarser
-  level's code, `decode_pack_mode`); v4.5 replaces that with explicit
-  staged cross-attention through the same shared weights (no packed
-  sequences). Both support `Config.share_level_weights` (default `True`,
-  original behavior unchanged) — `False` gives every level (v4.4) or
-  every level's own encode LM plus one independent LM per decode
-  cross-attention track (v4.5) fully independent weights, coupled only
-  through the bare integer code id crossing between them.
-- `qcute_refine_v4_4_1.py`/`qcute_refine_v4_5_1.py`: fix the self
-  track's decode conditioning to be genuine LM continuation (`code_b`
-  conditions block `b+1`, never its own block `b` — the original
-  v4.4/v4.5 mechanism was an accidental autoencoder for the self track
-  specifically). Math:
-  [docs/qcute_refine_v4_4_1_v4_5_1_math.md](docs/qcute_refine_v4_4_1_v4_5_1_math.md)
-  (this doc itself is not archived — its "self-code LM continuation"
-  mechanism carries over unchanged into `qcute_v5_concat.py`/
-  `qcute_v5_stack.py`, see below).
-
 `qcute_v5_concat.py` (from v4.4.1's packed self-attention decode) and
 `qcute_v5_stack.py` (from v4.5.1's staged cross-attention decode) add
 `Config.quant_type: "softmax"` (default, unchanged categorical code) or
@@ -369,6 +137,45 @@ yet tells you little about its behavior at scale.
 Ranks generation/architecture-correctness difficulty (raggedness, warm-up depth), not
 training/learnability difficulty — a high-product config may be easier to overfit10k
 (fewer effective tokens) despite being harder to verify `check_gen_consistency` on.
+
+**Latent-AR / parallel-block-local-decode investigation (2026-08-19, in progress)**: motivated
+by the observation that today's decode is DenseNet-like, not a chain — `decode_level`'s
+`for j in range(i, n_levels)` makes every level's decode cross-attend to its OWN self-code
+*and* every coarser level's code simultaneously (self-track + all-coarser, pervasive/dense),
+not just the next level up. Two coupling axes identified, both currently forced dense:
+1. **Track sparsity** (which levels condition which): target is a sparse topology (e.g. only
+   the deepest/topmost level conditions the lowest, with a configurable "in-between" set),
+   not today's all-to-all. Plan: a `track_dropout_p0`/`track_dropout_decay_steps`/
+   `track_dropout_schedule` curriculum, structurally identical to the existing `quant_dropout_p0`
+   mechanism (see above) — starts fully dense (keeps the training-convergence benefit dense
+   coupling appears to provide — matches the already-documented moving-target/cascade slow-
+   convergence finding for even fully-dense `n_levels=2` configs) and stochastically prunes
+   *middle* tracks over training, always keeping self + topmost, converging toward the sparse
+   target. Validation reuses existing infra with zero new eval code: `qualitative_generate`'s
+   `level0_mode{m}` loop (logs generation quality at every `max_decode_sources` depth) already
+   measures the dense-vs-sparse-inference gap directly — success criterion is that gap shrinking
+   over the curriculum vs. a dense-only control.
+2. **Window size** (how far back each surviving track can see): `decode_windows[i][0]` (the
+   self track) doubles as BOTH the self-code cross-attention window AND the raw byte-level
+   self-attention window (`merged_layout`'s `w0 = tracks_meta[0][1]`, shared by both decoders'
+   `t==0`/self stage) — coupled, not independently configurable today. Coarser tracks (`j>i`,
+   `cross_attn_stage`, `t>=1` in `StackDecoder`) are ALREADY independently windowed per track —
+   no code change needed to test "decode only needs 1-2 codes from the level above." Ultimate
+   motivation for both axes: enable a higher level to draft a window of future codes via its own
+   AR generation (`generate_level_codes`, already exists) ahead of time, then decode level0 for
+   many blocks in one batched parallel pass (no verifier, unlike speculative decoding — accepted
+   as a latency trick, not an exactness-preserving one), since each block's decode would then
+   only need a small already-available window into the level above plus its own block-local
+   (never cross-block) self-attention.
+
+**Hypothesis test plan** (staged, cheapest/most-falsifiable first, config-only where possible):
+window-size ablation (self-track window = block size K_i, then also shrinking the coarser
+track's window to ~1-2 codes) on top of the winning FSQ grid configs (`grid_dq=16`/
+`grid_levels=8`, `code_hard=True`/`code_sample=False`), `Ks=(2,1)` and `Ks=(2,2,1)`, run on a
+~10% data subset for fast iteration — see `configs/v5_stack_windowtest/`. Track-dropout
+curriculum (axis 1) and the actual generation-side rewrite (batched parallel decode) are
+deferred until the window-ablation result is in. Full narrative/results once the hypothesis
+tests complete: [docs/status.md](docs/status.md).
 
 Diagnostic: `scripts/probe_decoder_kv_contribution.py` (gradient/
 ablation/attention-mass analysis of how much cross-attention KV actually

@@ -1,6 +1,9 @@
 """v5_stack_gmm/ks1_256_diag: same as ks1_256.py but quant_type="gmm_diag" (diagonal
-covariance) -- sibling A/B, gmm_k=256/gmm_dq=4 unchanged. Cheaper head (256*(1+2*4)=2304 vs
-full-cov's 3840) and no triangular-solve sampling path.
+covariance), gmm_dq=8 (raised from 4). Cheaper head (256*(1+2*8)=4352) and no
+triangular-solve sampling path. code_hard=True/code_sample=False (deterministic mean+STE,
+matches ks1_256.py). Clean rerun -- the previous gmm_dq=4 run predates the eval_model_full
+chunking fix and stopped early (step 7399/8000) with corrupted live-logged metrics; not a
+trustworthy leaderboard entry, see docs/status.md.
 
 uv run python -m qcute.qcute_v5 --decoder_type stack --config configs/v5_stack_gmm/ks1_256_diag.py
 
@@ -20,7 +23,7 @@ code_hard = True
 code_sample = False
 quant_type = "gmm_diag"
 gmm_k = 256
-gmm_dq = 4
+gmm_dq = 8
 vocab = 256
 input_preset = 8
 output_preset = 8

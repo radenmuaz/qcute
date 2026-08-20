@@ -18,7 +18,8 @@ class Encoder(nn.Module):
     def quant(self):
         return self.lm.quant
 
-    def forward(self, seq_repr: torch.Tensor, level: int, window: int | None, compute_ntp: bool = True) -> dict:
+    def forward(self, seq_repr: torch.Tensor, level: int, window: int | None, compute_ntp: bool = True,
+                compute_code: bool = True) -> dict:
         cfg = self.cfg
         bb = self.lm
         K = cfg.Ks[level]
@@ -40,6 +41,9 @@ class Encoder(nn.Module):
             ntp_loss = h.new_zeros(())
             ntp_acc = h.new_zeros(())
 
-        extracted = bb.extract_code(h, x0, K, window)
-        return make_dict(code=extracted["code"], ntp_loss=ntp_loss, ntp_acc=ntp_acc, hidden=h,
-                          entropy_reg=extracted["entropy_reg"])
+        if compute_code:
+            extracted = bb.extract_code(h, x0, K, window)
+            code, entropy_reg = extracted["code"], extracted["entropy_reg"]
+        else:
+            code = entropy_reg = None
+        return make_dict(code=code, ntp_loss=ntp_loss, ntp_acc=ntp_acc, hidden=h, entropy_reg=entropy_reg)

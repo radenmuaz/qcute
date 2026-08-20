@@ -269,27 +269,63 @@ the full `256`-token context.
 
 | rank | config | mechanism | best val_bpb | params | FLOPs/token | FLOPs/ctx |
 |---|---|---|---|---|---|---|
-| 1 | `bytelm_xs4_ctx256_fullval` | byte-level baseline (no hierarchy/quantizer at all) | 2.4235 | 3.400M | 6.80M | 1740.8M |
-| 2 | `bytelm_xs2_ctx256_fullval` | byte-level baseline | 2.4502 | 1.800M | 3.60M | 921.6M |
-| 3 | `qcute_v5_stack_noreg/ks1_soft` | simplex, `code_hard=False/code_sample=False` | 2.4597 | 2.103M | 4.21M | 1076.7M |
-| 4 | `v5_stack_fsq_ks1_16x16` | grid/FSQ, dq=16/levels=16 | 2.4915† | 1.989M | 3.98M | 1018.4M |
-| 5 | `v5_stack_fsq_ks1_16x4` | grid/FSQ, dq=16/levels=4 | 2.5229 | 1.792M | 3.58M | 917.5M |
-| 6 | `v5_stack_fsq_ks1_8x8` | grid/FSQ, dq=8/levels=8 | 2.5523 | 1.784M | 3.57M | 913.4M |
-| 7 | `bytelm_xs1_ctx256_fullval` | byte-level baseline | 2.5846 | 1.100M | 2.20M | 563.2M |
-| 8 | `v5_stack_fsq_ks1` | grid/FSQ, dq=4/levels=8 | 2.6114 | 1.747M | 3.49M | 894.5M |
-| 9 | `v5_stack_fsq_ks1_4x8` | grid/FSQ, dq=8/levels=4 | 2.6651 | 1.751M | 3.50M | 896.5M |
-| 10 | `qcute_v5_stack_noreg/ks1` | simplex, `code_hard=True` | 2.7246 | 1.972M | 3.94M | 1009.7M |
-| 11 | `qcute_v5_stack_noreg/ks21` | simplex, Ks=(2,1) | 2.8105 | 5.257M | 10.51M | 2691.6M |
-| 12 | `qcute_v5_stack_noreg/ks221` | simplex, Ks=(2,2,1) | 2.8414 | 9.463M | 18.93M | 4845.1M |
+| 1 | `v5_stack_simplex_pq_ks21` | simplex PQ, vocab=8/pq_chunks=32, Ks=(2,1) | **2.3811** | 5.130M | 10.26M | 2626.6M |
+| 2 | `v5_stack_simplex_pq_ks221` | simplex PQ, vocab=8/pq_chunks=32, Ks=(2,2,1) | 2.3947 | 9.145M | 18.29M | 4682.2M |
+| 3 | `bytelm_xs4_ctx256_fullval` | byte-level baseline (no hierarchy/quantizer at all) | 2.4235 | 3.400M | 6.80M | 1740.8M |
+| 4 | `bytelm_xs2_ctx256_fullval` | byte-level baseline | 2.4502 | 1.800M | 3.60M | 921.6M |
+| 5 | `qcute_v5_stack_noreg/ks1_soft` | simplex, `code_hard=False/code_sample=False` | 2.4597 | 2.103M | 4.21M | 1076.7M |
+| 6 | `v5_stack_fsq_ks12_16x8` | grid/FSQ, dq=16/levels=8, Ks=(1,2) | 2.4630 | 4.644M | 9.29M | 2377.7M |
+| 7 | `v5_stack_fsq_ks41_16x8` | grid/FSQ, dq=16/levels=8, Ks=(4,1) | 2.4678 | 4.644M | 9.29M | 2377.7M |
+| 8 | `v5_stack_fsq_ks21_16x8` | grid/FSQ, dq=16/levels=8, Ks=(2,1) | 2.4761 | 4.644M | 9.29M | 2377.7M |
+| 9 | `v5_stack_fsq_ks1_16x16` | grid/FSQ, dq=16/levels=16, Ks=(1,) | 2.4915† | 1.989M | 3.98M | 1018.4M |
+| 10 | `v5_stack_fsq_ks1_16x8` | grid/FSQ, dq=16/levels=8, Ks=(1,) | 2.5140 | 1.858M | 3.72M | 951.3M |
+| 11 | `v5_stack_fsq_ks1_16x4` | grid/FSQ, dq=16/levels=4 | 2.5229 | 1.792M | 3.58M | 917.5M |
+| 12 | `v5_stack_fsq_ks1_8x8` | grid/FSQ, dq=8/levels=8 | 2.5523 | 1.784M | 3.57M | 913.4M |
+| 13 | `bytelm_xs1_ctx256_fullval` | byte-level baseline | 2.5846 | 1.100M | 2.20M | 563.2M |
+| 14 | `v5_stack_gmmdiag_pq_ks221` | gmm-diag PQ, dq=4/pq_chunks=4/k=8, Ks=(2,2,1) | 2.5959 | 7.869M | 15.74M | 4028.9M |
+| 15 | `v5_stack_gmmdiag_pq_ks21` | gmm-diag PQ, dq=4/pq_chunks=4/k=8, Ks=(2,1) | 2.6066 | 4.372M | 8.74M | 2238.5M |
+| 16 | `v5_stack_fsq_ks1` | grid/FSQ, dq=4/levels=8 | 2.6114 | 1.747M | 3.49M | 894.5M |
+| 17 | `v5_stack_fsq_ks221_16x8` | grid/FSQ, dq=16/levels=8, Ks=(2,2,1) | 2.6625 | 8.360M | 16.72M | 4280.3M |
+| 18 | `v5_stack_fsq_ks1_4x8` | grid/FSQ, dq=8/levels=4 | 2.6651 | 1.751M | 3.50M | 896.5M |
+| 19 | `qcute_v5_stack_noreg/ks1` | simplex, `code_hard=True` | 2.7246 | 1.972M | 3.94M | 1009.7M |
+| 20 | `qcute_v5_stack_noreg/ks21` | simplex, Ks=(2,1) | 2.8105 | 5.257M | 10.51M | 2691.6M |
+| 21 | `qcute_v5_stack_noreg/ks221` | simplex, Ks=(2,2,1) | 2.8414 | 9.463M | 18.93M | 4845.1M |
 | — | `v5_stack_gmm_ks1_256` | gmm full-cov, K=256/dq=4 | not trustworthy, see above | 1.988M | 3.98M | 1018.5M |
-| — | `v5_stack_gmm_ks1_256_diag` | gmm diag, K=256/dq=4 | not trustworthy, see above | 1.982M | 3.96M | 1014.6M |
+| — | `v5_stack_gmm_ks1_256_diag` (dq=4 version) | gmm diag, K=256/dq=4 | not trustworthy, see above (superseded by dq=8/pq_chunks below) | 1.982M | 3.96M | 1014.6M |
 
 † `v5_stack_fsq_ks1_16x16`'s live-logged number was corrupted by the MPS glitch above; this is the
 corrected value from a clean CPU replay of its final (step 8000) checkpoint.
 
-Patterns holding: every non-hardened/continuous config (`ks1_soft`, `bytelm`'s own no-quantizer
-baseline) clusters at the top, `bytelm_xs4` still wins outright; among genuinely discrete
-`code_hard=True` schemes, FSQ/grid beats simplex at every grid size tried and the biggest grid
-(`16x16`) is now the best discrete-code config overall; going deeper in the hierarchy (`ks21`,
-`ks221`) consistently hurts, and costs more params/FLOPs for it. GMM still has no trustworthy
-number -- both runs need a clean rerun with the fixed `eval_model_full` before ranking.
+**Product quantization (PQ) for `simplex`/`gmm`/`gmm_diag` (2026-08-19/20)**: `Config.pq_chunks`
+(default 1, no-op) generalizes both `SimplexQuant` and `GMMQuant`/`GMMDiagQuant` to chunked
+codes, standard PQ-literature convention -- `vocab`/`gmm_k` is the FIXED per-chunk codebook
+size, `pq_chunks` is a pure multiplier: total combinatorial capacity is
+`(per-chunk size)^pq_chunks` instead of one flat shared table. (`grid`/`binary` don't need this
+-- they're already fully per-dimension factorized, `levels^dq`/`2^bits`.) Motivated by the FSQ
+grid ablation's own finding: `ks1_4x8` (8 dims x 4 levels) scored *worse* than `ks1` (4 dims x 8
+levels) despite 16x more nominal capacity -- more independent low-resolution chunks beats fewer
+high-resolution ones, and that finding transfers directly to PQ chunk-count choice.
+`SimplexQuant`'s own chunking initially divided `vocab` (the wrong convention -- confusingly
+coupled `vocab`'s dual role as both codebook-size AND representational-width); corrected to
+match `GMMQuant`'s already-standard convention (divide the dimension, keep K fixed) before
+queueing the real runs above. `simplex_pq` (`vocab=8`/`pq_chunks=32`, chosen to match the FSQ
+ablation's own empirical sweet spot of ~8-way per-unit resolution) is now the **best config of
+the entire session** on both `Ks=(2,1)` and `Ks=(2,2,1)` -- a *learned* per-chunk categorical
+(softmax) beats FSQ's fixed uniform grid at comparable capacity. `gmmdiag_pq` (`gmm_dq=4`/
+`pq_chunks=4`/`gmm_k=8`, deliberately kept small since gmm_diag has been the slowest quant_type
+observed all session -- the `gmm_dq=8`/`k=256` non-PQ rerun alone took ~5.5h vs ~30-65min for
+grid/simplex at comparable scale) beat neither FSQ nor simplex-PQ, though it's a real
+apples-to-apples match against `v5_stack_fsq_ks1` (both 8^4=4096 capacity) -- learned Gaussian
+bins did *not* beat FSQ's fixed grid at matched capacity here, unlike simplex-PQ's win.
+
+Patterns holding/updated: simplex-PQ now dominates the top of the table, overturning the prior
+"FSQ/grid beats simplex at every grid size" finding -- that pattern held only for UN-chunked
+simplex (a single flat 256-way softmax); once simplex gets the same chunked-independent-units
+treatment FSQ already had by construction, it wins. `bytelm_xs4`'s continuous/no-quantizer
+baseline is no longer the outright best -- both simplex-PQ configs beat it now. Among the
+non-PQ, non-continuous configs, `Ks=(1,2)`/`Ks=(4,1)`/`Ks=(2,1)` (16x8 grid) are now closely
+clustered just above `bytelm_xs4`; 3-level configs (`ks221_16x8`) still consistently underperform
+their 2-level siblings at this step budget/scale, both for FSQ and PQ-simplex (though PQ-simplex's
+2-vs-3-level gap, 2.3811 vs 2.3947, is far smaller than FSQ's, 2.4761/2.4630 vs 2.6625). GMM
+(both full-cov and PQ-diag) has never produced a config that wins outright; full-cov GMM still
+has no trustworthy number at all (needs a clean rerun with the fixed `eval_model_full`).
