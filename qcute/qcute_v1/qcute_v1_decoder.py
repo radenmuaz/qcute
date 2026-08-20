@@ -538,6 +538,82 @@ class Decoder(nn.Module):
         return n_mismatch
 
     @torch.no_grad()
+    def check_decode_modes(self, model, full_bytes: torch.Tensor, device: str, log=print,
+                            label: str = "") -> dict:
+        """Dual-mode generation-quality proxy from docs/qcute_v1_plan.md's generation-feasibility
+        section: decode level0 twice for the same span -- once from the REAL ground-truth own-code
+        (gt mode, upper bound on decode quality) and once from level1's OWN sampled prediction of
+        that code (pred mode, the actual generation-time signal, "always lead one block ahead") --
+        report byte accuracy against ground truth for each. A large gt-vs-pred gap means level1's
+        code forecast isn't informative enough to support real generation on its own (see the
+        "two paths" discussion -- path (a), draft+encode+refine, would be the fallback). Position
+        0's block has no level1 prediction (nothing precedes it), so both modes are compared over
+        blocks 1..n_blocks-1 only, the same span either way. Diagnostic only. n_levels>=2 required
+        (no-op otherwise); n_levels>2 not yet generalized (only level0/level1 handled)."""
+        if model.n_levels < 2:
+            log(f"decode_modes{'_' + label if label else ''}: skipped (n_levels==1)")
+            return {}
+        was_training = model.training
+        model.eval()
+        full_bytes = full_bytes.to(device)
+        if full_bytes.dim() == 1:
+            full_bytes = full_bytes.unsqueeze(0)
+        cfg = model.cfg
+        K = cfg.Ks[0]
+        L = full_bytes.shape[1]
+        n_blocks = L // K
+        prefix = f"decode_modes_{label}" if label else "decode_modes"
+        if n_blocks < 2:
+            log(f"{prefix}: skipped (need >=2 blocks for level1 to have a real prediction)")
+            if was_training:
+                model.train()
+            return {}
+
+        enc0, enc1 = model.encoders[0], model.encoders[1]
+        enc0_out = enc0(full_bytes, level=0, window=model.windows[0], compute_ntp=False)
+        real_code = enc0_out["code"][:, :n_blocks, :]
+        enc1_out = enc1(real_code, level=1, window=model.windows[1], compute_ntp=False)
+        h1 = enc1_out["hidden"]
+        predicted_code = enc1.quant.sample_next(enc1.lm, h1[:, :-1, :], cfg.vocab)
+
+        gt_code = real_code[:, 1:, :]
+        n_cmp = gt_code.shape[1]
+        B = full_bytes.shape[0]
+        target_bytes = full_bytes[:, K:n_blocks * K].reshape(B, n_cmp, K)
+
+        decoder = model.decoder
+        bb_self, bb_cross = decoder.stage_lms[0][0], decoder.stage_lms[0][1]
+        self_window = model.decode_windows[0][0]
+        own_code_window = model.decode_windows[0][1] if len(model.decode_windows[0]) > 1 else None
+
+        def decode_from(code):
+            code_embeds = bb_cross.quant.embed_for_decode(bb_cross, code)
+            buf = target_bytes.reshape(B, n_cmp * K).clone()  # causal, so initial values here never leak (see check_roundtrip_consistency)
+            for t in range(K):
+                x0 = bb_self.embed_input(buf, True)
+                h_self = bos_interleaved_self_attn(bb_self, x0, K, self_window)
+                stage_result = cross_attn_stage(bb_cross, h_self, code_embeds, buf, 0, K,
+                                                  own_code_window, compute_ntp=False, want_code=False)
+                h = stage_result["hidden"].view(B, n_cmp, K, -1)
+                next_byte = sample_next_byte(bb_cross.embed.weight, h[:, :, t, :])
+                buf = buf.view(B, n_cmp, K).clone()
+                buf[:, :, t] = next_byte
+                buf = buf.view(B, n_cmp * K)
+            return buf.view(B, n_cmp, K)
+
+        gt_acc = (decode_from(gt_code) == target_bytes).float().mean().item()
+        pred_acc = (decode_from(predicted_code) == target_bytes).float().mean().item()
+        if was_training:
+            model.train()
+
+        def fmt(a):
+            return "1.0" if a >= 1.0 else f"{a:.2f}".lstrip("0")
+        log(f"{prefix}: gt_byte_acc={fmt(gt_acc)}  pred_byte_acc={fmt(pred_acc)}  "
+            f"(gt=decode from real ground-truth code, upper bound; pred=decode from level1's own "
+            f"sampled code prediction, the real generation-time signal)")
+        return {"gt_byte_acc": gt_acc, "pred_byte_acc": pred_acc}
+
+    @torch.no_grad()
     def generate_level_codes(self, model, prompt_bytes: torch.Tensor, level: int, n_new_codes: int,
                               device: str) -> torch.Tensor:
         was_training = model.training
@@ -672,11 +748,12 @@ class StackDecoder(Decoder):
     def __init__(self, cfg: Config, n_levels: int, encoders, d_models, n_layers_list, vocabs):
         super().__init__(cfg, n_levels)
 
-        def make_stage(i, is_top):
-            if is_top and cfg.share_encode_decode_self:
-                bb = encoders[i].lm
-            else:
-                bb = LM(cfg, d_models[i], n_layers_list[i], vocabs[i])
+        def make_self_stage(i):
+            # share_encode_decode_self: reuse encode's own LM (embed, blocks, self_code_const --
+            # everything except decode's separate cross-attention stage) for decode's self-attn
+            # stage, for BOTH top (unchanged v5 behavior) and non-top levels (bb_self only --
+            # bb_cross always stays a separate LM regardless of this flag).
+            bb = encoders[i].lm if cfg.share_encode_decode_self else LM(cfg, d_models[i], n_layers_list[i], vocabs[i])
             if not hasattr(bb, "merged_cache"):
                 bb.merged_cache = {}
             return bb
@@ -684,9 +761,9 @@ class StackDecoder(Decoder):
         def make_level(i):
             is_top = i == n_levels - 1
             if is_top:
-                return nn.ModuleList([make_stage(i, True)])
+                return nn.ModuleList([make_self_stage(i)])
             cross_layers = cfg.decode_cross_stage_layers if cfg.decode_cross_stage_layers is not None else n_layers_list[i]
-            bb_self = make_stage(i, False)
+            bb_self = make_self_stage(i)
             bb_cross = LM(cfg, d_models[i], cross_layers, vocabs[i])
             if not hasattr(bb_cross, "merged_cache"):
                 bb_cross.merged_cache = {}

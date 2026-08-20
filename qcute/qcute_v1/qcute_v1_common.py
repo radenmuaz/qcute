@@ -1334,6 +1334,7 @@ def train(model, train_data: torch.Tensor, val_data: torch.Tensor, args, log, ru
                     model.decoder.check_gen_consistency(model, window, device, prompt_len=args.qual_prompt_bytes,
                                                           log=log, label=label)
                     model.decoder.check_roundtrip_consistency(model, window, device, log=log, label=label)
+                    model.decoder.check_decode_modes(model, window, device, log=log, label=label)
 
 
 def build_argparser(description: str) -> tuple:
