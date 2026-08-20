@@ -13,7 +13,9 @@ uv run python scripts/plot_run.py logs/v1_stack_simplex_ks21_v64_pq4_overfit10k
 from pathlib import Path
 
 run_name = "v1_stack_simplex_ks21_v64_pq4_overfit10k"
-decoder_type = "stack"
+decoder_type = "stack"  # StackDecoder -- the current default lineage (chat 2026-08-20:
+# StackDecoderV1 is now legacy, memory-expensive relative to this one, see
+# encode_like_self_attn_decode/seed_query_decode's docstrings)
 Ks = (2, 1)
 d_model = 256
 n_layers = 1
@@ -41,7 +43,9 @@ log_every = 20
 eval_every = 50
 eval_batches = 5
 
-qual_gen_bytes = 64  # StackDecoderV1's own check_roundtrip_consistency/check_decode_modes ARE
-# implemented for this decoder_type (unlike the newer stack_v2/stack_v2_local, whose generation
-# path is still unsettled, see chat/docs 2026-08-20) -- overfit sanity check: can it memorize and
-# regenerate the training corpus via decode-from-own-code round-trip?
+qual_gen_bytes = 0  # check_gen_consistency/check_roundtrip_consistency/check_decode_modes (called
+# whenever qual_gen_bytes>0) are still StackDecoderV1-specific (reference bos_interleaved_self_attn/
+# own_block_cross_attn_decode and the bb_self/bb_cross stage_lms split directly, on the Decoder base
+# class -- would crash against StackDecoder's different stage_lms structure). StackDecoder's own
+# generation fix (StackDecoder._generate_blockwise, chat 2026-08-20) is validated separately via
+# check_blockwise_gen_consistency, called manually/from a script, not wired into this training loop.

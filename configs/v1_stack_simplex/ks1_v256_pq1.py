@@ -4,7 +4,7 @@ unchanged-from-v5 genuine self-code-recurrent NTP path (see that config's docstr
 quant_type=simplex, vocab=256, pq_chunks=1 -- paired against ks1_v64_pq4.py's PQ variant.
 Scale/schedule matches the v5_stack_fsq/* full-scale convention (steps=8000, context=256).
 
-uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks1_v256_pq1.py
+uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack_v1 --config configs/v1_stack_simplex/ks1_v256_pq1.py
 
 # plot after training:
 uv run python scripts/plot_run.py logs/v1_stack_simplex_ks1_v256_pq1
@@ -12,7 +12,7 @@ uv run python scripts/plot_run.py logs/v1_stack_simplex_ks1_v256_pq1
 from pathlib import Path
 
 run_name = "v1_stack_simplex_ks1_v256_pq1"
-decoder_type = "stack"
+decoder_type = "stack_v1"
 Ks = (1,)
 d_model = 256
 n_layers = 1

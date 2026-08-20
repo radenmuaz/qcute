@@ -4,7 +4,7 @@ width. n_levels=1, so decode is the unchanged-from-v5 top-level NTP path (see ks
 docstring); this config isolates whether the PQ-vs-no-PQ pattern from v5's FSQ/simplex-PQ
 ablations still holds at qcute_v1's baseline (n_levels=1) scale.
 
-uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks1_v64_pq4_overfit10k.py
+uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack_v1 --config configs/v1_stack_simplex/ks1_v64_pq4_overfit10k.py
 
 # plot after training:
 uv run python scripts/plot_run.py logs/v1_stack_simplex_ks1_v64_pq4_overfit10k
@@ -12,7 +12,7 @@ uv run python scripts/plot_run.py logs/v1_stack_simplex_ks1_v64_pq4_overfit10k
 from pathlib import Path
 
 run_name = "v1_stack_simplex_ks1_v64_pq4_overfit10k"
-decoder_type = "stack"
+decoder_type = "stack_v1"
 Ks = (1,)
 d_model = 256
 n_layers = 1

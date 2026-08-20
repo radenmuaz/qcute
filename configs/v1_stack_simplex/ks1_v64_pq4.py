@@ -2,7 +2,7 @@
 validation in ks1_v64_pq4_overfit10k.py. n_levels=1, vocab=64/pq_chunks=4 PQ variant paired
 against ks1_v256_pq1.py's single-softmax baseline. See ks1_v256_pq1.py for scale/schedule notes.
 
-uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks1_v64_pq4.py
+uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack_v1 --config configs/v1_stack_simplex/ks1_v64_pq4.py
 
 # plot after training:
 uv run python scripts/plot_run.py logs/v1_stack_simplex_ks1_v64_pq4
@@ -10,7 +10,7 @@ uv run python scripts/plot_run.py logs/v1_stack_simplex_ks1_v64_pq4
 from pathlib import Path
 
 run_name = "v1_stack_simplex_ks1_v64_pq4"
-decoder_type = "stack"
+decoder_type = "stack_v1"
 Ks = (1,)
 d_model = 256
 n_layers = 1

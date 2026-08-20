@@ -19,7 +19,7 @@ uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_ctx1024.py   # nam
                                                  # configs/bytelm_xs_mtp4.py (context=256) is superseded, kept only
                                                  # for historical reproducibility, not a comparison target anymore
 uv run python scripts/plot_run.py logs/<run_name>   # train/val bpb PNG from a run's run.jsonl
-uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks21_v256_pq1.py
+uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks21_v256_pq1_overfit10k.py
                                                  # ACTIVE lineage: qcute_v1 (qcute/qcute_v1/) is where the
                                                  # latent-AR / parallel-block-local-decode rewrite (see below)
                                                  # is actually implemented -- forked from a verbatim copy of
@@ -104,9 +104,19 @@ the staged plan: [docs/qcute_v1_plan.md](docs/qcute_v1_plan.md). Progress/result
 [docs/archive2/status.md](docs/archive2/status.md)).
 
 **TODO for a fresh session**: `configs/v1_stack_simplex/ks21_v256_pq1.py` and `ks21_v64_pq4.py`
-need re-running (full-scale, `--decoder_type stack`) — their existing `best_val_bpb` numbers in
-`docs/status.md` predate the own-block-reconstruction fix above and are stale. `ks1_*` configs
-(`Ks=(1,)`, no non-top level) are unaffected and don't need re-running.
+need re-running (full-scale, `--decoder_type stack_v1` — these two configs are pinned to the now-
+legacy `StackDecoderV1`, see below) — their existing `best_val_bpb` numbers in `docs/status.md`
+predate the own-block-reconstruction fix above and are stale. `ks1_*` configs (`Ks=(1,)`, no
+non-top level) are unaffected and don't need re-running.
+
+**`--decoder_type` naming (2026-08-20)**: `stack` now means the current-default `StackDecoder`
+(formerly `stack_v2`); the original interleaved-seed-token mechanism is `stack_v1`
+(`StackDecoderV1`, now considered legacy — memory-heavier than `stack`'s non-interleaved design,
+see `qcute_v1_decoder.py`'s `encode_like_self_attn_decode`/`seed_query_decode` docstrings). Also
+available: `stack_local` (`StackDecoderLocal`, block-diagonal same-level conditioning) and
+`stack_sync` (`StackDecoderSync`, design-note stub, `NotImplementedError` on use). Real,
+incrementally-correct (not yet KV-cached) generation now works for both `stack_v1` and `stack`
+(`n_levels==2` only so far) — see each class's `_generate_blockwise`/`check_blockwise_gen_consistency`.
 
 The rest of this section (below) describes `qcute_v5`'s own architecture — still accurate for
 that (frozen, archived) lineage, kept for reference when working in `qcute/v5_old/`.

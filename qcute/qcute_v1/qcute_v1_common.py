@@ -1348,7 +1348,7 @@ def build_argparser(description: str) -> tuple:
 
     p = argparse.ArgumentParser(description=description, parents=[pre])
     p.add_argument("--decoder_type", type=str, default="concat",
-                    choices=["concat", "stack", "stack_v2", "stack_v2_local", "stack_v2_sync"])
+                    choices=["concat", "stack_v1", "stack", "stack_local", "stack_sync"])
     p.add_argument("--Ks", default=(32, 32))
     p.add_argument("--d_model", type=parse_scalar_or_tuple, default=256)
     p.add_argument("--n_layers", type=parse_scalar_or_tuple, default=2)
@@ -1382,7 +1382,7 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--decode_cross_stage_layers", type=int, default=None)
     p.add_argument("--share_encode_decode_self", action="store_true")
     p.add_argument("--cond_depth", type=int, default=-1,
-                    help="StackDecoder (--decoder_type stack_v2) only: how many levels above own "
+                    help="StackDecoder (--decoder_type stack) only: how many levels above own "
                          "code each non-top level conditions on. -1 (default) = pervasive, every "
                          "level above. 1 = one level up only, the minimal own-code-plus-one-track shape.")
     p.add_argument("--grid_dq", type=int, default=None)

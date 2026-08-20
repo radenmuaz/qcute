@@ -9,7 +9,7 @@ never path (b) (no level above to predict a code from). quant_type=simplex, voca
 (paired against ks1_v64_pq4.py). Follows CLAUDE.md's standing overfit10k methodology
 (n_bytes=10000, context=256, steps=1000).
 
-uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks1_v256_pq1_overfit10k.py
+uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack_v1 --config configs/v1_stack_simplex/ks1_v256_pq1_overfit10k.py
 
 # plot after training:
 uv run python scripts/plot_run.py logs/v1_stack_simplex_ks1_v256_pq1_overfit10k
@@ -17,7 +17,7 @@ uv run python scripts/plot_run.py logs/v1_stack_simplex_ks1_v256_pq1_overfit10k
 from pathlib import Path
 
 run_name = "v1_stack_simplex_ks1_v256_pq1_overfit10k"
-decoder_type = "stack"
+decoder_type = "stack_v1"
 Ks = (1,)
 d_model = 256
 n_layers = 1

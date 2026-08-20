@@ -4,7 +4,7 @@ self-attn + cross-attn-to-own-code mechanism (see docs/qcute_v1_plan.md); level1
 unchanged genuine NTP over codes. quant_type=simplex, vocab=256, pq_chunks=1 -- paired against
 ks21_v64_pq4.py's PQ variant. Scale/schedule matches the v5_stack_fsq/* full-scale convention.
 
-uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks21_v256_pq1.py
+uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack_v1 --config configs/v1_stack_simplex/ks21_v256_pq1.py
 
 # plot after training:
 uv run python scripts/plot_run.py logs/v1_stack_simplex_ks21_v256_pq1
@@ -12,7 +12,7 @@ uv run python scripts/plot_run.py logs/v1_stack_simplex_ks21_v256_pq1
 from pathlib import Path
 
 run_name = "v1_stack_simplex_ks21_v256_pq1"
-decoder_type = "stack"
+decoder_type = "stack_v1"
 Ks = (2, 1)
 d_model = 256
 n_layers = 1

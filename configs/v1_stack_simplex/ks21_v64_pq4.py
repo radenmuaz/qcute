@@ -2,7 +2,7 @@
 validation in ks21_v64_pq4_overfit10k.py. Same as ks21_v256_pq1.py but vocab=64, pq_chunks=4 --
 4 independent 64-way softmaxes instead of one 256-way softmax, same total code width.
 
-uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks21_v64_pq4.py
+uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack_v1 --config configs/v1_stack_simplex/ks21_v64_pq4.py
 
 # plot after training:
 uv run python scripts/plot_run.py logs/v1_stack_simplex_ks21_v64_pq4
@@ -10,7 +10,7 @@ uv run python scripts/plot_run.py logs/v1_stack_simplex_ks21_v64_pq4
 from pathlib import Path
 
 run_name = "v1_stack_simplex_ks21_v64_pq4"
-decoder_type = "stack"
+decoder_type = "stack_v1"
 Ks = (2, 1)
 d_model = 256
 n_layers = 1
