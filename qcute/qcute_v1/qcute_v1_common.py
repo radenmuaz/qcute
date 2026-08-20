@@ -118,6 +118,7 @@ class Config:
     quant_dropout_schedule: str = "linear"
     decode_cross_stage_layers: int | None = None
     share_encode_decode_self: bool = False
+    cond_depth: int = -1
     pq_chunks: int = 1
     track_dropout_p0: float = 0.0
     track_dropout_ramp_steps: int | None = None
@@ -888,11 +889,14 @@ class LM(nn.Module):
         V = vocab
         self.embed = nn.Embedding(V, D)
         nn.init.normal_(self.embed.weight, std=0.02)
-        # trainable BOS, prepended before every K-block in qcute_v1's non-top-level decode (see
-        # docs/qcute_v1_plan.md) -- each block's self-attention chain is freshly seeded by this
-        # same constant rather than inheriting state from the previous block, since decode no
-        # longer fuses any code into self-attention at all (own-level code is cross-attended
-        # instead, see StackDecoder).
+        # trainable per-block SEED TOKEN, prepended before every K-block in qcute_v1's non-top-level
+        # decode (see docs/qcute_v1_plan.md) -- not "BOS" (a single sequence-start marker) or a
+        # "sink" (a passive fallback key that itself predicts nothing): it's a full token, going
+        # through self-attn/MLP/cross-attn like any real byte and genuinely predicting its block's
+        # own first byte from that block's own code (see StackDecoderV1, own_block_cross_attn_decode).
+        # Each block's self-attention chain is freshly seeded by this same constant rather than
+        # inheriting state from the previous block, since decode no longer fuses any code into
+        # self-attention at all (own-level code is cross-attended instead).
         self.self_code_const = nn.Parameter(torch.zeros(D))
         self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(D)
@@ -1091,7 +1095,7 @@ def track_dropout_p_at(step: int, p0: float, ramp_steps: int, schedule: str = "l
 
 def apply_track_dropout(tracks: list, p: float) -> list:
     """Returns a list of (original_index, track) pairs -- ALWAYS, even when nothing is pruned --
-    since StackDecoder's per-track stage weights (self.stage_lms[i][t]) are keyed by each
+    since StackDecoderV1's per-track stage weights (self.stage_lms[i][t]) are keyed by each
     track's ORIGINAL position (0=self, n_sources-1=topmost), not its position within whatever
     survives pruning; losing that would run topmost-track data through the wrong stage's
     weights. With probability p, prunes every track except the first (self, j==i) and the last
@@ -1343,7 +1347,8 @@ def build_argparser(description: str) -> tuple:
     pre_args, _ = pre.parse_known_args()
 
     p = argparse.ArgumentParser(description=description, parents=[pre])
-    p.add_argument("--decoder_type", type=str, default="concat", choices=["concat", "stack"])
+    p.add_argument("--decoder_type", type=str, default="concat",
+                    choices=["concat", "stack", "stack_v2", "stack_v2_local", "stack_v2_sync"])
     p.add_argument("--Ks", default=(32, 32))
     p.add_argument("--d_model", type=parse_scalar_or_tuple, default=256)
     p.add_argument("--n_layers", type=parse_scalar_or_tuple, default=2)
@@ -1376,6 +1381,10 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--ntp_head_tied", action="store_true")
     p.add_argument("--decode_cross_stage_layers", type=int, default=None)
     p.add_argument("--share_encode_decode_self", action="store_true")
+    p.add_argument("--cond_depth", type=int, default=-1,
+                    help="StackDecoder (--decoder_type stack_v2) only: how many levels above own "
+                         "code each non-top level conditions on. -1 (default) = pervasive, every "
+                         "level above. 1 = one level up only, the minimal own-code-plus-one-track shape.")
     p.add_argument("--grid_dq", type=int, default=None)
     p.add_argument("--grid_levels", type=int, default=None)
     p.add_argument("--grid_bound", type=str, default="sigmoid", choices=["sigmoid", "tanh"])
@@ -1519,6 +1528,7 @@ def config_from_args(args) -> Config:
         entropy_reg_weight=args.entropy_reg_weight, ntp_head_tied=args.ntp_head_tied,
         decode_cross_stage_layers=args.decode_cross_stage_layers,
         share_encode_decode_self=args.share_encode_decode_self,
+        cond_depth=args.cond_depth,
         grid_dq=args.grid_dq, grid_levels=args.grid_levels, grid_bound=args.grid_bound,
         grid_logistic_scale=args.grid_logistic_scale,
         gmm_k=args.gmm_k, gmm_dq=args.gmm_dq, gmm_bpb_precision_bits=args.gmm_bpb_precision_bits,

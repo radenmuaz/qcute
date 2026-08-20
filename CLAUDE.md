@@ -86,6 +86,31 @@ schedule.
 
 ## Architecture
 
+**`qcute_v1` (`qcute/qcute_v1/`) is the active lineage as of 2026-08-20** — forked from a verbatim
+copy of `qcute_v5` (now archived at `qcute/v5_old/`, see Commands above), implementing the
+latent-AR / parallel-block-local-decode rewrite: only the top level stays a genuine NTP/AR
+decoder; every level below decodes via per-block-seed-token-interleaved self-attention (a
+trainable seed token — neither a true single "BOS" (it recurs every block) nor a passive "sink"
+(it's a full token, not a fallback key that itself predicts nothing) — prepended before every
+`K`-block, not a recurrent self-code chain) plus cross-attention to that same block's own-level
+code, with the seed token's own hidden state genuinely reconstructing that block's own first byte
+from that block's own code (`own_block_cross_attn_decode`/`own_block_decode_loss` in
+`qcute_v1_decoder.py`, fixed
+2026-08-20 — an earlier version silently never let a block's own code inform its own
+reconstruction, see `docs/status.md`'s session log). Full design narrative, worked examples, and
+the staged plan: [docs/qcute_v1_plan.md](docs/qcute_v1_plan.md). Progress/results log:
+[docs/status.md](docs/status.md) (reset at the v1 transition — full v5-era history at
+[docs/archive4/status.md](docs/archive4/status.md), [docs/archive3/status.md](docs/archive3/status.md),
+[docs/archive2/status.md](docs/archive2/status.md)).
+
+**TODO for a fresh session**: `configs/v1_stack_simplex/ks21_v256_pq1.py` and `ks21_v64_pq4.py`
+need re-running (full-scale, `--decoder_type stack`) — their existing `best_val_bpb` numbers in
+`docs/status.md` predate the own-block-reconstruction fix above and are stale. `ks1_*` configs
+(`Ks=(1,)`, no non-top level) are unaffected and don't need re-running.
+
+The rest of this section (below) describes `qcute_v5`'s own architecture — still accurate for
+that (frozen, archived) lineage, kept for reference when working in `qcute/v5_old/`.
+
 `qcute_v5_concat.py` (from v4.4.1's packed self-attention decode) and
 `qcute_v5_stack.py` (from v4.5.1's staged cross-attention decode) add
 `Config.quant_type: "softmax"` (default, unchanged categorical code) or
@@ -98,14 +123,11 @@ much deeper gradient path back to the code producer — decode is now
 `n_layers * (1 + n_tracks)` deep sequentially, vs. the "concat"/v4.4-style
 decode's flat `n_layers`), and the `decode_code_ste` findings (predates
 `qcute_v5.py`/current `qcute_v5_concat.py` hardcoding `decode_code_ste`
-to always `True` — see above):
-[docs/status.md](docs/status.md) (reset partway through the v5 work —
-full pre-reset history at
-[docs/archive2/status.md](docs/archive2/status.md)).
+to always `True` — see above): [docs/archive4/status.md](docs/archive4/status.md).
 
 **Standing methodology**: use a small (`n_bytes=10000`) slice of the
 corpus with a short step budget as the standard fast-iteration testbed
-for v5 architecture changes — see `configs/*_overfit10k_*.py` — until a config can actually fast-overfit
+for architecture changes (v5 or v1) — see `configs/*_overfit10k_*.py` — until a config can actually fast-overfit
 that slice to a train bpb comparable to `qcute.bytelm`'s own parity
 numbers on the same slice (`n_layers=1`: 0.0212 train bpb at step 1000,
 ~19.7 it/s; `n_layers=2`: 0.0072, ~11.4 it/s — see
@@ -137,44 +159,12 @@ Ranks generation/architecture-correctness difficulty (raggedness, warm-up depth)
 training/learnability difficulty — a high-product config may be easier to overfit10k
 (fewer effective tokens) despite being harder to verify `check_gen_consistency` on.
 
-**Latent-AR / parallel-block-local-decode investigation (2026-08-19, in progress)**: motivated
-by the observation that today's decode is DenseNet-like, not a chain — `decode_level`'s
-`for j in range(i, n_levels)` makes every level's decode cross-attend to its OWN self-code
-*and* every coarser level's code simultaneously (self-track + all-coarser, pervasive/dense),
-not just the next level up. Two coupling axes identified, both currently forced dense:
-1. **Track sparsity** (which levels condition which): target is a sparse topology (e.g. only
-   the deepest/topmost level conditions the lowest, with a configurable "in-between" set),
-   not today's all-to-all. Plan: a `track_dropout_p0`/`track_dropout_decay_steps`/
-   `track_dropout_schedule` curriculum, structurally identical to the existing `quant_dropout_p0`
-   mechanism (see above) — starts fully dense (keeps the training-convergence benefit dense
-   coupling appears to provide — matches the already-documented moving-target/cascade slow-
-   convergence finding for even fully-dense `n_levels=2` configs) and stochastically prunes
-   *middle* tracks over training, always keeping self + topmost, converging toward the sparse
-   target. Validation reuses existing infra with zero new eval code: `qualitative_generate`'s
-   `level0_mode{m}` loop (logs generation quality at every `max_decode_sources` depth) already
-   measures the dense-vs-sparse-inference gap directly — success criterion is that gap shrinking
-   over the curriculum vs. a dense-only control.
-2. **Window size** (how far back each surviving track can see): `decode_windows[i][0]` (the
-   self track) doubles as BOTH the self-code cross-attention window AND the raw byte-level
-   self-attention window (`merged_layout`'s `w0 = tracks_meta[0][1]`, shared by both decoders'
-   `t==0`/self stage) — coupled, not independently configurable today. Coarser tracks (`j>i`,
-   `cross_attn_stage`, `t>=1` in `StackDecoder`) are ALREADY independently windowed per track —
-   no code change needed to test "decode only needs 1-2 codes from the level above." Ultimate
-   motivation for both axes: enable a higher level to draft a window of future codes via its own
-   AR generation (`generate_level_codes`, already exists) ahead of time, then decode level0 for
-   many blocks in one batched parallel pass (no verifier, unlike speculative decoding — accepted
-   as a latency trick, not an exactness-preserving one), since each block's decode would then
-   only need a small already-available window into the level above plus its own block-local
-   (never cross-block) self-attention.
-
-**Hypothesis test plan** (staged, cheapest/most-falsifiable first, config-only where possible):
-window-size ablation (self-track window = block size K_i, then also shrinking the coarser
-track's window to ~1-2 codes) on top of the winning FSQ grid configs (`grid_dq=16`/
-`grid_levels=8`, `code_hard=True`/`code_sample=False`), `Ks=(2,1)` and `Ks=(2,2,1)`, run on a
-~10% data subset for fast iteration — see `configs/v5_stack_windowtest/`. Track-dropout
-curriculum (axis 1) and the actual generation-side rewrite (batched parallel decode) are
-deferred until the window-ablation result is in. Full narrative/results once the hypothesis
-tests complete: [docs/status.md](docs/status.md).
+**Latent-AR / parallel-block-local-decode investigation**: originated here as a `qcute_v5`
+window-ablation/track-dropout curriculum plan (2026-08-19); superseded by the `qcute_v1` rewrite
+(2026-08-20, see top of this section) once the investigation concluded that plan's `code_window`/
+lag-`D` knobs were redundant with `attn_window` and that the real fix was retargeting decode's
+loss (NTP-next-block -> NTP-autoencode) plus a per-block BOS, not a track-sparsity curriculum.
+Full narrative: [docs/qcute_v1_plan.md](docs/qcute_v1_plan.md).
 
 Diagnostic: `scripts/probe_decoder_kv_contribution.py` (gradient/
 ablation/attention-mass analysis of how much cross-attention KV actually

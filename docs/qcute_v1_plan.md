@@ -48,32 +48,52 @@ the rewrite (stage 2 below).
 
 ## Decoder architecture (implemented)
 
-Went through two false starts before landing here: (1) a standalone learned-query
+Went through several false starts before landing here: (1) a standalone learned-query
 `autoencode_decode` function cross-attending only to a code, scrapped; (2) "self-attend on own
 code, cross-attend upper code," also wrong -- there is no own code in decoding's self-attention
-at all. The actual design, confirmed against a worked example (`Ks=(2,1)`, `abcd`):
+at all; (3) a shift-by-1-NTP + BOS-stripped-from-output version (first "implemented" pass, ran the
+four full-scale leaderboard numbers below) that turned out, on inspection prompted by a
+`check_gen_consistency` bug hunt, to never actually let a block's own code inform reconstruction of
+that SAME block's content -- `cross_attn_stage`'s `code_pos <= query_pos` mask (code_pos = a
+block's own LAST byte) meant a block's code only ever became visible starting at its own last
+position, i.e. useful only for predicting *later* blocks, functionally reducing decode to "hint
+from a past code" (v5's original mechanism, just same-level instead of coarser-level) rather than
+genuine reconstruction; (4) briefly tried collapsing BOS to a single global marker (matching v5
+exactly) to fix a `check_gen_consistency` truncation bug, but that fix was solving a
+diagnostic-only problem at the cost of BOS's real job and was reverted. The actual, current design
+(confirmed against the worked example, `Ks=(2,1)`, `abcd`, `c1`/`c2`):
 
 - **Self-attention**: plain causal self-attention over the ACTUAL sequence with a trainable
-  **BOS prepended before every `K`-block** (`bb.self_code_const`, repurposed) --
-  `[BOS,a,b,BOS,c,d]`, not `[a,b,c,d]`. Implemented as `bos_interleaved_self_attn` in
-  `qcute_v1_decoder.py`: reshape into `(n_blocks, K)`, concat BOS at the front of each block,
-  flatten, run ordinary RoPE'd causal self-attention (`window=None` = sync/unbounded, one
-  continuous chain across every block, today's default; `window=K+1` = async ablation, block-local
-  only, reuses `chunked_windowed_attention`); strip the BOS positions back out before returning.
-  BOS is needed every `K` positions, not once per sequence -- own-code recurrence is gone, so each
-  block's chain has nothing else to seed itself with.
-- **Cross-attention**: from those (BOS-seeded) hidden states to this SAME block's own-level code
-  (`c1` for block `ab`, `c2` for block `cd`) -- genuinely cross-attention (`cross_attn_stage`,
-  reused as-is, called with `compute_ntp=False` since its internal shift-by-K loss doesn't match
-  what's needed here), not a fused self-attention position. Uses a *separate* LM instance
-  (`bb_cross`, matching v5's `decode_cross_stage_layers` convention) from the self-attention stage
-  (`bb_self`). Its own window (`decode_windows[i][1]`) controls how many codes back are visible --
-  `1` (implicit in the base example) sees only the matching code, `2` would also see `c1` from the
-  `cd` block. Independent of the self-attention window above.
-- **Target**: plain shift-by-1 NTP over every position (`h[:,:-1] -> x_list[i][:,1:]`), not
-  block-summary-to-next-block (v5's old scheme) and not unshifted-same-position (the scrapped
-  autoencoder framing). `n_levels==1`/top level is untouched -- still v5's original genuine
-  self-code-recurrent NTP decode, `merged_decode_forward`, no BOS involved there.
+  **per-block SEED TOKEN prepended before every `K`-block** (`bb.self_code_const`, repurposed --
+  neither "BOS" (implies a single sequence-start marker; this recurs every block) nor "sink"
+  (implies a passive fallback key that itself predicts nothing; this is a full token -- see below
+  -- fits, see chat 2026-08-20) -- `[seed,a,b,seed,c,d]`, not `[a,b,c,d]`. Implemented as
+  `bos_interleaved_self_attn` in `qcute_v1_decoder.py`: reshape into `(n_blocks, K)`, concat the
+  seed token at the front of each block, flatten, run ordinary RoPE'd causal self-attention
+  (`window=None` = sync/unbounded, one continuous chain across every block, today's default;
+  `window=K+1` = async ablation, block-local only, reuses `chunked_windowed_attention`).
+  `strip_bos=False` keeps the seed-token positions in the output (needed for the next bullet);
+  `strip_bos=True` (unused by decode_level as of this revision, kept for any caller that only
+  wants the extra-key effect) drops them.
+- **Cross-attention**: `own_block_cross_attn_decode`, NOT `cross_attn_stage` (that function is
+  still used for the top level's coarser-code case, unrelated to this). The seed token's own hidden
+  state is a genuine query here, not discarded -- `code_pos` is set to each block's own seed-token
+  position (not its last byte), so a block's own code (`c1` for `ab`, `c2` for `cd`) is visible to
+  EVERY position in that block, seed token included. Uses a *separate* LM instance (`bb_cross`) from
+  the self-attention stage (`bb_self`), matching v5's `decode_cross_stage_layers` convention.
+- **Target**: `own_block_decode_loss` -- UNSHIFTED, one query per real byte of a block (the seed
+  token seeds the block's own first byte; each subsequent real byte seeds the next), so
+  concatenated across blocks the target is exactly `x_list[i]` itself, not shifted by 1. This is
+  the reconstruct-from-own-code framing the design always intended, now actually realized: `c1`
+  reconstructs `ab`, `c2` reconstructs `cd`, no lag. Confirmed empirically (code-sensitivity probe,
+  2026-08-20): perturbing a block's own code now changes that block's own reconstruction, not just
+  later blocks'. Reconstructing a block from its own REAL code during training is standard
+  VQ-VAE/discrete-autoencoder teacher-forcing, not a leak -- the real generalization test is the
+  gt-vs-pred gap in `check_decode_modes`, i.e. whether a level-above-PREDICTED code (available the
+  instant a block starts, no access to that block's real bytes) is ALSO informative enough, not
+  whether training on the real code is somehow cheating.
+- **`n_levels==1`/top level**: untouched -- still v5's original genuine self-code-recurrent NTP
+  decode, `merged_decode_forward`, no seed token involved there.
 - **`n_levels>=3`**: only the immediate own-level code is cross-attended so far; whether/how a
   third-level decode additionally cross-attends something coarser than its own code is open, not
   yet generalized.
@@ -87,7 +107,7 @@ exposure-bias gap on the code decode actually depends on -- directly motivated b
 upper-level LM's code prediction alone support real generation, or is it too vague" concern (see
 generation-feasibility discussion below).
 
-**BOS generalizes to every level except possibly the top** (not just where discussed above) --
+**The seed token generalizes to every level except possibly the top** (not just where discussed above) --
 every level has its own encode-side NTP model over its own code sequence, and at generation time
 that's what has to draft level `i`'s next code before decode can use it (no real bytes exist yet
 to run encode on). Whether top is actually exempt from needing one, or has the identical bootstrap
@@ -148,10 +168,15 @@ the sync/async quality gap (stage 3) is measured.
 
 ## Staged plan
 
-1. **DONE**: BOS-interleaved self-attention + cross-attention-to-own-code decode, sync self-track
-   window default, shift-by-1 NTP target, `scheduled_sampling_p`. Smoke-tested (`Ks=(1,)` sanity,
-   `Ks=(2,1)` sync/async/scheduled-sampling all run cleanly on CPU; a 300-step overfit check on
-   `Ks=(2,1)` shows real learning, train bpb 8.0->5.0, byte_acc 0%->26%). Not yet run as a real
+1. **DONE**: seed-token-interleaved self-attention + cross-attention-to-own-code decode, sync
+   self-track window default, `scheduled_sampling_p`. Smoke-tested (`Ks=(1,)` sanity, `Ks=(2,1)`
+   sync/async/scheduled-sampling all run cleanly on CPU; a 300-step overfit check on `Ks=(2,1)`
+   shows real learning, train bpb 8.0->5.0, byte_acc 0%->26%). Originally used a shift-by-1 NTP
+   target with a code-visibility lag that turned out to never let a block's own code inform its own
+   reconstruction (a real bug, see `docs/status.md`'s 2026-08-20 session log) -- fixed to the
+   UNSHIFTED own-block target described in "Decoder architecture" above
+   (`own_block_cross_attn_decode`/`own_block_decode_loss`); `ks21_v*` full-scale numbers need
+   re-running against the fix (`ks1_*` unaffected, no non-top level). Not yet run as a real
    experiment (overfit10k-scale or full-scale).
 2. **Run the actual `overfit10k` validation** (`configs/v1_stack_simplex/ks21_v256_pq1.py`,
    `ks21_v64_pq4.py` -- written earlier, need rerunning since their first partial run used the
@@ -172,7 +197,7 @@ the sync/async quality gap (stage 3) is measured.
 ## Open risks
 
 - **Loss changes for every non-top level**: reconstruction loss, not NTP cross-entropy --
-  touches `StackDecoder`'s core loss computation, not additive on top of what's there.
+  touches `StackDecoderV1`'s core loss computation, not additive on top of what's there.
 - **Codebook capacity becomes a hard reconstruction constraint**, not a soft compression-ratio
   knob: `K` bytes needs ~`8*K` bits of real information to reconstruct exactly. `Ks=(2,1)` +
   FSQ 16x8 (~48-bit nominal capacity) is comfortably above the 16-bit target for `K=2`; smaller

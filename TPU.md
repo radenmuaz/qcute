@@ -20,12 +20,13 @@ gcloud compute tpus queued-resources describe tpu1 \
     --project raden-tpu \
     --zone europe-west4-a
 
-gcloud compute tpus queued-resources list --project raden-tpu \
-    --zone europe-west4-a
+gcloud compute tpus queued-resources list --project raden-tpu --zone europe-west4-a
 
 gcloud compute tpus queued-resources delete tpu1 \
     --project raden-tpu \
     --zone europe-west4-a \
     --force \
     --async
+
+gcloud compute tpus queued-resources ssh tpu1 --project raden-tpu --zone europe-west4-a
 ```

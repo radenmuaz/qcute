@@ -41,4 +41,7 @@ log_every = 20
 eval_every = 50
 eval_batches = 5
 
-qual_gen_bytes = 0  # generation loop not yet updated for autoencoder decode (stage 2, not stage 1)
+qual_gen_bytes = 64  # StackDecoderV1's own check_roundtrip_consistency/check_decode_modes ARE
+# implemented for this decoder_type (unlike the newer stack_v2/stack_v2_local, whose generation
+# path is still unsettled, see chat/docs 2026-08-20) -- overfit sanity check: can it memorize and
+# regenerate the training corpus via decode-from-own-code round-trip?

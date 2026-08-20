@@ -1,5 +1,5 @@
 """v1_stack_simplex/ks1_v256_pq1_overfit10k: qcute_v1 baseline at n_levels=1 -- level0 IS the top level here,
-so decode is the UNCHANGED-from-v5 genuine self-code-recurrent NTP path (StackDecoder's is_top
+so decode is the UNCHANGED-from-v5 genuine self-code-recurrent NTP path (StackDecoderV1's is_top
 branch), not the new BOS-interleaved/cross-attend-own-code mechanism (that only applies to
 non-top levels, which don't exist when Ks=(1,)). Exists as: (1) a same-scale bpb reference point
 against ks21_v256_pq1.py's n_levels=2 run, and (2) the "truly autoencode, cannot extrapolate"

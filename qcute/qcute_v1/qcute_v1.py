@@ -154,7 +154,7 @@ class QCuteLM(nn.Module):
 
         # qcute_v1: the K0-1-partial encoder/decoder blend below only applies when level0 IS the
         # top level (n_levels==1, still genuine K-1-shifted NTP) -- for n_levels>=2, level0 is a
-        # non-top autoencoder (see StackDecoder) whose decode loss already covers every position
+        # non-top autoencoder (see StackDecoderV1) whose decode loss already covers every position
         # 0..n_blocks*K0-1 directly, no encoder-fallback prefix needed.
         K0 = cfg.Ks[0]
         if decode_losses[0] is not None and K0 > 1 and self.n_levels == 1:
