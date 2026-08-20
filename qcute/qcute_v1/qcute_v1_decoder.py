@@ -1069,12 +1069,14 @@ class Decoder(nn.Module):
         if ground_truth is not None:
             log(f"{prefix}ground_truth:        {pack_words(ground_truth.tolist(), bits)!r}")
         log(f"{prefix}level0_uncond:       {gen_bytes_uncond!r}")
+        align_width = len("level0_uncond:") + 7
         for m in range(1, model.n_levels + 1):
             out_m = self.generate_no_cache(model, prompt_bytes, gen_len, device, max_decode_sources=m)
             gen_bytes_m = pack_words(out_m[prompt_bytes.numel():].tolist(), bits)
             tag = "full" if m == model.n_levels else str(m)
-            pad = " " * 5 if tag == "full" else " " * 6
-            log(f"{prefix}level0_mode{tag}:{pad}{gen_bytes_m!r}")
+            label = f"level0_mode{tag}:"
+            pad = " " * max(1, align_width - len(label))
+            log(f"{prefix}{label}{pad}{gen_bytes_m!r}")
         for level in range(1, model.n_levels):
             cum_K = 1
             for k in model.cfg.Ks[:level]:
@@ -1467,7 +1469,7 @@ class StackDecoder(Decoder):
                           extra_losses=extra_losses, embed_weight=embed_weight_final)
 
     @torch.no_grad()
-    def _generate_blockwise(self, model, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
+    def _stack_generate_blockwise(self, model, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
                              code_source: str = "pred", gt_full_bytes: torch.Tensor | None = None) -> dict:
         """Generation fix (chat 2026-08-20) for this decoder, same root cause and same fix strategy
         as StackDecoderV1._generate_blockwise: query_last=None means the base class's
@@ -1491,7 +1493,7 @@ class StackDecoder(Decoder):
         code_used is track0's own code only, matching StackDecoderV1's return contract."""
         if self.n_levels != 2:
             raise NotImplementedError(
-                "StackDecoder._generate_blockwise: only n_levels==2 implemented so far (chat 2026-08-20)")
+                "StackDecoder._stack_generate_blockwise: only n_levels==2 implemented so far (chat 2026-08-20)")
         was_training = model.training
         model.eval()
         prompt_bytes = prompt_bytes.to(device)
@@ -1563,23 +1565,23 @@ class StackDecoder(Decoder):
                            max_decode_sources: int | None = None) -> torch.Tensor:
         if self.n_levels != 2:
             return super().generate_no_cache(model, prompt_bytes, n_new_bytes, device, max_decode_sources)
-        return self._generate_blockwise(model, prompt_bytes, n_new_bytes, device, code_source="pred")["bytes"][0]
+        return self._stack_generate_blockwise(model, prompt_bytes, n_new_bytes, device, code_source="pred")["bytes"][0]
 
     @torch.no_grad()
     def generate_kv_cache(self, model, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
                            max_decode_sources: int | None = None) -> torch.Tensor:
         if self.n_levels != 2:
             return super().generate_kv_cache(model, prompt_bytes, n_new_bytes, device, max_decode_sources)
-        return self._generate_blockwise(model, prompt_bytes, n_new_bytes, device, code_source="pred")["bytes"][0]
+        return self._stack_generate_blockwise(model, prompt_bytes, n_new_bytes, device, code_source="pred")["bytes"][0]
 
     @torch.no_grad()
     def check_blockwise_gen_consistency(self, model, full_bytes: torch.Tensor, device: str,
                                          prompt_len: int, code_source: str, log=print, label: str = "") -> int:
-        """Mechanics-only correctness check for _generate_blockwise, same contract as
+        """Mechanics-only correctness check for _stack_generate_blockwise, same contract as
         StackDecoderV1's version: given a FIXED track0 code sequence, decode is deterministic, so
         the incremental per-block loop must exactly match a single batched
         encode_like_self_attn_decode + seed_query_decode + upper_track_step pass over the same
-        span. Reuses _generate_blockwise's OWN code_used return value (never re-derives it), so a
+        span. Reuses _stack_generate_blockwise's OWN code_used return value (never re-derives it), so a
         mismatch can only mean the LOOP is wrong, not that two code assemblies drifted apart."""
         was_training = model.training
         model.eval()
@@ -1597,7 +1599,7 @@ class StackDecoder(Decoder):
                 model.train()
             return 0
 
-        out = self._generate_blockwise(model, full_bytes[:, :prompt_len], n_new_bytes, device,
+        out = self._stack_generate_blockwise(model, full_bytes[:, :prompt_len], n_new_bytes, device,
                                         code_source=code_source, gt_full_bytes=full_bytes)
         incremental, code0 = out["bytes"], out["code_used"]
         n_blocks = (prompt_len + n_new_bytes) // K
@@ -1643,11 +1645,16 @@ class StackDecoder(Decoder):
                                tol: float = 1e-3, log=print, label: str = "") -> int:
         """StackDecoder override (chat 2026-08-20): the base Decoder.check_gen_consistency
         re-derives its own mini generation step via model._run's query_last/h_list[0][:,-1,:]
-        fallback, bypassing _generate_blockwise entirely -- it would hit the exact same stale-
-        hidden-state bug _generate_blockwise was built to fix (see decode_level's query_last=None
+        fallback, bypassing _stack_generate_blockwise entirely -- it would hit the exact same stale-
+        hidden-state bug _stack_generate_blockwise was built to fix (see decode_level's query_last=None
         comment), just inside a diagnostic instead of real generation. Delegates to
         check_blockwise_gen_consistency (code_source='pred', the real generation-time signal)
-        instead -- tol is unused (byte-exact comparison, not a logit tolerance)."""
+        instead -- tol is unused (byte-exact comparison, not a logit tolerance). n_levels==2 only
+        (matching _stack_generate_blockwise's scope) -- skips rather than crashing otherwise."""
+        prefix = f"blockwise_gen_consistency_pred_{label}" if label else "blockwise_gen_consistency_pred"
+        if self.n_levels != 2:
+            log(f"{prefix}: skipped (StackDecoder's check only covers n_levels==2 so far)")
+            return 0
         return self.check_blockwise_gen_consistency(model, full_bytes, device, prompt_len=prompt_len,
                                                       code_source="pred", log=log, label=label)
 
@@ -1656,10 +1663,10 @@ class StackDecoder(Decoder):
                                      label: str = "") -> int:
         """StackDecoder counterpart to StackDecoderV1's version (same diagnostic intent: decode
         purely from real own-code, teacher-forced K bytes autoregressively per block, re-encode,
-        compare against the real code that produced it) -- built on _generate_blockwise(code_source
+        compare against the real code that produced it) -- built on _stack_generate_blockwise(code_source
         ='gt') with an EMPTY prompt (predict every block from scratch, real code only) instead of
         StackDecoderV1's own bos_interleaved_self_attn/own_block_cross_attn_decode calls directly.
-        n_levels==2 only, matching _generate_blockwise's own scope."""
+        n_levels==2 only, matching _stack_generate_blockwise's own scope."""
         prefix = f"roundtrip_{label}" if label else "roundtrip"
         if self.n_levels != 2:
             log(f"{prefix}: skipped (StackDecoder's check only covers n_levels==2 so far)")
@@ -1677,7 +1684,7 @@ class StackDecoder(Decoder):
                 model.train()
             return 0
 
-        out = self._generate_blockwise(model, full_bytes[:, :0], n_blocks * K, device,
+        out = self._stack_generate_blockwise(model, full_bytes[:, :0], n_blocks * K, device,
                                         code_source="gt", gt_full_bytes=full_bytes)
         predicted = out["bytes"]
         enc0 = model.encoders[0]
@@ -1698,13 +1705,57 @@ class StackDecoder(Decoder):
             f"sampling, baseline noise floor, diagnostic only)")
         return n_mismatch
 
+    def _decode_gt_context(self, model, full_bytes: torch.Tensor, prompt_len: int, n_new_bytes: int,
+                            device: str) -> torch.Tensor:
+        """True code-quality upper bound (chat 2026-08-20, fixes check_decode_modes's gt mode):
+        decode blocks [prompt_len//K, n_blocks) from REAL ground-truth own-code AND real
+        ground-truth self-attention context throughout (context is never overwritten with the
+        model's own predictions), same pattern as StackDecoderV1's decode_from -- causal, so real
+        values sitting at not-yet-predicted positions never leak (see check_roundtrip_consistency).
+        Unlike _stack_generate_blockwise(code_source='gt'), errors at one position can't compound into
+        the next, isolating decode quality from autoregressive context drift."""
+        cfg = self.cfg
+        K = cfg.Ks[0]
+        bb0, bb1 = self.stage_lms[0][0], self.stage_lms[0][1]
+        cum_K1 = K * cfg.Ks[1]
+        track0_window = model.decode_windows[0][0]
+        D = bb0.d_model
+        n_blocks = (prompt_len + n_new_bytes) // K
+        context = full_bytes[:, :n_blocks * K]
+        real_code = model.encoders[0](context, level=0, window=model.windows[0], compute_ntp=False)["code"]
+        code_embeds0 = bb0.quant.embed_for_decode(bb0, real_code)
+        code1 = model.encoders[1](real_code, level=1, window=model.windows[1], compute_ntp=False)["code"]
+        code_embeds1 = bb1.quant.embed_for_decode(bb1, code1)
+
+        pos_start_block = prompt_len // K
+        scored = context.clone()
+        for t in range(K):
+            x0 = bb0.embed_input(context, True)
+            pass1 = encode_like_self_attn_decode(bb0, x0, code_embeds0, K, track0_window, track0_window)
+            h_seed = seed_query_decode(bb0, pass1["saved_k"], pass1["saved_v"], code_embeds0, n_blocks, K,
+                                        track0_window, track0_window)
+            h_real_b = pass1["hidden"].view(context.shape[0], n_blocks, K, D)
+            h_query = h_seed if t == 0 else h_real_b[:, :, t - 1, :]
+
+            new_bytes = context.new_zeros(context.shape[0], n_blocks)
+            for b in range(pos_start_block, n_blocks):
+                pos = b * K + t
+                h_final = upper_track_step(bb1, h_query[:, b:b + 1, :], pos, code_embeds1, cum_K1)
+                new_bytes[:, b] = sample_next_byte(bb1.embed.weight, h_final[:, 0, :])
+            scored = scored.view(scored.shape[0], n_blocks, K).clone()
+            scored[:, pos_start_block:, t] = new_bytes[:, pos_start_block:]
+            scored = scored.view(scored.shape[0], n_blocks * K)
+        return scored
+
     @torch.no_grad()
     def check_decode_modes(self, model, full_bytes: torch.Tensor, device: str, log=print,
                             label: str = "") -> dict:
         """StackDecoder counterpart to StackDecoderV1's version: decode the same span twice --
-        once from real ground-truth own-code (gt mode, upper bound) and once from level1's own
-        sampled prediction of that code (pred mode, the real generation-time signal) -- report byte
-        accuracy against ground truth for each, via _generate_blockwise. n_levels==2 only."""
+        once from real ground-truth own-code with real ground-truth context (gt mode, true
+        code-quality upper bound, via _decode_gt_context) and once via real autoregressive
+        generation from level1's own sampled code predictions (pred mode, the real
+        generation-time signal, via _stack_generate_blockwise) -- report byte accuracy against ground
+        truth for each. n_levels==2 only."""
         prefix = f"decode_modes_{label}" if label else "decode_modes"
         if self.n_levels != 2:
             log(f"{prefix}: skipped (StackDecoder's check only covers n_levels==2 so far)")
@@ -1724,12 +1775,11 @@ class StackDecoder(Decoder):
 
         prompt_len = K
         n_new = (n_blocks - 1) * K
-        gt_out = self._generate_blockwise(model, full_bytes[:, :prompt_len], n_new, device,
-                                           code_source="gt", gt_full_bytes=full_bytes)
-        pred_out = self._generate_blockwise(model, full_bytes[:, :prompt_len], n_new, device,
+        gt_bytes = self._decode_gt_context(model, full_bytes, prompt_len, n_new, device)
+        pred_out = self._stack_generate_blockwise(model, full_bytes[:, :prompt_len], n_new, device,
                                              code_source="pred")
         target = full_bytes[0, prompt_len:prompt_len + n_new]
-        gt_acc = (gt_out["bytes"][0, prompt_len:prompt_len + n_new] == target).float().mean().item()
+        gt_acc = (gt_bytes[0, prompt_len:prompt_len + n_new] == target).float().mean().item()
         pred_acc = (pred_out["bytes"][0, prompt_len:prompt_len + n_new] == target).float().mean().item()
         if was_training:
             model.train()
@@ -1737,8 +1787,9 @@ class StackDecoder(Decoder):
         def fmt(a):
             return "1.0" if a >= 1.0 else f"{a:.2f}".lstrip("0")
         log(f"{prefix}: gt_byte_acc={fmt(gt_acc)}  pred_byte_acc={fmt(pred_acc)}  "
-            f"(gt=decode from real ground-truth code, upper bound; pred=decode from level1's own "
-            f"sampled code prediction, the real generation-time signal)")
+            f"(gt=decode from real ground-truth code with real ground-truth context, true upper "
+            f"bound; pred=real autoregressive decode from level1's own sampled code prediction, "
+            f"the real generation-time signal)")
         return {"gt_byte_acc": gt_acc, "pred_byte_acc": pred_acc}
 
 

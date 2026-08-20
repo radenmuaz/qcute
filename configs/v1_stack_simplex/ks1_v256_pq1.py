@@ -12,7 +12,7 @@ uv run python scripts/plot_run.py logs/v1_stack_simplex_ks1_v256_pq1
 from pathlib import Path
 
 run_name = "v1_stack_simplex_ks1_v256_pq1"
-decoder_type = "stack_v1"
+decoder_type = "stack"
 Ks = (1,)
 d_model = 256
 n_layers = 1
