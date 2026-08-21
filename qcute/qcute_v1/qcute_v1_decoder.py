@@ -652,7 +652,7 @@ class Decoder(nn.Module):
         self.n_levels = n_levels
 
     def decode_level(self, model, i: int, x_list: list, c_list: list, decode_derived_c: dict,
-                      compute_ntp: bool, max_decode_sources, want_next_query: bool):
+                      compute_ntp: bool, max_srcs, want_next_query: bool):
         raise NotImplementedError
 
     @torch.no_grad()
@@ -752,16 +752,16 @@ class Decoder(nn.Module):
 
     @torch.no_grad()
     def generate_no_cache(self, model, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
-                           max_decode_sources: int | None = None) -> torch.Tensor:
+                           max_srcs: int | None = None) -> torch.Tensor:
         if self.n_levels < 2:
-            return super().generate_no_cache(model, prompt_bytes, n_new_bytes, device, max_decode_sources)
+            return super().generate_no_cache(model, prompt_bytes, n_new_bytes, device, max_srcs)
         return self._generate_blockwise(model, prompt_bytes, n_new_bytes, device, code_source="pred")["bytes"][0]
 
     @torch.no_grad()
     def generate_kv_cache(self, model, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
-                           max_decode_sources: int | None = None) -> torch.Tensor:
+                           max_srcs: int | None = None) -> torch.Tensor:
         if self.n_levels < 2:
-            return super().generate_kv_cache(model, prompt_bytes, n_new_bytes, device, max_decode_sources)
+            return super().generate_kv_cache(model, prompt_bytes, n_new_bytes, device, max_srcs)
         return self._generate_blockwise(model, prompt_bytes, n_new_bytes, device, code_source="pred")["bytes"][0]
 
     @torch.no_grad()
@@ -848,7 +848,7 @@ class Decoder(nn.Module):
         K0 = model.cfg.Ks[0]
         block_aligned_only = model.n_levels >= 2
 
-        result_tf = model._run(full_bytes, compute_ntp=False, max_decode_sources=None, want_next_query=False)
+        result_tf = model._run(full_bytes, compute_ntp=False, max_srcs=None, want_next_query=False)
         embed0 = result_tf["embed_weights"][0] if result_tf["embed_weights"][0] is not None else model.encoders[0].embed.weight
         logits_tf_all = F.linear(result_tf["h_list"][0][0], embed0)
 
@@ -860,7 +860,7 @@ class Decoder(nn.Module):
             if ref_idx < 0 or ref_idx >= logits_tf_all.shape[0]:
                 continue
             padded = full_bytes[:, :t]
-            result_gen = model._run(padded, compute_ntp=False, max_decode_sources=None, want_next_query=True)
+            result_gen = model._run(padded, compute_ntp=False, max_srcs=None, want_next_query=True)
             embed_gen = result_gen["embed_weights"][0] if result_gen["embed_weights"][0] is not None else model.encoders[0].embed.weight
             query_gen = result_gen["next_query"][0] if result_gen["next_query"][0] is not None else result_gen["h_list"][0][:, -1, :]
             logits_gen = F.linear(query_gen[0], embed_gen)
@@ -1071,7 +1071,7 @@ class Decoder(nn.Module):
         log(f"{prefix}level0_uncond:       {gen_bytes_uncond!r}")
         align_width = len("level0_uncond:") + 7
         for m in range(1, model.n_levels + 1):
-            out_m = self.generate_no_cache(model, prompt_bytes, gen_len, device, max_decode_sources=m)
+            out_m = self.generate_no_cache(model, prompt_bytes, gen_len, device, max_srcs=m)
             gen_bytes_m = pack_words(out_m[prompt_bytes.numel():].tolist(), bits)
             tag = "full" if m == model.n_levels else str(m)
             label = f"level0_mode{tag}:"
@@ -1099,7 +1099,7 @@ class ConcatDecoder(Decoder):
         for bb in self.stage_lms:
             bb.merged_cache = {}
 
-    def decode_level(self, model, i, x_list, c_list, decode_derived_c, compute_ntp, max_decode_sources, want_next_query):
+    def decode_level(self, model, i, x_list, c_list, decode_derived_c, compute_ntp, max_srcs, want_next_query):
         cfg = self.cfg
         L_i = x_list[i].shape[1]
         self_active = self_code_active(i, self.n_levels, cfg.use_self_code)
@@ -1129,7 +1129,7 @@ class ConcatDecoder(Decoder):
             # ConcatDecoder shares one LM per level across every track (no per-track weights),
             # so original-index bookkeeping doesn't matter here -- just drop the indices.
             tracks = [t for _, t in apply_track_dropout(tracks, getattr(model, "track_dropout_p", 0.0))]
-        full_tracks = tracks[:max_decode_sources] if max_decode_sources is not None else tracks
+        full_tracks = tracks[:max_srcs] if max_srcs is not None else tracks
 
         is_byte_level = i == 0
         K = cfg.Ks[i]
@@ -1191,7 +1191,7 @@ class StackDecoderV1(Decoder):
 
         self.stage_lms = nn.ModuleList([make_level(i) for i in range(n_levels)])
 
-    def decode_level(self, model, i, x_list, c_list, decode_derived_c, compute_ntp, max_decode_sources, want_next_query):
+    def decode_level(self, model, i, x_list, c_list, decode_derived_c, compute_ntp, max_srcs, want_next_query):
         cfg = self.cfg
         L_i = x_list[i].shape[1]
         K = cfg.Ks[i]
@@ -1291,12 +1291,12 @@ class StackDecoder(Decoder):
     in qcute_v1.py). `decode_windows[i][t]` for t>=1 is track t's (level i+t's code)
     cross-attention window, same meaning as v5's StackDecoder. Track0 is never dropped/pruned
     (every later stage is built on it); tracks 1..T-1 are subject to apply_track_dropout +
-    max_decode_sources, same policy as v5, counted so max_decode_sources==1 means "own code only,
+    max_srcs, same policy as v5, counted so max_srcs==1 means "own code only,
     no upper conditioning".
 
     `cfg.cond_depth` caps how many levels above own code each level actually conditions on --
     -1 (default) = pervasive, every level above (n_levels-1-i tracks); 1 = one level up only,
-    the minimal case (own code + a single upper track). Static, unlike max_decode_sources (a
+    the minimal case (own code + a single upper track). Static, unlike max_srcs (a
     per-forward-call ablation knob) -- it also caps how many cross-attn-stage LMs __init__
     allocates, so a shallow cond_depth means genuinely fewer parameters, not just unused ones."""
 
@@ -1375,7 +1375,7 @@ class StackDecoder(Decoder):
                                 dim=2).reshape(B, L_used, D)
         return h0, h0_shifted, loss0, acc0
 
-    def decode_level(self, model, i, x_list, c_list, decode_derived_c, compute_ntp, max_decode_sources, want_next_query):
+    def decode_level(self, model, i, x_list, c_list, decode_derived_c, compute_ntp, max_srcs, want_next_query):
         cfg = self.cfg
         L_i = x_list[i].shape[1]
         K = cfg.Ks[i]
@@ -1432,8 +1432,8 @@ class StackDecoder(Decoder):
             indexed = apply_track_dropout(upper_specs, getattr(model, "track_dropout_p", 0.0))
         else:
             indexed = list(enumerate(upper_specs))
-        if max_decode_sources is not None:
-            indexed = indexed[:max(0, max_decode_sources - 1)]
+        if max_srcs is not None:
+            indexed = indexed[:max(0, max_srcs - 1)]
 
         x = h0_shifted
         loss_final, acc_final, code_final = loss0, acc0, None
@@ -1562,16 +1562,16 @@ class StackDecoder(Decoder):
 
     @torch.no_grad()
     def generate_no_cache(self, model, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
-                           max_decode_sources: int | None = None) -> torch.Tensor:
+                           max_srcs: int | None = None) -> torch.Tensor:
         if self.n_levels != 2:
-            return super().generate_no_cache(model, prompt_bytes, n_new_bytes, device, max_decode_sources)
+            return super().generate_no_cache(model, prompt_bytes, n_new_bytes, device, max_srcs)
         return self._stack_generate_blockwise(model, prompt_bytes, n_new_bytes, device, code_source="pred")["bytes"][0]
 
     @torch.no_grad()
     def generate_kv_cache(self, model, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
-                           max_decode_sources: int | None = None) -> torch.Tensor:
+                           max_srcs: int | None = None) -> torch.Tensor:
         if self.n_levels != 2:
-            return super().generate_kv_cache(model, prompt_bytes, n_new_bytes, device, max_decode_sources)
+            return super().generate_kv_cache(model, prompt_bytes, n_new_bytes, device, max_srcs)
         return self._stack_generate_blockwise(model, prompt_bytes, n_new_bytes, device, code_source="pred")["bytes"][0]
 
     @torch.no_grad()
@@ -1924,7 +1924,7 @@ class StackDecoderSync(StackDecoder):
     dominant remaining error source -- otherwise this is a lot of new masking machinery for a gain
     concentrated where the model already does comparatively well."""
 
-    def decode_level(self, model, i, x_list, c_list, decode_derived_c, compute_ntp, max_decode_sources, want_next_query):
+    def decode_level(self, model, i, x_list, c_list, decode_derived_c, compute_ntp, max_srcs, want_next_query):
         raise NotImplementedError(
             "StackDecoderSync (Variant C, synchronized wavefront) -- design note only, see class docstring")
 

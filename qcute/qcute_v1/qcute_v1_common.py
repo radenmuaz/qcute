@@ -126,6 +126,9 @@ class Config:
     use_self_code: bool = False
     scheduled_sampling_p: float = 0.0
     detach_ss_sample: bool = False
+    uncertainty_weighting: bool = False
+    curriculum_max_srcs: int | None = None
+    curriculum_step: int = 0
 
 
 def gumbel_quantize(logits: torch.Tensor, tau: float, hard: bool = True, sample: bool = False) -> torch.Tensor:
@@ -1304,7 +1307,8 @@ def train(model, train_data: torch.Tensor, val_data: torch.Tensor, args, log, ru
                                                         args.track_dropout_schedule))
 
         ctx = sample_context(train_data, args.batch_size, model.cfg.context_len, device)
-        loss, metrics = model(ctx)
+        cur_max_srcs = (args.curriculum_max_srcs if step < args.curriculum_step else None)
+        loss, metrics = model(ctx, max_srcs=cur_max_srcs)
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -1317,7 +1321,12 @@ def train(model, train_data: torch.Tensor, val_data: torch.Tensor, args, log, ru
             train_scalars = {k: v.item() for k, v in metrics.items()}
             train_scalars = add_per_level_bpb(train_scalars)
             train_scalars["bpb"] = train_bpb
-            log(f"{pbar}", step=step, lr=lr, loss=loss.item(),
+            uncertainty_str = ""
+            if args.uncertainty_weighting:
+                uncertainty_str = "  " + "  ".join(
+                    f"sigma_{k[len('uncertainty_sigma_'):]}={v:.4f}"
+                    for k, v in train_scalars.items() if k.startswith("uncertainty_sigma_"))
+            log(f"{pbar}{uncertainty_str}", step=step, lr=lr, loss=loss.item(),
                 **{k: v for k, v in train_scalars.items() if k not in ("loss",)})
 
         if step % args.eval_every == 0 or step == args.steps:
@@ -1463,6 +1472,22 @@ def build_argparser(description: str) -> tuple:
                          "STE path as normal quantize() by default, so its decode loss backprops into "
                          "the level-above encoder; set this to fall back to the old fully-detached "
                          "(no gradient to that encoder) behavior.")
+    p.add_argument("--uncertainty_weighting", action="store_true", default=False,
+                    help="Kendall/Gal/Cipolla 2018 homoscedastic uncertainty weighting: learn one "
+                         "log-variance per NTP task (each level's own encode loss, each level's decode "
+                         "loss, and the bundled decode_stage_extra loss) instead of the fixed "
+                         "byte_ntp_weight/code_ntp_weight/decode_ntp_weight scalars, so per-task scale "
+                         "differences (e.g. wider-vocab levels naturally producing bigger raw losses) "
+                         "self-balance via gradient descent rather than manual tuning. Logged each "
+                         "log_every step as train_uncertainty_sigma_<task>.")
+    p.add_argument("--curriculum_max_srcs", type=int, default=None,
+                    help="max_srcs passed to model(...) for steps < curriculum_step (default "
+                         "None: no curriculum). E.g. 2 makes a Ks=(2,2,1) StackDecoder's level0 decode "
+                         "condition on only its nearest upper track (level1's code), dropping level2's "
+                         "cross-attn stage -- behaves like a ks21 submodel during that phase.")
+    p.add_argument("--curriculum_step", type=int, default=0,
+                    help="step at which curriculum_max_srcs stops applying and training "
+                         "switches to full max_srcs=None (default 0: curriculum never active).")
     p.add_argument("--dim_monitor_plateau_tol", type=float, default=0.01,
                     help="relative change in effective_dim below which two consecutive --eval_every "
                          "measurements are flagged as a plateau")
@@ -1564,6 +1589,9 @@ def config_from_args(args) -> Config:
         use_self_code=args.use_self_code,
         scheduled_sampling_p=args.scheduled_sampling_p,
         detach_ss_sample=args.detach_ss_sample,
+        uncertainty_weighting=args.uncertainty_weighting,
+        curriculum_max_srcs=args.curriculum_max_srcs,
+        curriculum_step=args.curriculum_step,
     )
 
 

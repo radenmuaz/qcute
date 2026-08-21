@@ -1,10 +1,15 @@
 # Direct SSH to a TPU VM (bypassing `gcloud ... ssh` per-call overhead)
 
+**Do this immediately on every fresh TPU node connection** — right after confirming the node is
+`READY`, before installing anything or scp'ing the repo — not as an optional later optimization.
 `gcloud compute tpus queued-resources ssh <qr-name>` works but re-validates TPU state and
 re-preps the node on every single call (~3-25s overhead each time, more if there's a
-maintenance/preemption event to detect). Once a TPU VM is up and you've SSH'd into it via
-gcloud at least once (which propagates your `~/.ssh/google_compute_engine` public key to the
-instance), you can talk to it directly with plain `ssh` and a multiplexed connection.
+maintenance/preemption event to detect); every command on the node after this point should go
+through the direct connection set up below instead.
+
+Once a TPU VM is up and you've SSH'd into it via gcloud at least once (which propagates your
+`~/.ssh/google_compute_engine` public key to the instance), you can talk to it directly with
+plain `ssh` and a multiplexed connection.
 
 ## 1. Get the actual node name and external IP
 

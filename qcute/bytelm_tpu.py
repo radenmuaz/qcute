@@ -1,0 +1,826 @@
+"""qcute.bytelm_tpu — single-file fork of qcute.bytelm for CPU/TPU (torch_xla) use.
+
+Standalone on purpose (not an import of qcute.bytelm) so it can be read/debugged/deployed to a
+TPU VM without dragging in the rest of the repo's device-selection assumptions. Differences from
+qcute.bytelm:
+
+  - Device is cpu or xla only — no mps/cuda. `--device {cpu,xla}` (default: auto-detect, xla if
+    torch_xla+TPU is importable/visible, else cpu).
+  - Training step uses `torch_xla.core.xla_model.optimizer_step` (opt.step() + the XLA graph
+    execution barrier) on xla; eval loops call `xm.mark_step()` after every batch so the lazy
+    XLA graph doesn't grow unbounded across a no-grad loop. All hot-path tensor shapes (batch,
+    context, mtp_heads) are fixed for the whole run, so this should not recompile per step.
+  - Checkpointer.is_better guards against a non-finite or non-positive metric (copied from
+    qcute_v1_common.py's version — bf16 TPU training can occasionally spike to nan/inf; a bad
+    checkpoint from that is worse than skipping a save).
+  - New CausalSelfAttention.zero_kv_sink option (default off): prepends one all-zero key/value
+    ("sink") token before every real token, visible to every query unconditionally, before SDPA.
+    A static (non-learned) attention sink, sometimes used to relieve softmax's requirement that
+    attention weights sum to 1 even when no real key deserves much mass. Toggle via
+    `LMConfig(zero_kv_sink=True)` / `--zero_kv_sink`.
+
+Otherwise the model (plain pre-norm transformer, RoPE, MTP heads), training loop, and generation
+code (plain AR / KV-cache / self-speculative) are the same as qcute.bytelm — see that module's
+own docstring for the full design rationale (handover doc §5/§1.6 baseline framing).
+
+## sd preset (8 layers, ~101M params) full-enwik8 TPU run
+
+`PRESETS["sd"]` (d_model=1024, n_layers=8, n_heads=16, context=2048, mtp_heads=8) is the target
+config for this module: ~101M non-embedding params, aimed at sub-1.0 bpb on full enwik8
+(datasets/enwik8.gz, 100,000,000 bytes) within a 12h budget on a single TPU chip.
+
+FLOPs-vs-data budget check (see qcute/bytelm.py's own docstring for the underlying FLOPs grid):
+6*N_params*tokens (standard fwd+bwd approximation) means a single v6e-1 chip at a conservative
+~40% MFU of its ~918 TFLOPS/s bf16 peak processes on the order of 10^10 tokens in 12h — one to
+two orders of magnitude more than the ~2*10^9 tokens (~20 epochs over enwik8's ~95M-byte train
+split) that compute-optimal scaling (~20 tokens/param) would call for. In other words: for this
+model size, the full-enwik8 corpus (not compute) is almost certainly the binding constraint —
+convergence to sub-1.0 bpb should be a training-stability/epochs question, not a raw-FLOPs one.
+That said, this estimate is a priori (no real TPU torch_xla throughput measured yet for this
+module) — watch actual it/s on the very first run and retune `--steps` from there, per this
+repo's standing "long runs have shown unpredictable throughput" caution (CLAUDE.md).
+
+If a single TPU chip can't reach sub-1.0 bpb in 12h in practice, the natural next step is a
+4-chip pod — but this module is single-process/single-device only (no torch_xla
+SPMD/multiprocessing data-parallel wiring); that would be new infra, not implemented here.
+
+    uv run python -m qcute.bytelm_tpu --config configs/bytelm/bytelm_tpu_sd_full_enwik8.py
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import math
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from tqdm import tqdm
+
+try:
+    import torch_xla
+    _HAS_XLA = True
+except ImportError:
+    torch_xla = None
+    _HAS_XLA = False
+
+
+def is_xla_device(device) -> bool:
+    return getattr(device, "type", None) == "xla"
+
+
+def resolve_device(name: str | None) -> torch.device:
+    if name == "cpu":
+        return torch.device("cpu")
+    if name == "xla":
+        if not _HAS_XLA:
+            raise RuntimeError("--device xla requested but torch_xla is not importable")
+        return torch_xla.device()
+    if not _HAS_XLA:
+        return torch.device("cpu")
+    try:
+        return torch_xla.device()
+    except Exception:
+        return torch.device("cpu")
+
+
+def mark_step(device: torch.device) -> None:
+    # Lazy XLA ops otherwise queue up without executing — required at least once per training
+    # step and once per eval batch, or the unexecuted graph grows unboundedly and per-step wall
+    # time climbs without bound (confirmed directly: omitting this made every step slower than
+    # the last).
+    if is_xla_device(device):
+        torch_xla.sync()
+
+
+def optimizer_step(opt: torch.optim.Optimizer, device: torch.device) -> None:
+    opt.step()
+    mark_step(device)
+
+
+def format_hms(seconds: float) -> str:
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+class Logger:
+    """logs/<run_name>/run.log (human `tail -f`-able text) + run.jsonl (structured, for
+    scripts/plot_run.py). Only writes at the log_every/eval_every cadence — tqdm's own \\r-redraw
+    progress bar never touches either file."""
+
+    def __init__(self, run_dir: Path):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self.run_dir = run_dir
+        self.text_path = run_dir / "run.log"
+        self.json_path = run_dir / "run.jsonl"
+        self.text_f = open(self.text_path, "a")
+        self.json_f = open(self.json_path, "a")
+        self.start_time = time.time()
+
+    def __call__(self, msg: str, **record) -> None:
+        elapsed_s = int(time.time() - self.start_time)
+        elapsed_hms = format_hms(elapsed_s)
+        line = f"[{elapsed_hms}] {msg}"
+        tqdm.write(line)
+        self.text_f.write(line + "\n")
+        self.text_f.flush()
+        json_record = {"elapsed_s": elapsed_s, "elapsed_hms": elapsed_hms, **({} if record else {"msg": msg}), **record}
+        self.json_f.write(json.dumps(json_record) + "\n")
+        self.json_f.flush()
+
+
+class Checkpointer:
+    """checkpoints/<run_name>/{best,last}.pt. is_better rejects a non-finite or non-positive
+    metric (bf16 TPU training can spike to nan/inf; a checkpoint saved on that spike is worse
+    than just skipping the save) — copied from qcute_v1_common.py's Checkpointer."""
+
+    def __init__(self, run_dir: Path, save_every_n_evals: int = 1, minimize: bool = True):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self.best_path = run_dir / "best.pt"
+        self.last_path = run_dir / "last.pt"
+        self.save_every_n_evals = max(1, save_every_n_evals)
+        self.minimize = minimize
+        self.best_metric = float("inf") if minimize else float("-inf")
+        self._eval_count = 0
+
+    def is_better(self, metric: float) -> bool:
+        if not math.isfinite(metric) or metric <= 0:
+            return False
+        return metric < self.best_metric if self.minimize else metric > self.best_metric
+
+    def step(self, state: dict, metric: float) -> None:
+        self._eval_count += 1
+        if self.is_better(metric):
+            self.best_metric = metric
+            torch.save(state, self.best_path)
+        if self._eval_count % self.save_every_n_evals == 0:
+            torch.save(state, self.last_path)
+
+
+def load_enwik8(path: Path, n_bytes: int | None = None) -> torch.Tensor:
+    with gzip.open(path, "rb") as f:
+        data = f.read(n_bytes) if n_bytes else f.read()
+    return torch.tensor(list(data), dtype=torch.long)
+
+
+@dataclass
+class LMConfig:
+    vocab: int = 256
+    d_model: int = 1024
+    n_layers: int = 8
+    n_heads: int = 16
+    context: int = 2048
+    mlp_mult: int = 4
+    rope_base: float = 10000.0
+    mtp_heads: int = 8  # n parallel next-byte heads (bandwidth-matched to qcute.qcutelm's K)
+    zero_kv_sink: bool = False  # prepend one all-zero K/V token, always attendable, before SDPA
+
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.n_heads
+
+
+PRESETS: dict[str, LMConfig] = {
+    # ~(4 + 2*mlp_mult) * d_model^2 * n_layers non-embedding params (vocab=256 is negligible)
+    "tiny": LMConfig(d_model=128, n_layers=4, n_heads=4, context=512, mtp_heads=4),  # ~0.9M — pipeline sanity check
+    "xs": LMConfig(d_model=256, n_layers=4, n_heads=4, context=256, mtp_heads=4),  # ~3.7M, quick local/CPU runs
+    "sm": LMConfig(d_model=256, n_layers=8, n_heads=4, mlp_mult=2, context=1024, mtp_heads=4),  # ~4.3M — narrow/deep, not wide
+    "fast": LMConfig(d_model=512, n_layers=8, n_heads=8, mlp_mult=2, context=1024, mtp_heads=4),  # ~16.9M — narrow/deep, not wide
+    "sd": LMConfig(d_model=1024, n_layers=8, n_heads=16, context=2048),   # ~101M — the full-enwik8 TPU target
+    "md": LMConfig(d_model=2048, n_layers=8, n_heads=16, context=2048),   # ~403M
+}
+
+
+def count_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
+def rope_cos_sin(seq_len: int, head_dim: int, base: float, device: torch.device):
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    t = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(t, inv_freq)                      # [T, head_dim/2]
+    emb = torch.cat([freqs, freqs], dim=-1)                # [T, head_dim]
+    return emb.cos(), emb.sin()
+
+
+def rope_cos_sin_at(pos_id: int, head_dim: int, base: float, device: torch.device):
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    freqs = torch.tensor([[float(pos_id)]], device=device) * inv_freq
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos(), emb.sin()
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # x: [B, H, T, head_dim], cos/sin: [T, head_dim]
+    return x * cos[None, None] + rotate_half(x) * sin[None, None]
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg: LMConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
+        self.out = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        H, hd = self.cfg.n_heads, self.cfg.head_dim
+        qkv = self.qkv(x).reshape(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)  # [3, B, H, T, hd]
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        if self.cfg.zero_kv_sink:
+            zero = torch.zeros(B, H, 1, hd, device=x.device, dtype=k.dtype)
+            k = torch.cat([zero, k], dim=2)
+            v = torch.cat([zero, v], dim=2)
+            causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+            sink_col = torch.ones(T, 1, dtype=torch.bool, device=x.device)
+            attn_mask = torch.cat([sink_col, causal], dim=1)  # [T, T+1] — sink always attendable
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)       # [B, H, T, hd]
+        y = y.transpose(1, 2).reshape(B, T, D)
+        return self.out(y)
+
+    def forward_step(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
+                      cache_k: torch.Tensor | None, cache_v: torch.Tensor | None):
+        """Single-new-position forward, growing an explicit K/V cache. x_new: [B, 1, D]. Returns
+        (y [B, 1, D], new_cache_k, new_cache_v). With zero_kv_sink, the sink is prepended once
+        into an empty cache (position 0) and simply persists as the first cached K/V from then
+        on — no extra masking needed since forward_step already attends over the full cache."""
+        B, _, D = x_new.shape
+        H, hd = self.cfg.n_heads, self.cfg.head_dim
+        qkv = self.qkv(x_new).reshape(B, 1, 3, H, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k = apply_rope(q, cos_new, sin_new), apply_rope(k, cos_new, sin_new)
+        if self.cfg.zero_kv_sink and cache_k is None:
+            cache_k = torch.zeros(B, H, 1, hd, device=x_new.device, dtype=k.dtype)
+            cache_v = torch.zeros(B, H, 1, hd, device=x_new.device, dtype=v.dtype)
+        new_k = k if cache_k is None else torch.cat([cache_k, k], dim=2)
+        new_v = v if cache_v is None else torch.cat([cache_v, v], dim=2)
+        y = F.scaled_dot_product_attention(q, new_k, new_v, is_causal=False)   # single query, full past KV — no mask needed
+        y = y.transpose(1, 2).reshape(B, 1, D)
+        return self.out(y), new_k, new_v
+
+
+class MLP(nn.Module):
+    def __init__(self, cfg: LMConfig):
+        super().__init__()
+        hidden = cfg.mlp_mult * cfg.d_model
+        self.up = nn.Linear(cfg.d_model, hidden, bias=False)
+        self.down = nn.Linear(hidden, cfg.d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.silu(self.up(x)))
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: LMConfig):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(cfg.d_model)
+        self.attn = CausalSelfAttention(cfg)
+        self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.mlp = MLP(cfg)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), cos, sin)
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+    def forward_step(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
+                      cache_k: torch.Tensor | None, cache_v: torch.Tensor | None):
+        attn_out, new_k, new_v = self.attn.forward_step(self.ln1(x_new), cos_new, sin_new, cache_k, cache_v)
+        x_new = x_new + attn_out
+        x_new = x_new + self.mlp(self.ln2(x_new))
+        return x_new, new_k, new_v
+
+
+class ByteLM(nn.Module):
+    """MTP baseline (handover §1.6): n parallel softmax heads predict bytes t+1..t+n from the
+    same trunk hidden state, bandwidth-matched to qcute.qcutelm's K. Head 0 (immediate next-byte)
+    is weight-tied to the input embedding as usual; the other n-1 heads are untied (standard
+    MTP)."""
+
+    def __init__(self, cfg: LMConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.tok_emb = nn.Embedding(cfg.vocab, cfg.d_model)
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
+        self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.heads = nn.ModuleList(
+            [nn.Linear(cfg.d_model, cfg.vocab, bias=False) for _ in range(cfg.mtp_heads)]
+        )
+        self.heads[0].weight = self.tok_emb.weight  # weight tying, head 0 only
+        self.apply(self._init_weights)
+        # GPT-2-style residual scaling: keeps activation growth in check with depth
+        for block in self.blocks:
+            for proj in (block.attn.out, block.mlp.down):
+                nn.init.normal_(proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layers))
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        # tokens: [B, T] long -> logits [n_heads, B, T, vocab]
+        B, T = tokens.shape
+        cos, sin = rope_cos_sin(T, self.cfg.head_dim, self.cfg.rope_base, tokens.device)
+        x = self.tok_emb(tokens)
+        for block in self.blocks:
+            x = block(x, cos, sin)
+        x = self.ln_f(x)
+        return torch.stack([head(x) for head in self.heads], dim=0)
+
+
+def bits_per_byte(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    nats = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+    return nats / math.log(2)
+
+
+def mtp_loss(logits: torch.Tensor, tokens: torch.Tensor, context: int):
+    """logits: [n_heads, B, context, vocab] from model(tokens[:, :context]).
+    tokens: [B, context + n_heads]. Returns (mean loss over all heads, head-0 bpb — the standard
+    next-byte metric comparable to qcute.bytelm/qcute.qcutelm)."""
+    n_heads = logits.size(0)
+    losses = []
+    for i in range(n_heads):
+        targets_i = tokens[:, i + 1 : i + 1 + context]
+        losses.append(F.cross_entropy(logits[i].reshape(-1, logits.size(-1)), targets_i.reshape(-1)))
+    losses = torch.stack(losses)
+    head0_bpb = losses[0] / math.log(2)
+    return losses.mean(), head0_bpb
+
+
+def batch_iter(data: torch.Tensor, batch_size: int, context: int, n_heads: int, device: torch.device):
+    seq_len = context + n_heads  # n_heads bytes of lookahead beyond the context window
+    n = (len(data) - 1) // seq_len
+    while True:
+        starts = torch.randint(0, n, (batch_size,))
+        batch = torch.stack([data[i * seq_len : (i + 1) * seq_len] for i in starts])
+        yield batch.to(device)
+
+
+def split_train_val_test(
+    data: torch.Tensor, val_frac: float, test_frac: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Chronological split: test (if test_frac>0) is the trailing test_frac of bytes, val is the
+    val_frac before that, train is everything before both — so val/test never overlap regardless
+    of which fractions are requested. test is None (not just empty) when test_frac<=0, so callers
+    can tell "no test split configured" apart from "test split came out empty"."""
+    n_val = max(1, int(len(data) * val_frac))
+    if test_frac <= 0:
+        return data[:-n_val], data[-n_val:], None
+    n_test = max(1, int(len(data) * test_frac))
+    return data[: -(n_val + n_test)], data[-(n_val + n_test) : -n_test], data[-n_test:]
+
+
+@torch.no_grad()
+def eval_bpb(model: nn.Module, data_iter, context: int, n_batches: int, device: torch.device) -> float:
+    model.eval()
+    total = 0.0
+    for _ in range(n_batches):
+        batch = next(data_iter)
+        logits = model(batch[:, :context])
+        _, head0_bpb = mtp_loss(logits, batch, context)
+        total += head0_bpb.item()
+        mark_step(device)
+    model.train()
+    return total / n_batches
+
+
+@torch.no_grad()
+def eval_bpb_full(model: nn.Module, data: torch.Tensor, batch_size: int, context: int, n_heads: int,
+                   device: torch.device) -> float:
+    """Deterministic full-val-set pass: non-overlapping seq_len windows, walked in fixed
+    chronological order starting at byte 0 (never random), each byte scored exactly once."""
+    model.eval()
+    seq_len = context + n_heads
+    n_windows = (len(data) - 1) // seq_len
+    batch_size = n_windows if batch_size == -1 else batch_size
+    total, total_n = 0.0, 0
+    for start in range(0, n_windows, batch_size):
+        idxs = range(start, min(start + batch_size, n_windows))
+        batch = torch.stack([data[i * seq_len:(i + 1) * seq_len] for i in idxs]).to(device)
+        logits = model(batch[:, :context])
+        _, head0_bpb = mtp_loss(logits, batch, context)
+        bsz = batch.size(0)
+        total += head0_bpb.item() * bsz
+        total_n += bsz
+        mark_step(device)
+    model.train()
+    return total / total_n
+
+
+def lr_at(step: int, warmup: int, peak: float) -> float:
+    if step < warmup:
+        return peak * step / max(1, warmup)
+    return peak
+
+
+def lr_at_warmup_constant_cosine(
+    step: int, warmup: int, constant_steps: int, peak: float, total_steps: int, min_lr_frac: float = 0.1,
+) -> float:
+    if step < warmup:
+        return peak * step / max(1, warmup)
+    decay_start = warmup + constant_steps
+    if step < decay_start:
+        return peak
+    min_lr = peak * min_lr_frac
+    progress = min(1.0, (step - decay_start) / max(1, total_steps - decay_start))
+    return min_lr + 0.5 * (peak - min_lr) * (1 + math.cos(math.pi * progress))
+
+
+# ---------------------------------------------------------------------------
+# Generation — plain AR vs. self-speculative (MTP heads as draft). Fixed-shape training/eval is
+# what matters for TPU throughput; these run only optionally, post-training, and (KV-cache path
+# especially) will recompile per new sequence length on xla — not optimized for that here.
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def generate_ar(model: ByteLM, prompt: torch.Tensor, n_new_bytes: int, temperature: float = 1.0) -> torch.Tensor:
+    model.eval()
+    cfg = model.cfg
+    tokens = prompt.clone()
+    for _ in range(n_new_bytes):
+        ctx = tokens[:, -cfg.context :]
+        logits = model(ctx)[0][:, -1]
+        probs = F.softmax(logits / temperature, dim=-1)
+        next_tok = torch.multinomial(probs, 1)
+        tokens = torch.cat([tokens, next_tok], dim=1)
+    model.train()
+    return tokens
+
+
+@torch.no_grad()
+def generate_no_cache(model: ByteLM, prompt_bytes: torch.Tensor, n_new_bytes: int, device: torch.device) -> torch.Tensor:
+    """Reference (slow, obviously-correct) GREEDY decode: recomputes the whole trunk from scratch
+    over the whole sequence every new byte."""
+    was_training = model.training
+    model.eval()
+    prompt_bytes = prompt_bytes.to(device)
+    if prompt_bytes.dim() == 1:
+        prompt_bytes = prompt_bytes.unsqueeze(0)
+    all_bytes = prompt_bytes
+    cfg = model.cfg
+
+    for _ in range(n_new_bytes):
+        ctx = all_bytes[:, -cfg.context:]
+        logits = model(ctx)[0][:, -1]   # head 0 (immediate next-byte) only
+        next_byte = logits.argmax(-1)
+        all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
+
+    if was_training:
+        model.train()
+    return all_bytes[0]
+
+
+@torch.no_grad()
+def generate_kv_cache(model: ByteLM, prompt_bytes: torch.Tensor, n_new_bytes: int, device: torch.device) -> torch.Tensor:
+    """KV-cache-efficient GREEDY decode — a per-layer cache_k/cache_v list, advanced one position
+    at a time via each Block's forward_step."""
+    cfg = model.cfg
+    n_layers = len(model.blocks)
+    was_training = model.training
+    model.eval()
+    prompt_bytes = prompt_bytes.to(device)
+    if prompt_bytes.dim() == 1:
+        prompt_bytes = prompt_bytes.unsqueeze(0)
+
+    cache_k: list[torch.Tensor | None] = [None] * n_layers
+    cache_v: list[torch.Tensor | None] = [None] * n_layers
+
+    def step(byte_id: torch.Tensor, pos: int) -> torch.Tensor:
+        x = model.tok_emb(byte_id).unsqueeze(1)
+        cos_new, sin_new = rope_cos_sin_at(pos, cfg.head_dim, cfg.rope_base, device)
+        for li, block in enumerate(model.blocks):
+            x, cache_k[li], cache_v[li] = block.forward_step(x, cos_new, sin_new, cache_k[li], cache_v[li])
+        return model.ln_f(x).squeeze(1)
+
+    L0 = prompt_bytes.size(1)
+    last_h = None
+    for pos in range(L0):
+        last_h = step(prompt_bytes[:, pos], pos)
+
+    out_bytes = [prompt_bytes]
+    for i in range(n_new_bytes):
+        logits = model.heads[0](last_h)
+        next_byte = logits.argmax(-1)
+        out_bytes.append(next_byte.unsqueeze(1))
+        last_h = step(next_byte, L0 + i)
+
+    if was_training:
+        model.train()
+    return torch.cat(out_bytes, dim=1)[0]
+
+
+def validate_generation(model: ByteLM, prompt_bytes: torch.Tensor, n_new_bytes: int, device: torch.device) -> bool:
+    out_a = generate_no_cache(model, prompt_bytes, n_new_bytes, device)
+    out_b = generate_kv_cache(model, prompt_bytes, n_new_bytes, device)
+    assert torch.equal(out_a, out_b), (
+        f"generate_no_cache and generate_kv_cache diverged:\n"
+        f"  no_cache = {out_a.tolist()}\n"
+        f"  kv_cache = {out_b.tolist()}"
+    )
+    return True
+
+
+@torch.no_grad()
+def generate_speculative(
+    model: ByteLM, prompt: torch.Tensor, n_new_bytes: int, temperature: float = 1.0
+) -> tuple[torch.Tensor, list[int]]:
+    """Self-speculative decoding, draft = the model's own MTP heads. Batch size 1 only
+    (acceptance length varies per sequence)."""
+    assert prompt.size(0) == 1, "generate_speculative supports batch size 1"
+    model.eval()
+    cfg = model.cfg
+    n_heads = cfg.mtp_heads
+    tokens = prompt.clone()
+    accept_lengths: list[int] = []
+    generated = 0
+
+    while generated < n_new_bytes:
+        ctx = tokens[:, -cfg.context :]
+        draft_logits = model(ctx)[:, :, -1, :]                      # [n_heads, 1, vocab]
+        draft_probs = F.softmax(draft_logits / temperature, dim=-1)
+        draft_tokens = torch.multinomial(draft_probs.squeeze(1), 1).squeeze(-1)  # [n_heads]
+        candidate = torch.cat([tokens, draft_tokens.unsqueeze(0)], dim=1)
+
+        verify_ctx = candidate[:, -cfg.context :]
+        verify_logits = model(verify_ctx)[0]                        # head-0, true causal: [1, T, vocab]
+        target_logits = verify_logits[:, -(n_heads + 1) : -1]       # p(x_{t+i} | x_{<t+i}), i=1..n_heads
+        target_probs = F.softmax(target_logits / temperature, dim=-1).squeeze(0)  # [n_heads, vocab]
+
+        accepted = 0
+        for i in range(n_heads):
+            tok = draft_tokens[i].item()
+            p_target = target_probs[i, tok].item()
+            p_draft = draft_probs[i, 0, tok].item()
+            if torch.rand(()).item() < min(1.0, p_target / max(p_draft, 1e-8)):
+                accepted += 1
+            else:
+                break
+
+        if accepted > 0:
+            tokens = torch.cat([tokens, draft_tokens[:accepted].unsqueeze(0)], dim=1)
+        if accepted < n_heads:
+            resid = (target_probs[accepted] - draft_probs[accepted, 0]).clamp_min(0)
+            resid = resid if resid.sum() > 0 else target_probs[accepted]
+            next_tok = torch.multinomial(resid / resid.sum(), 1)
+        else:
+            bonus_probs = F.softmax(verify_logits[:, -1] / temperature, dim=-1)
+            next_tok = torch.multinomial(bonus_probs.squeeze(0), 1).unsqueeze(0)
+        tokens = torch.cat([tokens, next_tok.reshape(1, 1)], dim=1)
+
+        accept_lengths.append(accepted)
+        generated += accepted + 1
+
+    model.train()
+    return tokens, accept_lengths
+
+
+def benchmark_generation(model: ByteLM, prompt: torch.Tensor, n_bytes: int, temperature: float = 1.0, log=print):
+    t0 = time.perf_counter()
+    generate_ar(model, prompt, n_bytes, temperature)
+    ar_time = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    _, accept_lengths = generate_speculative(model, prompt, n_bytes, temperature)
+    spec_time = time.perf_counter() - t0
+
+    avg_accept = sum(accept_lengths) / len(accept_lengths) if accept_lengths else 0.0
+    log(
+        f"generation benchmark ({n_bytes} bytes): "
+        f"plain_ar={ar_time:.2f}s ({n_bytes/ar_time:.1f} B/s)  "
+        f"speculative={spec_time:.2f}s ({n_bytes/spec_time:.1f} B/s)  "
+        f"avg_accept_len={avg_accept:.2f}/{model.cfg.mtp_heads}  "
+        f"speedup={ar_time/spec_time:.2f}x"
+    )
+
+
+@torch.no_grad()
+def score_continuation_bpb(model: ByteLM, full_bytes: bytes, prompt_len: int, device: torch.device) -> float:
+    model.eval()
+    seq = torch.tensor([list(full_bytes)], dtype=torch.long, device=device)
+    inputs, targets = seq[:, :-1], seq[:, 1:]
+    logits = model(inputs)[0]  # head 0: [1, T, vocab]
+    cont_logits = logits[:, prompt_len - 1 :]
+    cont_targets = targets[:, prompt_len - 1 :]
+    nats = F.cross_entropy(cont_logits.reshape(-1, cont_logits.size(-1)), cont_targets.reshape(-1))
+    model.train()
+    return (nats / math.log(2)).item()
+
+
+def qualitative_generate(
+    model: ByteLM, prompt_bytes: bytes, gen_len: int, ground_truth: bytes | None, device: torch.device,
+    temperature: float = 1.0, log=print,
+) -> None:
+    prompt = torch.tensor([list(prompt_bytes)], dtype=torch.long, device=device)
+    out, _ = generate_speculative(model, prompt, gen_len, temperature)
+    gen_bytes = bytes(out[0, prompt.size(1):].tolist())
+
+    log(f"qual_prompt:       {prompt_bytes!r}")
+    log(f"qual_generated:    {gen_bytes!r}")
+    if ground_truth is not None:
+        log(f"qual_ground_truth: {ground_truth!r}")
+        bpb = score_continuation_bpb(model, prompt_bytes + ground_truth, len(prompt_bytes), device)
+        log(f"qual_bpb_on_ground_truth: {bpb:.4f}", qual_bpb_on_ground_truth=bpb)
+
+
+def load_config_module(path: Path) -> dict:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return {k: v for k, v in vars(module).items() if not k.startswith("_")}
+
+
+def main():
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=Path, default=None, help="Python config file (configs/*.py); CLI flags override it")
+    pre_args, _ = pre.parse_known_args()
+
+    p = argparse.ArgumentParser(
+        description="Byte-level causal transformer + MTP-head LM baseline (BPB), CPU/TPU only", parents=[pre]
+    )
+    p.add_argument("--preset", choices=list(PRESETS), default="sd")
+    p.add_argument("--device", choices=["cpu", "xla"], default=None, help="default: auto (xla if available, else cpu)")
+    p.add_argument("--context", type=int, default=None, help="override preset's context length")
+    p.add_argument("--mtp_heads", type=int, default=None, help="override preset's MTP head count")
+    p.add_argument("--n_layers", type=int, default=None, help="override preset's transformer layer count")
+    p.add_argument("--zero_kv_sink", action="store_true", help="prepend an all-zero, always-attendable K/V sink token")
+    p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
+    p.add_argument("--n_bytes", type=int, default=None, help="prefix of the corpus to load (default: all)")
+    p.add_argument("--val_frac", type=float, default=0.1)
+    p.add_argument("--test_frac", type=float, default=0.0,
+                    help="held-out test fraction, chronologically before val (default 0: no test split)")
+    p.add_argument("--steps", type=int, default=5000)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--lr_peak", type=float, default=6e-4)
+    p.add_argument("--warmup_steps", type=int, default=200)
+    p.add_argument("--cosine_decay", action="store_true")
+    p.add_argument("--constant_steps", type=int, default=1000, help="steps held at peak LR before cosine decay begins")
+    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--weight_decay", type=float, default=0.1)
+    p.add_argument("--log_every", type=int, default=50)
+    p.add_argument("--eval_every", type=int, default=200)
+    p.add_argument("--eval_batches", type=int, default=10)
+    p.add_argument("--full_val_eval", action="store_true")
+    p.add_argument("--benchmark_generate_bytes", type=int, default=0)
+    p.add_argument("--run_name", type=str, default=None)
+    p.add_argument("--logs_dir", type=Path, default=Path("logs"))
+    p.add_argument("--checkpoint_dir", type=Path, default=Path("checkpoints"))
+    p.add_argument("--save_every_n_evals", type=int, default=1)
+    p.add_argument("--eval_only", action="store_true")
+    p.add_argument("--eval_split", choices=["train", "val", "test"], default="val")
+    p.add_argument("--checkpoint_path", type=Path, default=None)
+    p.add_argument("--qual_gen_bytes", type=int, default=0)
+    p.add_argument("--qual_source", choices=["train", "val", "user"], default="val")
+    p.add_argument("--qual_prompt_bytes", type=int, default=64)
+    p.add_argument("--qual_user_text", type=str, default=None)
+
+    if pre_args.config:
+        config_vars = load_config_module(pre_args.config)
+        known = {a.dest for a in p._actions}
+        p.set_defaults(**{k: v for k, v in config_vars.items() if k in known})
+    args = p.parse_args()
+    if args.eval_only and args.checkpoint_path is None:
+        p.error("--eval_only requires --checkpoint_path")
+    if args.qual_gen_bytes > 0 and args.qual_source == "user" and not args.qual_user_text:
+        p.error("--qual_source user requires --qual_user_text")
+    if args.eval_split == "test" and args.test_frac <= 0:
+        p.error("--eval_split test requires --test_frac > 0")
+
+    device = resolve_device(args.device)
+
+    if args.checkpoint_path is not None:
+        ckpt = torch.load(args.checkpoint_path, map_location="cpu")
+        cfg = LMConfig(**ckpt["cfg"])
+        model = ByteLM(cfg).to(device)
+        model.load_state_dict(ckpt["model"])
+        start_step = ckpt["step"]
+    else:
+        cfg = PRESETS[args.preset]
+        if args.context is not None:
+            cfg.context = args.context
+        if args.mtp_heads is not None:
+            cfg.mtp_heads = args.mtp_heads
+        if args.n_layers is not None:
+            cfg.n_layers = args.n_layers
+        if args.zero_kv_sink:
+            cfg.zero_kv_sink = True
+        model = ByteLM(cfg).to(device)
+        start_step = 0
+
+    if args.run_name:
+        run_name = args.run_name
+    elif pre_args.config:
+        run_name = pre_args.config.stem
+    else:
+        run_name = f"bytelm_tpu_{args.preset}_{int(time.time())}"
+    log = Logger(args.logs_dir / run_name)
+    print(f"run_name={run_name}  logging to {log.text_path} (raw text) / {log.json_path} (JSONL) — tail -f {log.text_path}")
+    preset_label = f"loaded_from={args.checkpoint_path} (step {start_step})" if args.checkpoint_path else f"preset={args.preset}"
+    log(
+        f"{preset_label}  params={count_params(model)/1e6:.1f}M  device={device}  xla={_HAS_XLA}"
+        f"  context={cfg.context}  mtp_heads={cfg.mtp_heads}  zero_kv_sink={cfg.zero_kv_sink}"
+    )
+
+    data = load_enwik8(args.data, args.n_bytes)
+    train_data, val_data, test_data = split_train_val_test(data, args.val_frac, args.test_frac)
+    log(f"train_bytes={len(train_data)}  val_bytes={len(val_data)}"
+        + (f"  test_bytes={len(test_data)}" if test_data is not None else "  test_bytes=0 (no --test_frac)"))
+    if not args.eval_only:
+        seq_len = cfg.context + cfg.mtp_heads
+        epochs = args.steps * args.batch_size * seq_len / len(train_data)
+        log(f"~{epochs:.1f} epochs over train_bytes (steps={args.steps} batch_size={args.batch_size} seq_len={seq_len}, "
+            f"random-with-replacement sampling — see batch_iter)")
+    val_iter = batch_iter(val_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
+
+    if args.eval_only:
+        eval_data = {"train": train_data, "val": val_data, "test": test_data}[args.eval_split]
+        eval_bpb_val = eval_bpb_full(model, eval_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
+        log(f"eval_only_full_{args.eval_split}set  {args.eval_split}_bpb {eval_bpb_val:.4f}",
+            **{f"{args.eval_split}_bpb": eval_bpb_val})
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+        train_iter = batch_iter(train_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
+        checkpointer = Checkpointer(args.checkpoint_dir / run_name, args.save_every_n_evals, minimize=True)
+
+        model.train()
+        pbar = tqdm(range(1, args.steps + 1), desc="train", dynamic_ncols=True)
+        for step in pbar:
+            if args.cosine_decay:
+                lr = lr_at_warmup_constant_cosine(step, args.warmup_steps, args.constant_steps, args.lr_peak, args.steps)
+            else:
+                lr = lr_at(step, args.warmup_steps, args.lr_peak)
+            for g in opt.param_groups:
+                g["lr"] = lr
+
+            batch = next(train_iter)
+            logits = model(batch[:, : cfg.context])
+            loss, head0_bpb = mtp_loss(logits, batch, cfg.context)
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer_step(opt, device)
+
+            pbar.set_postfix(lr=f"{lr:.2e}", mtp_loss=f"{loss.item():.4f}", bpb=f"{head0_bpb.item():.4f}")
+            if step % args.log_every == 0:
+                log(f"{pbar}", step=step, lr=lr, mtp_loss=loss.item(), bpb=head0_bpb.item())
+            if step % args.eval_every == 0 or step == args.steps:
+                if args.full_val_eval:
+                    val_bpb = eval_bpb_full(model, val_data, -1, cfg.context, cfg.mtp_heads, device)
+                else:
+                    val_bpb = eval_bpb(model, val_iter, cfg.context, args.eval_batches, device)
+                log(f"step {step:5d}  val_bpb {val_bpb:.4f}", step=step, val_bpb=val_bpb)
+                checkpointer.step(
+                    {"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "cfg": asdict(cfg), "val_bpb": val_bpb},
+                    val_bpb,
+                )
+        log(
+            f"checkpoints: best={checkpointer.best_path} (val_bpb {checkpointer.best_metric:.4f})  last={checkpointer.last_path}"
+        )
+        if test_data is not None:
+            # Held out from both training and every val_bpb-driven checkpoint/LR decision, so
+            # unlike val_bpb this number was never used to pick anything during the run — load
+            # the val-selected best checkpoint back and score it on test exactly once, at the end.
+            best_ckpt = torch.load(checkpointer.best_path, map_location="cpu")
+            model.load_state_dict(best_ckpt["model"])
+            test_bpb = eval_bpb_full(model, test_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
+            log(f"final_test_bpb (best-val checkpoint, step {best_ckpt['step']})  test_bpb {test_bpb:.4f}",
+                test_bpb=test_bpb, test_bpb_from_step=best_ckpt["step"])
+
+    if args.benchmark_generate_bytes > 0:
+        prompt = next(val_iter)[:1, :1]  # one real byte as prompt, batch size 1
+        benchmark_generation(model, prompt, args.benchmark_generate_bytes, log=log)
+
+    if args.qual_gen_bytes > 0:
+        if args.qual_source == "user":
+            prompt_bytes = args.qual_user_text.encode("utf-8")
+            ground_truth = None
+        else:
+            src_data = train_data if args.qual_source == "train" else val_data
+            total_len = args.qual_prompt_bytes + args.qual_gen_bytes
+            start = torch.randint(0, len(src_data) - total_len, (1,)).item()
+            window = src_data[start : start + total_len].tolist()
+            prompt_bytes = bytes(window[: args.qual_prompt_bytes])
+            ground_truth = bytes(window[args.qual_prompt_bytes :])
+        qualitative_generate(model, prompt_bytes, args.qual_gen_bytes, ground_truth, device, log=log)
+
+
+if __name__ == "__main__":
+    main()

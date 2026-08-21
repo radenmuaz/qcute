@@ -49,6 +49,6 @@ eval_batches = 5
 
 qual_gen_bytes = 64  # StackDecoder now has its own check_gen_consistency/check_roundtrip_consistency/
 # check_decode_modes overrides (chat 2026-08-20, built on the validated _generate_blockwise) -- safe
-# to enable. qualitative_generate's max_decode_sources sweep is NOT yet honored by StackDecoder's
+# to enable. qualitative_generate's max_srcs sweep is NOT yet honored by StackDecoder's
 # generate_no_cache override (always uses the full track chain), so those display lines will all
 # look identical -- diagnostic only, doesn't affect correctness of the checks above.

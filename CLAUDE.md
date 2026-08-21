@@ -86,14 +86,33 @@ schedule.
 
 ## TPU access
 
+**Starting a fresh session asked to do a TPU run: read [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md)
+and [docs/tpu_direct_ssh.md](docs/tpu_direct_ssh.md) first, in full** — the first walks
+scp → install → run → common failure modes (including two bugs already hit and fixed: the
+torch/torch_xla version-pin ABI mismatch, and `xm.optimizer_step`'s `barrier=False` default
+silently growing the XLA graph unboundedly across steps); the second is the direct-ssh
+connection setup below, which is not optional — do it immediately, every time. Don't rediscover
+any of this from scratch. [TPU.md](TPU.md) lists which queued resources exist (never create a
+new one).
+
 TPU VMs (see [TPU.md](TPU.md) for available queued resources) are reachable via
-`gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone>`, but
-that re-validates TPU state and re-preps the node on every call (several seconds of overhead
-each time). Once a node is `READY` and has been SSH'd into once via gcloud (which propagates
-the local `~/.ssh/google_compute_engine` key), prefer direct `ssh`/`scp` with a persistent
-multiplexed connection instead — full setup, caveats (state-check gap on preemption, `pgrep -f`
-self-matching over ssh), and copy-pasteable commands: [docs/tpu_direct_ssh.md](docs/tpu_direct_ssh.md).
+`gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone>`, but that
+re-validates TPU state and re-preps the node on every call (several seconds of overhead each
+time). **The very first thing to do on any fresh TPU node connection — right after confirming
+it's `READY`, before install/scp/anything else — is set up the direct-ssh persistent multiplexed
+connection** (one `gcloud ... ssh` call to propagate the key, then a `ControlMaster`/
+`ControlPersist` session against the node's external IP) and use that for every subsequent
+command on that node, not repeated `gcloud ... ssh` calls. Full setup, caveats (state-check gap
+on preemption — direct ssh won't surface `PREEMPTED` the way gcloud does, so if a command hangs
+check `queued-resources describe ... state.state`; `pgrep -f` self-matching over ssh), and
+copy-pasteable commands: [docs/tpu_direct_ssh.md](docs/tpu_direct_ssh.md).
 **Never create/start a TPU yourself** — only use nodes already listed in TPU.md/already running.
+Full scp-to-running-training walkthrough (uv/torch_xla install, common failure modes, `qcute.
+bytelm_tpu` smoke test): [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md). **Any long-running
+or user-monitorable remote command (installs, training) goes inside a `tmux` session on the TPU
+VM**, not a bare blocking `gcloud ... ssh --command`, and the user gets the exact `tmux attach`
+command back so they can watch it live themselves — see that doc's own tmux section for the
+launch/attach/peek incantations.
 
 ## Architecture
 

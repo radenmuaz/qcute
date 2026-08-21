@@ -79,7 +79,15 @@ class QCuteLM(nn.Module):
                                         for i in range(self.n_levels)])
         self.decoder = make_decoder(cfg, self.n_levels, self.encoders, self.d_models, self.n_layers_list, self.vocabs)
 
-    def _run(self, byte_ids: torch.Tensor, compute_ntp: bool = True, max_decode_sources: int | None = None,
+        # Uncertainty weighting (Kendall/Gal/Cipolla 2018): one learnable log-variance per NTP task,
+        # replacing byte_ntp_weight/code_ntp_weight/decode_ntp_weight's fixed scalars when enabled.
+        # Layout: [0:n_levels)=each level's own encode loss, [n_levels:2*n_levels)=each level's own
+        # decode loss, [2*n_levels]=the bundled decode_stage_extra loss (count varies with cond_depth,
+        # so it's weighted as one aggregate task rather than per-source).
+        if cfg.uncertainty_weighting:
+            self.uncertainty_log_vars = nn.Parameter(torch.zeros(2 * self.n_levels + 1))
+
+    def _run(self, byte_ids: torch.Tensor, compute_ntp: bool = True, max_srcs: int | None = None,
              want_next_query: bool = False) -> dict:
         cfg = self.cfg
         seq_repr = byte_ids
@@ -121,7 +129,7 @@ class QCuteLM(nn.Module):
 
         for i in reversed(range(self.n_levels)):
             result = self.decoder.decode_level(self, i, x_list, c_list_for_decode, decode_derived_c,
-                                                compute_ntp, max_decode_sources, want_next_query)
+                                                compute_ntp, max_srcs, want_next_query)
             if result is None:
                 continue
             decode_losses[i] = result["loss"]
@@ -131,7 +139,7 @@ class QCuteLM(nn.Module):
             decode_stage_extra_losses += result["extra_losses"]
             if i == 0:
                 next_query[i] = result["query_last"]
-            if max_decode_sources is None:
+            if max_srcs is None:
                 decode_derived_c[i] = result["code"]
 
         return make_dict(encode_losses=encode_losses, encode_accs=encode_accs, decode_losses=decode_losses,
@@ -140,9 +148,9 @@ class QCuteLM(nn.Module):
                           decode_stage_extra_losses=decode_stage_extra_losses,
                           encode_entropy_regs=encode_entropy_regs, embed_weights=embed_weights)
 
-    def forward(self, byte_ids: torch.Tensor) -> tuple:
+    def forward(self, byte_ids: torch.Tensor, max_srcs: int | None = None) -> tuple:
         cfg = self.cfg
-        result = self._run(byte_ids)
+        result = self._run(byte_ids, max_srcs=max_srcs)
         encode_losses, encode_accs = result["encode_losses"], result["encode_accs"]
         decode_losses, decode_accs = result["decode_losses"], result["decode_accs"]
         h0_encode = result["h0_encode"]
@@ -168,18 +176,39 @@ class QCuteLM(nn.Module):
         else:
             byte_loss_full = byte_loss
 
-        encode_code_total = (torch.stack(encode_losses[1:]).sum() if self.n_levels > 1
-                              else byte_loss.new_zeros(()))
-        encode_total = cfg.byte_ntp_weight * encode_losses[0] + cfg.code_ntp_weight * encode_code_total
+        uncertainty_sigmas = {}
+        if cfg.uncertainty_weighting:
+            lv = self.uncertainty_log_vars
 
-        decode_ntp_weight = (cfg.decode_ntp_weight if isinstance(cfg.decode_ntp_weight, (tuple, list))
-                              else (cfg.decode_ntp_weight,) * self.n_levels)
-        decode_terms = [decode_ntp_weight[i] * l for i, l in enumerate(decode_losses) if l is not None]
-        decode_total = torch.stack(decode_terms).sum() if decode_terms else byte_loss.new_zeros(())
+            def uw_term(loss_val, idx):
+                return torch.exp(-lv[idx]) * loss_val + lv[idx]
 
-        decode_stage_extra_weight = sum(decode_ntp_weight) / len(decode_ntp_weight)
-        decode_stage_extra_total = (decode_stage_extra_weight * torch.stack(decode_stage_extra_losses).sum()
-                                     if decode_stage_extra_losses else byte_loss.new_zeros(()))
+            encode_total = torch.stack([uw_term(l, i) for i, l in enumerate(encode_losses)]).sum()
+            decode_terms = [uw_term(l, self.n_levels + i) for i, l in enumerate(decode_losses) if l is not None]
+            decode_total = torch.stack(decode_terms).sum() if decode_terms else byte_loss.new_zeros(())
+            decode_stage_extra_total = (uw_term(torch.stack(decode_stage_extra_losses).sum(), 2 * self.n_levels)
+                                         if decode_stage_extra_losses else byte_loss.new_zeros(()))
+            with torch.no_grad():
+                sigma = torch.exp(0.5 * lv)
+            uncertainty_sigmas = {
+                **{f"uncertainty_sigma_encode{i}": sigma[i] for i in range(self.n_levels)},
+                **{f"uncertainty_sigma_decode{i}": sigma[self.n_levels + i] for i in range(self.n_levels)
+                   if decode_losses[i] is not None},
+                "uncertainty_sigma_stage_extra": sigma[2 * self.n_levels],
+            }
+        else:
+            encode_code_total = (torch.stack(encode_losses[1:]).sum() if self.n_levels > 1
+                                  else byte_loss.new_zeros(()))
+            encode_total = cfg.byte_ntp_weight * encode_losses[0] + cfg.code_ntp_weight * encode_code_total
+
+            decode_ntp_weight = (cfg.decode_ntp_weight if isinstance(cfg.decode_ntp_weight, (tuple, list))
+                                  else (cfg.decode_ntp_weight,) * self.n_levels)
+            decode_terms = [decode_ntp_weight[i] * l for i, l in enumerate(decode_losses) if l is not None]
+            decode_total = torch.stack(decode_terms).sum() if decode_terms else byte_loss.new_zeros(())
+
+            decode_stage_extra_weight = sum(decode_ntp_weight) / len(decode_ntp_weight)
+            decode_stage_extra_total = (decode_stage_extra_weight * torch.stack(decode_stage_extra_losses).sum()
+                                         if decode_stage_extra_losses else byte_loss.new_zeros(()))
 
         entropy_reg_terms = [r for r in encode_entropy_regs if r is not None]
         entropy_reg_total = (torch.stack(entropy_reg_terms).sum() if entropy_reg_terms
@@ -192,7 +221,7 @@ class QCuteLM(nn.Module):
             "loss": loss, "byte_loss": byte_loss, "byte_loss_full": byte_loss_full, "byte_acc": byte_acc,
             "encode_total": encode_total, "decode_total": decode_total,
             "decode_stage_extra_total": decode_stage_extra_total, "ntp_loss_total": ntp_total,
-            "entropy_reg_total": entropy_reg_total,
+            "entropy_reg_total": entropy_reg_total, **uncertainty_sigmas,
             **{f"level{i}_ntp_loss_encode": l for i, l in enumerate(encode_losses)},
             **{f"level{i}_ntp_acc_encode": a for i, a in enumerate(encode_accs)},
             **{f"level{i}_ntp_loss_decode": l for i, l in enumerate(decode_losses) if l is not None},
