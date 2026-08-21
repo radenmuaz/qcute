@@ -112,7 +112,10 @@ bytelm_tpu` smoke test): [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md). *
 or user-monitorable remote command (installs, training) goes inside a `tmux` session on the TPU
 VM**, not a bare blocking `gcloud ... ssh --command`, and the user gets the exact `tmux attach`
 command back so they can watch it live themselves — see that doc's own tmux section for the
-launch/attach/peek incantations.
+launch/attach/peek incantations. **For a multi-hour run, check in periodically (roughly hourly)
+and pull back only `run.jsonl` (not `run.log` or checkpoints) to the matching local `logs/<run_name>/`
+path to save egress** — see that doc's "Monitoring a multi-hour run" section for the exact
+commands.
 
 ## Architecture
 

@@ -223,6 +223,35 @@ watch `~/qcute/logs/bytelm_tpu_sd_full_enwik8/run.log` directly (structured, rea
 elapsed-time/it-rate early** rather than trusting the config docstring's step estimate; retune
 `--steps` (or edit the config and relaunch) once real throughput is known.
 
+## Monitoring a multi-hour run
+
+For a run sized in hours (not minutes), check in periodically — roughly hourly is a reasonable
+default cadence, tighter early on if the step budget/throughput estimate hasn't been validated
+yet — rather than leaving it fully unattended or babysitting continuously. Each check:
+
+```bash
+ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine \
+  muaz@<external_ip> "tmux capture-pane -t bytelm -p -S -20"
+```
+
+note the latest `val_bpb` (and whether it's still falling or has plateaued/started climbing —
+overfitting on a small corpus over many epochs is expected for small models, see
+configs/bytelm_tpu/bytelm_tpu_sm_full_enwik8.py's own docstring), and confirm no traceback.
+
+**Pull back only `run.jsonl`, not `run.log` or checkpoints, to save egress**: `run.jsonl` is the
+small structured record `scripts/plot_run.py` reads; `run.log` is the same data plus tqdm
+progress-bar noise (redundant, larger), and checkpoints are large binary files with no reason to
+leave the TPU VM mid-run. Copy it to the *same relative path* under the local repo's own `logs/`
+(so `scripts/plot_run.py logs/<run_name>` works locally without edits):
+
+```bash
+scp -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine \
+  muaz@<external_ip>:~/qcute/logs/<run_name>/run.jsonl logs/<run_name>/run.jsonl
+```
+
+(`mkdir -p logs/<run_name>` first if this is the first pull for that run.) Re-running the same
+command later just overwrites the local copy with the latest one — safe to repeat every check-in.
+
 ## Common failure modes recap
 
 | Symptom | Cause | Fix |

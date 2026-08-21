@@ -87,8 +87,15 @@ class QCuteLM(nn.Module):
         if cfg.uncertainty_weighting:
             self.uncertainty_log_vars = nn.Parameter(torch.zeros(2 * self.n_levels + 1))
 
-    def _run(self, byte_ids: torch.Tensor, compute_ntp: bool = True, max_srcs: int | None = None,
-             want_next_query: bool = False) -> dict:
+    def _run(self, byte_ids: torch.Tensor, compute_ntp: bool = True,
+             max_srcs: int | None | tuple = None, want_next_query: bool = False) -> dict:
+        """max_srcs: scalar (broadcast to every level, legacy behavior) or a per-level tuple/list
+        (max_srcs[i] used for level i's decode_level call) -- lets a curriculum drop level i's
+        conditioning on a coarser level asymmetrically, e.g. (2, 1, None) on a Ks=(2,2,1) model
+        makes level0 keep its level1 track (drop level2) while level1 drops ITS only upper track
+        (level2) too, unlike a scalar max_srcs=2 which can't do both at once (see chat 2026-08-21:
+        level1 always has exactly one upper track in a 3-level model, so a global cap of 2 never
+        removes it)."""
         cfg = self.cfg
         seq_repr = byte_ids
         encode_losses, encode_accs, h_list, c_list, x_list, encode_entropy_regs = [], [], [], [], [], []
@@ -128,8 +135,9 @@ class QCuteLM(nn.Module):
         decode_stage_extra_losses: list = []
 
         for i in reversed(range(self.n_levels)):
+            max_srcs_i = max_srcs[i] if isinstance(max_srcs, (list, tuple)) else max_srcs
             result = self.decoder.decode_level(self, i, x_list, c_list_for_decode, decode_derived_c,
-                                                compute_ntp, max_srcs, want_next_query)
+                                                compute_ntp, max_srcs_i, want_next_query)
             if result is None:
                 continue
             decode_losses[i] = result["loss"]
@@ -139,7 +147,7 @@ class QCuteLM(nn.Module):
             decode_stage_extra_losses += result["extra_losses"]
             if i == 0:
                 next_query[i] = result["query_last"]
-            if max_srcs is None:
+            if max_srcs_i is None:
                 decode_derived_c[i] = result["code"]
 
         return make_dict(encode_losses=encode_losses, encode_accs=encode_accs, decode_losses=decode_losses,
@@ -148,7 +156,7 @@ class QCuteLM(nn.Module):
                           decode_stage_extra_losses=decode_stage_extra_losses,
                           encode_entropy_regs=encode_entropy_regs, embed_weights=embed_weights)
 
-    def forward(self, byte_ids: torch.Tensor, max_srcs: int | None = None) -> tuple:
+    def forward(self, byte_ids: torch.Tensor, max_srcs: int | None | tuple = None) -> tuple:
         cfg = self.cfg
         result = self._run(byte_ids, max_srcs=max_srcs)
         encode_losses, encode_accs = result["encode_losses"], result["encode_accs"]

@@ -127,7 +127,7 @@ class Config:
     scheduled_sampling_p: float = 0.0
     detach_ss_sample: bool = False
     uncertainty_weighting: bool = False
-    curriculum_max_srcs: int | None = None
+    curriculum_max_srcs: int | None | tuple = None
     curriculum_step: int = 0
 
 
@@ -1482,9 +1482,12 @@ def build_argparser(description: str) -> tuple:
                          "log_every step as train_uncertainty_sigma_<task>.")
     p.add_argument("--curriculum_max_srcs", type=int, default=None,
                     help="max_srcs passed to model(...) for steps < curriculum_step (default "
-                         "None: no curriculum). E.g. 2 makes a Ks=(2,2,1) StackDecoder's level0 decode "
-                         "condition on only its nearest upper track (level1's code), dropping level2's "
-                         "cross-attn stage -- behaves like a ks21 submodel during that phase.")
+                         "None: no curriculum). Scalar (e.g. 2, via CLI) broadcasts to every level's "
+                         "decode_level call; a per-level tuple (config-file only, e.g. (2, 1, None) on "
+                         "a Ks=(2,2,1) model) is required to genuinely drop ALL conditioning on a given "
+                         "coarser level -- a scalar cap can't do this since a level's OWN nearest upper "
+                         "track always survives any cap >=2, e.g. level1 (only 1 upper track: level2) "
+                         "still sees level2 under a global max_srcs=2 meant to hide it from level0.")
     p.add_argument("--curriculum_step", type=int, default=0,
                     help="step at which curriculum_max_srcs stops applying and training "
                          "switches to full max_srcs=None (default 0: curriculum never active).")
