@@ -84,6 +84,17 @@ nominal ~30-minute budget taking 2.5-3.5 hours instead) — watch actual
 elapsed time/step rate early on rather than assuming a run will finish on
 schedule.
 
+## TPU access
+
+TPU VMs (see [TPU.md](TPU.md) for available queued resources) are reachable via
+`gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone>`, but
+that re-validates TPU state and re-preps the node on every call (several seconds of overhead
+each time). Once a node is `READY` and has been SSH'd into once via gcloud (which propagates
+the local `~/.ssh/google_compute_engine` key), prefer direct `ssh`/`scp` with a persistent
+multiplexed connection instead — full setup, caveats (state-check gap on preemption, `pgrep -f`
+self-matching over ssh), and copy-pasteable commands: [docs/tpu_direct_ssh.md](docs/tpu_direct_ssh.md).
+**Never create/start a TPU yourself** — only use nodes already listed in TPU.md/already running.
+
 ## Architecture
 
 **`qcute_v1` (`qcute/qcute_v1/`) is the active lineage as of 2026-08-20** — forked from a verbatim

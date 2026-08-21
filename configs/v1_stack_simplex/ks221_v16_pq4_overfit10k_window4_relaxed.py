@@ -1,22 +1,20 @@
-"""v1_stack_simplex/ks221_v256_pq1_overfit10k_window4_relaxed: same as
-ks221_v256_pq1_overfit10k_window_long.py (Ks=(2,2,1), pervasive cond_depth=-1, 3000 steps) but
-BOTH non-top levels' own self-attention windows relaxed from exactly their own K (current block
-only) to 2x their own K (current block plus one prior block, "2 blocks worth of context back") --
-level0's own-byte window: 2 -> 4; level1's own-code window: 2 -> 4. Every cross-attention window
-onto a HIGHER level's code stays full/unbounded either way. Isolates whether the
-pervasive-conditioning long run's non-convergence (level0_mode1 stayed repetitive garble through
-3000 steps even at 96% train byte_acc, see docs/status.md's 2026-08-20 hard-convergence-queue
-entry) was specifically caused by the zero-lookback handicap, independent of the
-cond_depth/quant_type fallbacks tried in parallel.
+"""v1_stack_simplex/ks221_v16_pq4_overfit10k_window4_relaxed: same window-relaxation isolation
+test as ks221_v256_pq1_overfit10k_window4_relaxed.py (Ks=(2,2,1), pervasive cond_depth=-1, both
+non-top levels' own self-attention windows relaxed from their own K to 2x their own K -- level0's
+own-byte window: 2->4; level1's own-code window: 2->4 -- 3000 steps) but with vocab=16, pq_chunks=4
+(16-bit combinatorial code) instead of the single 256-way softmax, combining the window-relaxation
+variable with the PQ quant-type fallback that converged cleanly at ks21 (n_levels=2) but not yet
+tested at ks221 with window relaxation specifically. See docs/status.md's 2026-08-20
+hard-convergence-queue entries.
 
-uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks221_v256_pq1_overfit10k_window4_relaxed.py
+uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks221_v16_pq4_overfit10k_window4_relaxed.py
 
 # plot after training:
-uv run python scripts/plot_run.py logs/v1_stack_simplex_ks221_v256_pq1_overfit10k_window4_relaxed
+uv run python scripts/plot_run.py logs/v1_stack_simplex_ks221_v16_pq4_overfit10k_window4_relaxed
 """
 from pathlib import Path
 
-run_name = "v1_stack_simplex_ks221_v256_pq1_overfit10k_window4_relaxed"
+run_name = "v1_stack_simplex_ks221_v16_pq4_overfit10k_window4_relaxed"
 decoder_type = "stack"
 Ks = (2, 2, 1)
 d_model = 256
@@ -32,8 +30,8 @@ attn_window = (
 code_hard = True
 code_sample = False
 quant_type = "simplex"
-vocab = 256
-pq_chunks = 1
+vocab = 16
+pq_chunks = 4
 input_preset = 8
 output_preset = 8
 entropy_reg_weight = 0.0

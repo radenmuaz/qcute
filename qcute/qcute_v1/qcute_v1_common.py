@@ -125,6 +125,7 @@ class Config:
     track_dropout_schedule: str = "linear"
     use_self_code: bool = False
     scheduled_sampling_p: float = 0.0
+    detach_ss_sample: bool = False
 
 
 def gumbel_quantize(logits: torch.Tensor, tau: float, hard: bool = True, sample: bool = False) -> torch.Tensor:
@@ -237,6 +238,7 @@ class FSQEmbed(nn.Module):
 class QuantScheme:
     def __init__(self):
         self.quant_dropout_p = 0.0
+        self.detach_ss_sample = False  # set from cfg.detach_ss_sample by make_quant()
 
     def _effective_hard_sample(self) -> tuple:
         """Quant Noise (Fan et al. 2020): with probability quant_dropout_p, take the plain
@@ -353,9 +355,14 @@ class SimplexQuant(QuantScheme):
     def sample_next(self, stage_lm, h_query, vocab):
         # `vocab` (cfg.vocab, the caller-passed per-chunk width) is unused here -- self.V
         # (the true total code width, V_sub * pq_chunks) is what the returned code must match.
+        # Same hard/sample setting as quantize() (via _effective_hard_sample), so scheduled
+        # sampling's substitute code goes through the identical STE path -- gradient flows back
+        # to the level-above encoder unless detach_ss_sample forces the old detached behavior.
         logits = self._chunked(self._ntp_logits(stage_lm, h_query))  # (..., pq_chunks, V_sub)
-        next_id = logits.argmax(-1)  # (..., pq_chunks)
-        onehot = F.one_hot(next_id, num_classes=self.V_sub).to(h_query.dtype)  # (..., pq_chunks, V_sub)
+        hard, sample = self._effective_hard_sample()
+        onehot = gumbel_quantize(logits, self.tau, hard, sample)
+        if self.detach_ss_sample:
+            onehot = onehot.detach()
         return onehot.reshape(*h_query.shape[:-1], self.V)
 
     def entropy_reg(self, pre_q):
@@ -409,7 +416,8 @@ class BinaryQuant(QuantScheme):
     def sample_next(self, stage_lm, h_query, vocab):
         pred = stage_lm.code_predict(h_query)
         hard, sample = self._effective_hard_sample()
-        return bsq_quantize(pred, self.binary_bits, hard, sample, self.lfq)
+        out = bsq_quantize(pred, self.binary_bits, hard, sample, self.lfq)
+        return out.detach() if self.detach_ss_sample else out
 
     def entropy_reg(self, pre_q):
         return bsq_entropy_reg(pre_q)
@@ -456,14 +464,18 @@ class GridQuant(QuantScheme):
         return stage_lm.code_embed(seq_repr)
 
     def sample_next(self, stage_lm, h_query, vocab):
+        # No sampling noise here (unlike quantize()'s self.sample) -- there's no well-defined
+        # sampling distribution over FSQ's L levels the way there is for a softmax; always a
+        # plain deterministic STE pick (hard argmax forward, soft-softmax gradient backward),
+        # tau=1.0 is arbitrary since GridQuant has no tau of its own. detach_ss_sample forces
+        # the old fully-detached (no gradient to the level-above encoder) behavior.
         bound = (self.L - 1) / 2
         pred = stage_lm.code_predict(h_query).reshape(*h_query.shape[:-1], self.dq, self.L)
-        if self.sample:
-            probs = F.softmax(pred, dim=-1)
-            levels = torch.multinomial(probs.reshape(-1, self.L), 1).reshape(pred.shape[:-1])
-        else:
-            levels = pred.argmax(-1)
-        return (levels.float() - bound) / bound
+        onehot = gumbel_quantize(pred, 1.0, hard=True, sample=False)
+        levels = (onehot * torch.arange(self.L, device=pred.device, dtype=pred.dtype)).sum(-1)
+        if self.detach_ss_sample:
+            levels = levels.detach()
+        return (levels - bound) / bound
 
 
 def solve_upper_triangular(U: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -681,7 +693,8 @@ class _GMMQuantBase(QuantScheme):
     def sample_next(self, stage_lm, h_query, vocab):
         query_pred, gating_pred = stage_lm.code_predict(h_query)
         hard, sample = self._effective_hard_sample()
-        return self._select(query_pred, gating_pred, hard, sample)
+        out = self._select(query_pred, gating_pred, hard, sample)
+        return out.detach() if self.detach_ss_sample else out
 
     def bpb_bound(self, stage_lm, h_query, target_repr, precision_bits: int) -> torch.Tensor:
         """Achievable bpb bound for code_hard=False / code_sample=True, where ntp_loss_acc's
@@ -720,15 +733,18 @@ class GMMDiagQuant(_GMMQuantBase):
 
 def make_quant(cfg: Config) -> QuantScheme:
     if cfg.quant_type == "binary":
-        return BinaryQuant(cfg.binary_bits, cfg.code_hard, cfg.code_sample, cfg.binary_lfq)
-    if cfg.quant_type == "grid":
-        return GridQuant(cfg.grid_dq, cfg.grid_levels, cfg.code_hard, cfg.code_sample, cfg.grid_bound,
-                          cfg.grid_logistic_scale)
-    if cfg.quant_type == "gmm":
-        return GMMQuant(cfg.gmm_k, cfg.gmm_dq, cfg.code_hard, cfg.code_sample, cfg.pq_chunks)
-    if cfg.quant_type == "gmm_diag":
-        return GMMDiagQuant(cfg.gmm_k, cfg.gmm_dq, cfg.code_hard, cfg.code_sample, cfg.pq_chunks)
-    return SimplexQuant(cfg.gumbel_tau, cfg.code_hard, cfg.code_sample, cfg.ntp_head_tied, cfg.pq_chunks)
+        quant = BinaryQuant(cfg.binary_bits, cfg.code_hard, cfg.code_sample, cfg.binary_lfq)
+    elif cfg.quant_type == "grid":
+        quant = GridQuant(cfg.grid_dq, cfg.grid_levels, cfg.code_hard, cfg.code_sample, cfg.grid_bound,
+                           cfg.grid_logistic_scale)
+    elif cfg.quant_type == "gmm":
+        quant = GMMQuant(cfg.gmm_k, cfg.gmm_dq, cfg.code_hard, cfg.code_sample, cfg.pq_chunks)
+    elif cfg.quant_type == "gmm_diag":
+        quant = GMMDiagQuant(cfg.gmm_k, cfg.gmm_dq, cfg.code_hard, cfg.code_sample, cfg.pq_chunks)
+    else:
+        quant = SimplexQuant(cfg.gumbel_tau, cfg.code_hard, cfg.code_sample, cfg.ntp_head_tied, cfg.pq_chunks)
+    quant.detach_ss_sample = cfg.detach_ss_sample
+    return quant
 
 
 def rope_cos_sin(seq_len: int, head_dim: int, base: float, device: torch.device):
@@ -1442,6 +1458,11 @@ def build_argparser(description: str) -> tuple:
                          "level-above's OWN sampled code prediction instead of the ground-truth code "
                          "(one flip per forward pass, training only) -- pseudo scheduled sampling to "
                          "reduce the train/generation exposure-bias gap on the code that feeds decode.")
+    p.add_argument("--detach_ss_sample", action="store_true", default=False,
+                    help="scheduled sampling's substitute code (sample_next()) goes through the same "
+                         "STE path as normal quantize() by default, so its decode loss backprops into "
+                         "the level-above encoder; set this to fall back to the old fully-detached "
+                         "(no gradient to that encoder) behavior.")
     p.add_argument("--dim_monitor_plateau_tol", type=float, default=0.01,
                     help="relative change in effective_dim below which two consecutive --eval_every "
                          "measurements are flagged as a plateau")
@@ -1542,6 +1563,7 @@ def config_from_args(args) -> Config:
         track_dropout_schedule=args.track_dropout_schedule,
         use_self_code=args.use_self_code,
         scheduled_sampling_p=args.scheduled_sampling_p,
+        detach_ss_sample=args.detach_ss_sample,
     )
 
 

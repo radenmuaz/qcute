@@ -227,3 +227,79 @@ usable signal to avoid visible generation collapse even while its raw single-ste
 accuracy looks equally weak by the numeric proxy -- worth keeping in mind before trusting
 `pred_byte_acc` alone as "generation quality," and a reason to prefer PQ-style codebooks going
 forward for any config where level0's window is constrained.
+
+**2026-08-20/21 hard-convergence-queue: `ks221`/`ks441` (n_levels=3) real-generation collapse,
+13-config sweep.** Four bugs fixed first: `qualitative_generate`'s `level0_mode{N}:` log padding
+(hardcoded, now computed to match `level0_uncond:`'s width); `check_decode_modes`'s "gt" mode
+wasn't a true code-quality upper bound (see the tinywindow entry above for the same root cause --
+`_generate_blockwise(code_source="gt")` still fed self-attention context from the model's own
+prior predictions), fixed via a new `_decode_gt_context` method (batched, real ground-truth
+context throughout, `StackDecoderV1.decode_from`-style) used only by `check_decode_modes`;
+`StackDecoder.check_gen_consistency` was missing the `n_levels != 2` skip guard present on its
+sibling checks, crashing any `n_levels==3` config with `qual_gen_bytes>0` -- fixed; and a
+method-name collision (`StackDecoder` and the base `Decoder` both defined their own differently-
+designed `_generate_blockwise` -- `StackDecoder.generate_no_cache`'s `n_levels!=2` fallback called
+`super().generate_no_cache()`, which internally called `self._generate_blockwise(...)`, but that
+polymorphically resolved to `StackDecoder`'s own override, defeating the fallback) -- fixed by
+renaming `StackDecoder`'s version to `_stack_generate_blockwise`.
+
+Question investigated: does the `ks41`/`ks81` window-constrained-overfit success (from the
+tinywindow entries above) generalize past `n_levels=2`? `configs/v1_stack_simplex/
+ks41_v256_pq1_overfit10k_window4.py` and `ks81_v256_pq1_overfit10k_window8.py` (Ks=(4,1)/(8,1),
+each level0 window forced to exactly its own K) both **converged cleanly** at 1000 steps
+(gt_byte_acc .96-.97, coherent real generation). But `ks221_v256_pq1_overfit10k_window.py` and
+`ks441_v256_pq1_overfit10k_window.py` (Ks=(2,2,1)/(4,4,1), n_levels=3, same per-level tiny-window
+treatment) **did not converge** -- train byte_acc plateaued at 89-95%, real generation
+(`level0_mode1`) stayed repetitive garble even on train data. Longer steps (3000, `_long` variants)
+didn't fix it (96-97% train byte_acc, still non-coherent). `cond_depth=1` didn't fix `ks221`
+(93.01%, slightly *worse* than pervasive's 96.19%) though it showed a partial improvement for
+`ks441` (96.25%, real domain vocabulary like "Anarchism"/"Kropotkin" appearing repeatedly and
+correctly, `level1`/`level2_ntp_acc` ~0.30-0.37, notably higher than other configs) -- still no
+coherent grammatical sentences.
+
+Quant-structure sweep on `ks221` (all `cond_depth=1`, all converge train byte_acc to 93-99.7%,
+**none** fixed real generation -- `level0_mode1` always collapsed into a repetitive token loop):
+PQ vocab=16/pq_chunks=4 (99.70%, `"[[an1 ana]] [[an1 ana]]..."`), FSQ grid_dq=8/grid_levels=4
+(93.23%), then a further 5-config random sweep all matched to the original 8-bit combinatorial
+width but different chunk/dim structure -- PQ vocab=4/pq_chunks=4 (99.43%), vocab=8/pq_chunks=3
+(99.56%, `".x.x.x.x..."`), vocab=16/pq_chunks=2 (99.26%); FSQ grid_dq=4/grid_levels=4 (98.33%,
+`"histanp]] histanp]]..."`), grid_dq=2/grid_levels=16 (98.70%, `"Med Med Med..."`). Chunk/dim
+structure at fixed width made no qualitative difference -- every variant hit the same failure
+mode. A pure window-relaxation isolation test (pervasive cond_depth, no quant change, level0/
+level1 windows relaxed from exactly-K to 2x-K, "2 blocks worth of context back") also failed
+(v256pq1 98.18%, v16pq4 99.70%), as did a much more generous 16x-K ("16 codes worth") relaxation
+on both simplex (v256pq1, 99.24%) and FSQ (8x4, 98.77%) -- notably, at 16x-K the failure mode
+changed from repetitive token loops to non-coherent but *diverse* word-salad (no more
+`"xxx]]xxx]]..."`-style collapse, but still no grammatical sentences), suggesting the window size
+does matter for avoiding one specific pathology without yet being sufficient on its own.
+
+`scheduled_sampling_p` (real usage, not just smoke-tested): the last fallback tried.
+`sample_next()` originally used raw hard-argmax + `F.one_hot` with no gradient path back to the
+level-above encoder that produced the substituted code (confirmed by inspection -- `argmax`/
+`one_hot` have no `grad_fn`), unlike `BinaryQuant`/`GMMQuant`'s own `sample_next()`, which already
+routed through their STE `bsq_quantize`/`_select` machinery. Changed `SimplexQuant.sample_next` to
+use the same `_effective_hard_sample()` hard/sample setting as `quantize()` through
+`gumbel_quantize` (STE: hard forward, soft-softmax gradient backward, forward value unchanged from
+the old argmax version); `GridQuant.sample_next` similarly but always `sample=False` (no gumbel
+noise -- there's no well-defined sampling distribution over FSQ's L levels the way there is for a
+softmax, per direct instruction). Added `Config.detach_ss_sample: bool = False` (new default:
+gradient connects to the encoder; set `True` for the old fully-detached behavior) threaded through
+`make_quant()`. At `scheduled_sampling_p=0.5` with the new STE-connected gradient: `ks21` sanity
+check (n_levels=2) train byte_acc **dropped** to 73.92% (vs the old detached version's 99.02%,
+`gt_byte_acc` oscillated .59->.87->.55, unstable) -- the extra gradient signal destabilized
+training -- but real generation showed more diverse plausible text fragments ("Category",
+"namespace", "contributor") instead of pure repetitive collapse. `ks221` at the same p=0.5 still
+**failed** (93.97% train byte_acc, `"hatim]] hatim]] hatim]]..."`). Lowered to p=0.1: `ks21` sanity
+recovered to 89.64% (still below baseline but more stable, coherent-ish prose fragments), `ks221`
+reached 97.61% train byte_acc but still **failed** (`"...in [\net in [\net in [\net in..."`).
+
+**Net conclusion across all 13 configs in this investigation**: every lever tried (longer steps,
+`cond_depth`, six PQ/FSQ quant-structure variants at matched code width, window relaxation from
+exactly-K up to 16x-K, and STE-connected scheduled sampling at two substitution rates) converges
+`ks221`/`ks441` train byte_acc to 93-99.7%, but **none** produce coherent real (non-teacher-forced)
+generation -- the failure mode shifts (tight windows/high substitution rates -> repetitive token
+loops; generous windows -> non-coherent but diverse word-salad) without ever resolving into
+grammatical output. The `n_levels==2` case (`ks21`, `ks41`, `ks81`) converges cleanly and
+generates coherently under the same per-level window handicaps -- this appears to be specifically
+an `n_levels>=3` (multi-hop cross-attention depth) problem, not a code-width, quant-type, window-
+size, or exposure-bias problem in isolation.
