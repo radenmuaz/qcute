@@ -164,16 +164,25 @@ fix, or a code-level consistency loss — `scheduled_sampling_p` already impleme
 this and empirically *hurt*, not helped, an open unresolved question) in docs/status.md's
 "real differentiator" section (2026-08-22).
 
-**`qcute/qcute_zero_parallel/` (forked off 2026-08-22) is the preserved home of the query-vec/
-block-parallel-decode line of work** (design doc/brainstorm/comparison-vs-`qcute_v1` all in
-docs/status.md's "parallel block decode brainstorm" section) — `parallel_decode`
-training (multi-block, batch-folded) and `generate_blockwise` (the free-tier inference path) were
-both built and verified there, but the whole lineage was then forked off intact rather than
-continuing on top of it in `qcute_zero` itself, so the two directions (parallel decode vs. real KV
-caching) stay untangled. Revisit it on its own terms later if worth returning to; not part of
-`qcute_zero`'s own file anymore.
+**query_vec/`parallel_decode` pruned from `qcute_zero`, replaced with regular MTP heads
+(2026-08-22)** — diagnosed flaw: one `query_vec` slot cost a full attention-stack pass and only
+covered `parallel_decode_n_blocks` sampled clusters per step, nowhere near real MTP's density
+(reuse one hidden state, many cheap linear heads). `Config.mtp_heads`/`mtp_weight` (default
+`mtp_heads=1`, disabled) now add untied `nn.Linear(D, V)` heads reading the SAME final hidden state
+head0's own cond/uncond readout already uses — pervasive (every position, every step), cheap (zero
+extra attention FLOPs), mirroring `qcute.bytelm`'s own `mtp_heads` pattern exactly.
+`generate_speculative` now drafts via these heads (one forward pass, no per-slot attention cost)
+instead of `query_vec`, still verified byte-by-byte against the real, exact `generate_kv_cache`
+stepper (`_make_incremental_stepper`) — same accept/reject-to-first-divergence scheme, confirmed
+still **exactly** matching `generate_kv_cache`'s own trajectory after the swap. `generate_blockwise`
+(the free-tier query_vec decode) was removed outright, no MTP-head replacement needed (superseded
+by `generate_speculative`). The query_vec/cluster mechanism itself is preserved as its own
+standalone testbed, forked onto the simpler `qcute.bytelm` trunk (no fuse-stage complexity, direct
+cross-attend into the real trunk's per-layer K/V): `qcute/bytelm_queryvec/bytelm_queryvec.py`.
+`qcute/qcute_zero_parallel/` (the original query-vec fork of `qcute_zero`) is left as-is, now
+doubly superseded, kept only for historical reference.
 
-**`qcute_zero` itself pivoted instead to a real incremental KV cache** (2026-08-22):
+**`qcute_zero`'s real incremental KV cache** (2026-08-22):
 `generate_kv_cache` is no longer aliased to `generate_no_cache`'s full recompute — it's a genuine
 incremental cache (byte-level self-attention + each fuse stage's post-cross-attn refinement pass,
 the two `O(L)`-per-step costs; the short code-sequence/kvlm pass and fuse cross-attention itself
