@@ -48,11 +48,14 @@ Differences from qcute.bytelm:
   - Checkpointer.is_better guards against a non-finite or non-positive metric (copied from
     qcute_v1_common.py's version — bf16 TPU training can occasionally spike to nan/inf; a bad
     checkpoint from that is worse than skipping a save).
-  - New CausalSelfAttention.zero_kv_sink option (default off): prepends one all-zero key/value
+  - CausalSelfAttention.zero_kv_sink option (default ON): prepends one all-zero key/value
     ("sink") token before every real token, visible to every query unconditionally, before SDPA.
     A static (non-learned) attention sink, sometimes used to relieve softmax's requirement that
-    attention weights sum to 1 even when no real key deserves much mass. Toggle via
-    `LMConfig(zero_kv_sink=True)` / `--zero_kv_sink`.
+    attention weights sum to 1 even when no real key deserves much mass. Disable via
+    `LMConfig(zero_kv_sink=False)` / `--no_zero_kv_sink`.
+  - RMSNorm (not LayerNorm) and SwiGLU MLP (gate+up+down, not a single-branch silu MLP) —
+    LLaMA-style stack, all Linear layers already bias-free. Adopted 2026-08-22 to converge
+    faster as a baseline, independent of whether any enwik8-bpb literature result used them.
 
 Otherwise the model (plain pre-norm transformer, RoPE, MTP heads), training loop, and generation
 code (plain AR / KV-cache / self-speculative) are the same as qcute.bytelm — see that module's
@@ -230,7 +233,7 @@ class LMConfig:
     mlp_mult: int = 4
     rope_base: float = 10000.0
     mtp_heads: int = 8  # n parallel next-byte heads (bandwidth-matched to qcute.qcutelm's K)
-    zero_kv_sink: bool = False  # prepend one all-zero K/V token, always attendable, before SDPA
+    zero_kv_sink: bool = True  # prepend one all-zero K/V token, always attendable, before SDPA
     use_flash_attention: bool = False  # nightly-only (see module docstring); ignored if unavailable
 
     @property
@@ -327,23 +330,39 @@ class CausalSelfAttention(nn.Module):
         return self.out(y), new_k, new_v
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * self.weight
+
+
 class MLP(nn.Module):
+    """SwiGLU (LLaMA-style): gate and up are separate projections, unlike a plain Swish MLP —
+    hidden width (cfg.mlp_mult * d_model) is unchanged, so this has ~50% more MLP params than a
+    single-branch silu MLP at the same mlp_mult."""
+
     def __init__(self, cfg: LMConfig):
         super().__init__()
         hidden = cfg.mlp_mult * cfg.d_model
+        self.gate = nn.Linear(cfg.d_model, hidden, bias=False)
         self.up = nn.Linear(cfg.d_model, hidden, bias=False)
         self.down = nn.Linear(hidden, cfg.d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(F.silu(self.up(x)))
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 class Block(nn.Module):
     def __init__(self, cfg: LMConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.d_model)
+        self.ln1 = RMSNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
-        self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.ln2 = RMSNorm(cfg.d_model)
         self.mlp = MLP(cfg)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -370,7 +389,7 @@ class ByteLM(nn.Module):
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab, cfg.d_model)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
-        self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.ln_f = RMSNorm(cfg.d_model)
         self.heads = nn.ModuleList(
             [nn.Linear(cfg.d_model, cfg.vocab, bias=False) for _ in range(cfg.mtp_heads)]
         )
@@ -720,7 +739,7 @@ def main():
     p.add_argument("--context", type=int, default=None, help="override preset's context length")
     p.add_argument("--mtp_heads", type=int, default=None, help="override preset's MTP head count")
     p.add_argument("--n_layers", type=int, default=None, help="override preset's transformer layer count")
-    p.add_argument("--zero_kv_sink", action="store_true", help="prepend an all-zero, always-attendable K/V sink token")
+    p.add_argument("--no_zero_kv_sink", action="store_true", help="disable the (default-on) all-zero, always-attendable K/V sink token")
     p.add_argument("--use_flash_attention", action="store_true",
                     help="use torch_xla's Pallas flash-attention kernel in the training forward pass (nightly-only, see module docstring; silently falls back to plain SDPA if unavailable)")
     p.add_argument("--multichip", action="store_true",
@@ -793,8 +812,8 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
             cfg.mtp_heads = args.mtp_heads
         if args.n_layers is not None:
             cfg.n_layers = args.n_layers
-        if args.zero_kv_sink:
-            cfg.zero_kv_sink = True
+        if args.no_zero_kv_sink:
+            cfg.zero_kv_sink = False
         if args.use_flash_attention:
             cfg.use_flash_attention = True
         model = ByteLM(cfg).to(device)

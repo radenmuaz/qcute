@@ -41,31 +41,23 @@ lets a stage's own freshly-initialized cross-attention weights learn to suppress
 emergent, learned on-ramp instead of a hand-scheduled one. Expected, not yet proven -- the whole
 point of the ks21/ks221-no-curriculum runs this file's plan calls for.
 
-Query for "what predicts a new position" is the ordinary previous-token hidden state (no seed/BOS
-token at all, unlike qcute_v1) -- pure standard AR continuation, causal by construction.
-
-Real incremental KV caching (`generate_kv_cache`): byte-level self.blocks self-attention and each
-fuse stage's post-cross-attn refinement self.blocks pass are cached across generation steps
-(O(1) attention work per new byte instead of full O(L) recompute) -- see `Attn.forward_incremental`/
-`Block.forward_incremental`. The short code-sequence self-attention (kvlm) pass and the fuse
-cross-attention itself are still recomputed fresh whenever a new code appears (every Ks[s] bytes),
-since code sequences are short (length ~ L/prod(Ks[:s+1])) -- not worth incrementally caching.
-Produces the exact same argmax choices as `generate_no_cache` (verified by direct comparison),
-just asymptotically cheaper for long generations.
-
-A separate, preserved lineage (`qcute/qcute_zero_parallel/`) explored an alternative, OPTIONAL
-block-parallel-decode mechanism (a trained query vector standing in for a missing hidden state,
-predicting a whole Ks[0]-sized block per step) -- forked off before this file's own incremental
-KV-cache work, kept intact under its own name rather than merged in, since the two are separate
-lines of investigation (see that lineage's own module docstring, and docs/status.md's
-"parallel block decode brainstorm" section, 2026-08-22).
+Default query for "what predicts a new position" is the ordinary previous-token hidden state (no
+seed/BOS token at all, unlike qcute_v1) -- pure standard AR continuation, causal by construction.
+`cfg.parallel_decode` (default False) is an OPTIONAL, separate mechanism: a single trainable query
+vector, trained by predicting a WHOLE randomly-chosen Ks[0]-sized block in parallel (one random
+block-aligned boundary per batch, all its bytes at once, cheap relative to a full per-position loss)
+-- toward block-parallel local decode (predicting a block's bytes from strictly-prior codes only,
+without needing their true sequential hidden states first). Every slot's cross-attn is masked to the
+last GROUNDED position before the block (never any slot's own future position, matching the
+causal invariant proven in docs/status.md), so this stays fully consistent with ordinary training --
+not required for, or exercised by, the default training path.
 
 Single file by design for now (explicitly asked: "make thing single file first refactor later") --
 copies/adapts primitives from qcute_v1_common.py (Block/RoPE/Logger/data-loading/train-loop shapes)
 rather than importing them, since this is meant to stay a separate, prunable lineage.
 
-uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks21_overfit10k.py
-uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks221_overfit10k.py
+uv run python -m qcute.qcute_zero_parallel.qcute_zero_parallel --config configs/qcute_zero_parallel/ks21_overfit10k.py
+uv run python -m qcute.qcute_zero_parallel.qcute_zero_parallel --config configs/qcute_zero_parallel/ks221_overfit10k.py
 """
 import argparse
 import gzip
@@ -200,8 +192,11 @@ def load_config_module(path: Path) -> dict:
 # ----------------------------------------------------------------------------
 
 def rope_cos_sin_for_positions(position_ids: torch.Tensor, head_dim: int, base: float, device: torch.device):
+    """position_ids: (T,) shared across the whole batch (the common case), or (Bv, T) -- one
+    absolute-position row per batch element (block-folded parallel-decode training, where
+    different folded blocks sit at different real byte positions)."""
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
-    freqs = torch.outer(position_ids.float(), inv_freq)
+    freqs = position_ids.float().unsqueeze(-1) * inv_freq  # (..., T, hd/2), generalizes torch.outer
     emb = torch.cat([freqs, freqs], dim=-1)
     return emb.cos(), emb.sin()
 
@@ -212,7 +207,13 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    return x * cos[None, None] + rotate_half(x) * sin[None, None]
+    """cos/sin: (T, hd) shared across batch (broadcasts via [None, None]), or (Bv, T, hd)
+    per-batch-row positions (broadcasts via [:, None] over the head dim only)."""
+    if cos.dim() == 2:
+        cos, sin = cos[None, None], sin[None, None]
+    else:
+        cos, sin = cos[:, None], sin[:, None]
+    return x * cos + rotate_half(x) * sin
 
 
 def sdpa_with_sink(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
@@ -273,36 +274,6 @@ class Attn(nn.Module):
         y = sdpa_with_sink(q, k, v, attn_mask)
         return self.out(y.transpose(1, 2).reshape(B, T, D))
 
-    def forward_incremental(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
-                             cache, window: int | None):
-        """Incremental self-attention: x_new is only the NEW position(s) (Tn=1 per generation
-        step, or the whole prompt on the priming call); cache is None (nothing yet) or (k_prev,
-        v_prev) from earlier calls. Returns (out, new_cache) -- new_cache is trimmed to the last
-        `window` entries when windowed, so a subsequent call only ever pays for what's visible.
-        Mask uses LOCAL (call-relative) positions -- only relative order matters for causality,
-        and cos/sin (computed from true absolute positions by the caller) is what actually encodes
-        real distance, so this stays exactly consistent with the full-recompute path."""
-        B, Tn, D = x_new.shape
-        H, hd = self.n_heads, self.head_dim
-        qkv = self.qkv(x_new).reshape(B, Tn, 3, H, hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        q, k = apply_rope(q, cos_new, sin_new), apply_rope(k, cos_new, sin_new)
-        if cache is None:
-            k_all, v_all, S_prev = k, v, 0
-        else:
-            k_prev, v_prev = cache
-            k_all, v_all = torch.cat([k_prev, k], dim=2), torch.cat([v_prev, v], dim=2)
-            S_prev = k_prev.shape[2]
-        S = k_all.shape[2]
-        new_pos = torch.arange(S_prev, S_prev + Tn, device=x_new.device)
-        key_pos = torch.arange(S, device=x_new.device)
-        mask = causal_mask(new_pos, key_pos, window)
-        y = sdpa_with_sink(q, k_all, v_all, mask)
-        out = self.out(y.transpose(1, 2).reshape(B, Tn, D))
-        if window is not None and S > window:
-            k_all, v_all = k_all[:, :, -window:], v_all[:, :, -window:]
-        return out, (k_all, v_all)
-
     def forward_cross(self, x_q: torch.Tensor, x_kv: torch.Tensor, cos_q: torch.Tensor, sin_q: torch.Tensor,
                        cos_k: torch.Tensor, sin_k: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         B, T, D = x_q.shape
@@ -337,13 +308,6 @@ class Block(nn.Module):
         x = x + self.attn(self.ln1(x), cos, sin, attn_mask)
         x = x + self.mlp(self.ln2(x))
         return x
-
-    def forward_incremental(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
-                             cache, window: int | None):
-        attn_out, new_cache = self.attn.forward_incremental(self.ln1(x_new), cos_new, sin_new, cache, window)
-        x_new = x_new + attn_out
-        x_new = x_new + self.mlp(self.ln2(x_new))
-        return x_new, new_cache
 
 
 class FuseStage(nn.Module):
@@ -414,6 +378,11 @@ class Config:
     code_sample: bool = False
     code_ntp_weight: float = 1.0             # weight for each fuse stage's own code-sequence NTP loss
     cond_weight: float = 1.0                 # weight for each stage's post-fusion byte NTP loss
+    parallel_decode: bool = False            # trains a shared query vector to predict a WHOLE upcoming
+    parallel_decode_weight: float = 1.0      # Ks[0]-sized block in parallel, off by default (see
+                                              # docs/status.md's "parallel block decode brainstorm")
+    parallel_decode_n_blocks: int = 1        # independently-sampled blocks trained per step, all
+                                              # reusing the SAME code_kv_cache (folded into batch)
 
 
 def resolve_fuse_window(w, n_fuse: int) -> tuple:
@@ -442,6 +411,9 @@ class QCuteZero(nn.Module):
         self.fuse_stages = nn.ModuleList(
             [FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers) for _ in range(self.n_fuse)])
         self.fuse_windows = resolve_fuse_window(cfg.fuse_window, self.n_fuse)
+
+        if cfg.parallel_decode:
+            self.query_vec = nn.Parameter(torch.zeros(D))
 
     def _run_blocks(self, x: torch.Tensor, cos, sin, attn_mask) -> torch.Tensor:
         for block in self.blocks:
@@ -473,7 +445,7 @@ class QCuteZero(nn.Module):
         cum_K = 1
         fuse_ntp_losses, fuse_ntp_accs = [], []
         cond_losses, cond_accs = [], []
-        code_kv_cache = []       # (h_code_s, code_pos_abs, window) per stage
+        code_kv_cache = []       # (h_code_s, code_pos_abs, window) per stage, reused by parallel_decode
 
         for s in range(self.n_fuse):
             K_s = cfg.Ks[s]
@@ -528,11 +500,57 @@ class QCuteZero(nn.Module):
             code_kv_cache += [(h_code, code_pos_abs, window_s)]
             cur_h = h_code
 
+        # --- optional: parallel-decode query vector, trained on `parallel_decode_n_blocks`
+        # independently-sampled WHOLE Ks[0]-sized blocks per step, all reusing the SAME
+        # code_kv_cache from this one forward pass (folded into an extended batch dim -- "Option B"
+        # from the parallel-decode brainstorm: each sampled block becomes its own batch row, so
+        # self-attn among a block's own K0 slots needs no new block-diagonal mask machinery, only
+        # per-row RoPE positions and a per-row cross-attn clamp). Every slot's cross-attn is clamped
+        # to ITS OWN block's last-grounded boundary -- never any slot's own future position -- so
+        # this stays exactly consistent with the free-tier invariant (docs/status.md's
+        # parallel-decode brainstorm section).
+        parallel_decode_loss = None
+        K0 = cfg.Ks[0] if cfg.Ks else None
+        if cfg.parallel_decode and self.n_fuse > 0 and code_kv_cache and K0 and L >= 2 * K0:
+            n_full_blocks = L // K0
+            nb = max(1, min(cfg.parallel_decode_n_blocks, n_full_blocks - 1))
+            bis = torch.randint(1, n_full_blocks, (nb,), device=device)      # bi>=1: prior block exists
+            m_list = bis * K0                                                # (nb,)
+            clamp_list = m_list - 1                                          # (nb,)
+            offsets = torch.arange(K0, device=device)                       # (K0,) local slot index
+            slot_pos_2d = m_list.view(nb, 1) + offsets.view(1, K0)          # (nb, K0) absolute positions
+
+            # fold (real batch, sampled block) into one virtual batch axis Bv = B*nb, B-major/
+            # nb-minor throughout, so orig_idx below stays consistent with every other expand
+            Bv = B * nb
+            orig_idx = torch.arange(B, device=device).view(B, 1).expand(B, nb).reshape(Bv)
+            slot_pos_v = slot_pos_2d.unsqueeze(0).expand(B, nb, K0).reshape(Bv, K0)
+            clamp_v = clamp_list.view(1, nb).expand(B, nb).reshape(Bv)       # (Bv,) one clamp per row
+            targets = byte_ids[orig_idx.view(Bv, 1), slot_pos_v]            # (Bv, K0)
+
+            cos_q1, sin_q1 = rope_cos_sin_for_positions(slot_pos_v, hd, cfg.rope_base, device)  # (Bv,K0,hd)
+            self_mask_q = causal_mask(offsets, offsets, None)  # shared (1,1,K0,K0): rows are now
+            # independent batch elements, so plain within-block causality needs no per-row variant
+            xq = self.query_vec.view(1, 1, D).expand(Bv, K0, D)
+            for s, (h_code, code_pos_abs, window_s) in enumerate(code_kv_cache):
+                h_code_v = h_code.unsqueeze(1).expand(B, nb, *h_code.shape[1:]).reshape(Bv, *h_code.shape[1:])
+                allow = code_pos_abs.view(1, -1) <= clamp_v.view(-1, 1)      # (Bv, n_codes_s)
+                if window_s is not None:
+                    allow = allow & ((clamp_v.view(-1, 1) - code_pos_abs.view(1, -1)) < window_s)
+                mask_q = allow.view(Bv, 1, 1, -1)  # per-row clamp, broadcasts over K0 query rows & heads
+                cos_k, sin_k = rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base, device)
+                xq = self.fuse_stages[s](xq, h_code_v, cos_q1, sin_q1, cos_k, sin_k, mask_q)
+                xq = self._run_blocks(xq, cos_q1, sin_q1, self_mask_q)
+            pd_logits_full = self.fuse_stages[s].readout(xq, self.embed.weight)  # (Bv, K0, V)
+            parallel_decode_loss = F.cross_entropy(pd_logits_full.reshape(-1, V), targets.reshape(-1))
+
         final_loss = cond_losses[-1] if cond_losses else uncond_loss
         final_acc = cond_accs[-1] if cond_accs else uncond_acc
         total_loss = (sum(cond_losses) * cfg.cond_weight if cond_losses else uncond_loss)
         if fuse_ntp_losses:
             total_loss = total_loss + cfg.code_ntp_weight * torch.stack(fuse_ntp_losses).sum()
+        if parallel_decode_loss is not None:
+            total_loss = total_loss + cfg.parallel_decode_weight * parallel_decode_loss
 
         metrics = {
             "loss": total_loss, "final_loss": final_loss, "byte_acc": final_acc,
@@ -542,6 +560,9 @@ class QCuteZero(nn.Module):
             **{f"fuse{s}_ntp_loss": l for s, l in enumerate(fuse_ntp_losses)},
             **{f"fuse{s}_ntp_acc": a for s, a in enumerate(fuse_ntp_accs)},
         }
+        if parallel_decode_loss is not None:
+            metrics["parallel_decode_loss"] = parallel_decode_loss
+            metrics["parallel_decode_acc"] = (pd_logits_full.argmax(-1) == targets).float().mean()
         return total_loss, metrics
 
     @torch.no_grad()
@@ -550,9 +571,10 @@ class QCuteZero(nn.Module):
         computation as forward()'s cascade minus the loss terms. Returns (cond_logits_full,
         code_kv_cache) -- cond_logits_full is the final stage's full per-position logits (uncond
         fallback if n_fuse==0), code_kv_cache is the per-stage (h_code, code_pos_abs, window) list.
-        Used by _forward_next_byte_logits so there is exactly one generation-time code path, not
-        two drifting copies -- unlike qcute_v1's generate_no_cache/_stack_generate_blockwise split
-        (see docs/status.md's 2026-08-21/22 generation-bug entry for why that split is risky)."""
+        Used by both _forward_next_byte_logits (byte-at-a-time) and generate_blockwise
+        (block-at-a-time) so there is exactly one generation-time code path, not two drifting
+        copies -- unlike qcute_v1's generate_no_cache/_stack_generate_blockwise split (see
+        docs/status.md's 2026-08-21/22 generation-bug entry for why that split is risky)."""
         cfg = self.cfg
         B, L = byte_ids.shape
         D = cfg.d_model
@@ -607,8 +629,11 @@ class QCuteZero(nn.Module):
 
     @torch.no_grad()
     def generate_no_cache(self, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> torch.Tensor:
-        """Byte-by-byte, full recompute each step -- correctness reference. generate_kv_cache
-        (below) produces the exact same argmax trajectory, incrementally, for actual use."""
+        """Byte-by-byte, full recompute each step -- correctness-first, matches qcute_v1's own
+        current "not yet KV-cached" state (CLAUDE.md: "incrementally-correct (not yet KV-cached)
+        generation"), same precedent. generate_kv_cache is aliased to this until real incremental
+        caching is built -- the causal/static-shape design (chat 2026-08-22) is what makes that a
+        future optimization, not a correctness fix."""
         was_training = self.training
         self.eval()
         prompt_bytes = prompt_bytes.to(device)
@@ -623,152 +648,61 @@ class QCuteZero(nn.Module):
             self.train()
         return all_bytes[0]
 
+    generate_kv_cache = generate_no_cache
+
     @torch.no_grad()
-    def generate_kv_cache(self, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> torch.Tensor:
-        """Real incremental KV cache: the byte-level self.blocks self-attention and each fuse
-        stage's post-cross-attn refinement self.blocks pass are cached across steps (O(1) new
-        attention work per new byte, vs generate_no_cache's full O(L) recompute). The short
-        code-sequence self-attention (kvlm) pass and the fuse cross-attention itself are still
-        recomputed fresh whenever a new code appears (every Ks[s] bytes) -- cheap, since those
-        sequences are short (~L/prod(Ks[:s+1])), not worth incrementally caching. Produces the
-        exact same argmax choices as generate_no_cache (see scripts/*_kv_cache_equiv_check for the
-        direct comparison), just asymptotically cheaper for long generations."""
+    def generate_blockwise(self, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> torch.Tensor:
+        """Free-tier block-parallel decode (docs/status.md's parallel-decode brainstorm, "free
+        tier"): decides Ks[0] bytes per step via the trained query_vec instead of one byte at a
+        time. Requires cfg.parallel_decode=True AND a checkpoint actually trained with it --
+        otherwise query_vec is untrained noise and this will not produce coherent output. Reuses
+        ONE prefix forward's code_kv_cache (via _generate_cascade) across all Ks[0] slots of the
+        step -- the "kv cache reuse" this buys is per-BLOCK, not a real incremental cache across
+        steps (the prefix itself is still fully recomputed each step, same as generate_no_cache --
+        no true incremental KV cache exists yet, see that method's own docstring). No code
+        drafting/accept-reject here -- that's the separate, unbuilt speculative tier."""
         cfg = self.cfg
+        assert cfg.parallel_decode, "generate_blockwise requires a model trained with cfg.parallel_decode=True"
+        K0 = cfg.Ks[0]
         D = cfg.d_model
         hd = D // cfg.n_heads
-        device_t = torch.device(device)
 
         was_training = self.training
         self.eval()
         prompt_bytes = prompt_bytes.to(device)
         if prompt_bytes.dim() == 1:
             prompt_bytes = prompt_bytes.unsqueeze(0)
-        Bsz = prompt_bytes.shape[0]
-
-        byte_caches = [None] * cfg.n_layers
-        refine_caches = [[None] * cfg.n_layers for _ in range(self.n_fuse)]
-        h_hist = None                        # (Bsz, cur_L, D): raw byte hidden states so far
-        stage_h_hist = [torch.zeros(Bsz, 0, D, device=device_t) for _ in range(self.n_fuse)]
-        # per-stage backlog: while a stage is still fully inactive (n_blocks_now==0, matching
-        # forward()'s own "if n_blocks<1: break" -- the WHOLE stage is skipped, not just some
-        # positions), its input is accumulated here so the first activation can catch up on
-        # everything it missed in ONE priming call, exactly matching a full recompute at that
-        # point (an earlier version skipped this catch-up entirely -- confirmed via direct
-        # generate_no_cache vs generate_kv_cache mismatch on short prompts, chat 2026-08-22).
-        x_in_backlog = [None] * self.n_fuse
-        cum_Ks = []
-        cum = 1
-        for K_s in cfg.Ks[:self.n_fuse]:
-            cum *= K_s
-            cum_Ks.append(cum)
-
-        def step(byte_chunk: torch.Tensor, start_pos: int) -> torch.Tensor:
-            nonlocal h_hist
-            Tn = byte_chunk.shape[1]
-            pos = torch.arange(start_pos, start_pos + Tn, device=device_t)
-            cos_b, sin_b = rope_cos_sin_for_positions(pos, hd, cfg.rope_base, device_t)
-            h_new = self.embed(byte_chunk)
-            for l, block in enumerate(self.blocks):
-                h_new, byte_caches[l] = block.forward_incremental(h_new, cos_b, sin_b, byte_caches[l], cfg.attn_window)
-            h_new = self.ln_f(h_new)
-            h_hist = h_new if h_hist is None else torch.cat([h_hist, h_new], dim=1)
-
-            x_in = h_new
-            cur_h_hist = h_hist
-            logits_full = F.linear(x_in, self.embed.weight)  # uncond fallback if n_fuse==0
-            for s in range(self.n_fuse):
-                K_s = cfg.Ks[s]
-                n_blocks = cur_h_hist.shape[1] // K_s
-                if n_blocks > stage_h_hist[s].shape[1]:
-                    # a new code boundary was crossed -- recompute this stage's short code
-                    # sequence fresh (cheap: length n_blocks, not the full byte length)
-                    code_h = cur_h_hist[:, K_s - 1::K_s, :][:, :n_blocks, :]
-                    code_logits = F.linear(code_h, self.embed.weight)
-                    onehot = gumbel_quantize(code_logits, cfg.gumbel_tau, hard=True, sample=False)
-                    code_embeds = onehot @ self.embed.weight
-                    code_local_pos = torch.arange(n_blocks, device=device_t)
-                    cos_c, sin_c = rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base, device_t)
-                    code_mask = causal_mask(code_local_pos, code_local_pos, None)
-                    stage_h_hist[s] = self._run_blocks(code_embeds, cos_c, sin_c, code_mask)
-                h_code = stage_h_hist[s]
-                n_blocks_now = h_code.shape[1]
-
-                if n_blocks_now < 1:
-                    # stage still fully inactive -- a hard BREAK, matching forward()'s own
-                    # "if n_blocks<1: break" exactly: a deeper stage can never be active while
-                    # this one isn't (its codes are derived FROM this stage's own h_code), so
-                    # there is nothing further to accumulate downstream this step either (an
-                    # earlier version used `continue` here, letting a later stage's backlog
-                    # prematurely accumulate this stage's not-yet-final input -- double-counted
-                    # once this stage later caught up, confirmed via direct logit comparison
-                    # against _generate_cascade, chat 2026-08-22).
-                    x_in_backlog[s] = x_in if x_in_backlog[s] is None else torch.cat([x_in_backlog[s], x_in], dim=1)
-                    break
-
-                code_pos_abs = (torch.arange(n_blocks_now, device=device_t) + 1) * cum_Ks[s] - 1
-                window_s = self.fuse_windows[s]
-                cos_k, sin_k = rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base, device_t)
-
-                if refine_caches[s][0] is None:
-                    # first activation: prime with the FULL backlog (+ this chunk) in one shot,
-                    # true absolute positions (this chunk's end always equals start_pos+Tn)
-                    x_q = x_in if x_in_backlog[s] is None else torch.cat([x_in_backlog[s], x_in], dim=1)
-                    x_in_backlog[s] = None
-                else:
-                    x_q = x_in
-                q_len = x_q.shape[1]
-                q_start = (start_pos + Tn) - q_len
-                q_pos = torch.arange(q_start, q_start + q_len, device=device_t)
-                cos_q, sin_q = rope_cos_sin_for_positions(q_pos, hd, cfg.rope_base, device_t)
-                fuse_mask = causal_mask(q_pos, code_pos_abs, window_s)
-
-                x_cross = self.fuse_stages[s](x_q, h_code, cos_q, sin_q, cos_k, sin_k, fuse_mask)
-                for l, block in enumerate(self.blocks):
-                    x_cross, refine_caches[s][l] = block.forward_incremental(
-                        x_cross, cos_q, sin_q, refine_caches[s][l], cfg.attn_window)
-                x_cross = self.ln_f(x_cross)
-                logits_full = self.fuse_stages[s].readout(x_cross, self.embed.weight)
-                x_in = x_cross
-                cur_h_hist = h_code
-            return logits_full
-
         all_bytes = prompt_bytes
-        logits_all = step(all_bytes, 0)          # prime the caches with the whole prompt
-        next_logits = logits_all[:, -1, :]
-        for _ in range(n_new_bytes):
-            next_byte = next_logits.argmax(-1, keepdim=True)
-            all_bytes = torch.cat([all_bytes, next_byte], dim=1)
-            logits_all = step(next_byte, all_bytes.shape[1] - 1)   # feed only the new byte
-            next_logits = logits_all[:, -1, :]
+        target_len = prompt_bytes.shape[1] + n_new_bytes
+
+        while all_bytes.shape[1] < target_len:
+            m = all_bytes.shape[1]
+            block_size = min(K0 - (m % K0), target_len - m)
+            _, code_kv_cache = self._generate_cascade(all_bytes)
+
+            slot_pos = torch.arange(m, m + block_size, device=device)
+            cos_q, sin_q = rope_cos_sin_for_positions(slot_pos, hd, cfg.rope_base, device)
+            self_mask = causal_mask(slot_pos, slot_pos, None)
+            xq = self.query_vec.view(1, 1, D).expand(all_bytes.shape[0], block_size, D)
+
+            if not code_kv_cache:  # n_fuse==0 -- no code KV at all, fall back to the uncond readout
+                xq = self._run_blocks(xq, cos_q, sin_q, self_mask)
+                logits = F.linear(self.ln_f(xq), self.embed.weight)
+            else:
+                clamp_pos_vec = torch.full((block_size,), m - 1, device=device)
+                for s, (h_code, code_pos_abs, window_s) in enumerate(code_kv_cache):
+                    mask_q = causal_mask(clamp_pos_vec, code_pos_abs, window_s)
+                    cos_k, sin_k = rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base, device)
+                    xq = self.fuse_stages[s](xq, h_code, cos_q, sin_q, cos_k, sin_k, mask_q)
+                    xq = self._run_blocks(xq, cos_q, sin_q, self_mask)
+                logits = self.fuse_stages[s].readout(xq, self.embed.weight)
+
+            new_bytes = logits.argmax(-1)  # (Bsz, block_size), all decided in one shot
+            all_bytes = torch.cat([all_bytes, new_bytes], dim=1)
 
         if was_training:
             self.train()
         return all_bytes[0]
-
-    @torch.no_grad()
-    def check_kv_cache_consistency(self, val_data: torch.Tensor, device: str,
-                                    n_checks: int = 3, prompt_len: int = 8, n_new_bytes: int = 24) -> dict:
-        """Diagnostic: generate_no_cache vs generate_kv_cache MUST produce bit-exact identical
-        greedy trajectories -- generate_kv_cache is a pure efficiency reformulation of the same
-        computation, not an approximation. Checks n_checks random prompts sampled from val_data at
-        varying lengths (short prompts specifically exercise the "stage not yet active" backlog
-        path -- this is exactly where a real bug was caught and fixed, chat 2026-08-22). Returns
-        {"match_rate": float, "n_checks": int} -- match_rate should always be 1.0; anything less
-        means the two paths have desynced and needs debugging before trusting generate_kv_cache."""
-        was_training = self.training
-        self.eval()
-        n_match = 0
-        for i in range(n_checks):
-            pl = max(1, prompt_len - i * (prompt_len // max(1, n_checks)))  # vary length, incl. short
-            start = torch.randint(0, max(1, val_data.shape[0] - pl - n_new_bytes), (1,)).item()
-            prompt = val_data[start:start + pl].to(device)
-            out_full = self.generate_no_cache(prompt, n_new_bytes, device)
-            out_cache = self.generate_kv_cache(prompt, n_new_bytes, device)
-            if torch.equal(out_full, out_cache):
-                n_match += 1
-        if was_training:
-            self.train()
-        return {"match_rate": n_match / n_checks, "n_checks": n_checks}
 
 
 # ----------------------------------------------------------------------------
@@ -838,6 +772,9 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--code_sample", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--code_ntp_weight", type=float, default=1.0)
     p.add_argument("--cond_weight", type=float, default=1.0)
+    p.add_argument("--parallel_decode", action="store_true", default=False)
+    p.add_argument("--parallel_decode_weight", type=float, default=1.0)
+    p.add_argument("--parallel_decode_n_blocks", type=int, default=1)
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -873,6 +810,8 @@ def config_from_args(args) -> Config:
         attn_window=args.attn_window, fuse_window=args.fuse_window, input_preset=args.input_preset,
         gumbel_tau=args.gumbel_tau, code_hard=args.code_hard, code_sample=args.code_sample,
         code_ntp_weight=args.code_ntp_weight, cond_weight=args.cond_weight,
+        parallel_decode=args.parallel_decode, parallel_decode_weight=args.parallel_decode_weight,
+        parallel_decode_n_blocks=args.parallel_decode_n_blocks,
     )
 
 
@@ -883,7 +822,7 @@ def main() -> None:
     model = QCuteZero(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
 
-    run_name = args.run_name or (pre_args.config.stem if pre_args.config else f"qcute_zero_{int(time.time())}")
+    run_name = args.run_name or (pre_args.config.stem if pre_args.config else f"qcute_zero_parallel_{int(time.time())}")
     log = Logger(args.logs_dir / run_name)
     print(f"run_name={run_name}  logging to {log.text_path} -- tail -f {log.text_path}")
     log(f"Ks={cfg.Ks} n_fuse={model.n_fuse} d_model={cfg.d_model} n_layers={cfg.n_layers} "

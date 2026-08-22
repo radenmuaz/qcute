@@ -123,8 +123,12 @@ commands.
 stable pin's `libtpu==0.0.21` is too old for the Pallas kernel) — full install steps, confirmed
 working on a `v4-8` node: [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md)'s "Optional:
 nightly build" section. **`--multichip` (collective data-parallel across chips) is confirmed
-broken** (hangs in PJRT rendezvous on that same nightly+v4-8 combo) — for using more than one
-chip on a host, launch independent single-chip processes instead, one per chip, via
+broken** (hangs in PJRT rendezvous on that same nightly+v4-8 combo) — static code review found
+nothing wrong in our own collective usage, so the leading hypothesis (untested as of 2026-08-22)
+is a nightly-build-specific PJRT bug: next thing to try, once a chip is free, is `--multichip`
+*without* `--use_flash_attention` on the **stable** `torch==2.9.0`/`torch_xla==2.9.0` pin instead
+of nightly (see docs/bytelm_tpu_setup.md's "Optional: multiple TPU chips on one host" section).
+For using more than one chip on a host today, launch independent single-chip processes instead, one per chip, via
 `TPU_VISIBLE_CHIPS=<i>` (verified working, no collectives needed) — see that doc's "Optional:
 multiple TPU chips on one host" section for the exact pattern. Check real addressable device
 count first (`torch_xla.runtime.addressable_runtime_device_count()` / `ls /dev/accel*` /
@@ -136,6 +140,48 @@ node, `tmux capture-pane -t <session> -p -S -N` peeks at any one without attachi
 target, for a real pty) attaches interactively.
 
 ## Architecture
+
+**`qcute_zero` (`qcute/qcute_zero/`, single file) — new monolithic single-shared-LM lineage,
+2026-08-22**: one LM (embed + blocks) does the byte pass AND, reusing the same weights, every fuse
+stage's own code-sequence NTP pass; periodic per-`Ks`-stage cross-attention ("fuse") back into the
+byte stream, own weights per stage, no curriculum by design (see docs/status.md's qcute_zero
+section for the full rationale/causality proof). First real `ks21`/`ks221` overfit10k runs (no
+curriculum) both converged cleanly and generated coherent text — the first 3-level config in either
+lineage to do so with zero curriculum. **Checkpoint caveat**: `Checkpointer` picks `best.pt` by
+lowest summed total val_loss, which is a bad proxy here (that sum keeps climbing well past the point
+`val_byte_acc` is still improving) — use `last.pt`, not `best.pt`, when loading a checkpoint from
+this lineage for generation or further analysis, until the checkpoint metric itself is fixed.
+Full-scale `ks221_1M` run (real enwik8_1M) launched 2026-08-22, in progress.
+
+**Why `qcute_zero` avoids `qcute_v1`'s free-rollout collapse — the real differentiator**: `qcute_v1`'s
+decode is structurally autoencoding at every block boundary (a block's seed token cross-attends to
+*that same block's own code*, which the encoder derived from that block's own real bytes — genuinely
+can't have that code before the block's bytes exist); `qcute_zero`'s decode is genuinely predictive by
+construction (verified position-by-position: a byte's cross-attn mask never admits its own or any
+future block's code, no exception). This is more fundamental than any weight-sharing/curriculum
+detail — full analysis, plus what discipline `v1` would actually need to close the gap (a structural
+fix, or a code-level consistency loss — `scheduled_sampling_p` already implements something close to
+this and empirically *hurt*, not helped, an open unresolved question) in docs/status.md's
+"real differentiator" section (2026-08-22).
+
+**`qcute/qcute_zero_parallel/` (forked off 2026-08-22) is the preserved home of the query-vec/
+block-parallel-decode line of work** (design doc/brainstorm/comparison-vs-`qcute_v1` all in
+docs/status.md's "parallel block decode brainstorm" section) — `parallel_decode`
+training (multi-block, batch-folded) and `generate_blockwise` (the free-tier inference path) were
+both built and verified there, but the whole lineage was then forked off intact rather than
+continuing on top of it in `qcute_zero` itself, so the two directions (parallel decode vs. real KV
+caching) stay untangled. Revisit it on its own terms later if worth returning to; not part of
+`qcute_zero`'s own file anymore.
+
+**`qcute_zero` itself pivoted instead to a real incremental KV cache** (2026-08-22):
+`generate_kv_cache` is no longer aliased to `generate_no_cache`'s full recompute — it's a genuine
+incremental cache (byte-level self-attention + each fuse stage's post-cross-attn refinement pass,
+the two `O(L)`-per-step costs; the short code-sequence/kvlm pass and fuse cross-attention itself
+stay full-recompute, cheap enough not to bother caching), verified **bit-exact** identical to
+`generate_no_cache` across 315 random configs via the new `check_kv_cache_consistency` diagnostic
+(`qcute_zero`'s first checked-in generation-consistency check, the analog of `qcute_v1`'s
+`check_roundtrip_consistency`/`check_gen_consistency`). Two real bugs were caught and fixed getting
+here — full writeup in docs/status.md's "real incremental KV cache" section (2026-08-22).
 
 **`qcute_v1` (`qcute/qcute_v1/`) is the active lineage as of 2026-08-20** — forked from a verbatim
 copy of `qcute_v5` (now archived at `qcute/v5_old/`, see Commands above), implementing the

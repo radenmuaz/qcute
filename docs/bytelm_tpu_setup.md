@@ -273,6 +273,19 @@ go idle (CPU time stops climbing) with no further progress, consistent with a st
 multi-process rendezvous. Not resolved; treat `--multichip` as unverified/broken until someone
 debugs the rendezvous further.
 
+**Static code review (2026-08-22, no live TPU test yet — see below for why)**: the training loop
+itself looks correct for collective use — every rank reaches `optimizer_step`'s all-reduce in
+lockstep every step (the `if not is_master: continue` guard sits *after* `optimizer_step`, so it
+only skips file I/O/eval/logging, never the collective itself), and no other collective
+(`rendezvous`/`all_reduce`/`all_gather`/`broadcast`) appears anywhere in the file. This points away
+from our own code and toward the PJRT client bootstrap itself (before any Python-level collective
+runs) — plausibly specific to the **nightly** `torch_xla==2.10.0.dev0` build (only installed for
+`--use_flash_attention`'s Pallas kernel requirement, see above), not the stable `2.9.0` pin.
+**Next thing to actually try, once a chip is free**: run `--multichip` (without
+`--use_flash_attention`) on the **stable** `torch==2.9.0`/`torch_xla==2.9.0` install instead of the
+nightly one — isolates whether the hang is a nightly-build-specific PJRT bug or a real bug in this
+project's multichip wiring. Untested hypothesis, not yet confirmed either way.
+
 **What does work**: independent single-chip processes via `TPU_VISIBLE_CHIPS`, confirmed directly
 — two concurrent single-device processes with `TPU_VISIBLE_CHIPS=0` and `TPU_VISIBLE_CHIPS=1` both
 ran and computed correctly with no conflict, no collectives, no rendezvous needed. This is
@@ -318,6 +331,30 @@ ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute
 
 or peek at each without attaching, same `tmux capture-pane -t <session> -p -S -N` pattern as the
 single-run case above, once per session name.
+
+## Rough sizing estimate: model/context for 1.0 bpb in 12h on a v4-16 pod
+
+Back-of-envelope only (2026-08-22) — not fit from this project's own scaling data, no controlled
+sweep has been run yet. Treat as a starting guess, re-derive once real throughput numbers exist
+at a larger model scale.
+
+- v4-16 = 16 TensorCores = **8 addressable chips** (megacore fuses 2 cores/chip, confirmed on the
+  `v4-8` node this session: 4 addressable devices via `addressable_runtime_device_count()`/
+  `/dev/accel*`/`tpu-info`).
+- Compute budget: `8 chips * 275 TFLOPS/chip (bf16 peak) * 35% assumed MFU * 12h = ~3.3e19 FLOPs`.
+- `6*N*D` heuristic (N=params, D=bytes trained on) → `N*D <= ~5.5e18`.
+- Anchoring to published near-1.0-bpc enwik8 results (Transformer-XL-large 277M, Perceiver AR
+  358M/context=8192, ~0.97-0.99 bpc): `N~250-350M`, `D~1-2e10` bytes (~150-220 epochs of enwik8's
+  ~90M-byte train split) — product ~2.5-3.5e18, fits the budget with headroom.
+- **Pareto point: N≈250-300M params, context≈4096-8192, ~180-200 epochs.**
+
+**Critical caveat**: this budget assumes all 8 chips combine into one data-parallel run via
+`--multichip`, which is currently broken (see below) — only independent single-chip runs are
+verified working. On one chip alone the same math gives `~4.1e18 FLOPs` → `N*D<=6.9e17`, roughly
+4-5x short of the anchor above; realistic single-chip outcome in 12h is closer to `N≈60-90M`,
+landing bpb ~1.1-1.2, not confidently 1.0. Fixing `--multichip` (or working around it, e.g.
+manual gradient averaging across independent per-chip runs) is the real gate on hitting 1.0 bpb
+in-budget, not step count or context length alone.
 
 ## Monitoring a multi-hour run
 

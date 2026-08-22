@@ -13,39 +13,30 @@ tmux capture-pane -t bytelm -p -S -10
 ```
 
 ```
+gcloud compute tpus queued-resources list --project raden-tpu --zone us-central2-b
 gcloud compute tpus queued-resources list --project raden-tpu --zone europe-west4-a
 gcloud compute tpus queued-resources list --project raden-tpu --zone europe-west4-b
 gcloud compute tpus queued-resources list --project raden-tpu --zone us-east1-d
-gcloud compute tpus queued-resources list --project raden-tpu --zone us-central2-b
 
 ```
 
 ```
-
-# on demand
-#gcloud compute tpus queued-resources create your-queued-resource-id \
-#    --node-id your-node-id \
-#    --project your-project-id \
-#    --zone us-central2-b \
-#    --accelerator-type v4-8 \
-#    --runtime-version tpu-ubuntu2204-base
-
-gcloud compute tpus queued-resources create tpu1 --node-id tpunode --project raden-tpu --zone us-central2-b --accelerator-type v4-8 --runtime-version tpu-ubuntu2204-base
+gcloud compute tpus queued-resources create tpu5 --node-id tpunode5 --project raden-tpu --zone us-central2-b --accelerator-type v4-8 --runtime-version tpu-ubuntu2204-base
 
 gcloud compute tpus queued-resources describe tpu1 --project raden-tpu --zone us-central2-b
 
-gcloud compute tpus queued-resources delete tpu1 --project raden-tpu  --zone us-central2-b --force --async
+gcloud compute tpus queued-resources delete tpu3 --project raden-tpu  --zone us-central2-b --force --async
 
-gcloud compute tpus queued-resources ssh tpu1 --project raden-tpu --zone us-central2-b
+gcloud compute tpus queued-resources ssh tpu2 --project raden-tpu --zone us-central2-b
 ```
 
 
 ```
-gcloud compute tpus queued-resources create tpu1 --node-id tpunode --project raden-tpu --zone europe-west4-a --accelerator-type v6e-1 --runtime-version v2-alpha-tpuv6e --spot
+gcloud compute tpus queued-resources create tpu1 --node-id tpunode1 --project raden-tpu --zone europe-west4-a --accelerator-type v6e-1 --runtime-version v2-alpha-tpuv6e --spot
 
 gcloud compute tpus queued-resources describe tpu1 --project raden-tpu --zone europe-west4-a
 
-gcloud compute tpus queued-resources delete tpu2 --project raden-tpu  --zone europe-west4-a --force --async
+gcloud compute tpus queued-resources delete tpu1 --project raden-tpu  --zone europe-west4-a --force --async
 
 gcloud compute tpus queued-resources ssh tpu1 --project raden-tpu --zone europe-west4-a
 ```

@@ -461,8 +461,18 @@ code" is just "predict a byte-shaped distribution, STE-hard-sample it"). That co
 run through the SAME shared blocks again (a second, shorter forward pass) for a genuine NTP loss on
 the code sequence itself (free via weight reuse, no separate per-level encoder) plus contextualized
 K/V for a cross-attention ("fuse") stage back into the byte-level query stream. `len(Ks)-1` fuse
-stages, one per cumulative period -- own cross-attention weights per stage, but a shared MLP across
-every stage. A mandatory, non-trainable all-zero K/V "sink" is prepended to every attention call
+stages, one per cumulative period -- each stage (`FuseStage`) owns its cross-attention, its own MLP,
+and its own final `ln_out` feeding its own cond-NTP head (revised 2026-08-22: an earlier version
+tracked cross-attention and MLP as two separate module lists with the MLP meant to be shared across
+stages, but the code actually instantiated one MLP per stage anyway -- merged into one per-stage
+module, no pretense of cross-stage MLP sharing left). After a fuse stage's cross-attn+own-MLP, the
+byte-level query stream gets ANOTHER pass through the shared self-attn+MLP LM blocks before that
+stage's own cond-NTP readout (and before the next stage's cross-attn query input) -- i.e. per stage:
+fuse cross-attn+own-MLP -> shared self-attn/MLP -> that stage's own cond head. Also revised: RMSNorm
+everywhere (was `nn.LayerNorm`) and every `Linear` is `bias=False`, matching `qcute.bytelm`'s own
+bias-free convention (bytelm itself still uses `LayerNorm`, not RMSNorm -- this is a `qcute_zero`-only
+change, not applied to the frozen baseline). A mandatory, non-trainable all-zero K/V "sink" is
+prepended to every attention call
 (self- and cross-, uniformly) so every query row has >=1 visible key even before a periodic code's
 causal boundary is reached (avoids NaN from an all-masked softmax row; when the sink is the only
 visible key the output is provably exactly zero, a clean no-op, not an arbitrary bias). Default
@@ -491,5 +501,209 @@ parameter receives gradient. `generate_kv_cache` is currently aliased to `genera
 KV-cached" state, same precedent; real incremental caching is future work the causal/static-shape
 design was built to allow, not a correctness fix needed now.
 
-First real runs launched: `configs/qcute_zero/ks21_overfit10k.py` and `ks221_overfit10k.py`, both
-**no curriculum** (matching the design's own expectation above) -- results pending.
+First real runs (2026-08-22, post RMSNorm/no-bias/merged-FuseStage revision above), both
+`configs/qcute_zero/ks21_overfit10k.py` and `ks221_overfit10k.py`, **no curriculum** (matching the
+design's own expectation above):
+
+| metric (final, step 1000) | `ks21` (2 levels) | `ks221` (3 levels) |
+|---|---|---|
+| `val_byte_acc` | 0.391 | 0.387 |
+| `val_uncond_acc` (no conditioning) | 0.069 | 0.033 |
+| `val_cond0_acc` (level 1) | 0.391 | 0.382 |
+| `val_cond1_acc` (level 2, top) | -- | 0.387 |
+| `val_fuse0_ntp_acc` | 0.979 | 0.752 |
+| `val_fuse1_ntp_acc` | -- | 0.946 |
+
+Key result: `val_cond1_acc` (deepest/top-level cross-attn stage) is not worse than `val_cond0_acc`
+for `ks221` -- no degradation cascading up the hierarchy, which is exactly the failure mode
+`qcute_v1`'s `StackDecoder` needed `curriculum_max_srcs`/`curriculum_step` to avoid. First 3-level
+hierarchical config in this whole investigation (either lineage) to converge cleanly with **zero**
+curriculum.
+
+**Checkpoint-selection caveat (important)**: `Checkpointer` saves `best.pt` by lowest *total summed*
+val_loss (`uncond_loss + sum(cond_losses) + sum(fuse_ntp_losses)`, per `Config.cond_weight`/
+`code_ntp_weight`) -- for both runs this picked a spuriously EARLY checkpoint (step ~200-250) because
+`uncond_loss`/`cond1_loss` keep climbing through training even as `byte_acc` keeps improving, dragging
+the sum up long before the model is actually done improving. `last.pt` (step 1000, matching the
+`val_byte_acc` numbers above) is the trustworthy checkpoint for these overfit10k runs, not `best.pt` --
+confirmed by generating from both and comparing (see below). Worth fixing properly later (checkpoint
+on `val_byte_acc` or `val_cond{N}_acc` instead of the summed loss), not yet done.
+
+Real generation (`generate_no_cache`, 128 bytes, prompt = 64 real val bytes), from `last.pt`:
+
+- `ks21`: `"arliest times to the present day'', 1945.&lt;/ref&gt; [[Diggers of [[Internation]]] [[Peter Kropotkin|Kropotkin]] foun sond similar sed Intellectuals in Social Change Toward Laissez Faire]&quo"`
+- `ks221`: `"arliest times to the present day'', 1945.&lt;/ref&gt; [[Diggers of the Family, Priceter Property Kropotkin, from Encyclopaedia Britannica, 1910]&lt;/ref&gt;\n[[Peter Kropotkin|Kropotkin]] found"`
+
+Both coherent, grammatical, correct wiki-markup structure, no repetitive collapse -- `ks221` (the
+hard 3-level case) reads if anything slightly more coherent than `ks21` here. From the same
+checkpoints' spurious early `best.pt` instead, both degrade into a repetitive `[[[[[[[...` collapse
+(worse for `ks221`, total collapse by ~200 bytes) -- consistent with those being genuinely
+under-trained snapshots, not a real architecture regression.
+
+Conclusion: `qcute_zero`'s no-curriculum design premise holds up on first real test, for the exact
+case (`ks221`) that broke `qcute_v1` without one.
+
+Full-scale `ks221_1M` run (real `enwik8_1M`, `n_bytes=None`, `configs/qcute_zero/ks221_1M.py`,
+`d_model=256, n_layers=4`, 8000 steps) launched 2026-08-22, in progress. `bytelm_xs4_ctx256_mtp1`/
+`bytelm_xs4_ctx1024_mtp1` (`mtp_heads=1`, no MTP — isolating whatever MTP itself contributes vs the
+xs4/xs preset default of `mtp_heads=4`) queued to follow it (one-job-at-a-time rule).
+
+### The real `qcute_v1` vs `qcute_zero` differentiator: autoencoding vs predictive decode (2026-08-22)
+
+Chat discussion converged on a sharper, more fundamental characterization than anything above
+(weight-sharing, curriculum mechanics, etc. are all downstream engineering detail by comparison):
+
+**`qcute_v1`'s decode is structurally autoencoding at every block boundary, not genuine NTP.**
+`own_block_cross_attn_decode`/`own_block_decode_loss` cross-attends a block's seed token to *that
+same block's own code* — a code the encoder produced from that block's own real bytes. Reconstructing
+a block's first byte from a code that already encodes that byte is reconstruction, not prediction:
+there is no way to have that code before the block's bytes are already known. This is not incidental
+— it's the seed-token mechanism's whole design (compress-and-immediately-reuse-your-own-block), and
+it explains several things previously logged as separate findings:
+- **Free-rollout collapse** (`level1_gen`/`level2_gen` degenerating to a repeated code): the only way
+  to get a code without already knowing its block's bytes is a level generating codes generatively on
+  its own — a capability the training objective (always teacher-forced, ground-truth code) never
+  actually trained. Unsurprising it's bad.
+- **Why `level0_modefull` "works"**: it sidesteps the problem entirely by re-encoding from real,
+  already-generated bytes every block — always one byte behind, never actually resolving the
+  autoencoding gap, just avoiding needing to.
+- **Why `curriculum_max_srcs` helped training but not free rollout**: it scaffolds cross-level
+  visibility depth, a different axis from the own-block reconstruction issue.
+
+**`qcute_zero`'s decode is genuinely predictive by construction, not by convention.** Verified
+position-by-position (chat 2026-08-22, `Ks=(2,1)` worked example): predicting byte `p` always reads
+`x_cross` at position `p-1` (next-token shift), and `fuse_mask` only admits codes with
+`abs_pos <= p-1` — strictly prior blocks, *including* a block's own first byte (the one case `v1`
+can't avoid). No exception exists anywhere in the mechanism. Cross-attention is purely an auxiliary
+long-range-context channel layered on an ordinary AR LM, never part of the loop that decides the
+current token's own identity.
+
+**What discipline `v1` would actually need to close this gap** (none currently fully in place):
+1. *Structural*: never let decode cross-attend to its own block's code — drop
+   `own_block_cross_attn_decode` outright, matching `qcute_zero`'s invariant exactly. Real cost: loses
+   the "compress and immediately reuse my own block" capacity — not a free fix.
+2. *Code-level consistency training, if own-code cross-attn is kept*: `cfg.scheduled_sampling_p`
+   **already implements almost exactly this** — one flip per forward pass, training-only, substitutes
+   the level-above's own sampled code prediction for the real one across every non-top level
+   simultaneously (`qcute_v1.py:114-127`), specifically to close this exact exposure-bias gap
+   (correcting an earlier, less careful characterization in chat as "byte-level" — it is not, it's a
+   whole-code-sequence substitution). **Empirically this did not help**: `curriculum2_noss` (no SS)
+   beat `curriculum2` (`ss=1.0`) on every metric this session. Open question, not yet resolved: is
+   `p=1.0` (always-on, all-or-nothing per forward pass) too aggressive vs. an annealed/partial
+   schedule, or is a same-loss-different-input substitution insufficient without also weighting a
+   dedicated consistency term — i.e. the *mechanism* for #2 exists in the codebase, but the negative
+   result found so far doesn't yet distinguish "the idea is wrong" from "this specific tuning of it is
+   wrong."
+3. *Counter-incentive against the collapse escape hatch*: without a working #2, self-NTP loss alone
+   has a free out — go low-entropy/constant, trivially minimizing self-predictability without needing
+   to stay useful to decode. A working consistency loss is what punishes that escape (a constant code
+   fails to help decode reconstruct diverse blocks when self-sampled); it doesn't currently, since #2
+   as tested didn't help.
+4. *Or sidestep the joint dynamic entirely*: the already-documented "Non-recurrent upper-level plan"
+   in `CLAUDE.md` (train decode-with-real-codes to convergence, freeze, train the upper-level code LM
+   purely as an ordinary sequence model over the frozen encoder's real code stream) avoids needing
+   #2/#3 at all, since decode and the free-rollout LM never share an optimization loop — a standard,
+   well-posed NTP problem has no collapse incentive built in. Given #2's negative empirical result,
+   this freeze-then-chain path looks more promising than continuing to tune joint SS.
+
+**Why `qcute_zero`'s basic (already-working, already-tested) generation path needs none of this**:
+there is no free-rollout step in ordinary byte-by-byte generation — cross-attn KV always comes from
+bytes already committed (real), never an undetermined future code, so the collapse dynamic has no
+seam to live in. The one place an analog of #2/#3 *would* become necessary is the speculative
+multi-block decode brainstorm below, where a drafted code is genuinely unverified until grounded.
+
+### `qcute_zero`: parallel block decode brainstorm (2026-08-22, not yet implemented)
+
+Motivating question: `qcute_zero`'s generation is currently strictly sequential (byte-by-byte, no
+parallel decode at all, unlike `qcute_v1`'s block-parallel-per-level design intent) — but the
+existing `learned_query`/`code_kv_cache` scaffolding (single generic trainable query vector, trained
+via one random position per batch, currently unused by the default training path) was built exactly
+toward this. Worked out concretely for `Ks=(2,1)`:
+
+**Free tier (zero speculation, works today in principle, not yet wired up)**: within a single
+`Ks[0]`-period block, parallel decode needs **no code prediction at all**. Predicting byte `p` reads
+`x_cross[p-1]`, whose `fuse_mask` only sees codes with `abs_pos <= p-1` — and a block's own code sits
+at *its own last byte's* absolute position, so (per the invariant above) neither byte in a
+soon-to-be-formed block ever needs that block's own not-yet-real code. Both bytes of a `Ks=(2,1)`
+block can be decoded from two `query_vec` slots at once, using only strictly-prior, already-grounded
+codes — `B = Ks[0]` bytes per parallel step, entirely for free, no risk.
+
+**Speculative tier (going past one block per parallel step)**: needs the code-level LM
+(`fuse{s}_ntp`) to draft codes for blocks not yet grounded — cheap, since it operates at the
+compressed code rate (`1` draft token per `K` bytes), even though the drafting itself must stay
+sequential (an AR code LM). Procedure: (1) roll `self.blocks`'s own NTP head forward over the *short*
+code sequence to draft `ĉ_{m+1}, ĉ_{m+2}, ...`; (2) seed `code_kv_cache` with these at their real
+abs positions; (3) run many `query_vec` slots in parallel, each masked exactly per the free-tier rule
+(so `ĉ` only becomes visible starting at the block *after* the one that would ground it — never its
+own); (4) once those bytes are decided, extract the *real* grounded code and compare to the draft
+— match: accept, downstream decode already validated; mismatch: reject and re-decode everything
+downstream of the first divergence (standard speculative-decoding accept/reject, but at the code
+granularity rather than the byte granularity).
+
+**Comparison to `qcute_v1`'s parallel-decode story — not a strict improvement, a different tradeoff**:
+`v1`'s design (only the top/coarsest level genuinely sequential; every level below block-parallel via
+a seed token cross-attending to an *already fully-known* upper-level code) is, if it converges,
+non-speculative — no accept/reject, no risk of wasted work, block size bounded only by `K` (can be
+large, e.g. 32 in real configs). `qcute_zero`'s free tier is bounded by the *smallest* `Ks[0]`
+(often tiny, e.g. 2), and going further requires genuine speculative decoding with its usual costs
+(payoff gated on the code-LM's acceptance rate, wasted compute on rejection). `qcute_zero` trades a
+much easier-to-train decode (see differentiator section above) for a currently unproven,
+probabilistic parallel-decode story; `v1` trades brutal training fragility (curriculum, kv_lm,
+several collapse bugs this session) for — if it converges — a cleaner, larger, non-speculative
+parallel-decode mechanism. Not fixed by removing weight-sharing either way: whether `qcute_zero`'s
+per-stage kvlm/heads are tied or fully separate doesn't change this tradeoff, since it depends only
+on the code-LM's own NTP accuracy, not on parameter sharing.
+
+**Not yet implemented** at brainstorm time; **built the same session (2026-08-22), then forked off**:
+multi-slot `parallel_decode` training (generalized from one random position/batch to `parallel_decode_n_blocks`
+independently-sampled `Ks[0]`-blocks per step, folded into an extended batch axis -- "Option B" from
+this section, required generalizing `rope_cos_sin_for_positions`/`apply_rope` to per-row positions)
+and `generate_blockwise` (the free-tier inference path itself) were both implemented and verified
+(no NaN, full gradient coverage, both `Ks=(2,1)`/`Ks=(2,2,1)`). The speculative multi-block extension
+and the code-level consistency-training question remain unbuilt.
+
+**This entire query-vec/parallel-decode line of work was then forked off intact into its own
+preserved lineage, `qcute/qcute_zero_parallel/`** (module renamed throughout, own `configs/qcute_zero_parallel/`),
+rather than continuing to build on top of it in `qcute_zero` itself — a deliberate split, not an
+abandonment: `qcute_zero` (this lineage) pivoted instead to building a REAL incremental KV cache for
+ordinary sequential generation (see below), a separate, more foundational piece of work that the
+query-vec direction doesn't need and shouldn't be entangled with. Revisit `qcute_zero_parallel` on
+its own terms later if the parallel-decode direction is worth returning to.
+
+## `qcute_zero`: real incremental KV cache (2026-08-22)
+
+Added `generate_kv_cache` -- a genuine incremental KV cache (previously just aliased to
+`generate_no_cache`'s full recompute), verified to produce **bit-exact** the same greedy output as
+`generate_no_cache` (315/315 random configs: `Ks` in `{(1,),(2,1),(2,2,1),(4,2,1),(3,3,1),(2,3,1),(4,4,1)}`,
+varying `attn_window`/`fuse_window`/prompt length/seed -- see the new `check_kv_cache_consistency`
+diagnostic method, the checked-in analog of `qcute_v1`'s `check_roundtrip_consistency`/
+`check_gen_consistency` pattern that `qcute_zero` didn't have an equivalent of before this).
+
+Scope: real incremental caching only for the byte-level `self.blocks` self-attention and each fuse
+stage's post-cross-attn refinement `self.blocks` pass (`Attn.forward_incremental`/
+`Block.forward_incremental`, new) -- the two genuinely `O(L)`-per-step costs. The short
+code-sequence self-attention (kvlm) pass and the fuse cross-attention itself are still recomputed
+fresh whenever a new code appears (every `Ks[s]` bytes) -- deliberately not cached, since those
+sequences are short (`~L/prod(Ks[:s+1])`), not worth the complexity.
+
+Two real bugs found and fixed via direct comparison against `_generate_cascade` (the existing
+full-recompute path, refactored out of `_forward_next_byte_logits` to serve as the correctness
+reference) before reaching bit-exact:
+1. **Skipping a stage's cross-attn+refine pass whenever it had zero real codes yet.** Even with no
+   real code, that stage's refine self-attention pass is NOT a no-op (the zero-sink makes
+   cross-attn itself contribute a provable zero, but the refine MLP+self-attention afterward still
+   transforms its input into something later positions' self-attention needs to have seen) --
+   skipping it left `refine_caches[s]` missing entries for every early position. Fixed by always
+   running the pass, letting the empty-code case flow through the zero-sink naturally.
+2. **Missing "catch-up" priming + wrong `continue` (not `break`) on first activation.** The
+   non-incremental cascade has an `if n_blocks<1: break` that skips a stage ENTIRELY (not
+   per-position) until enough bytes exist anywhere; matching that exactly requires a stage's FIRST
+   activation to prime its refine cache with the FULL backlog of everything it missed (not just the
+   newest byte) in one shot -- and, since a deeper stage can never be active while a shallower one
+   isn't, that inactive-stage branch must `break` out of the per-stage loop entirely (not
+   `continue`), or a later stage's backlog silently double-counts a not-yet-finalized upstream
+   value. Both confirmed via direct logit comparison at each prefix length against `_generate_cascade`.
+
+Net result: `generate_kv_cache` now does `O(1)` new attention work per generated byte (for the
+dominant byte-level + refinement costs) instead of `generate_no_cache`'s full `O(L)` recompute,
+with verified bit-exact equivalence, not an approximation.
