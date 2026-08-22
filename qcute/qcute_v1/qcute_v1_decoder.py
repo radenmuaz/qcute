@@ -596,6 +596,38 @@ def upper_track_step(bb: LM, x_last: torch.Tensor, pos: int, code_kv: torch.Tens
     return bb.ln_f(x)
 
 
+def code_context_pass(bb: LM, code_embeds: torch.Tensor) -> torch.Tensor:
+    """Causal self-attention + MLP over a code-embedding sequence (own sequential index, not
+    absolute byte position -- a separate RoPE application from whatever cross-attention consumes
+    the result downstream), used by KVContextLM's "fresh"/"shared" kv_lm modes to contextualize
+    each code position from earlier codes in the same track, before it becomes cross-attention K/V.
+    Input stays purely the discrete code's own embedding -- never the producing encoder's raw
+    pre-quantization hidden state -- so this doesn't reopen the discrete-bottleneck gap
+    StackEncAttnDecoder would have (see chat 2026-08-22)."""
+    cfg = bb.cfg
+    hd = bb.d_model // cfg.n_heads
+    n = code_embeds.shape[1]
+    pos = torch.arange(n, device=code_embeds.device)
+    cos, sin = rope_cos_sin_for_positions(pos, hd, cfg.rope_base, code_embeds.device)
+    x = code_embeds
+    for block in bb.blocks:
+        x = block(x, cos, sin, window=None)
+    return bb.ln_f(x)
+
+
+class KVContextLM(nn.Module):
+    """kv_lm_mode="fresh"/"shared": wraps an LM's transformer blocks so cross-attention K/V comes
+    from a causally-contextualized code representation (code_context_pass) instead of an isolated
+    per-position code embedding. Same calling convention as nn.Identity() (kv_lm_mode="identity",
+    the default -- unchanged prior behavior): embeds in, embeds out."""
+    def __init__(self, bb: LM):
+        super().__init__()
+        self.bb = bb
+
+    def forward(self, code_embeds: torch.Tensor) -> torch.Tensor:
+        return code_context_pass(self.bb, code_embeds)
+
+
 def bos_query_only_parallel_sync_decode(bb: LM, x0: torch.Tensor, K: int) -> torch.Tensor:
     """STUB, not implemented -- design note for a future parallel-decode generation strategy,
     distinct from both branches of bos_interleaved_self_attn above.
@@ -1334,6 +1366,29 @@ class StackDecoder(Decoder):
 
         self.stage_lms = nn.ModuleList([make_level(i) for i in range(n_levels)])
 
+        def make_kv_lm(i, t):
+            # j = the coarser level (i+1+t) whose code this kv_lm contextualizes for level i's
+            # decode. "shared" reuses that level's own encoder LM (same var, no new module, per
+            # chat 2026-08-22) -- requires d_models[i]==d_models[j], since the result is used
+            # directly as level i's stage K/V.
+            j = i + 1 + t
+            if cfg.kv_lm_mode == "identity":
+                return nn.Identity()
+            if cfg.kv_lm_mode == "shared":
+                return KVContextLM(encoders[j].lm)
+            layers = cfg.kv_lm_layers if cfg.kv_lm_layers is not None else n_layers_list[i]
+            return KVContextLM(LM(cfg, d_models[i], layers, vocabs[i]))
+
+        def make_level_kv(i):
+            if i == n_levels - 1:
+                return nn.ModuleList([])
+            n_upper = n_levels - 1 - i
+            if cfg.cond_depth != -1:
+                n_upper = min(n_upper, cfg.cond_depth)
+            return nn.ModuleList([make_kv_lm(i, t) for t in range(n_upper)])
+
+        self.kv_lms = nn.ModuleList([make_level_kv(i) for i in range(n_levels)])
+
     def _track0(self, bb0: LM, x_list_i: torch.Tensor, code_embeds0: torch.Tensor, K: int, n_blocks: int,
                 track0_window: int | None, is_byte_level: bool, compute_ntp: bool) -> tuple:
         """Track0 (own-code) computation for one non-top level -- factored out of decode_level so
@@ -1450,6 +1505,7 @@ class StackDecoder(Decoder):
         for t, (orig_idx, (source_c, cum_K, window)) in enumerate(indexed):
             bb = stage_bbs[orig_idx + 1]
             code_embeds = bb.quant.embed_for_decode(bb, source_c)
+            code_embeds = self.kv_lms[i][orig_idx](code_embeds)
             is_last = t == len(indexed) - 1
             stage_result = cross_attn_stage(bb, x, code_embeds, x_list[i], i, cum_K, window, compute_ntp, is_last)
             x = stage_result["hidden"]
@@ -1559,7 +1615,8 @@ class StackDecoder(Decoder):
             for t, j in enumerate(range(1, n_upper + 1)):
                 seq_repr = model.encoders[j](seq_repr, level=j, window=model.windows[j], compute_ntp=False)["code"]
                 bb_j = stage_bbs[t + 1]
-                upper_code_embeds += [bb_j.quant.embed_for_decode(bb_j, seq_repr)]
+                code_embeds_j = bb_j.quant.embed_for_decode(bb_j, seq_repr)
+                upper_code_embeds += [self.kv_lms[0][t](code_embeds_j)]
 
             buf = torch.cat([all_bytes, all_bytes.new_zeros(all_bytes.shape[0], K)], dim=1)
             for t in range(K):

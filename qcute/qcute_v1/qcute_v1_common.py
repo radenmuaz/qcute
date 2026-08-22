@@ -129,6 +129,8 @@ class Config:
     uncertainty_weighting: bool = False
     curriculum_max_srcs: int | None | tuple = None
     curriculum_step: int = 0
+    kv_lm_mode: str = "identity"
+    kv_lm_layers: int | None = None
 
 
 def gumbel_quantize(logits: torch.Tensor, tau: float, hard: bool = True, sample: bool = False) -> torch.Tensor:
@@ -1491,6 +1493,21 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--curriculum_step", type=int, default=0,
                     help="step at which curriculum_max_srcs stops applying and training "
                          "switches to full max_srcs=None (default 0: curriculum never active).")
+    p.add_argument("--kv_lm_mode", choices=["identity", "fresh", "shared"], default="identity",
+                    help="how upper-track cross-attention K/V is built from a coarser level's code "
+                         "(StackDecoder only). 'identity' (default, prior behavior): raw per-position "
+                         "code embedding, no interaction between code positions. 'fresh': a new small "
+                         "LM (kv_lm_layers, own weights) causally self-attends over the embedded code "
+                         "sequence first, contextualizing each position from earlier codes in the same "
+                         "track, before it's used as K/V. 'shared': same causal pass, but reusing the "
+                         "producing level's OWN encoder LM weights (encoders[j].lm) instead of a fresh "
+                         "module -- cheaper, but ties this pass to whatever the encoder's own self-NTP "
+                         "loss shapes those weights toward (see chat 2026-08-22 for the gradient-"
+                         "interference concern this raises). Requires d_model to match across the "
+                         "levels involved.")
+    p.add_argument("--kv_lm_layers", type=int, default=None,
+                    help="n_layers for kv_lm_mode='fresh's dedicated LM (default: same as this "
+                         "level's own n_layers). Ignored for 'identity'/'shared'.")
     p.add_argument("--dim_monitor_plateau_tol", type=float, default=0.01,
                     help="relative change in effective_dim below which two consecutive --eval_every "
                          "measurements are flagged as a plateau")
@@ -1595,6 +1612,8 @@ def config_from_args(args) -> Config:
         uncertainty_weighting=args.uncertainty_weighting,
         curriculum_max_srcs=args.curriculum_max_srcs,
         curriculum_step=args.curriculum_step,
+        kv_lm_mode=args.kv_lm_mode,
+        kv_lm_layers=args.kv_lm_layers,
     )
 
 

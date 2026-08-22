@@ -388,6 +388,108 @@ fixes `ks221`.** Three threads, in order:
 
    Net conclusion: the `ks221`/`ks441` architecture is sound and the asymmetric-cap curriculum
    (converge a real ks21-equivalent submodel first, only then graft on the coarser level) is a
-   working fix for full-model real generation, at overfit10k scale. Not yet tried: full-scale (not
-   overfit10k) runs with this curriculum, `ks441`, or dropping non-top levels' self-NTP loss
-   entirely (the next planned test, per `CLAUDE.md`).
+   working fix for full-model real generation, at overfit10k scale.
+
+4. **Isolation: is `scheduled_sampling_p=1.0` actually necessary alongside the curriculum, or just
+   carried over from the prior (failed) lever-sweep this config was built on?**
+   `ks221_v16_pq4_overfit10k_window16_relaxed_curriculum2_noss` — identical to the run above except
+   `scheduled_sampling_p=0.0` (no scheduled sampling at all). **Result: not just as good, strictly
+   better.** Train byte_acc 99.73% (vs 98.20%), val byte_acc **0.579** (vs ~0.36-0.40), best val bpb
+   **2.73** (vs 4.63) — and the same phase-1-noise/phase-2-graft/coherent-convergence pattern
+   replicates cleanly, with the end-of-training val sample even showing a genuine content match
+   (`"...Against Anarchists&quot;, 189"` -> both modes correctly continue `"8&lt;/ref&gt;, it has
+   also..."`, matching ground truth), not just stylistic coherence. Conclusion: `ss=1.0` was not
+   only unnecessary, it was actively worse — the curriculum (`curriculum_max_srcs`/`curriculum_step`
+   alone, no scheduled sampling, no uncertainty weighting) is the recipe to keep. This is the
+   simplest config that has produced coherent `ks221` generation so far, and the one to carry into
+   a full-scale run.
+
+   Not yet tried (superseded by finding 5 below before being run): full-scale (not overfit10k) runs
+   with this curriculum, `ks441`, replication across seeds/Ks, or dropping non-top levels' self-NTP
+   loss entirely -- that last one addresses the still-unresolved `level1_gen`/`level2_gen`
+   free-rollout collapse, not the (now working) grounded generation path.
+
+5. **`kv_lm`: give cross-attention K/V a causal self-attention pass over the embedded code
+   sequence first, instead of an isolated per-position embedding** (chat 2026-08-22). Motivation:
+   `embed_for_decode(code)` gives each code position a K/V vector with zero interaction between
+   code positions -- any context the *producing* level's own self-attention built got thrown away
+   at quantization. New `StackDecoder.kv_lm_mode` (`qcute_v1_decoder.py`'s `code_context_pass`/
+   `KVContextLM`): `"identity"` (default, unchanged prior behavior), `"fresh"` (one more small LM
+   per track, own weights, causally self-attends over the embedded code sequence before it's used
+   as K/V), `"shared"` (same causal pass, reusing the producing level's own encoder LM weights
+   instead of a fresh module -- cheaper, but ties it to whatever the encoder's self-NTP loss shapes
+   those weights toward). Also generalized `max_srcs` (renamed from `max_decode_sources`) to accept
+   a per-level tuple, not just a scalar -- a scalar cap can't drop a level's own single nearest
+   upper track without also dropping level0's, which is why the *first* curriculum attempt
+   (`..._curriculum.py`, superseded by `curriculum2`/`curriculum2_noss` above) was contaminated.
+
+   Three-way comparison, `Ks=(2,2,1)`, `window16_relaxed`, `vocab=16 pq_chunks=4`, no scheduled
+   sampling, no uncertainty weighting:
+
+   | run | train byte_acc | val byte_acc | best val bpb |
+   |---|---|---|---|
+   | curriculum alone (`curriculum2_noss`, finding 4) | 99.73% | 0.579 | 2.73 |
+   | **`kv_lm_mode=fresh`, no curriculum** | 99.61% | **0.563** | **1.93** |
+   | `kv_lm_mode=fresh` + curriculum together | 99.73% | 0.504 | 3.11 |
+
+   **`kv_lm` alone is the best result of this entire investigation, and combining it with the
+   curriculum makes it *worse*, not better.** `ks221_v16_pq4_overfit10k_window16_relaxed_kvlm_fresh_nocurriculum`
+   produces coherent, exact-matching real generation with no curriculum, no scheduled sampling, no
+   uncertainty weighting -- e.g. `qual_train_level0_modeks21`/`modefull` both reproduce
+   `"&gt;[[Friedrich Engels|Engels]], Freidrich. ''&quot;[http://www."` identically. This is strong
+   evidence the collapse was fundamentally an *expressiveness* problem (isolated per-position code
+   embeddings starved of any cross-code context) rather than a training-signal-ordering problem --
+   the curriculum was compensating for that expressiveness gap, not fixing an independent issue, so
+   once `kv_lm` fixes the gap directly, the curriculum's phase-1 restriction on training signal is
+   pure friction. `ks21_v256_pq1_overfit10k_kvlm_fresh` (regression sanity check on the already-easy
+   2-level case) ran without incident (val byte_acc 0.347, best val bpb 3.08).
+
+   New recipe to carry forward: `kv_lm_mode="fresh"`, no curriculum, no scheduled sampling, no
+   uncertainty weighting. Not yet tried: full-scale (not overfit10k) runs with this recipe, `ks441`,
+   `kv_lm_mode="shared"` (cheaper, untested), replication across seeds, or the still-open
+   `level1_gen`/`level2_gen` free-rollout-collapse question (unrelated to this fix -- see finding 3's
+   caveat, still applies).
+
+## `qcute_zero`: a monolithic single-LM alternative (2026-08-22)
+
+Separate lineage, not a fork of `qcute_v1` -- `qcute/qcute_zero/qcute_zero.py` (single file by
+design for now, per direct instruction: "make thing single file first refactor later"). Full design
+rationale in the module's own docstring. Core idea: exactly ONE shared transformer LM (embed +
+blocks). Every `Ks[s]`-cumulative-period bytes, it summarizes its own hidden state into a discrete
+code via the SAME tied embed/output head bytes use (code vocab == byte vocab, so "extracting a
+code" is just "predict a byte-shaped distribution, STE-hard-sample it"). That code sequence gets
+run through the SAME shared blocks again (a second, shorter forward pass) for a genuine NTP loss on
+the code sequence itself (free via weight reuse, no separate per-level encoder) plus contextualized
+K/V for a cross-attention ("fuse") stage back into the byte-level query stream. `len(Ks)-1` fuse
+stages, one per cumulative period -- own cross-attention weights per stage, but a shared MLP across
+every stage. A mandatory, non-trainable all-zero K/V "sink" is prepended to every attention call
+(self- and cross-, uniformly) so every query row has >=1 visible key even before a periodic code's
+causal boundary is reached (avoids NaN from an all-masked softmax row; when the sink is the only
+visible key the output is provably exactly zero, a clean no-op, not an arbitrary bias). Default
+next-token query is ordinary previous-hidden-state continuation (no seed/BOS token, unlike
+`qcute_v1`); an optional, off-by-default `learned_query` mode trains a single generic query vector
+(one randomly-sampled position per batch) toward future block-parallel local decode, not required
+for or exercised by the default training path.
+
+Designed to need no curriculum at all (unlike `qcute_v1`'s `max_srcs`/`curriculum_max_srcs`): every
+fuse stage's code source is the same already-training shared backbone from step 1 (nothing is a
+fresh, untouched module the way each `qcute_v1` encoder level was), and the zero-sink lets a
+stage's freshly-initialized cross-attention weights self-suppress early (route softmax weight to
+the sink) and gradually rely on real codes as those weights improve -- an emergent, learned on-ramp
+rather than a hand-scheduled one. Expected, not yet proven.
+
+Causality verified by hand (chat 2026-08-22): every code's visibility boundary must use its
+CUMULATIVE byte-span (`cum_K*(block_idx+1)-1`, absolute byte coordinates), never its local index
+within whatever intermediate code sequence produced it -- confirmed non-circular under this rule
+(a code can only ever inform prediction of bytes strictly after every byte it was itself computed
+from).
+
+Implementation smoke-tested (tiny random model, both `Ks=(2,1)` and `Ks=(2,2,1)`, plus the trivial
+`Ks=(1,)` no-fuse case): forward+backward+`generate_no_cache` all run without NaN or error, every
+parameter receives gradient. `generate_kv_cache` is currently aliased to `generate_no_cache`
+(byte-by-byte full recompute) -- matches `qcute_v1`'s own current "incrementally-correct, not yet
+KV-cached" state, same precedent; real incremental caching is future work the causal/static-shape
+design was built to allow, not a correctness fix needed now.
+
+First real runs launched: `configs/qcute_zero/ks21_overfit10k.py` and `ks221_overfit10k.py`, both
+**no curriculum** (matching the design's own expectation above) -- results pending.
