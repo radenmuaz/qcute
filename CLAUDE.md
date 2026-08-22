@@ -102,10 +102,12 @@ time). **The very first thing to do on any fresh TPU node connection — right a
 it's `READY`, before install/scp/anything else — is set up the direct-ssh persistent multiplexed
 connection** (one `gcloud ... ssh` call to propagate the key, then a `ControlMaster`/
 `ControlPersist` session against the node's external IP) and use that for every subsequent
-command on that node, not repeated `gcloud ... ssh` calls. Full setup, caveats (state-check gap
-on preemption — direct ssh won't surface `PREEMPTED` the way gcloud does, so if a command hangs
-check `queued-resources describe ... state.state`; `pgrep -f` self-matching over ssh), and
-copy-pasteable commands: [docs/tpu_direct_ssh.md](docs/tpu_direct_ssh.md).
+command on that node, not repeated `gcloud ... ssh` calls. **Every TPU listed in TPU.md is a
+spot instance and can be preempted at any time with no warning** — if a node that was just
+working suddenly can't be reached (hang, `Connection refused`, `No route to host`), check
+`queued-resources describe ... state.state` for `PREEMPTED` *before* assuming a flaky connection,
+retrying, or standing up a replacement node (don't — see above). Full setup and copy-pasteable
+commands: [docs/tpu_direct_ssh.md](docs/tpu_direct_ssh.md).
 **Never create/start a TPU yourself** — only use nodes already listed in TPU.md/already running.
 Full scp-to-running-training walkthrough (uv/torch_xla install, common failure modes, `qcute.
 bytelm_tpu` smoke test): [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md). **Any long-running
@@ -116,6 +118,22 @@ launch/attach/peek incantations. **For a multi-hour run, check in periodically (
 and pull back only `run.jsonl` (not `run.log` or checkpoints) to the matching local `logs/<run_name>/`
 path to save egress** — see that doc's "Monitoring a multi-hour run" section for the exact
 commands.
+
+**`qcute.bytelm_tpu`'s `--use_flash_attention` needs a nightly torch/torch_xla build** (the
+stable pin's `libtpu==0.0.21` is too old for the Pallas kernel) — full install steps, confirmed
+working on a `v4-8` node: [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md)'s "Optional:
+nightly build" section. **`--multichip` (collective data-parallel across chips) is confirmed
+broken** (hangs in PJRT rendezvous on that same nightly+v4-8 combo) — for using more than one
+chip on a host, launch independent single-chip processes instead, one per chip, via
+`TPU_VISIBLE_CHIPS=<i>` (verified working, no collectives needed) — see that doc's "Optional:
+multiple TPU chips on one host" section for the exact pattern. Check real addressable device
+count first (`torch_xla.runtime.addressable_runtime_device_count()` / `ls /dev/accel*` /
+`tpu-info`) — a slice's "-N" suffix (e.g. `v4-8`) counts TensorCores, not addressable devices.
+**Multi-chip runs get one named `tmux` session per chip**, not backgrounded `&` jobs in a single
+shell (those all die if that one shell's session ends) — `tmux ls` lists every session on the
+node, `tmux capture-pane -t <session> -p -S -N` peeks at any one without attaching (swap
+`<session>` per run), `-t muaz@<ip> "tmux attach -t <session>"` (note the `-t` before the ssh
+target, for a real pty) attaches interactively.
 
 ## Architecture
 
@@ -208,6 +226,27 @@ window-ablation/track-dropout curriculum plan (2026-08-19); superseded by the `q
 lag-`D` knobs were redundant with `attn_window` and that the real fix was retargeting decode's
 loss (NTP-next-block -> NTP-autoencode) plus a per-block BOS, not a track-sparsity curriculum.
 Full narrative: [docs/qcute_v1_plan.md](docs/qcute_v1_plan.md).
+
+**Non-recurrent upper-level plan (2026-08-21, not yet started)**: originates from the
+`ks221`/`ks441` hard-convergence-queue collapse (repetitive single-code generation despite 96-99%+
+train byte_acc, see `docs/status.md`) and a chat questioning whether the upper levels' own
+autoregressive self-NTP loss is itself the cause (a constant/repeating code trivially minimizes
+self-predictability, matching the observed failure signature) rather than any window/PQ/curriculum
+lever tried so far. Staged plan:
+1. Train a single-level (byte-only) encoder/decoder, but with many cross-attention tracks/windows
+   to compensate for whatever long-range context a single level's own bounded self-attention window
+   can't reach -- i.e. push long-range aggregation into decode's cross-attn window width rather than
+   into an upstream recurrent summarizer (a per-chunk linear-head code, STE-trained purely from
+   decode usefulness, is still fully causal even with no self-attention of its own: the hidden state
+   it reads from is already causal, and `upper_track_step`'s `code_pos <= pos` rule enforces
+   cross-attn causality independent of how the code was produced -- confirmed by inspection, chat
+   2026-08-21).
+2. Once that single-level model is converged/stable enough, freeze it, then train an upper-level LM
+   on top to learn a genuine code LM (autoregressive prior over the frozen level's code stream).
+3. Open question motivating step 2's own justification: is a trained upper LM actually earning its
+   keep over simply re-running the (frozen) lower encoder on its own past output to get fresh codes
+   on the fly -- i.e. does the upper LM do genuine long-range modeling beyond what re-encoding
+   already gives for free, or is it only faster/cheaper, not more capable?
 
 Diagnostic: `scripts/probe_decoder_kv_contribution.py` (gradient/
 ablation/attention-mass analysis of how much cross-attention KV actually

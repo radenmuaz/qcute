@@ -223,6 +223,102 @@ watch `~/qcute/logs/bytelm_tpu_sd_full_enwik8/run.log` directly (structured, rea
 elapsed-time/it-rate early** rather than trusting the config docstring's step estimate; retune
 `--steps` (or edit the config and relaunch) once real throughput is known.
 
+## Optional: nightly build, for `--use_flash_attention`
+
+The stable pin above (torch/torch_xla 2.9.0) can't use `qcute.bytelm_tpu`'s
+`--use_flash_attention` flag — that kernel needs `libtpu>=0.0.44`, and 2.9.0 locks `libtpu==0.0.21`
+as its own dependency. Bumping libtpu alone on top of the stable pin is a confirmed hard break
+(`RuntimeError: Unexpected PJRT_ExecuteOptions size: expected 112, got 80` — plugin/framework PJRT
+API versions disagree). What works instead, confirmed directly on a `v4-8` node (Ubuntu 22.04):
+
+```bash
+uv venv --python 3.12 && source .venv/bin/activate
+UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install \
+  https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch-2.10.0.dev-cp312-cp312-linux_x86_64.whl \
+  https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-2.10.0.dev-cp312-cp312-linux_x86_64.whl
+uv pip install libtpu jax   # left unpinned — resolves to libtpu 0.0.46 + matching jax/jaxlib
+sudo apt-get update -qq && sudo apt-get install -y -qq libopenblas0   # nightly torch's wheel needs this; stable doesn't
+```
+
+(`UV_SKIP_WHEEL_FILENAME_CHECK=1` is needed because uv strictly checks wheel-filename-vs-metadata
+version agreement, and this particular nightly wheel's internal metadata says `2.10.0+git...`
+while the filename says `2.10.0.dev` — a real nightly-build quirk, not file corruption.) Verify
+with the same device + tensor-op smoke test as step 3 above, then confirm flash-attention itself:
+
+```bash
+python3 -c "
+import torch, torch.nn.functional as F, torch_xla
+from torch_xla.experimental.custom_kernel import flash_attention
+device = torch_xla.device()
+q = torch.randn(8, 4, 4096, 64, device=device)
+k = torch.randn(8, 4, 4096, 64, device=device)
+v = torch.randn(8, 4, 4096, 64, device=device)
+y_flash = flash_attention(q, k, v, causal=True, sm_scale=1.0/8.0)
+y_ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+torch_xla.sync()
+print('max abs diff:', (y_flash - y_ref).abs().max().item())  # ~0.01 is normal (algorithm variance, not a bug)
+"
+```
+
+Nightly builds are less stable than the pinned release — re-verify this whole chain (including
+the generation-consistency check, `qcute.bytelm_tpu.validate_generation`) after any nightly
+version bump, don't assume it still works.
+
+## Optional: multiple TPU chips on one host
+
+A multi-chip TPU slice (e.g. `v4-8` = 4 chips) exposes more than one device on a single VM, but
+**`qcute.bytelm_tpu --multichip` (true collective data-parallel training via `torch_xla.launch`)
+hangs on this session's nightly-build + `v4-8` combination** — all worker processes spin up then
+go idle (CPU time stops climbing) with no further progress, consistent with a stuck PJRT
+multi-process rendezvous. Not resolved; treat `--multichip` as unverified/broken until someone
+debugs the rendezvous further.
+
+**What does work**: independent single-chip processes via `TPU_VISIBLE_CHIPS`, confirmed directly
+— two concurrent single-device processes with `TPU_VISIBLE_CHIPS=0` and `TPU_VISIBLE_CHIPS=1` both
+ran and computed correctly with no conflict, no collectives, no rendezvous needed. This is
+embarrassingly-parallel, not larger-batch data-parallel: each process is a fully independent
+training run (own `--run_name`, own logs/checkpoints), and it's on you to make each process's
+`--run_name` distinct (a collision silently interleaves two runs' log lines into one file). Check
+the real device count first — a "v4-8" slice's "8" is TensorCores, not addressable devices (v4
+runs 2 cores per chip fused as one "megacore" logical device by default): confirmed 4 addressable
+devices on this session's `v4-8` node via three independent sources —
+`torch_xla.runtime.addressable_runtime_device_count()`, `ls /dev/accel*`, and `tpu-info`. Launch
+one process per chip:
+
+**One named `tmux` session per chip** (not 4 background `&` jobs in a single shell — those all die
+together if that one shell's session ends; separate sessions survive and can be
+attached/detached/killed independently), each with a distinct `--run_name` and its own
+`--config` (a 4-way hparam sweep, say — this is what a genuinely useful use of 4 chips on one host
+looks like, since `--multichip` doesn't work):
+
+```bash
+ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine \
+  muaz@<external_ip> "
+  tmux new-session -d -s sweep_a 'cd ~/qcute && source .venv/bin/activate && \
+    export LD_LIBRARY_PATH=/home/muaz/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib && \
+    export TPU_VISIBLE_CHIPS=0 && \
+    python3 -m qcute.bytelm_tpu --config configs/bytelm_tpu/<variant_a>.py --device xla; echo TRAIN_EXIT=\$?; exec bash'
+  tmux new-session -d -s sweep_b 'cd ~/qcute && source .venv/bin/activate && \
+    export LD_LIBRARY_PATH=/home/muaz/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib && \
+    export TPU_VISIBLE_CHIPS=1 && \
+    python3 -m qcute.bytelm_tpu --config configs/bytelm_tpu/<variant_b>.py --device xla; echo TRAIN_EXIT=\$?; exec bash'
+  # ... one more tmux new-session block per remaining chip (TPU_VISIBLE_CHIPS=2, =3, ...)
+"
+```
+
+List and attach to any of them from the local machine:
+
+```bash
+ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine \
+  muaz@<external_ip> "tmux ls"                    # list all sessions on the node
+
+ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine \
+  -t muaz@<external_ip> "tmux attach -t sweep_a"   # attach to one (Ctrl-b d to detach)
+```
+
+or peek at each without attaching, same `tmux capture-pane -t <session> -p -S -N` pattern as the
+single-run case above, once per session name.
+
 ## Monitoring a multi-hour run
 
 For a run sized in hours (not minutes), check in periodically — roughly hourly is a reasonable
@@ -237,6 +333,17 @@ ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute
 note the latest `val_bpb` (and whether it's still falling or has plateaued/started climbing —
 overfitting on a small corpus over many epochs is expected for small models, see
 configs/bytelm_tpu/bytelm_tpu_sm_full_enwik8.py's own docstring), and confirm no traceback.
+
+**If that command suddenly can't connect** (hangs, or fails immediately with `Connection
+refused`/`No route to host`) **on a node that was working at the last check-in, check for
+preemption before anything else** — every TPU here is a spot instance (see [TPU.md](../TPU.md)),
+reclaimable with no warning mid-run, and a dead node is indistinguishable from a flaky connection
+until you check state:
+`gcloud compute tpus queued-resources describe <qr-name> --project raden-tpu --zone <zone> --format="value(state.state)"`.
+`PREEMPTED` means the node and everything on it (the training process, anything not already
+copied back) is gone for good — report it and ask how to proceed rather than retrying the
+connection or standing up a replacement node unasked. Full detail:
+[docs/tpu_direct_ssh.md](tpu_direct_ssh.md)'s caveats section.
 
 **Pull back only `run.jsonl`, not `run.log` or checkpoints, to save egress**: `run.jsonl` is the
 small structured record `scripts/plot_run.py` reads; `run.log` is the same data plus tqdm
@@ -261,3 +368,10 @@ command later just overwrites the local copy with the latest one — safe to rep
 | `undefined symbol: ...deleteNodeEPN...` importing `_XLAC` | torch/torch_xla version mismatch | pin both to torch_xla's exact max version (step 2) |
 | `ssh ... exited with return code 255` / hangs | TPU preempted (spot), or transient SSH flakiness | check `queued-resources describe ... state.state`; retry |
 | training log shows `device=cpu` | forgot `--device xla`, or torch_xla import silently failed | always check the startup log line, not just exit code |
+| `RuntimeError: Unexpected PJRT_ExecuteOptions size: expected 112, got 80` | libtpu bumped independently of the torch/torch_xla pin — plugin/framework PJRT API versions disagree | use the matched nightly build (see above), don't mix a newer libtpu with the stable pin |
+| `RuntimeError: Pallas TPU requires a recent libtpu version` | `--use_flash_attention` on the stable pin (`libtpu==0.0.21` < required `0.0.44`) | use the nightly build (see above) |
+| `ModuleNotFoundError: No module named 'jax'` calling `flash_attention` | jax not installed — it's the flash-attention kernel's implementation dependency, not a normal project dep | `uv pip install jax` (in the nightly venv) |
+| `ImportError: libopenblas.so.0` on the nightly torch wheel | missing system package (the stable release doesn't need it) | `sudo apt-get install -y libopenblas0` |
+| `error: ... Wheel version does not match filename` installing a nightly wheel via uv | known nightly-build wheel-metadata quirk, not real corruption | `UV_SKIP_WHEEL_FILENAME_CHECK=1` |
+| `--multichip` hangs (workers spin up, CPU time stops climbing, no progress) | stuck PJRT multi-process rendezvous, unresolved on this session's nightly+v4-8 combo | don't use `--multichip`; use independent single-chip processes via `TPU_VISIBLE_CHIPS` instead (see above) |
+| `RuntimeError: TPU initialization failed: ... Device or resource busy` | a previous process (stuck, killed slow, or just concurrent) still holds the chip | `ps aux \| grep python3`, `kill -9` the stale PID, retry — `TPU_VISIBLE_CHIPS` conflicts show the same error if two processes claim the same chip index |

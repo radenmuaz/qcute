@@ -1,8 +1,43 @@
 """qcute.bytelm_tpu — single-file fork of qcute.bytelm for CPU/TPU (torch_xla) use.
 
 Standalone on purpose (not an import of qcute.bytelm) so it can be read/debugged/deployed to a
-TPU VM without dragging in the rest of the repo's device-selection assumptions. Differences from
-qcute.bytelm:
+TPU VM without dragging in the rest of the repo's device-selection assumptions.
+
+**Optional flash-attention kernel (`--use_flash_attention`), default off.**
+`torch_xla.experimental.custom_kernel.flash_attention` (a JAX Pallas TPU kernel under
+torch_xla's hood) needs `jax` installed *and* `libtpu>=0.0.44` — the pinned stable
+`torch_xla==2.9.0` install (see docs/bytelm_tpu_setup.md) locks `libtpu==0.0.21`, and bumping
+libtpu alone against that pin is a confirmed hard break (`RuntimeError: Unexpected
+PJRT_ExecuteOptions size: expected 112, got 80` — the plugin/framework PJRT API versions
+disagree). What does work, confirmed directly on a v4-8 node: `torch==2.10.0.dev0` +
+`torch_xla==2.10.0.dev0` (from the GCS nightly wheel URLs — `pip install
+UV_SKIP_WHEEL_FILENAME_CHECK=1 ... https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch{,_xla}-2.10.0.dev-cp312-cp312-linux_x86_64.whl`,
+the "no date suffix" rolling-latest nightly), `libtpu` and `jax`/`jaxlib` left unpinned (resolve
+to 0.0.46 automatically), plus the system package `libopenblas0` (nightly torch's wheel needs it,
+`sudo apt-get install -y libopenblas0` — the stable release doesn't need this). Flash-attention
+output matches plain SDPA closely (max abs diff ~0.011, mean ~0.00016 against a ~0.04-magnitude
+reference) once that's all in place. **This is a nightly-only feature** — `--use_flash_attention`
+on the stable pin will just raise ImportError-guarded fallback to plain SDPA (`_HAS_FLASH_ATTENTION`
+stays False), not crash. Only used in the full-sequence training `forward` path — `forward_step`
+(single-query KV-cache decode) stays on plain SDPA regardless, since flash_attention's kernel
+assumes a self-attention causal pattern (q_len == kv_len), not a growing single-query cache.
+
+**Optional multi-chip data-parallel training (`--multichip`), default off.** Spawns one process
+per locally-addressable TPU device via `torch_xla.launch` (confirmed on the same v4-8 node:
+`torch_xla.runtime.addressable_runtime_device_count()` reports 4 — a "v4-8" slice has 8
+TensorCores across 4 chips, but each v4 chip's 2 cores run combined as one "megacore" logical
+device by default, hence 4 addressable devices, not 8). Gradient sync uses
+`xm.optimizer_step(opt, barrier=True)` (calls `reduce_gradients` — an all-reduce average across
+replicas — then `opt.step()`, then the execution barrier) in place of a bare `opt.step()`; this is
+the same call whether running single- or multi-process, since reducing over a replica group of 1
+is a no-op. Only the rank-0 process does file I/O (Logger, Checkpointer, qualitative
+generation/benchmarking) — every rank still runs the forward/backward/optimizer_step loop since
+gradient all-reduce is a collective operation all replicas must participate in. `--batch_size` is
+per-process (local batch); effective global batch is `batch_size * world_size`, logged as such
+when `--multichip` is on. Each process's `batch_iter` draws independently-random batches (spawned
+processes get independent RNG state), so this is genuine data parallelism, not repeated work.
+
+Differences from qcute.bytelm:
 
   - Device is cpu or xla only — no mps/cuda. `--device {cpu,xla}` (default: auto-detect, xla if
     torch_xla+TPU is importable/visible, else cpu).
@@ -63,10 +98,21 @@ from tqdm import tqdm
 
 try:
     import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.runtime as xr
     _HAS_XLA = True
 except ImportError:
     torch_xla = None
+    xm = None
+    xr = None
     _HAS_XLA = False
+
+try:
+    from torch_xla.experimental.custom_kernel import flash_attention as _xla_flash_attention
+    _HAS_FLASH_ATTENTION = True
+except ImportError:
+    _xla_flash_attention = None
+    _HAS_FLASH_ATTENTION = False
 
 
 def is_xla_device(device) -> bool:
@@ -98,8 +144,13 @@ def mark_step(device: torch.device) -> None:
 
 
 def optimizer_step(opt: torch.optim.Optimizer, device: torch.device) -> None:
-    opt.step()
-    mark_step(device)
+    if is_xla_device(device):
+        # reduce_gradients (all-reduce average across replicas) + opt.step() + the execution
+        # barrier — the same call whether running single- or multi-process (--multichip): an
+        # all-reduce over a replica group of 1 is a no-op, so this doesn't need branching.
+        xm.optimizer_step(opt, barrier=True)
+    else:
+        opt.step()
 
 
 def format_hms(seconds: float) -> str:
@@ -180,6 +231,7 @@ class LMConfig:
     rope_base: float = 10000.0
     mtp_heads: int = 8  # n parallel next-byte heads (bandwidth-matched to qcute.qcutelm's K)
     zero_kv_sink: bool = False  # prepend one all-zero K/V token, always attendable, before SDPA
+    use_flash_attention: bool = False  # nightly-only (see module docstring); ignored if unavailable
 
     @property
     def head_dim(self) -> int:
@@ -247,6 +299,8 @@ class CausalSelfAttention(nn.Module):
             sink_col = torch.ones(T, 1, dtype=torch.bool, device=x.device)
             attn_mask = torch.cat([sink_col, causal], dim=1)  # [T, T+1] — sink always attendable
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        elif self.cfg.use_flash_attention and _HAS_FLASH_ATTENTION and is_xla_device(x.device):
+            y = _xla_flash_attention(q, k, v, causal=True, sm_scale=1.0 / (hd ** 0.5))
         else:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)       # [B, H, T, hd]
         y = y.transpose(1, 2).reshape(B, T, D)
@@ -401,15 +455,21 @@ def eval_bpb(model: nn.Module, data_iter, context: int, n_batches: int, device: 
 
 @torch.no_grad()
 def eval_bpb_full(model: nn.Module, data: torch.Tensor, batch_size: int, context: int, n_heads: int,
-                   device: torch.device) -> float:
+                   device: torch.device, desc: str | None = None) -> float:
     """Deterministic full-val-set pass: non-overlapping seq_len windows, walked in fixed
-    chronological order starting at byte 0 (never random), each byte scored exactly once."""
+    chronological order starting at byte 0 (never random), each byte scored exactly once.
+    `desc`, if given, shows a live tqdm bar over the eval batches (e.g. "val_full"/"test_full") —
+    off by default since a full pass is normally a few seconds to tens of seconds, but useful to
+    see it's actually progressing (not stuck) on a slow/large eval."""
     model.eval()
     seq_len = context + n_heads
     n_windows = (len(data) - 1) // seq_len
     batch_size = n_windows if batch_size == -1 else batch_size
     total, total_n = 0.0, 0
-    for start in range(0, n_windows, batch_size):
+    starts = range(0, n_windows, batch_size)
+    if desc is not None:
+        starts = tqdm(starts, desc=desc, leave=False, dynamic_ncols=True)
+    for start in starts:
         idxs = range(start, min(start + batch_size, n_windows))
         batch = torch.stack([data[i * seq_len:(i + 1) * seq_len] for i in idxs]).to(device)
         logits = model(batch[:, :context])
@@ -661,6 +721,10 @@ def main():
     p.add_argument("--mtp_heads", type=int, default=None, help="override preset's MTP head count")
     p.add_argument("--n_layers", type=int, default=None, help="override preset's transformer layer count")
     p.add_argument("--zero_kv_sink", action="store_true", help="prepend an all-zero, always-attendable K/V sink token")
+    p.add_argument("--use_flash_attention", action="store_true",
+                    help="use torch_xla's Pallas flash-attention kernel in the training forward pass (nightly-only, see module docstring; silently falls back to plain SDPA if unavailable)")
+    p.add_argument("--multichip", action="store_true",
+                    help="data-parallel across all locally-addressable TPU devices via torch_xla.launch (--batch_size is per-process; global batch = batch_size * world_size)")
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None, help="prefix of the corpus to load (default: all)")
     p.add_argument("--val_frac", type=float, default=0.1)
@@ -702,7 +766,17 @@ def main():
         p.error("--qual_source user requires --qual_user_text")
     if args.eval_split == "test" and args.test_frac <= 0:
         p.error("--eval_split test requires --test_frac > 0")
+    if args.multichip and not _HAS_XLA:
+        p.error("--multichip requires torch_xla")
 
+    if args.multichip:
+        torch_xla.launch(_run, args=(args, pre_args))
+    else:
+        _run(0, args, pre_args)
+
+
+def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> None:
+    is_master = index == 0
     device = resolve_device(args.device)
 
     if args.checkpoint_path is not None:
@@ -721,6 +795,8 @@ def main():
             cfg.n_layers = args.n_layers
         if args.zero_kv_sink:
             cfg.zero_kv_sink = True
+        if args.use_flash_attention:
+            cfg.use_flash_attention = True
         model = ByteLM(cfg).to(device)
         start_step = 0
 
@@ -730,12 +806,19 @@ def main():
         run_name = pre_args.config.stem
     else:
         run_name = f"bytelm_tpu_{args.preset}_{int(time.time())}"
-    log = Logger(args.logs_dir / run_name)
-    print(f"run_name={run_name}  logging to {log.text_path} (raw text) / {log.json_path} (JSONL) — tail -f {log.text_path}")
+
+    if is_master:
+        log = Logger(args.logs_dir / run_name)
+        print(f"run_name={run_name}  logging to {log.text_path} (raw text) / {log.json_path} (JSONL) — tail -f {log.text_path}")
+    else:
+        log = lambda msg="", **record: None  # noqa: E731 — non-master ranks do no file/console I/O
     preset_label = f"loaded_from={args.checkpoint_path} (step {start_step})" if args.checkpoint_path else f"preset={args.preset}"
+    world_size = xr.addressable_runtime_device_count() if (args.multichip and _HAS_XLA) else 1
     log(
         f"{preset_label}  params={count_params(model)/1e6:.1f}M  device={device}  xla={_HAS_XLA}"
         f"  context={cfg.context}  mtp_heads={cfg.mtp_heads}  zero_kv_sink={cfg.zero_kv_sink}"
+        f"  use_flash_attention={cfg.use_flash_attention} (available={_HAS_FLASH_ATTENTION})"
+        + (f"  multichip=True world_size={world_size} global_batch={args.batch_size * world_size}" if args.multichip else "")
     )
 
     data = load_enwik8(args.data, args.n_bytes)
@@ -750,18 +833,22 @@ def main():
     val_iter = batch_iter(val_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
 
     if args.eval_only:
-        eval_data = {"train": train_data, "val": val_data, "test": test_data}[args.eval_split]
-        eval_bpb_val = eval_bpb_full(model, eval_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
-        log(f"eval_only_full_{args.eval_split}set  {args.eval_split}_bpb {eval_bpb_val:.4f}",
-            **{f"{args.eval_split}_bpb": eval_bpb_val})
+        if is_master:
+            eval_data = {"train": train_data, "val": val_data, "test": test_data}[args.eval_split]
+            eval_bpb_val = eval_bpb_full(model, eval_data, args.batch_size, cfg.context, cfg.mtp_heads, device, desc=f"{args.eval_split}_full")
+            log(f"eval_only_full_{args.eval_split}set  {args.eval_split}_bpb {eval_bpb_val:.4f}",
+                **{f"{args.eval_split}_bpb": eval_bpb_val})
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(0.9, 0.95), weight_decay=args.weight_decay)
         train_iter = batch_iter(train_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
-        checkpointer = Checkpointer(args.checkpoint_dir / run_name, args.save_every_n_evals, minimize=True)
+        checkpointer = Checkpointer(args.checkpoint_dir / run_name, args.save_every_n_evals, minimize=True) if is_master else None
 
         model.train()
-        pbar = tqdm(range(1, args.steps + 1), desc="train", dynamic_ncols=True)
-        for step in pbar:
+        # Every rank must run this loop in lockstep (optimizer_step's gradient all-reduce is a
+        # collective op) — only master creates the tqdm bar / does eval+checkpoint I/O, so
+        # non-master ranks don't clutter shared stdout with duplicate progress bars.
+        step_iter = tqdm(range(1, args.steps + 1), desc="train", dynamic_ncols=True) if is_master else range(1, args.steps + 1)
+        for step in step_iter:
             if args.cosine_decay:
                 lr = lr_at_warmup_constant_cosine(step, args.warmup_steps, args.constant_steps, args.lr_peak, args.steps)
             else:
@@ -778,31 +865,61 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer_step(opt, device)
 
-            pbar.set_postfix(lr=f"{lr:.2e}", mtp_loss=f"{loss.item():.4f}", bpb=f"{head0_bpb.item():.4f}")
+            if not is_master:
+                continue
+            step_iter.set_postfix(lr=f"{lr:.2e}", mtp_loss=f"{loss.item():.4f}", bpb=f"{head0_bpb.item():.4f}")
             if step % args.log_every == 0:
-                log(f"{pbar}", step=step, lr=lr, mtp_loss=loss.item(), bpb=head0_bpb.item())
+                log(f"{step_iter}", step=step, lr=lr, mtp_loss=loss.item(), bpb=head0_bpb.item())
             if step % args.eval_every == 0 or step == args.steps:
                 if args.full_val_eval:
-                    val_bpb = eval_bpb_full(model, val_data, -1, cfg.context, cfg.mtp_heads, device)
+                    # Chunked through args.batch_size (never a single-giant-batch -1 pass) to
+                    # avoid OOM — same per-process batch size already proven safe in the training
+                    # forward pass itself, and eval has no backward-pass memory to worry about.
+                    # desc= shows a live tqdm bar (visible progress + timing, not stuck-vs-slow
+                    # guesswork) and elapsed time gets logged alongside the bpb numbers below.
+                    t0 = time.perf_counter()
+                    val_bpb = eval_bpb_full(model, val_data, args.batch_size, cfg.context, cfg.mtp_heads, device, desc="val_full")
+                    val_eval_s = time.perf_counter() - t0
                 else:
                     val_bpb = eval_bpb(model, val_iter, cfg.context, args.eval_batches, device)
-                log(f"step {step:5d}  val_bpb {val_bpb:.4f}", step=step, val_bpb=val_bpb)
+                    val_eval_s = None
+                log_line = f"step {step:5d}  val_bpb {val_bpb:.4f}"
+                log_fields = {"step": step, "val_bpb": val_bpb}
+                if val_eval_s is not None:
+                    log_line += f"  val_eval_s {val_eval_s:.1f}"
+                    log_fields["val_eval_s"] = val_eval_s
+                if args.full_val_eval and test_data is not None:
+                    # Logged for observability only — never drives checkpoint selection (that
+                    # stays val_bpb-only below), so this doesn't compromise test as a genuinely
+                    # held-out number; it just gets watched throughout training instead of only
+                    # once at the end.
+                    t0 = time.perf_counter()
+                    test_bpb_now = eval_bpb_full(model, test_data, args.batch_size, cfg.context, cfg.mtp_heads, device, desc="test_full")
+                    test_eval_s = time.perf_counter() - t0
+                    log_line += f"  test_bpb {test_bpb_now:.4f}  test_eval_s {test_eval_s:.1f}"
+                    log_fields["test_bpb"] = test_bpb_now
+                    log_fields["test_eval_s"] = test_eval_s
+                log(log_line, **log_fields)
                 checkpointer.step(
                     {"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "cfg": asdict(cfg), "val_bpb": val_bpb},
                     val_bpb,
                 )
-        log(
-            f"checkpoints: best={checkpointer.best_path} (val_bpb {checkpointer.best_metric:.4f})  last={checkpointer.last_path}"
-        )
-        if test_data is not None:
+        if is_master:
+            log(
+                f"checkpoints: best={checkpointer.best_path} (val_bpb {checkpointer.best_metric:.4f})  last={checkpointer.last_path}"
+            )
+        if test_data is not None and is_master:
             # Held out from both training and every val_bpb-driven checkpoint/LR decision, so
             # unlike val_bpb this number was never used to pick anything during the run — load
             # the val-selected best checkpoint back and score it on test exactly once, at the end.
             best_ckpt = torch.load(checkpointer.best_path, map_location="cpu")
             model.load_state_dict(best_ckpt["model"])
-            test_bpb = eval_bpb_full(model, test_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
+            test_bpb = eval_bpb_full(model, test_data, args.batch_size, cfg.context, cfg.mtp_heads, device, desc="final_test_full")
             log(f"final_test_bpb (best-val checkpoint, step {best_ckpt['step']})  test_bpb {test_bpb:.4f}",
                 test_bpb=test_bpb, test_bpb_from_step=best_ckpt["step"])
+
+    if not is_master:
+        return
 
     if args.benchmark_generate_bytes > 0:
         prompt = next(val_iter)[:1, :1]  # one real byte as prompt, batch size 1

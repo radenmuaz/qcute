@@ -324,3 +324,70 @@ specifically to level1's/level2's own next-code forecast being wrong at generati
 decode/architecture defect -- any further fix needs to target upper-level code-forecasting
 quality (more capacity/data/training signal for those small code-sequence LMs), not decode
 mechanics, quant type, or window size.
+
+**2026-08-21/22: uncertainty weighting, a real generation bug, and the curriculum that finally
+fixes `ks221`.** Three threads, in order:
+
+1. **Uncertainty weighting** (Kendall/Gal/Cipolla 2018, `Config.uncertainty_weighting`): one
+   learnable log-variance per NTP task replacing the fixed `byte_ntp_weight`/`code_ntp_weight`/
+   `decode_ntp_weight` scalars, logged as `uncertainty_sigma_<task>`. Implemented as a fully
+   isolated `if/else` in `QCuteLM.forward` (trivial to remove). Tested alone
+   (`ks221_v16_pq4_..._uw`, `ks221_v16_pq8_..._uw`) and combined with full-strength STE-connected
+   scheduled sampling (`..._uw_ss1` vs `..._ss1` isolation pair) — **all four failed identically**
+   (98-99.9% train byte_acc, repetitive single-token collapse in real generation); the learned
+   sigmas even moved the *wrong* direction (deprioritizing the upper-level forecast loss further).
+   Net: uncertainty weighting is not the fix, in any combination tried.
+
+2. **Real generation bug found and fixed**: `StackDecoder.generate_no_cache`/`generate_kv_cache`
+   silently fell back to the base `Decoder`'s `_generate_blockwise` for any `n_levels != 2` model
+   (i.e. every `ks221`/`ks441` config) — a method hardcoded to a 2-level assumption
+   (`self.stage_lms[0][1]`, `model.encoders[1]`) that **takes no `max_srcs` argument at all**.
+   Confirmed by direct log inspection: `qual_*_level0_mode1`/`mode2`/`modefull` were byte-identical
+   in *every* run this entire session — the mode sweep never actually exercised different
+   conditioning depths, and level2 was never exercised by real generation at all, ever, before this
+   fix. Every "repetitive collapse" conclusion drawn from real-generation output prior to this
+   point (the whole hard-convergence-queue, both uw variants, both ss1 variants) was reading the
+   same fixed own+level1-only path regardless of label. Fixed by generalizing
+   `StackDecoder._stack_generate_blockwise` to `n_levels>2` (chains `upper_track_step` through
+   however many upper-track stages `cond_depth` allocated, capped by a runtime `max_srcs`);
+   `generate_no_cache`/`generate_kv_cache` no longer special-case away from it. Verified via smoke
+   test (tiny random model, `n_levels=3`) producing genuinely different `ks21` vs `full` output,
+   and via `check_gen_consistency`/`check_roundtrip_consistency`/`check_decode_modes` unaffected
+   (still correctly gated `n_levels==2`-only, no regression).
+
+3. **`max_srcs` generalized to per-level** (renamed from `max_decode_sources`, same meaning):
+   `QCuteLM._run`/`forward` now accept a per-level tuple, not just a scalar. This mattered because
+   a *scalar* `max_srcs=2` can't cleanly emulate "as if level2 didn't exist" for `ks221`: level0
+   correctly drops level2 (2 upper tracks, keeps the nearer one), but level1 has only *one* upper
+   track (level2) to begin with, so a scalar cap of 2 never removes it — level1's decode kept
+   conditioning on level2 throughout any scalar-capped "phase 1", contaminating the intended
+   ks21-equivalent baseline. A tuple like `(2, 1, None)` fixes this: level0 keeps level1 only,
+   level1 keeps nothing above it — genuinely no path from level2's code into decode anywhere.
+
+   With both fixes in place, ran `ks221_v16_pq4_overfit10k_window16_relaxed_ss1_curriculum2`
+   (`curriculum_max_srcs=(2, 1, None)` for the first half of training, `None`/full for the second
+   half, `scheduled_sampling_p=1.0`, no uncertainty weighting): **phase 1 (`level0_modeks21`)
+   becomes real, structured Wikipedia-XML text within ~2 minutes and keeps improving. At the
+   phase-2 switch (~step 1500), `level0_modefull` — which had been pure noise the entire first half
+   (its cross-attn stage never touched) — flips to real words within one eval step and converges to
+   coherent text nearly matching `modeks21` within ~200-400 steps, with zero repetitive collapse.**
+   This is the first time in the whole investigation that full `ks221` real generation has produced
+   coherent output. Train byte_acc ~98%, unremarkable — the qualitative generation is the real
+   signal here.
+
+   One caveat surfaced in the same run: `level1_gen`/`level2_gen` (`generate_level_codes` — a
+   *free-running* rollout that repeatedly samples from level1's/level2's own NTP head and feeds the
+   sample back as its own next input, no byte grounding at all) still collapses to a single
+   repeated code, even post-curriculum. This is a *different* generation path from
+   `level0_modefull`'s (which recomputes level1/level2's code fresh from the real just-generated
+   byte stream every block, never a multi-step free rollout of the code itself) — so the two
+   results aren't contradictory: the code is fine when grounded, degenerates immediately under free
+   rollout. Consistent with a live hypothesis (see `CLAUDE.md`'s "Non-recurrent upper-level plan"):
+   level1/level2's own self-NTP loss rewards a low-entropy/constant code, and it shows up exactly
+   where you'd expect — unconstrained free rollout — not in one-step-grounded generation.
+
+   Net conclusion: the `ks221`/`ks441` architecture is sound and the asymmetric-cap curriculum
+   (converge a real ks21-equivalent submodel first, only then graft on the coarser level) is a
+   working fix for full-model real generation, at overfit10k scale. Not yet tried: full-scale (not
+   overfit10k) runs with this curriculum, `ks441`, or dropping non-top levels' self-NTP loss
+   entirely (the next planned test, per `CLAUDE.md`).

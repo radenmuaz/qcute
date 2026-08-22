@@ -56,11 +56,18 @@ ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute
 
 ## Caveats
 
-- Direct ssh does **not** check TPU state first. If the TPU gets preempted (spot instances,
-  see [TPU.md](../TPU.md)) mid-session, a direct `ssh`/multiplexed command just hangs until
-  `ConnectTimeout`/TCP timeout instead of gcloud's immediate `PREEMPTED` state error. If a
-  command unexpectedly hangs, check state with:
+- **Every TPU listed in [TPU.md](../TPU.md) is a spot instance** — it can be preempted (reclaimed)
+  by Google at any time, with no warning, mid-session, mid-training-run. Direct ssh does **not**
+  check TPU state first, so preemption shows up purely as a sudden connectivity failure against a
+  node that was working seconds ago: the command might hang until `ConnectTimeout`/TCP timeout,
+  or fail immediately with `Connection refused`/`No route to host` (the VM itself is gone, not
+  just unresponsive) — both are consistent with preemption, not just "network is flaky". **The
+  very first thing to check when a previously-working direct-ssh connection suddenly can't
+  connect is TPU state, not connection retries or a new ControlMaster**:
   `gcloud compute tpus queued-resources describe <qr-name> --project raden-tpu --zone <zone> --format="value(state.state)"`
+  — if it prints `PREEMPTED`, the node is gone and won't come back; per CLAUDE.md, don't create a
+  replacement yourself, report it and ask how to proceed. Only retry the connection if state
+  still says `READY`/`ACTIVE`.
 - The multiplexed master survives across separate tool calls/shells as long as its process
   (`ControlPersist`) is alive — check with
   `ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -O check muaz@<external_ip>`.

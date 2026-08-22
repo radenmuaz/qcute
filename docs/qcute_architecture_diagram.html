@@ -1,0 +1,452 @@
+<title>Cascading Code Decoder</title>
+<style>
+  :root{
+    --paper:#EEF0F2; --ink:#12181F; --muted:#5B6672; --surface:#FFFFFF; --border:#D7DCE1;
+    --teal:#0E7C86; --teal-soft:#0E7C8622;
+    --ochre:#9C6A21; --ochre-soft:#9C6A2122;
+    --seed:#7A4FB0; --seed-soft:#7A4FB022;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --paper:#10141A; --ink:#E7EAEE; --muted:#93A0AD; --surface:#171D24; --border:#2A323B;
+      --teal:#2FB8C4; --teal-soft:#2FB8C42a;
+      --ochre:#E0A84D; --ochre-soft:#E0A84D2a;
+      --seed:#B79CE8; --seed-soft:#B79CE82a;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#10141A; --ink:#E7EAEE; --muted:#93A0AD; --surface:#171D24; --border:#2A323B;
+    --teal:#2FB8C4; --teal-soft:#2FB8C42a;
+    --ochre:#E0A84D; --ochre-soft:#E0A84D2a;
+    --seed:#B79CE8; --seed-soft:#B79CE82a;
+  }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:"IBM Plex Serif", Georgia, serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:960px; margin:0 auto; padding:4rem 1.5rem 6rem;}
+
+  .eyebrow{
+    font-family:"IBM Plex Sans", system-ui, sans-serif;
+    font-size:0.72rem; letter-spacing:0.14em; text-transform:uppercase;
+    color:var(--muted); margin:0 0 0.9rem;
+  }
+  h1{
+    font-family:"IBM Plex Sans", system-ui, sans-serif;
+    font-weight:600; font-size:2.15rem; line-height:1.15; margin:0 0 0.6rem;
+    text-wrap:balance; letter-spacing:-0.01em;
+  }
+  .sub{
+    font-size:1.08rem; color:var(--muted); max-width:62ch; margin:0 0 2.6rem;
+    line-height:1.55;
+  }
+  h2{
+    font-family:"IBM Plex Sans", system-ui, sans-serif;
+    font-weight:600; font-size:1.3rem; margin:0 0 0.35rem; letter-spacing:-0.005em;
+  }
+  .fig-kicker{
+    font-family:"IBM Plex Sans", system-ui, sans-serif;
+    font-size:0.72rem; letter-spacing:0.1em; text-transform:uppercase; color:var(--teal);
+    margin:0 0 0.4rem; font-weight:600;
+  }
+  p{ max-width:66ch; line-height:1.65; font-size:1rem; }
+  .lead-p{ margin:0 0 1.6rem; }
+
+  section.figure{
+    margin:3.2rem 0 3.6rem; padding-top:2.6rem; border-top:1px solid var(--border);
+  }
+  section.figure:first-of-type{ border-top:1px solid var(--border); }
+
+  .diagram-frame{
+    background:var(--surface); border:1px solid var(--border); border-radius:4px;
+    padding:1.4rem 0.6rem 1rem; margin:1.2rem 0 1rem;
+    overflow-x:auto;
+  }
+  .diagram-frame svg{ display:block; margin:0 auto; font-family:"IBM Plex Mono", ui-monospace, monospace; }
+
+  .caption{
+    font-size:0.95rem; color:var(--muted); line-height:1.6; max-width:68ch;
+    margin:0.9rem 0 0;
+  }
+  .caption b{ color:var(--ink); font-weight:600; }
+  code.inline{
+    font-family:"IBM Plex Mono", ui-monospace, monospace; font-size:0.88em;
+    background:var(--teal-soft); color:var(--teal); padding:0.05em 0.35em; border-radius:3px;
+  }
+
+  .legend{
+    display:flex; flex-wrap:wrap; gap:1.6rem;
+    font-family:"IBM Plex Sans", system-ui, sans-serif; font-size:0.85rem;
+    margin:2.2rem 0 0; padding:1.1rem 1.3rem; background:var(--surface);
+    border:1px solid var(--border); border-radius:4px; color:var(--ink);
+  }
+  .legend-item{ display:flex; align-items:center; gap:0.55rem; white-space:nowrap; }
+  .swatch{ width:26px; height:3px; border-radius:2px; flex:none; }
+  .swatch.dash{ background:repeating-linear-gradient(90deg, var(--c) 0 6px, transparent 6px 10px); }
+  .swatch.solid{ background:var(--c); }
+  .swatch.box{ width:16px; height:16px; border-radius:3px; border:1.5px solid var(--c); background:none; }
+
+  footer.closing{
+    margin-top:3.4rem; padding-top:1.8rem; border-top:1px solid var(--border);
+  }
+  footer.closing p{ font-size:0.98rem; }
+
+  @media (max-width: 640px){
+    h1{ font-size:1.6rem; }
+    .wrap{ padding:2.6rem 1.1rem 4rem; }
+  }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:wght@400;500;600&family=IBM+Plex+Sans:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<div class="wrap">
+
+  <p class="eyebrow">qcute_v1 — StackDecoder</p>
+  <h1>How a cascading code decoder turns bytes into layered codes, and layered codes back into bytes</h1>
+  <p class="sub">
+    A walkthrough of two related architectures — <code class="inline">ks21</code> (two levels) and
+    <code class="inline">ks221</code> (three levels) — using one running example, the 8&nbsp;byte
+    string <code class="inline">the_cats</code>. Same grammar throughout: solid arcs are
+    self-attention inside one level, teal arrows are a level extracting its own code, ochre dashed
+    arrows are decode cross-attending back to a code.
+  </p>
+
+  <!-- ============================= FIGURE A: ks21 ============================= -->
+  <section class="figure">
+    <p class="fig-kicker">Figure A</p>
+    <h2><code class="inline">ks21</code> — two levels</h2>
+    <p class="caption" style="margin-bottom:1rem">
+      Level&nbsp;0 reads raw bytes. Level&nbsp;1 is the <b>top</b> — it reads level&nbsp;0's own code
+      as its input sequence, and nothing sits above it.
+    </p>
+
+    <div class="diagram-frame">
+<svg viewBox="0 0 880 470" width="880" height="470" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ahT" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--teal)"/></marker>
+    <marker id="ahO" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--ochre)"/></marker>
+    <marker id="ahI" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--ink)"/></marker>
+  </defs>
+  <style>
+    .lvl-label{ font:600 12px "IBM Plex Sans", sans-serif; fill:var(--muted); letter-spacing:0.02em; }
+    .box-byte{ fill:var(--surface); stroke:var(--ink); stroke-width:1.3; }
+    .box-code{ fill:var(--teal-soft); stroke:var(--teal); stroke-width:1.4; }
+    .box-seed{ fill:var(--seed-soft); stroke:var(--seed); stroke-width:1.4; }
+    .glyph{ font:600 15px "IBM Plex Mono", monospace; fill:var(--ink); text-anchor:middle; }
+    .glyph-code{ font:600 14px "IBM Plex Mono", monospace; fill:var(--teal); text-anchor:middle; }
+    .glyph-seed{ font:700 12px "IBM Plex Mono", monospace; fill:var(--seed); text-anchor:middle; }
+    .arc-self{ fill:none; stroke:var(--ink); stroke-width:1.1; opacity:0.55; }
+    .arr-extract{ fill:none; stroke:var(--teal); stroke-width:1.6; marker-end:url(#ahT); }
+    .arr-cross{ fill:none; stroke:var(--ochre); stroke-width:1.6; stroke-dasharray:5 4; marker-end:url(#ahO); }
+    .arr-out{ fill:none; stroke:var(--ink); stroke-width:1.5; marker-end:url(#ahI); }
+    .tag{ font:500 10.5px "IBM Plex Sans", sans-serif; fill:var(--muted); text-anchor:middle; }
+    .tag-strong{ font:600 10.5px "IBM Plex Sans", sans-serif; fill:var(--ink); text-anchor:middle; }
+  </style>
+
+  <!-- ===== Level 1 row (top, AR) ===== -->
+  <text x="16" y="34" class="lvl-label">LEVEL 1 ENCODER — the top, genuine autoregressive LM over its own code</text>
+  <!-- self attention arcs among c1..c4 -->
+  <path class="arc-self" d="M 156,66 Q 216,34 276,66"/>
+  <path class="arc-self" d="M 276,66 Q 366,20 456,66"/>
+  <path class="arc-self" d="M 156,66 Q 306,4 456,66"/>
+  <g>
+    <rect class="box-code" x="126" y="66" width="60" height="38" rx="3"/>
+    <text class="glyph-code" x="156" y="90">c1</text>
+    <rect class="box-code" x="246" y="66" width="60" height="38" rx="3"/>
+    <text class="glyph-code" x="276" y="90">c2</text>
+    <rect class="box-code" x="366" y="66" width="60" height="38" rx="3"/>
+    <text class="glyph-code" x="396" y="90">c3</text>
+    <rect class="box-code" x="486" y="66" width="60" height="38" rx="3"/>
+    <text class="glyph-code" x="516" y="90">c4</text>
+  </g>
+  <!-- own-code loop badge for level1 -->
+  <path class="arc-self" d="M 590,85 q 26,-30 0,-46 q -10,-6 -14,6" />
+  <text x="612" y="52" class="tag" text-anchor="start">level1 also extracts</text>
+  <text x="612" y="64" class="tag" text-anchor="start">its own code "e"</text>
+  <rect class="box-code" x="700" y="66" width="46" height="38" rx="3"/>
+  <text class="glyph-code" x="723" y="90" style="font-size:13px">e</text>
+
+  <!-- extract-code arrows from byte pairs up to c_i -->
+  <path class="arr-extract" d="M 96,210 C 96,150 156,150 156,110"/>
+  <path class="arr-extract" d="M 216,210 C 216,150 276,150 276,110"/>
+  <path class="arr-extract" d="M 336,210 C 336,150 396,150 396,110"/>
+  <path class="arr-extract" d="M 456,210 C 456,150 516,150 516,110"/>
+  <text x="70" y="150" class="tag" text-anchor="end">extract</text>
+  <text x="70" y="162" class="tag" text-anchor="end">code</text>
+
+  <!-- ===== Level 0 row (bytes) ===== -->
+  <text x="16" y="196" class="lvl-label">LEVEL 0 ENCODER — causal byte LM, "the_cats"</text>
+  <path class="arc-self" d="M 46,232 Q 76,206 106,232"/>
+  <path class="arc-self" d="M 106,232 Q 136,206 166,232"/>
+  <path class="arc-self" d="M 166,232 Q 196,206 226,232"/>
+  <path class="arc-self" d="M 226,232 Q 256,206 286,232"/>
+  <path class="arc-self" d="M 286,232 Q 316,206 346,232"/>
+  <path class="arc-self" d="M 346,232 Q 376,206 406,232"/>
+  <path class="arc-self" d="M 406,232 Q 436,206 466,232"/>
+
+  <g>
+    <rect class="box-byte" x="16"  y="232" width="60" height="38" rx="3"/><text class="glyph" x="46"  y="256">t</text>
+    <rect class="box-byte" x="76"  y="232" width="60" height="38" rx="3"/><text class="glyph" x="106" y="256">h</text>
+    <rect class="box-byte" x="136" y="232" width="60" height="38" rx="3"/><text class="glyph" x="166" y="256">e</text>
+    <rect class="box-byte" x="196" y="232" width="60" height="38" rx="3"/><text class="glyph" x="226" y="256">_</text>
+    <rect class="box-byte" x="256" y="232" width="60" height="38" rx="3"/><text class="glyph" x="286" y="256">c</text>
+    <rect class="box-byte" x="316" y="232" width="60" height="38" rx="3"/><text class="glyph" x="346" y="256">a</text>
+    <rect class="box-byte" x="376" y="232" width="60" height="38" rx="3"/><text class="glyph" x="406" y="256">t</text>
+    <rect class="box-byte" x="436" y="232" width="60" height="38" rx="3"/><text class="glyph" x="466" y="256">s</text>
+  </g>
+  <!-- block brackets -->
+  <path d="M 16,278 h 120" stroke="var(--muted)" stroke-width="1"/>
+  <path d="M 136,278 h 120" stroke="var(--muted)" stroke-width="1"/>
+  <path d="M 256,278 h 120" stroke="var(--muted)" stroke-width="1"/>
+  <path d="M 376,278 h 120" stroke="var(--muted)" stroke-width="1"/>
+  <text x="76" y="292" class="tag">block 1</text>
+  <text x="196" y="292" class="tag">block 2</text>
+  <text x="316" y="292" class="tag">block 3</text>
+  <text x="436" y="292" class="tag">block 4</text>
+
+  <!-- ===== Decode row: seed/query tokens + own-code cross-attn ===== -->
+  <text x="16" y="330" class="lvl-label" fill="var(--seed)">LEVEL 0 DECODER — per-block seed/query token, own-code + stacked cross-attention</text>
+
+  <!-- embed pill + own-code cross-attn arrows, one per block, converging on seed tokens -->
+  <g>
+    <rect x="126" y="356" width="60" height="20" rx="10" fill="none" stroke="var(--teal)" stroke-width="1"/>
+    <text x="156" y="370" class="tag" fill="var(--teal)" style="font-size:9.5px">embed</text>
+    <path class="arr-cross" d="M 156,104 L 156,356"/>
+
+    <rect class="box-seed" x="46" y="376" width="44" height="34" rx="3"/>
+    <text class="glyph-seed" x="68" y="398">Q1</text>
+    <path class="arr-cross" d="M 156,376 Q 110,388 90,393"/>
+  </g>
+  <g>
+    <rect x="246" y="356" width="60" height="20" rx="10" fill="none" stroke="var(--teal)" stroke-width="1"/>
+    <text x="276" y="370" class="tag" fill="var(--teal)" style="font-size:9.5px">embed</text>
+    <path class="arr-cross" d="M 276,104 L 276,356"/>
+    <rect class="box-seed" x="166" y="376" width="44" height="34" rx="3"/>
+    <text class="glyph-seed" x="188" y="398">Q2</text>
+    <path class="arr-cross" d="M 276,376 Q 230,388 210,393"/>
+  </g>
+  <g>
+    <rect x="366" y="356" width="60" height="20" rx="10" fill="none" stroke="var(--teal)" stroke-width="1"/>
+    <text x="396" y="370" class="tag" fill="var(--teal)" style="font-size:9.5px">embed</text>
+    <path class="arr-cross" d="M 396,104 L 396,356"/>
+    <rect class="box-seed" x="286" y="376" width="44" height="34" rx="3"/>
+    <text class="glyph-seed" x="308" y="398">Q3</text>
+    <path class="arr-cross" d="M 396,376 Q 350,388 330,393"/>
+  </g>
+  <g>
+    <rect x="486" y="356" width="60" height="20" rx="10" fill="none" stroke="var(--teal)" stroke-width="1"/>
+    <text x="516" y="370" class="tag" fill="var(--teal)" style="font-size:9.5px">embed</text>
+    <path class="arr-cross" d="M 516,104 L 516,356"/>
+    <rect class="box-seed" x="406" y="376" width="44" height="34" rx="3"/>
+    <text class="glyph-seed" x="428" y="398">Q4</text>
+    <path class="arr-cross" d="M 516,376 Q 470,388 450,393"/>
+  </g>
+  <text x="16" y="400" class="tag-strong" text-anchor="start">own code</text>
+
+  <!-- track 1: level1's own code "e" cross-attends into every seed token, chained after own-code -->
+  <path class="arr-cross" d="M 723,104 C 723,300 600,340 90,410"/>
+  <path class="arr-cross" d="M 723,104 C 723,320 620,350 210,414"/>
+  <path class="arr-cross" d="M 723,104 C 723,340 640,360 330,417"/>
+  <path class="arr-cross" d="M 723,104 C 723,300 660,350 450,414"/>
+  <text x="740" y="150" class="tag" text-anchor="start" fill="var(--ochre)">track 1</text>
+  <text x="740" y="162" class="tag" text-anchor="start" fill="var(--ochre)">(level1's</text>
+  <text x="740" y="174" class="tag" text-anchor="start" fill="var(--ochre)">own code)</text>
+
+  <!-- output -->
+  <path class="arr-out" d="M 68,410 L 68,440"/>
+  <path class="arr-out" d="M 188,410 L 188,440"/>
+  <path class="arr-out" d="M 308,410 L 308,440"/>
+  <path class="arr-out" d="M 428,410 L 428,440"/>
+  <text x="16" y="462" class="tag-strong" text-anchor="start">predicted bytes (final output logits)</text>
+</svg>
+    </div>
+    <p class="caption">
+      Reading bottom to top: <b>level 0's encoder</b> self-attends causally over the 8 bytes of
+      <code class="inline">the_cats</code> and, at the end of every 2-byte block, extracts one
+      discrete code (<code class="inline">c1..c4</code>) — this is the <b>cascade</b>: that code
+      sequence <i>is</i> level 1's input. <b>Level 1's encoder</b> self-attends over
+      <code class="inline">c1..c4</code> the same way; since nothing sits above it, this is the
+      genuinely autoregressive top. Level 1 also extracts one further code from itself
+      (<code class="inline">e</code>) exactly like every other level does.
+      Reading top to bottom: <b>level 0's decoder</b> gives each block a trainable seed/query
+      token (<code class="inline">Q1..Q4</code>) that cross-attends first to that block's <b>own
+      code</b>, then — chained one hop further — to level&nbsp;1's own code
+      <code class="inline">e</code> (<b>track 1</b>). Every code is <b>embedded</b> before it
+      becomes cross-attention key/value — the decoder never reads a raw hidden state directly.
+    </p>
+  </section>
+
+  <!-- ============================= FIGURE B: ks221 ============================= -->
+  <section class="figure">
+    <p class="fig-kicker">Figure B</p>
+    <h2><code class="inline">ks221</code> — three levels</h2>
+    <p class="caption" style="margin-bottom:1rem">
+      Same byte string, one more level of compression. Level&nbsp;2 now reads level&nbsp;1's own
+      code as its input, and is the top. Level&nbsp;0's decoder now chains
+      <b>two</b> cross-attention tracks above its own code.
+    </p>
+
+    <div class="diagram-frame">
+<svg viewBox="0 0 880 590" width="880" height="590" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ahT2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--teal)"/></marker>
+    <marker id="ahO2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--ochre)"/></marker>
+    <marker id="ahI2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--ink)"/></marker>
+  </defs>
+  <style>
+    .lvl-label{ font:600 12px "IBM Plex Sans", sans-serif; fill:var(--muted); letter-spacing:0.02em; }
+    .box-byte{ fill:var(--surface); stroke:var(--ink); stroke-width:1.3; }
+    .box-code{ fill:var(--teal-soft); stroke:var(--teal); stroke-width:1.4; }
+    .box-seed{ fill:var(--seed-soft); stroke:var(--seed); stroke-width:1.4; }
+    .glyph{ font:600 15px "IBM Plex Mono", monospace; fill:var(--ink); text-anchor:middle; }
+    .glyph-code{ font:600 14px "IBM Plex Mono", monospace; fill:var(--teal); text-anchor:middle; }
+    .glyph-seed{ font:700 12px "IBM Plex Mono", monospace; fill:var(--seed); text-anchor:middle; }
+    .arc-self{ fill:none; stroke:var(--ink); stroke-width:1.1; opacity:0.55; }
+    .arr-extract{ fill:none; stroke:var(--teal); stroke-width:1.6; marker-end:url(#ahT2); }
+    .arr-cross{ fill:none; stroke:var(--ochre); stroke-width:1.6; stroke-dasharray:5 4; marker-end:url(#ahO2); }
+    .arr-cross2{ fill:none; stroke:var(--ochre); stroke-width:1.3; stroke-dasharray:3 5; marker-end:url(#ahO2); opacity:0.85; }
+    .arr-out{ fill:none; stroke:var(--ink); stroke-width:1.5; marker-end:url(#ahI2); }
+    .tag{ font:500 10.5px "IBM Plex Sans", sans-serif; fill:var(--muted); text-anchor:middle; }
+    .tag-strong{ font:600 10.5px "IBM Plex Sans", sans-serif; fill:var(--ink); text-anchor:middle; }
+  </style>
+
+  <!-- ===== Level 2 row (new, top) ===== -->
+  <text x="16" y="34" class="lvl-label">LEVEL 2 ENCODER — the top, genuine AR over level 1's code</text>
+  <path class="arc-self" d="M 216,66 Q 336,18 456,66"/>
+  <rect class="box-code" x="186" y="66" width="60" height="38" rx="3"/>
+  <text class="glyph-code" x="216" y="90">d1</text>
+  <rect class="box-code" x="426" y="66" width="60" height="38" rx="3"/>
+  <text class="glyph-code" x="456" y="90">d2</text>
+  <path class="arc-self" d="M 550,85 q 26,-30 0,-46 q -10,-6 -14,6" />
+  <text x="572" y="52" class="tag" text-anchor="start">level2 also extracts</text>
+  <text x="572" y="64" class="tag" text-anchor="start">its own code "f"</text>
+  <rect class="box-code" x="660" y="66" width="46" height="38" rx="3"/>
+  <text class="glyph-code" x="683" y="90" style="font-size:13px">f</text>
+
+  <!-- extract arrows level1 -> level2 (grouping c-pairs) -->
+  <path class="arr-extract" d="M 156,196 C 156,150 216,150 216,110"/>
+  <path class="arr-extract" d="M 396,196 C 396,150 456,150 456,110"/>
+
+  <!-- ===== Level 1 row ===== -->
+  <text x="16" y="182" class="lvl-label">LEVEL 1 ENCODER — self-attends over level 0's code</text>
+  <path class="arc-self" d="M 156,232 Q 216,206 276,232"/>
+  <path class="arc-self" d="M 276,232 Q 336,206 396,232"/>
+  <path class="arc-self" d="M 156,232 Q 276,186 396,232"/>
+  <rect class="box-code" x="126" y="232" width="60" height="38" rx="3"/><text class="glyph-code" x="156" y="256">c1</text>
+  <rect class="box-code" x="246" y="232" width="60" height="38" rx="3"/><text class="glyph-code" x="276" y="256">c2</text>
+  <rect class="box-code" x="366" y="232" width="60" height="38" rx="3"/><text class="glyph-code" x="396" y="256">c3</text>
+  <rect class="box-code" x="486" y="232" width="60" height="38" rx="3"/><text class="glyph-code" x="516" y="256">c4</text>
+
+  <!-- extract arrows byte -> level1 -->
+  <path class="arr-extract" d="M 96,376 C 96,310 156,310 156,276"/>
+  <path class="arr-extract" d="M 216,376 C 216,310 276,310 276,276"/>
+  <path class="arr-extract" d="M 336,376 C 336,310 396,310 396,276"/>
+  <path class="arr-extract" d="M 456,376 C 456,310 516,310 516,276"/>
+  <text x="70" y="316" class="tag" text-anchor="end">extract</text>
+  <text x="70" y="328" class="tag" text-anchor="end">code</text>
+
+  <!-- ===== Level 0 row (bytes) ===== -->
+  <text x="16" y="362" class="lvl-label">LEVEL 0 ENCODER — causal byte LM, "the_cats"</text>
+  <path class="arc-self" d="M 46,398 Q 76,372 106,398"/>
+  <path class="arc-self" d="M 106,398 Q 136,372 166,398"/>
+  <path class="arc-self" d="M 166,398 Q 196,372 226,398"/>
+  <path class="arc-self" d="M 226,398 Q 256,372 286,398"/>
+  <path class="arc-self" d="M 286,398 Q 316,372 346,398"/>
+  <path class="arc-self" d="M 346,398 Q 376,372 406,398"/>
+  <path class="arc-self" d="M 406,398 Q 436,372 466,398"/>
+  <rect class="box-byte" x="16"  y="398" width="60" height="38" rx="3"/><text class="glyph" x="46"  y="422">t</text>
+  <rect class="box-byte" x="76"  y="398" width="60" height="38" rx="3"/><text class="glyph" x="106" y="422">h</text>
+  <rect class="box-byte" x="136" y="398" width="60" height="38" rx="3"/><text class="glyph" x="166" y="422">e</text>
+  <rect class="box-byte" x="196" y="398" width="60" height="38" rx="3"/><text class="glyph" x="226" y="422">_</text>
+  <rect class="box-byte" x="256" y="398" width="60" height="38" rx="3"/><text class="glyph" x="286" y="422">c</text>
+  <rect class="box-byte" x="316" y="398" width="60" height="38" rx="3"/><text class="glyph" x="346" y="422">a</text>
+  <rect class="box-byte" x="376" y="398" width="60" height="38" rx="3"/><text class="glyph" x="406" y="422">t</text>
+  <rect class="box-byte" x="436" y="398" width="60" height="38" rx="3"/><text class="glyph" x="466" y="422">s</text>
+
+  <!-- ===== Decode row ===== -->
+  <text x="16" y="462" class="lvl-label" fill="var(--seed)">LEVEL 0 DECODER — own code, then two chained cross-attention tracks</text>
+
+  <g>
+    <path class="arr-cross" d="M 156,270 L 156,486"/>
+    <rect class="box-seed" x="46" y="500" width="44" height="34" rx="3"/><text class="glyph-seed" x="68" y="522">Q1</text>
+    <path class="arr-cross" d="M 156,500 Q 110,510 90,516"/>
+  </g>
+  <g>
+    <path class="arr-cross" d="M 276,270 L 276,486"/>
+    <rect class="box-seed" x="166" y="500" width="44" height="34" rx="3"/><text class="glyph-seed" x="188" y="522">Q2</text>
+    <path class="arr-cross" d="M 276,500 Q 230,510 210,516"/>
+  </g>
+  <g>
+    <path class="arr-cross" d="M 396,270 L 396,486"/>
+    <rect class="box-seed" x="286" y="500" width="44" height="34" rx="3"/><text class="glyph-seed" x="308" y="522">Q3</text>
+    <path class="arr-cross" d="M 396,500 Q 350,510 330,516"/>
+  </g>
+  <g>
+    <path class="arr-cross" d="M 516,270 L 516,486"/>
+    <rect class="box-seed" x="406" y="500" width="44" height="34" rx="3"/><text class="glyph-seed" x="428" y="522">Q4</text>
+    <path class="arr-cross" d="M 516,500 Q 470,510 450,516"/>
+  </g>
+  <text x="16" y="524" class="tag-strong" text-anchor="start">own code</text>
+
+  <!-- track 1: level1's own code (grouped) -- reuse d1/d2 as the "level1 own code" stand-in is wrong; level1's own code at K=1 granularity mirrors c1..c4 one-for-one, so route dashed arrows from level1 row's OWN extraction badge -->
+  <path class="arc-self" d="M 550,251 q 22,-26 0,-40 q -8,-5 -12,5" />
+  <text x="568" y="222" class="tag" text-anchor="start" style="font-size:9px">level1 own code "g1..g4"</text>
+  <rect class="box-code" x="600" y="232" width="40" height="38" rx="3"/>
+  <text class="glyph-code" x="620" y="256" style="font-size:12px">g</text>
+
+  <path class="arr-cross2" d="M 620,270 C 620,340 200,420 90,520"/>
+  <path class="arr-cross2" d="M 620,270 C 620,350 260,430 210,524"/>
+  <path class="arr-cross2" d="M 620,270 C 620,360 340,440 330,527"/>
+  <path class="arr-cross2" d="M 620,270 C 620,340 400,430 450,524"/>
+  <text x="645" y="300" class="tag" text-anchor="start" fill="var(--ochre)">track 1 (level1's own code)</text>
+
+  <!-- track 2: level2's own code "f" -->
+  <path class="arr-cross" d="M 683,104 C 683,400 700,460 90,530"/>
+  <path class="arr-cross" d="M 683,104 C 683,410 710,465 210,533"/>
+  <path class="arr-cross" d="M 683,104 C 683,420 715,470 330,536"/>
+  <path class="arr-cross" d="M 683,104 C 683,400 705,460 450,533"/>
+  <text x="700" y="150" class="tag" text-anchor="start" fill="var(--ochre)">track 2</text>
+  <text x="700" y="162" class="tag" text-anchor="start" fill="var(--ochre)">(level2's</text>
+  <text x="700" y="174" class="tag" text-anchor="start" fill="var(--ochre)">own code)</text>
+
+  <path class="arr-out" d="M 68,534 L 68,560"/>
+  <path class="arr-out" d="M 188,534 L 188,560"/>
+  <path class="arr-out" d="M 308,534 L 308,560"/>
+  <path class="arr-out" d="M 428,534 L 428,560"/>
+  <text x="16" y="580" class="tag-strong" text-anchor="start">predicted bytes (final output logits)</text>
+</svg>
+    </div>
+    <p class="caption">
+      One more level, same grammar. <b>Level 1</b> now sits in the middle: it self-attends over
+      level 0's code (<code class="inline">c1..c4</code>), and its own extraction groups
+      <i>pairs</i> of those into level 2's input (<code class="inline">d1, d2</code>).
+      <b>Level 2</b> is now the top. <b>Level 0's decoder</b> is unchanged in kind, just longer: the
+      same seed/query tokens cross-attend first to their own code, then chain through
+      <b>two</b> further tracks — level 1's own code, then level 2's own code — each one embedded
+      before it reaches cross-attention, each stage's output feeding the next as its query.
+    </p>
+  </section>
+
+  <div class="legend">
+    <div class="legend-item"><span class="swatch solid" style="--c:var(--ink); opacity:0.55"></span> self-attention (causal, within one level)</div>
+    <div class="legend-item"><span class="swatch solid" style="--c:var(--teal)"></span> extract code (encoder cascade, upward)</div>
+    <div class="legend-item"><span class="swatch dash" style="--c:var(--ochre)"></span> cross-attention to a code (decode, downward)</div>
+    <div class="legend-item"><span class="swatch box" style="--c:var(--seed)"></span> seed / query token</div>
+  </div>
+
+  <footer class="closing">
+    <p>
+      What's identical between the two figures: every level is trained the same way (self-attend,
+      extract a code, and separately decode itself from that same code); a code is always
+      <b>embedded</b> before it reaches any cross-attention, never handed over as a raw hidden
+      state. What changes going from <code class="inline">ks21</code> to <code class="inline">ks221</code>
+      is only <i>how many</i> coarser codes level 0's decoder chains through before producing its
+      final byte predictions — one more level means one more track, staged after the ones already
+      there, not a different mechanism.
+    </p>
+  </footer>
+
+</div>

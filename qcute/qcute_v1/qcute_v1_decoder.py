@@ -1070,10 +1070,18 @@ class Decoder(nn.Module):
             log(f"{prefix}ground_truth:        {pack_words(ground_truth.tolist(), bits)!r}")
         log(f"{prefix}level0_uncond:       {gen_bytes_uncond!r}")
         align_width = len("level0_uncond:") + 7
-        for m in range(1, model.n_levels + 1):
-            out_m = self.generate_no_cache(model, prompt_bytes, gen_len, device, max_srcs=m)
+        # A single scalar max_srcs can't isolate "as if the top level didn't exist" once
+        # n_levels>=3 -- a level's OWN nearest upper track survives any cap>=2 regardless (e.g.
+        # level1 in a Ks=(2,2,1) model always sees level2 under a global cap of 2, since level2 is
+        # its only upper track). Use the genuine per-level truncation instead: drop the real top
+        # level from every non-top level's conditioning entirely (own code + at most the next
+        # coarser level that ISN'T the real top), the actual submodel a shallower Ks would train --
+        # see qcute_v1_common.py's Config.curriculum_max_srcs docstring, chat 2026-08-21.
+        n = model.n_levels
+        ks21_equiv = tuple((1 + max(0, (n - 2) - i)) if i < n - 1 else None for i in range(n))
+        for tag, max_srcs in (("ks21", ks21_equiv), ("full", None)):
+            out_m = self.generate_no_cache(model, prompt_bytes, gen_len, device, max_srcs=max_srcs)
             gen_bytes_m = pack_words(out_m[prompt_bytes.numel():].tolist(), bits)
-            tag = "full" if m == model.n_levels else str(m)
             label = f"level0_mode{tag}:"
             pad = " " * max(1, align_width - len(label))
             log(f"{prefix}{label}{pad}{gen_bytes_m!r}")
@@ -1470,13 +1478,14 @@ class StackDecoder(Decoder):
 
     @torch.no_grad()
     def _stack_generate_blockwise(self, model, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
-                             code_source: str = "pred", gt_full_bytes: torch.Tensor | None = None) -> dict:
+                             code_source: str = "pred", gt_full_bytes: torch.Tensor | None = None,
+                             max_srcs: int | None = None) -> dict:
         """Generation fix (chat 2026-08-20) for this decoder, same root cause and same fix strategy
         as StackDecoderV1._generate_blockwise: query_last=None means the base class's
         generate_no_cache/generate_kv_cache fall back to a stale hidden state (see decode_level's
         query_last=None comment). Fix: decode one whole NEW block at a time using THIS decoder's own
         validated primitives (encode_like_self_attn_decode + seed_query_decode for track0, chained
-        through upper_track_step for cond_depth's upper tracks), teacher-forcing each new byte back
+        through upper_track_step for each active upper track), teacher-forcing each new byte back
         in before predicting the next one within the block. code_source picks where the new block's
         own (track0) code comes from -- "pred" (default, real generation) samples it from level1's
         genuine NTP; "gt" (diagnostic only, needs gt_full_bytes) uses the real encoded code, per
@@ -1485,15 +1494,16 @@ class StackDecoder(Decoder):
         just-predicted), computed fresh via encoders[j], not "predicted" the way track0's own code
         must be.
 
-        Scope: n_levels==2 only (one upper track) for now, matching the ks21_* test configs this
-        was built and validated against -- falls back to the (still-broken) base class otherwise,
-        same honesty policy as StackDecoderV1's scoping note.
+        Generalized 2026-08-21 (chat) to n_levels>2: chains through however many upper-track stages
+        `self.stage_lms[0]` actually holds (capped by cond_depth at __init__ time already), in order
+        level1, level2, .... `max_srcs` (int|None, own-level0 semantics only -- this method only
+        ever produces level0's bytes) caps how many of those tracks are actually used, same
+        own-code-always-kept convention as decode_level's max_srcs (max_srcs==1 means own code
+        only). Unlike decode_level's max_srcs, there is no per-level tuple support here since this
+        method only ever handles i=0's own generation -- pass an int/None, not a tuple.
 
         Returns dict(bytes=(B, prompt_len+n_new_bytes), code_used=(B, n_blocks_total, code_dim)) --
         code_used is track0's own code only, matching StackDecoderV1's return contract."""
-        if self.n_levels != 2:
-            raise NotImplementedError(
-                "StackDecoder._stack_generate_blockwise: only n_levels==2 implemented so far (chat 2026-08-20)")
         was_training = model.training
         model.eval()
         prompt_bytes = prompt_bytes.to(device)
@@ -1501,8 +1511,10 @@ class StackDecoder(Decoder):
             prompt_bytes = prompt_bytes.unsqueeze(0)
         cfg = self.cfg
         K = cfg.Ks[0]
-        bb0, bb1 = self.stage_lms[0][0], self.stage_lms[0][1]
-        cum_K1 = K * cfg.Ks[1]
+        stage_bbs = self.stage_lms[0]
+        bb0 = stage_bbs[0]
+        n_upper_avail = len(stage_bbs) - 1
+        n_upper = n_upper_avail if max_srcs is None else max(0, min(n_upper_avail, max_srcs - 1))
         track0_window = model.decode_windows[0][0]
         D = bb0.d_model
         all_bytes = prompt_bytes[:, :prompt_bytes.shape[1] // K * K]
@@ -1510,6 +1522,12 @@ class StackDecoder(Decoder):
         n_blocks_prompt = all_bytes.shape[1] // K
         code_parts = [model.encoders[0](all_bytes, level=0, window=model.windows[0],
                                          compute_ntp=False)["code"][:, :n_blocks_prompt, :]] if n_blocks_prompt > 0 else []
+
+        cum_Ks = []
+        cum = K
+        for j in range(1, n_upper + 1):
+            cum *= cfg.Ks[j]
+            cum_Ks += [cum]
 
         n_new_blocks = -(-n_new_bytes // K)
         for _ in range(n_new_blocks):
@@ -1534,10 +1552,14 @@ class StackDecoder(Decoder):
             code_embeds0 = bb0.quant.embed_for_decode(bb0, code0)
             n_blocks = n_blocks_prev + 1
 
-            # level1's OWN code over the (now fully available, real or just-predicted) code0 stream
-            # -- never circular, a plain function of code0, unlike track0's own code.
-            code1 = model.encoders[1](code0, level=1, window=model.windows[1], compute_ntp=False)["code"]
-            code_embeds1 = bb1.quant.embed_for_decode(bb1, code1)
+            # Each active upper track j's OWN code over the level-(j-1) code stream -- never
+            # circular, a plain function of the level below, unlike track0's own code.
+            upper_code_embeds = []
+            seq_repr = code0
+            for t, j in enumerate(range(1, n_upper + 1)):
+                seq_repr = model.encoders[j](seq_repr, level=j, window=model.windows[j], compute_ntp=False)["code"]
+                bb_j = stage_bbs[t + 1]
+                upper_code_embeds += [bb_j.quant.embed_for_decode(bb_j, seq_repr)]
 
             buf = torch.cat([all_bytes, all_bytes.new_zeros(all_bytes.shape[0], K)], dim=1)
             for t in range(K):
@@ -1549,8 +1571,11 @@ class StackDecoder(Decoder):
                 h_query = h_seed[:, -1, :] if t == 0 else h_real_b[:, -1, t - 1, :]
 
                 pos = n_blocks_prev * K + t
-                h_final = upper_track_step(bb1, h_query.unsqueeze(1), pos, code_embeds1, cum_K1)
-                next_byte = sample_next_byte(bb1.embed.weight, h_final[:, 0, :])
+                h_final = h_query.unsqueeze(1)
+                for bb_j, code_embeds_j, cum_Kj in zip(stage_bbs[1:n_upper + 1], upper_code_embeds, cum_Ks):
+                    h_final = upper_track_step(bb_j, h_final, pos, code_embeds_j, cum_Kj)
+                embed_weight_final = stage_bbs[n_upper].embed.weight
+                next_byte = sample_next_byte(embed_weight_final, h_final[:, 0, :])
                 buf = buf.clone()
                 buf[:, pos] = next_byte
             all_bytes = buf
@@ -1562,17 +1587,17 @@ class StackDecoder(Decoder):
 
     @torch.no_grad()
     def generate_no_cache(self, model, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
-                           max_srcs: int | None = None) -> torch.Tensor:
-        if self.n_levels != 2:
-            return super().generate_no_cache(model, prompt_bytes, n_new_bytes, device, max_srcs)
-        return self._stack_generate_blockwise(model, prompt_bytes, n_new_bytes, device, code_source="pred")["bytes"][0]
+                           max_srcs: int | None | tuple = None) -> torch.Tensor:
+        srcs0 = max_srcs[0] if isinstance(max_srcs, (list, tuple)) else max_srcs
+        return self._stack_generate_blockwise(model, prompt_bytes, n_new_bytes, device,
+                                               code_source="pred", max_srcs=srcs0)["bytes"][0]
 
     @torch.no_grad()
     def generate_kv_cache(self, model, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
-                           max_srcs: int | None = None) -> torch.Tensor:
-        if self.n_levels != 2:
-            return super().generate_kv_cache(model, prompt_bytes, n_new_bytes, device, max_srcs)
-        return self._stack_generate_blockwise(model, prompt_bytes, n_new_bytes, device, code_source="pred")["bytes"][0]
+                           max_srcs: int | None | tuple = None) -> torch.Tensor:
+        srcs0 = max_srcs[0] if isinstance(max_srcs, (list, tuple)) else max_srcs
+        return self._stack_generate_blockwise(model, prompt_bytes, n_new_bytes, device,
+                                               code_source="pred", max_srcs=srcs0)["bytes"][0]
 
     @torch.no_grad()
     def check_blockwise_gen_consistency(self, model, full_bytes: torch.Tensor, device: str,
