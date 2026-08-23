@@ -280,8 +280,18 @@ count — 1, inside an already-spawned worker — not the total across all proce
 `xr.world_size()`, the actual global replica count). **Previously reported as "confirmed broken"
 below — that finding was specific to the nightly `torch_xla==2.10.0.dev0` build, not a bug in this
 project's multichip wiring**, exactly as the static-review hypothesis from 2026-08-22 predicted.
-`--use_flash_attention` + `--multichip` together (on nightly, the only build where flash-attention
-works) is still untested — do that next if both are wanted simultaneously.
+**`--use_flash_attention` + `--multichip` together: confirmed hanging (2026-08-23, tpu5, fresh
+v4-8 node, nightly build).** A `--steps 5` smoke test showed all 4 worker processes' cumulative
+CPU *time* (via `ps -o time`, not the noisier `%cpu` column) flat across repeated snapshots ~20s
+apart (`00:00:18`/`00:00:19`, unchanged) — the exact "spin up then go idle, no further progress"
+signature described below for the plain nightly-build hang. Standalone `flash_attention()` calls
+work fine on this same node/build (verified via the smoke-test snippet above, max abs diff
+~0.011, normal variance) — the hang is specific to combining the two mechanisms, not a broken
+install. Conclusion: `--multichip` and `--use_flash_attention` are not usable together on any
+build tried so far (stable pin can't do flash-attention at all; nightly can do flash-attention
+alone or multichip alone, but not both at once). Use `TPU_VISIBLE_CHIPS`-based independent
+single-chip processes (see below) if both flash-attention and multi-chip utilization are wanted
+simultaneously.
 
 **Nightly-build-specific hang** (`torch_xla==2.10.0.dev0`, needed only for
 `--use_flash_attention`, see above) — kept for reference in case the nightly build is used again:

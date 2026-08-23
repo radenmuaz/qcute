@@ -426,9 +426,10 @@ def encode_like_self_attn_decode(bb: LM, x0: torch.Tensor, code_kv: torch.Tensor
     docs/qcute_v1_plan.md and chat that day): plain causal self-attention over the real byte
     sequence, literally the encode pass (no seed token in the sequence at all, contrast
     bos_interleaved_self_attn above), with cross-attention to that byte's own-block code spliced in
-    per layer between self-attn and MLP -- masked so a byte in block b sees only code_b (or the last
-    own_code_window blocks' codes if not None), same own-code causality rule as
-    own_block_cross_attn_decode. Also saves each layer's post-RoPE self-attention K/V (real bytes
+    per layer between self-attn and MLP -- masked so a byte in block b sees code_b (or, if
+    cfg.own_code_min_lag > 0, only strictly-earlier codes starting at lag min_lag -- 2026-08-23,
+    the causal/exact retargeting of docs/maths.md's Part 8), within own_code_window codes of that
+    lag. Also saves each layer's post-RoPE self-attention K/V (real bytes
     only, computed before this layer's cross-attn mutates the residual stream) for
     seed_query_decode's second pass to reuse directly -- these are exactly what an incremental
     KV-cache over the real byte stream would already hold, so the seed token never occupies a cache
@@ -448,10 +449,10 @@ def encode_like_self_attn_decode(bb: LM, x0: torch.Tensor, code_kv: torch.Tensor
     code_pos = torch.arange(n_blocks, device=device) * K
     cos_k, sin_k = rope_cos_sin_for_positions(code_pos, hd, cfg.rope_base, device)
 
-    causal = code_pos.view(1, -1) <= pos.view(-1, 1)
     block_lag = (pos.view(-1, 1) // K) - code_pos.view(1, -1) // K
+    min_lag = cfg.own_code_min_lag
     win = own_code_window if own_code_window is not None else n_blocks
-    cross_mask = (causal & (block_lag < win)).view(1, 1, L, n_blocks)
+    cross_mask = ((block_lag >= min_lag) & (block_lag < min_lag + win)).view(1, 1, L, n_blocks)
 
     x = x0
     saved_k, saved_v = [], []
@@ -478,8 +479,10 @@ def seed_query_decode(bb: LM, saved_k: list, saved_v: list, code_kv: torch.Tenso
     sequence as a key, unlike bos_interleaved_self_attn -- cross-attending directly to pass 1's
     saved_k/saved_v (never recomputed). Masked causal at block granularity: seed_b sees only bytes
     strictly before block b starts (block b's own bytes don't exist yet at generation time -- same
-    rule as own_block_cross_attn_decode's causality note), then cross-attends to block b's own code.
-    Static shape (exactly n_blocks queries, deterministic from L, K) and KV-cache-able (pass 2 reads
+    rule as own_block_cross_attn_decode's causality note), then cross-attends to block b's own code
+    (or, if cfg.own_code_min_lag > 0, only strictly-earlier codes -- same knob as
+    encode_like_self_attn_decode). Static shape (exactly n_blocks queries, deterministic from L, K)
+    and KV-cache-able (pass 2 reads
     the existing cache, writes nothing new). Returns h_seed (B, n_blocks, D), predicting each
     block's own first byte."""
     cfg = bb.cfg
@@ -500,8 +503,9 @@ def seed_query_decode(bb: LM, saved_k: list, saved_v: list, code_kv: torch.Tenso
     code_pos = torch.arange(n_blocks, device=device) * K
     cos_k, sin_k = rope_cos_sin_for_positions(code_pos, hd, cfg.rope_base, device)
     block_lag = torch.arange(n_blocks, device=device).view(-1, 1) - torch.arange(n_blocks, device=device).view(1, -1)
+    min_lag = cfg.own_code_min_lag
     win = own_code_window if own_code_window is not None else n_blocks
-    cross_mask = ((block_lag >= 0) & (block_lag < win)).view(1, 1, n_blocks, n_blocks)
+    cross_mask = ((block_lag >= min_lag) & (block_lag < min_lag + win)).view(1, 1, n_blocks, n_blocks)
 
     x = bb.self_code_const.view(1, 1, D).expand(B, n_blocks, D)
     for i, block in enumerate(bb.blocks):

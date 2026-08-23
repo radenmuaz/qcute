@@ -125,6 +125,14 @@ class Config:
     # (non-encoder-reused) decoder parameters left by default are the cross-attention machinery
     # itself (cross_attn_stage's per-layer cross-attn+MLP -- no encoder equivalent to reuse) and
     # each level's own NTP/prediction head.
+    own_code_min_lag: int = 0  # 2026-08-23 (docs/maths.md Part 8): minimum block-lag track0's
+    # own-code cross-attention (encode_like_self_attn_decode/seed_query_decode) may see. 0 (default,
+    # unchanged) = block b sees its OWN code c_b (own-block reconstruction, ELBO-bound-only bpb,
+    # Parts 3/5). 1 = block b sees only strictly-earlier codes (c_{b-1} and older, up to
+    # own_code_window further back if set) -- retargets decode from reconstruction to genuine
+    # next-block prediction, making bpb an exact chain-rule identity like a plain AR LM (Part 8),
+    # at the cost of per-block reconstruction fidelity (own_block_cross_attn_decode/StackDecoderV1's
+    # legacy own-code mechanism is untouched by this flag -- StackDecoder/StackDecoderLocal only).
     cond_depth: int = -1
     pq_chunks: int = 1
     track_dropout_p0: float = 0.0
@@ -1290,6 +1298,31 @@ def add_per_level_bpb(result: dict) -> dict:
     return result
 
 
+@torch.no_grad()
+def add_valid_bpb(result: dict, cfg: "Config") -> dict:
+    """docs/maths.md Part 4 fix: result['bpb']/['bpb_full'] only count decode_losses[0] (the
+    reconstruction cost given a free, uncosted code) -- a genuinely valid ELBO-style bound
+    (Parts 3/5) also needs each upper level's own code-transmission cost (encode_losses[1:],
+    nats/code at that level) converted to nats/byte via that level's cum_K and added in. Adds
+    'bpb_valid'/'bpb_full_valid' alongside the existing (decode-only) fields rather than
+    redefining them -- Checkpointer and every existing config's historical best_val_bpb number
+    still key off the unchanged 'bpb'."""
+    n_levels = len(cfg.Ks)
+    extra_nats_per_byte = 0.0
+    cum_K = 1
+    for i in range(1, n_levels):
+        cum_K *= cfg.Ks[i - 1]
+        key = f"level{i}_ntp_loss_encode"
+        if key in result:
+            extra_nats_per_byte += result[key] / cum_K
+    extra_bpb = extra_nats_per_byte / math.log(2)
+    if "bpb" in result:
+        result["bpb_valid"] = result["bpb"] + extra_bpb
+    if "bpb_full" in result:
+        result["bpb_full_valid"] = result["bpb_full"] + extra_bpb
+    return result
+
+
 def eval_model(model, data: torch.Tensor, batch_size: int, n_batches: int, device: str) -> dict:
     model.eval()
     accum: dict = {}
@@ -1302,7 +1335,7 @@ def eval_model(model, data: torch.Tensor, batch_size: int, n_batches: int, devic
     result = {k: sum(v) / len(v) for k, v in accum.items()}
     result["bpb"] = result["byte_loss"] / math.log(2)
     result["bpb_full"] = result["byte_loss_full"] / math.log(2)
-    return add_per_level_bpb(result)
+    return add_valid_bpb(add_per_level_bpb(result), model.cfg)
 
 
 def parse_eval_sample(s):
@@ -1340,7 +1373,7 @@ def eval_model_full(model, data: torch.Tensor, batch_size: int, device: str, sam
     result = {k: v / total_n for k, v in accum.items()}
     result["bpb"] = result["byte_loss"] / math.log(2)
     result["bpb_full"] = result["byte_loss_full"] / math.log(2)
-    return add_per_level_bpb(result)
+    return add_valid_bpb(add_per_level_bpb(result), model.cfg)
 
 
 def build_param_groups(model) -> list:
@@ -1404,6 +1437,7 @@ def train(model, train_data: torch.Tensor, val_data: torch.Tensor, args, log, ru
             train_scalars = {k: v.item() for k, v in metrics.items()}
             train_scalars = add_per_level_bpb(train_scalars)
             train_scalars["bpb"] = train_bpb
+            train_scalars = add_valid_bpb(train_scalars, model.cfg)
             uncertainty_str = ""
             if args.uncertainty_weighting:
                 uncertainty_str = "  " + "  ".join(
@@ -1496,6 +1530,11 @@ def build_argparser(description: str) -> tuple:
                     help="level i's own-stage decode LM (default since 2026-08-23: 'shared' -- "
                          "reuses encoders[i].lm directly, was 'copy'/share_encode_decode_self=False). "
                          "'copy': an independently-initialized/trained LM instead.")
+    p.add_argument("--own_code_min_lag", type=int, default=0,
+                    help="minimum block-lag for track0's own-code cross-attention (default 0: "
+                         "block b sees its own code c_b, own-block reconstruction, Parts 3/5 of "
+                         "docs/maths.md). 1: block b sees only strictly-earlier codes -- retargets "
+                         "decode to genuine next-block prediction, exact chain-rule bpb (Part 8).")
     p.add_argument("--cond_depth", type=int, default=-1,
                     help="StackDecoder (--decoder_type stack) only: how many levels above own "
                          "code each non-top level conditions on. -1 (default) = pervasive, every "
@@ -1711,6 +1750,7 @@ def config_from_args(args) -> Config:
         byte_head_tied=args.byte_head_tied,
         decode_cross_stage_layers=args.decode_cross_stage_layers,
         decoder_own_stage_mode=args.decoder_own_stage_mode,
+        own_code_min_lag=args.own_code_min_lag,
         cond_depth=args.cond_depth,
         grid_dq=args.grid_dq, grid_levels=args.grid_levels, grid_bound=args.grid_bound,
         grid_logistic_scale=args.grid_logistic_scale,

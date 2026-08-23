@@ -138,7 +138,11 @@ come from `xr.world_size()`, not `xr.addressable_runtime_device_count()`, which 
 an already-spawned worker) — the earlier "confirmed broken" hang was specific to the **nightly**
 `torch_xla==2.10.0.dev0` build (only needed for `--use_flash_attention`), not this project's own
 wiring, exactly as the 2026-08-22 static-code-review hypothesis predicted. `--multichip` +
-`--use_flash_attention` together (nightly-only) is still untested. See
+`--use_flash_attention` together **is now confirmed to hang** (2026-08-23, fresh `v4-8` node,
+nightly build) — CPU time flat across all 4 workers on a 5-step smoke test, the same signature as
+the plain nightly-build hang below; standalone flash-attention works fine on the same node/build,
+so it's specifically the combination that's broken. Not usable together on any build tried so far
+(stable pin can't do flash-attention at all; nightly can do either alone, not both at once). See
 docs/bytelm_tpu_setup.md's "Optional: multiple TPU chips on one host" section for the full
 writeup. For single-chip-per-process (embarrassingly-parallel, e.g. a hparam sweep) instead of
 collective multichip, launch independent processes one per chip via `TPU_VISIBLE_CHIPS=<i>`
@@ -166,8 +170,8 @@ flash-attention: investigation" section.
 **`qcute_zero` (`qcute/qcute_zero/`, single file) — new monolithic single-shared-LM lineage,
 2026-08-22**: one LM (embed + blocks) does the byte pass AND, reusing the same weights, every fuse
 stage's own code-sequence NTP pass; periodic per-`Ks`-stage cross-attention ("fuse") back into the
-byte stream, own weights per stage, no curriculum by design (see docs/status.md's qcute_zero
-section for the full rationale/causality proof). First real `ks21`/`ks221` overfit10k runs (no
+byte stream, own weights per stage, no curriculum by design (see docs/archive5/status.md's
+qcute_zero section for the full rationale/causality proof). First real `ks21`/`ks221` overfit10k runs (no
 curriculum) both converged cleanly and generated coherent text — the first 3-level config in either
 lineage to do so with zero curriculum. **Checkpoint caveat**: `Checkpointer` picks `best.pt` by
 lowest summed total val_loss, which is a bad proxy here (that sum keeps climbing well past the point
@@ -183,8 +187,10 @@ construction (verified position-by-position: a byte's cross-attn mask never admi
 future block's code, no exception). This is more fundamental than any weight-sharing/curriculum
 detail — full analysis, plus what discipline `v1` would actually need to close the gap (a structural
 fix, or a code-level consistency loss — `scheduled_sampling_p` already implements something close to
-this and empirically *hurt*, not helped, an open unresolved question) in docs/status.md's
-"real differentiator" section (2026-08-22).
+this and empirically *hurt*, not helped, an open unresolved question) in docs/archive5/status.md's
+"real differentiator" section (2026-08-22). Related, current: [docs/maths.md](docs/maths.md)'s
+Parts 8-9 formalize this same gap and its cost (docs/status.md's 2026-08-23 `own_code_min_lag` PoC
+closes it directly, at the cost of own-block reconstruction fidelity).
 
 **query_vec/`parallel_decode` pruned from `qcute_zero`, replaced with regular MTP heads
 (2026-08-22)** — diagnosed flaw: one `query_vec` slot cost a full attention-stack pass and only
@@ -212,7 +218,7 @@ stay full-recompute, cheap enough not to bother caching), verified **bit-exact**
 `generate_no_cache` across 315 random configs via the new `check_kv_cache_consistency` diagnostic
 (`qcute_zero`'s first checked-in generation-consistency check, the analog of `qcute_v1`'s
 `check_roundtrip_consistency`/`check_gen_consistency`). Two real bugs were caught and fixed getting
-here — full writeup in docs/status.md's "real incremental KV cache" section (2026-08-22).
+here — full writeup in docs/archive5/status.md's "real incremental KV cache" section (2026-08-22).
 
 **`qcute_v1` (`qcute/qcute_v1/`) is the active lineage as of 2026-08-20** — forked from a verbatim
 copy of `qcute_v5` (now archived at `qcute/v5_old/`, see Commands above), implementing the
@@ -225,16 +231,19 @@ code, with the seed token's own hidden state genuinely reconstructing that block
 from that block's own code (`own_block_cross_attn_decode`/`own_block_decode_loss` in
 `qcute_v1_decoder.py`, fixed
 2026-08-20 — an earlier version silently never let a block's own code inform its own
-reconstruction, see `docs/status.md`'s session log). Full design narrative, worked examples, and
+reconstruction, see `docs/archive5/status.md`'s session log). Full design narrative, worked examples, and
 the staged plan: [docs/qcute_v1_plan.md](docs/qcute_v1_plan.md). Progress/results log:
-[docs/status.md](docs/status.md) (reset at the v1 transition — full v5-era history at
+[docs/status.md](docs/status.md) (pruned 2026-08-23 once `qcute_zero` became a second fully-fledged
+active lineage and the file passed 1300 lines — full prior history, including the v1-transition
+reset, at [docs/archive5/status.md](docs/archive5/status.md),
 [docs/archive4/status.md](docs/archive4/status.md), [docs/archive3/status.md](docs/archive3/status.md),
-[docs/archive2/status.md](docs/archive2/status.md)).
+[docs/archive2/status.md](docs/archive2/status.md)). Formal bpb-validity/paradigm-comparison
+writeup (not a results log): [docs/maths.md](docs/maths.md).
 
 **TODO for a fresh session**: `configs/v1_stack_simplex/ks21_v256_pq1.py` and `ks21_v64_pq4.py`
 need re-running (full-scale, `--decoder_type stack_v1` — these two configs are pinned to the now-
-legacy `StackDecoderV1`, see below) — their existing `best_val_bpb` numbers in `docs/status.md`
-predate the own-block-reconstruction fix above and are stale. `ks1_*` configs (`Ks=(1,)`, no
+legacy `StackDecoderV1`, see below) — their existing `best_val_bpb` numbers in
+`docs/archive5/status.md` predate the own-block-reconstruction fix above and are stale. `ks1_*` configs (`Ks=(1,)`, no
 non-top level) are unaffected and don't need re-running.
 
 **`--decoder_type` naming (2026-08-20)**: `stack` now means the current-default `StackDecoder`
@@ -306,7 +315,7 @@ Full narrative: [docs/qcute_v1_plan.md](docs/qcute_v1_plan.md).
 
 **Non-recurrent upper-level plan (2026-08-21, not yet started)**: originates from the
 `ks221`/`ks441` hard-convergence-queue collapse (repetitive single-code generation despite 96-99%+
-train byte_acc, see `docs/status.md`) and a chat questioning whether the upper levels' own
+train byte_acc, see `docs/archive5/status.md`) and a chat questioning whether the upper levels' own
 autoregressive self-NTP loss is itself the cause (a constant/repeating code trivially minimizes
 self-predictability, matching the observed failure signature) rather than any window/PQ/curriculum
 lever tried so far. Staged plan:

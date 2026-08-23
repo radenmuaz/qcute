@@ -27,7 +27,7 @@ gcloud compute tpus queued-resources describe tpu1 --project raden-tpu --zone us
 
 gcloud compute tpus queued-resources delete tpu3 --project raden-tpu  --zone us-central2-b --force --async
 
-gcloud compute tpus queued-resources ssh tpu4 --project raden-tpu --zone us-central2-b
+gcloud compute tpus queued-resources ssh tpu5 --project raden-tpu --zone us-central2-b
 ```
 
 

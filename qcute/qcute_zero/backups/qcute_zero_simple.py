@@ -329,20 +329,6 @@ class Attn(nn.Module):
         return self.out(y.transpose(1, 2).reshape(B, T, D))
 
 
-class SwiGLU(nn.Module):
-    """gate/up/down, no bias: down(silu(gate(x)) * up(x)). Replaces the plain Linear-GELU-Linear
-    MLP everywhere in this file (Block and FuseStage both)."""
-    def __init__(self, d_model: int, mlp_mult: int):
-        super().__init__()
-        hidden = mlp_mult * d_model
-        self.gate = nn.Linear(d_model, hidden, bias=False)
-        self.up = nn.Linear(d_model, hidden, bias=False)
-        self.down = nn.Linear(hidden, d_model, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(F.silu(self.gate(x)) * self.up(x))
-
-
 class Block(nn.Module):
     """"block regular": self-attention + MLP. Shared (same weights) across the byte-level pass and
     every fuse stage's own code-sequence NTP pass -- this IS the "single LM" the whole design
@@ -352,7 +338,11 @@ class Block(nn.Module):
         self.ln1 = RMSNorm(d_model)
         self.attn = Attn(d_model, n_heads)
         self.ln2 = RMSNorm(d_model)
-        self.mlp = SwiGLU(d_model, mlp_mult)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, mlp_mult * d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(mlp_mult * d_model, d_model, bias=False),
+        )
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln1(x), cos, sin, attn_mask)
@@ -377,7 +367,10 @@ class FuseStage(nn.Module):
         self.ln1 = nn.ModuleList([RMSNorm(d_model) for _ in range(n_layers)])
         self.attn = nn.ModuleList([Attn(d_model, n_heads) for _ in range(n_layers)])
         self.ln2 = nn.ModuleList([RMSNorm(d_model) for _ in range(n_layers)])
-        self.mlp = nn.ModuleList([SwiGLU(d_model, mlp_mult) for _ in range(n_layers)])
+        self.mlp = nn.ModuleList([nn.Sequential(
+            nn.Linear(d_model, mlp_mult * d_model, bias=False), nn.GELU(),
+            nn.Linear(mlp_mult * d_model, d_model, bias=False))
+            for _ in range(n_layers)])
         self.ln_out = RMSNorm(d_model)
 
     def forward(self, x: torch.Tensor, code_kv: torch.Tensor, cos_q, sin_q, cos_k, sin_k,
@@ -407,85 +400,6 @@ def gumbel_quantize(logits: torch.Tensor, tau: float, hard: bool = True, sample:
     return soft + (hard_oh - soft).detach()
 
 
-class Quantizer(nn.Module):
-    """Pluggable code representation for every fuse stage's own code (ported from
-    qcute_v1_common.py's SimplexQuant, quant_type="simplex" only for now -- adapted to this file's
-    own module shapes: dedicated code_head/code_embed/code_predict instead of a stage_lm object's
-    attributes). Categorical code via gumbel-softmax STE, product-quantized: pq_chunks independent
-    vocab-way softmaxes concatenated (total code width = vocab*pq_chunks), combinatorial capacity
-    vocab**pq_chunks. Constraint: vocab**pq_chunks >= 256 (must be able to represent at least a
-    byte). Default vocab=256, pq_chunks=1 is functionally the original single 256-way softmax,
-    now with its own dedicated weights rather than literally reusing self.embed/self.head."""
-    def __init__(self, D: int, vocab: int, pq_chunks: int, gumbel_tau: float, code_hard: bool, code_sample: bool):
-        super().__init__()
-        assert vocab ** pq_chunks >= 256, (
-            f"quantizer code space too small: vocab**pq_chunks = {vocab}**{pq_chunks} = "
-            f"{vocab ** pq_chunks} < 256 (must represent at least a byte)")
-        self.vocab = vocab
-        self.pq_chunks = pq_chunks
-        self.width = vocab * pq_chunks
-        self.tau = gumbel_tau
-        self.hard = code_hard
-        self.sample = code_sample
-
-        self.code_head = nn.Linear(D, self.width, bias=False)
-        nn.init.normal_(self.code_head.weight, std=0.02)
-        self.code_embed = nn.Linear(self.width, D, bias=False)
-        nn.init.normal_(self.code_embed.weight, std=0.02)
-        self.code_predict = nn.Linear(D, self.width, bias=False)
-        nn.init.normal_(self.code_predict.weight, std=0.02)
-
-    def _chunked(self, x: torch.Tensor) -> torch.Tensor:
-        """(..., width) -> (..., pq_chunks, vocab) -- pure reshape, no data movement."""
-        return x.reshape(*x.shape[:-1], self.pq_chunks, self.vocab)
-
-    def extract(self, h: torch.Tensor) -> tuple:
-        """h: (..., D) hidden state at a code boundary -> (code_repr (..., width) STE one-hot(s)
-        concatenated, code_ids (...) combined integer id, code_embeds (..., D))."""
-        logits = self.code_head(h)
-        if self.pq_chunks == 1:
-            onehot = gumbel_quantize(logits, self.tau, self.hard, self.sample)
-        else:
-            onehot = gumbel_quantize(self._chunked(logits), self.tau, self.hard, self.sample).reshape(logits.shape)
-        return onehot, self.to_ids(onehot), self.code_embed(onehot)
-
-    def extract_greedy(self, h: torch.Tensor) -> tuple:
-        """Same as extract() but always hard=True/sample=False -- generation-time greedy code
-        extraction, regardless of cfg.code_hard/code_sample (matches the old gumbel_quantize(...,
-        hard=True, sample=False) calls every generate_* method used at code-extraction sites)."""
-        logits = self.code_head(h)
-        if self.pq_chunks == 1:
-            onehot = gumbel_quantize(logits, self.tau, hard=True, sample=False)
-        else:
-            onehot = gumbel_quantize(self._chunked(logits), self.tau, hard=True, sample=False).reshape(logits.shape)
-        return onehot, self.code_embed(onehot)
-
-    def to_ids(self, code_repr: torch.Tensor) -> torch.Tensor:
-        chunk_ids = self._chunked(code_repr).argmax(-1)
-        if self.pq_chunks == 1:
-            return chunk_ids[..., 0]
-        weights = self.vocab ** torch.arange(self.pq_chunks, device=code_repr.device)
-        return (chunk_ids * weights).sum(-1)
-
-    def ntp_loss_acc(self, h_query: torch.Tensor, target_repr: torch.Tensor) -> tuple:
-        """h_query: (..., D) code-sequence LM hidden state; target_repr: (..., width) the NEXT
-        code's own one-hot representation (from extract())."""
-        logits = self._chunked(self.code_predict(h_query)).reshape(-1, self.vocab)
-        target = self._chunked(target_repr).argmax(-1).reshape(-1)
-        loss = F.cross_entropy(logits, target)
-        with torch.no_grad():
-            acc = (logits.argmax(-1) == target).float().mean()
-        return loss, acc
-
-    def sample_next(self, h_query: torch.Tensor) -> tuple:
-        """For generation: greedy per-chunk argmax over code_predict's logits -> STE one-hot ->
-        code_embed. Used wherever generation needs to sample the NEXT code from the code-sequence
-        LM's own hidden state (not extracted from real bytes) -- e.g. generate_free_rollout."""
-        logits = self._chunked(self.code_predict(h_query))
-        onehot = gumbel_quantize(logits, self.tau, hard=True, sample=False).reshape(*h_query.shape[:-1], self.width)
-        return onehot, self.code_embed(onehot)
-
-
 # ----------------------------------------------------------------------------
 # Config + model
 # ----------------------------------------------------------------------------
@@ -509,11 +423,6 @@ class Config:
     gumbel_tau: float = 1.0
     code_hard: bool = True
     code_sample: bool = False
-    quant_type: str = "simplex"              # only "simplex" ported so far (see Quantizer)
-    vocab: int = 256                         # per-chunk code vocab size (Quantizer)
-    pq_chunks: int = 1                       # product-quantization chunks; vocab**pq_chunks>=256
-                                              # required (must represent at least a byte); default
-                                              # 256/1 is functionally the old tied-embed code
     code_ntp_weight: float = 1.0             # weight for each fuse stage's own code-sequence NTP loss
     cond_weight: float = 1.0                 # weight for each stage's post-fusion byte NTP loss
     mtp_heads: int = 1                       # extra byte-ahead heads reading the SAME final hidden
@@ -521,156 +430,6 @@ class Config:
                                               # 1 = disabled (only the existing head0 next-byte
                                               # prediction). >1 heads predict t+2..t+mtp_heads.
     mtp_weight: float = 1.0                  # weight for the extra heads' mean loss
-    mtp_heads_code: int = 1                  # extra code-ahead heads reading the code-sequence
-                                              # LM's own hidden state (h_code), predicting further
-                                              # future codes (1 = disabled). One shared set reused
-                                              # across every fuse stage, same as self.quantizer.
-    mtp_weight_code: float = 1.0
-    mtp_heads_uncond: int = 1                # extra byte-ahead heads reading the BASE trunk
-                                              # hidden state h (before any fuse cross-attention --
-                                              # the cheap/coarse "uncond" signal), predicting
-                                              # future bytes (1 = disabled).
-    mtp_weight_uncond: float = 1.0
-    weight_tie: bool = False                 # default untied: byte output head is its own
-                                              # nn.Linear(D, V, bias=False), separate params from
-                                              # self.embed. True: head.weight literally refs
-                                              # embed.weight (shared tensor, not a copy).
-    seed_query_p: float = 0.0                # fraction of byte positions sampled each training
-                                              # step for the sparse any-timestep seed-token
-                                              # auxiliary loss (0 = disabled). At a sampled
-                                              # position p, a learned seed embedding (NO real byte
-                                              # context at all -- not even self-attention) cross-
-                                              # attends to whatever code fuse_mask already makes
-                                              # visible to p, and predicts byte_ids[:,p] itself
-                                              # (not p+1, since it has no context to predict FROM --
-                                              # it's a cold-start prediction of p itself given only
-                                              # the code). Prep for block-local/wavefront decode
-                                              # (where a chunk's first byte structurally has no
-                                              # other context) -- not yet wired into
-                                              # generate_free_rollout's current mechanics, which
-                                              # still has full cross-chunk self-attention and so
-                                              # doesn't structurally need this yet.
-    seed_query_weight: float = 1.0
-    share_lm: bool = False                   # default unshared: each level (byte pass = level 0,
-                                              # each fuse stage's own code-sequence NTP pass =
-                                              # level s+1) gets its own independent Block stack,
-                                              # inverting this file's original "one shared LM"
-                                              # thesis into an opt-in. True: every level literally
-                                              # references the same first stack (nn.ModuleList of
-                                              # the same module instance -- safe, .parameters()
-                                              # dedupes by identity, same trick ALBERT uses).
-    head_word_bits: int | None = None        # None = same as input_preset (no change). Decouples
-                                              # the output head's own prediction granularity from
-                                              # the trunk's per-position word size (input_preset).
-                                              # > input_preset ("model bits, head bytes"): head
-                                              # jointly predicts head_word_bits/input_preset FUTURE
-                                              # trunk positions as one combined classification.
-                                              # < input_preset ("model bytes, head nibble"): head
-                                              # factorizes each position's own word into
-                                              # input_preset/head_word_bits independent PQ-style
-                                              # sub-word chunks (same conditional-independence-
-                                              # given-hidden-state status as Quantizer's pq_chunks
-                                              # -- valid exact chain-rule bpb, not an ELBO, see
-                                              # 2026-08-23 chat). The finer case is fully
-                                              # generation-compatible (WordHead.sample_id
-                                              # reconstructs one next unit id via factorized
-                                              # argmax); the coarser case only has a dedicated,
-                                              # full-recompute generate_word_head (not KV-cached,
-                                              # not wired into generate_no_cache/generate_kv_cache/
-                                              # generate_speculative, which all still assume
-                                              # head_word_bits==input_preset).
-
-
-class WordHead(nn.Module):
-    """Pluggable output-head granularity, decoupled from the trunk's own per-position word size
-    (unit_bits = input_preset). word_bits==unit_bits: plain linear head, unchanged. word_bits>
-    unit_bits (coarser): predicts group_size=word_bits//unit_bits FUTURE unit positions jointly as
-    one combined classification (place-value combination, same convention as Quantizer.to_ids'
-    PQ combination). word_bits<unit_bits (finer): factorizes one position's own unit word into
-    n_sub=unit_bits//word_bits independent sub-word chunks -- literally Quantizer's own PQ
-    pattern, reused directly for the byte-output head instead of the code head."""
-    def __init__(self, D: int, unit_bits: int, word_bits: int | None):
-        super().__init__()
-        self.unit_bits = unit_bits
-        self.word_bits = word_bits if word_bits is not None else unit_bits
-        assert self.word_bits % unit_bits == 0 or unit_bits % self.word_bits == 0, (
-            f"head_word_bits ({self.word_bits}) must evenly divide, or be an even multiple of, "
-            f"input_preset ({unit_bits})")
-        self.unit_vocab = 2 ** unit_bits
-        self.sub_vocab = 2 ** self.word_bits     # per-chunk width in BOTH cases (see class docstring)
-        self.group_size = max(1, self.word_bits // unit_bits)     # >1: coarser (joint multi-position)
-        self.n_sub = max(1, unit_bits // self.word_bits)          # >1: finer (PQ-style sub-word split)
-        self.proj = nn.Linear(D, self.sub_vocab * self.n_sub, bias=False)
-        nn.init.normal_(self.proj.weight, std=0.02)
-
-    def _chunked(self, x: torch.Tensor) -> torch.Tensor:
-        return x.reshape(*x.shape[:-1], self.n_sub, self.sub_vocab)
-
-    def _split_unit_into_subchunks(self, unit_id: torch.Tensor) -> torch.Tensor:
-        """Finer case only: (...,) one unit id in [0, unit_vocab) -> (..., n_sub) base-sub_vocab
-        digits (place-value decomposition, inverse of combining n_sub sub-chunk argmaxes)."""
-        ids = []
-        rem = unit_id
-        for _ in range(self.n_sub):
-            ids.append(rem % self.sub_vocab)
-            rem = rem // self.sub_vocab
-        return torch.stack(ids, dim=-1)
-
-    def combine_ids(self, unit_ids_grouped: torch.Tensor) -> torch.Tensor:
-        """Coarser case only: (..., group_size) consecutive unit ids -> one combined place-value
-        integer in [0, unit_vocab**group_size) == [0, sub_vocab)."""
-        weights = self.unit_vocab ** torch.arange(self.group_size, device=unit_ids_grouped.device)
-        return (unit_ids_grouped * weights).sum(-1)
-
-    def split_id(self, combined_id: torch.Tensor) -> torch.Tensor:
-        """Coarser case only: inverse of combine_ids -- (...,) combined integer -> (...,
-        group_size) unit ids."""
-        ids = []
-        rem = combined_id
-        for _ in range(self.group_size):
-            ids.append(rem % self.unit_vocab)
-            rem = rem // self.unit_vocab
-        return torch.stack(ids, dim=-1)
-
-    def loss_acc(self, h: torch.Tensor, unit_ids: torch.Tensor):
-        """h: (B, L, D); unit_ids: (B, L) trunk-granularity ids (e.g. byte_ids). Returns (loss,
-        acc), or (None, None) if the sequence is too short for even one prediction."""
-        L = h.shape[1]
-        if self.n_sub > 1:
-            if L < 2:
-                return None, None
-            logits = self._chunked(self.proj(h[:, :-1, :]))               # (B, L-1, n_sub, sub_vocab)
-            target = self._split_unit_into_subchunks(unit_ids[:, 1:])     # (B, L-1, n_sub)
-            loss = F.cross_entropy(logits.reshape(-1, self.sub_vocab), target.reshape(-1))
-            with torch.no_grad():
-                acc = (logits.argmax(-1) == target).float().mean()
-            return loss, acc
-        n_pos = L - self.group_size
-        if n_pos < 1:
-            return None, None
-        logits = self.proj(h[:, :n_pos, :])
-        windows = torch.stack([unit_ids[:, i + 1:i + 1 + n_pos] for i in range(self.group_size)], dim=-1)
-        target = self.combine_ids(windows)
-        loss = F.cross_entropy(logits.reshape(-1, self.sub_vocab), target.reshape(-1))
-        with torch.no_grad():
-            acc = (logits.argmax(-1) == target).float().mean()
-        return loss, acc
-
-    def sample(self, h_last: torch.Tensor) -> torch.Tensor:
-        """h_last: (B, D) or (B, 1, D) final hidden state -> (B, group_size) next unit ids
-        (group_size==1 in the equal/finer cases -- a single next id, reconstructed via factorized
-        argmax when n_sub>1, exactly like Quantizer.to_ids)."""
-        squeeze = h_last.dim() == 2
-        h_last = h_last.unsqueeze(1) if squeeze else h_last
-        logits = self.proj(h_last)                                        # (B, 1, sub_vocab*n_sub)
-        if self.n_sub > 1:
-            chunk_ids = self._chunked(logits).argmax(-1)                  # (B, 1, n_sub)
-            weights = self.sub_vocab ** torch.arange(self.n_sub, device=logits.device)
-            out = (chunk_ids * weights).sum(-1, keepdim=True)              # (B, 1) single unit id
-        else:
-            combined_id = logits.argmax(-1)                                # (B, 1)
-            out = self.split_id(combined_id) if self.group_size > 1 else combined_id.unsqueeze(-1)
-        return out.squeeze(1) if squeeze else out
 
 
 def resolve_fuse_window(w, n_fuse: int) -> tuple:
@@ -692,30 +451,8 @@ class QCuteZero(nn.Module):
 
         self.embed = nn.Embedding(V, D)
         nn.init.normal_(self.embed.weight, std=0.02)
-
-        # per-level LM stacks: level 0 = byte pass (+ every fuse stage's post-cross-attn
-        # refinement pass), level s+1 = fuse stage s's own code-sequence NTP pass. Unshared by
-        # default (each level its own independent Block stack); share_lm=True makes every entry
-        # literally the same module instance (nn.ModuleList dedupes params by identity).
-        n_lms = self.n_fuse + 1
-        if cfg.share_lm:
-            first = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
-            self.lms = nn.ModuleList([first] * n_lms)
-        else:
-            self.lms = nn.ModuleList(
-                [nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
-                 for _ in range(n_lms)])
+        self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
         self.ln_f = RMSNorm(D)
-
-        # byte-output head: untied (own nn.Linear) by default; weight_tie=True makes it literally
-        # reference self.embed.weight (shared tensor -- PyTorch's .parameters() dedupes by
-        # identity, so this doesn't double-count params). Code extraction/code-NTP still read
-        # self.embed.weight directly (codes live in embed space until the quantizer refactor).
-        self.head = nn.Linear(D, V, bias=False)
-        if cfg.weight_tie:
-            self.head.weight = self.embed.weight
-        else:
-            nn.init.normal_(self.head.weight, std=0.02)
 
         fuse_layers = cfg.fuse_n_layers if cfg.fuse_n_layers is not None else cfg.n_layers
         self.fuse_stages = nn.ModuleList(
@@ -724,19 +461,9 @@ class QCuteZero(nn.Module):
 
         self.extra_heads = nn.ModuleList(
             [nn.Linear(D, V, bias=False) for _ in range(max(0, cfg.mtp_heads - 1))])
-        self.extra_heads_uncond = nn.ModuleList(
-            [nn.Linear(D, V, bias=False) for _ in range(max(0, cfg.mtp_heads_uncond - 1))])
 
-        self.seed_embed = nn.Parameter(torch.zeros(D))
-        nn.init.normal_(self.seed_embed, std=0.02)
-
-        assert cfg.quant_type == "simplex", f"only quant_type='simplex' is ported so far, got {cfg.quant_type!r}"
-        self.quantizer = Quantizer(D, cfg.vocab, cfg.pq_chunks, cfg.gumbel_tau, cfg.code_hard, cfg.code_sample)
-        self.extra_heads_code = nn.ModuleList(
-            [nn.Linear(D, self.quantizer.width, bias=False) for _ in range(max(0, cfg.mtp_heads_code - 1))])
-
-    def _run_blocks(self, level: int, x: torch.Tensor, cos, sin, attn_mask) -> torch.Tensor:
-        for block in self.lms[level]:
+    def _run_blocks(self, x: torch.Tensor, cos, sin, attn_mask) -> torch.Tensor:
+        for block in self.blocks:
             x = block(x, cos, sin, attn_mask)
         return self.ln_f(x)
 
@@ -753,24 +480,11 @@ class QCuteZero(nn.Module):
         cos_b, sin_b = rope_cos_sin_for_positions(byte_pos, hd, cfg.rope_base, device)
         byte_mask = causal_mask(byte_pos, byte_pos, cfg.attn_window)
         x0 = self.embed(byte_ids)
-        h = self._run_blocks(0, x0, cos_b, sin_b, byte_mask)
+        h = self._run_blocks(x0, cos_b, sin_b, byte_mask)
 
-        uncond_logits = self.head(h[:, :-1, :])
+        uncond_logits = F.linear(h[:, :-1, :], self.embed.weight)
         uncond_loss = F.cross_entropy(uncond_logits.reshape(-1, V), byte_ids[:, 1:].reshape(-1))
         uncond_acc = (uncond_logits.argmax(-1) == byte_ids[:, 1:]).float().mean()
-
-        # uncond-level-0 MTP heads: cheap/coarse extra byte-ahead heads reading the BASE trunk
-        # hidden state h, before any fuse cross-attention -- same pattern as the byte-level extra
-        # heads below, just off a cheaper/earlier hidden state.
-        uncond_mtp_losses, uncond_mtp_accs = [], []
-        for i, head_u in enumerate(self.extra_heads_uncond):
-            k = i + 2
-            if L <= k:
-                continue
-            logits_u = head_u(h[:, :-k, :])
-            targets_u = byte_ids[:, k:]
-            uncond_mtp_losses.append(F.cross_entropy(logits_u.reshape(-1, V), targets_u.reshape(-1)))
-            uncond_mtp_accs.append((logits_u.argmax(-1) == targets_u).float().mean())
 
         # --- cascade through fuse stages ---
         cur_h = h                # source hidden states to extract this stage's codes from
@@ -778,8 +492,6 @@ class QCuteZero(nn.Module):
         cum_K = 1
         fuse_ntp_losses, fuse_ntp_accs = [], []
         cond_losses, cond_accs = [], []
-        seed_losses, seed_accs = [], []
-        code_mtp_losses, code_mtp_accs = {}, {}   # keyed by (stage, k) -- see below for why
         code_kv_cache = []       # (h_code_s, code_pos_abs, window) per stage
 
         for s in range(self.n_fuse):
@@ -790,33 +502,26 @@ class QCuteZero(nn.Module):
             if n_blocks < 1:
                 break
 
-            # code extraction: pluggable Quantizer (own code_head/code_embed, STE hard sample)
+            # code extraction: same tied embed/output head bytes use, STE hard sample
             code_h = cur_h[:, K_s - 1::K_s, :][:, :n_blocks, :]
-            onehot, code_ids, code_embeds = self.quantizer.extract(code_h)
+            code_logits = F.linear(code_h, self.embed.weight)
+            onehot = gumbel_quantize(code_logits, cfg.gumbel_tau, cfg.code_hard, cfg.code_sample)
+            code_embeds = onehot @ self.embed.weight
+            code_ids = onehot.argmax(-1)
 
             # this stage's own code-sequence NTP pass -- SAME shared blocks, causal, unbounded
             # (short sequence: n_blocks = cur_len // K_s)
             code_local_pos = torch.arange(n_blocks, device=device)
             cos_c, sin_c = rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base, device)
             code_mask = causal_mask(code_local_pos, code_local_pos, None)
-            h_code = self._run_blocks(s + 1, code_embeds, cos_c, sin_c, code_mask)
+            h_code = self._run_blocks(code_embeds, cos_c, sin_c, code_mask)
 
             if n_blocks >= 2:
-                code_ntp_loss, code_ntp_acc = self.quantizer.ntp_loss_acc(h_code[:, :-1, :], onehot[:, 1:, :])
+                code_ntp_logits = F.linear(h_code[:, :-1, :], self.embed.weight)
+                code_ntp_loss = F.cross_entropy(code_ntp_logits.reshape(-1, V), code_ids[:, 1:].reshape(-1))
+                code_ntp_acc = (code_ntp_logits.argmax(-1) == code_ids[:, 1:]).float().mean()
                 fuse_ntp_losses += [code_ntp_loss]
                 fuse_ntp_accs += [code_ntp_acc]
-
-            # code-level MTP heads: extra code-ahead heads reading h_code, predicting further
-            # future codes (offset i+2..) -- one shared set reused across every fuse stage, same
-            # as self.quantizer itself.
-            for i, head_c in enumerate(self.extra_heads_code):
-                k = i + 2
-                if n_blocks <= k:
-                    continue
-                logits_c = self.quantizer._chunked(head_c(h_code[:, :-k, :])).reshape(-1, self.quantizer.vocab)
-                target_c = self.quantizer._chunked(onehot[:, k:, :]).argmax(-1).reshape(-1)
-                code_mtp_losses[(s, k)] = F.cross_entropy(logits_c, target_c)
-                code_mtp_accs[(s, k)] = (logits_c.argmax(-1) == target_c).float().mean()
 
             # cross-attn: byte-level query stream attends into h_code, causal on CUMULATIVE
             # (absolute-byte) boundary, never this stage's local code-sequence index (chat
@@ -826,32 +531,12 @@ class QCuteZero(nn.Module):
             fuse_mask = causal_mask(byte_pos, code_pos_abs, window_s)
             cos_q, sin_q = cos_b, sin_b
             cos_k, sin_k = rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base, device)
-
-            # sparse any-timestep seed-token auxiliary loss: sample a subset of positions, replace
-            # their query with the learned seed embedding (no real byte context at all -- not even
-            # self-attention), cross-attend to the SAME code KV/mask a real query at that position
-            # would see, and predict that position's OWN byte (not p+1 -- there is no "from"
-            # context here, this is a cold-start prediction of p given only the code).
-            if cfg.seed_query_p > 0:
-                n_sample = max(1, int(round(L * cfg.seed_query_p)))
-                sel = torch.randperm(L, device=device)[:n_sample].sort().values
-                seed_q = self.seed_embed.view(1, 1, D).expand(B, n_sample, D)
-                cos_sq, sin_sq = cos_b[sel], sin_b[sel]
-                mask_sq = fuse_mask[:, :, sel, :]
-                seed_out = self.fuse_stages[s](seed_q, h_code, cos_sq, sin_sq, cos_k, sin_k, mask_sq)
-                seed_logits = self.fuse_stages[s].readout(seed_out, self.head.weight)
-                seed_targets = byte_ids[:, sel]
-                seed_loss = F.cross_entropy(seed_logits.reshape(-1, V), seed_targets.reshape(-1))
-                seed_acc = (seed_logits.argmax(-1) == seed_targets).float().mean()
-                seed_losses += [seed_loss]
-                seed_accs += [seed_acc]
-
             x_cross = self.fuse_stages[s](x_cross, h_code, cos_q, sin_q, cos_k, sin_k, fuse_mask)
             # another pass through the SAME shared self-attn+MLP LM blocks before this stage's
             # own cond readout (and before the next stage's cross-attn query input) -- i.e. fuse
             # cross-attn+own-mlp -> shared self-attn/mlp -> this stage's own cond NTP head.
-            x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, byte_mask)
-            cond_logits_full = self.fuse_stages[s].readout(x_cross, self.head.weight)
+            x_cross = self._run_blocks(x_cross, cos_b, sin_b, byte_mask)
+            cond_logits_full = self.fuse_stages[s].readout(x_cross, self.embed.weight)
 
             cond_logits = cond_logits_full[:, :-1, :]
             cond_loss = F.cross_entropy(cond_logits.reshape(-1, V), byte_ids[:, 1:].reshape(-1))
@@ -888,28 +573,16 @@ class QCuteZero(nn.Module):
             total_loss = total_loss + cfg.code_ntp_weight * torch.stack(fuse_ntp_losses).sum()
         if mtp_losses:
             total_loss = total_loss + cfg.mtp_weight * torch.stack(mtp_losses).mean()
-        if seed_losses:
-            total_loss = total_loss + cfg.seed_query_weight * torch.stack(seed_losses).sum()
-        if code_mtp_losses:
-            total_loss = total_loss + cfg.mtp_weight_code * torch.stack(list(code_mtp_losses.values())).mean()
-        if uncond_mtp_losses:
-            total_loss = total_loss + cfg.mtp_weight_uncond * torch.stack(uncond_mtp_losses).mean()
 
         metrics = {
             "loss": total_loss, "final_loss": final_loss, "byte_acc": final_acc,
             "uncond_loss": uncond_loss, "uncond_acc": uncond_acc,
             **{f"cond{s}_loss": l for s, l in enumerate(cond_losses)},
             **{f"cond{s}_acc": a for s, a in enumerate(cond_accs)},
-            **{f"seed{s}_loss": l for s, l in enumerate(seed_losses)},
-            **{f"seed{s}_acc": a for s, a in enumerate(seed_accs)},
             **{f"fuse{s}_ntp_loss": l for s, l in enumerate(fuse_ntp_losses)},
             **{f"fuse{s}_ntp_acc": a for s, a in enumerate(fuse_ntp_accs)},
             **{f"mtp{i+2}_loss": l for i, l in enumerate(mtp_losses)},
             **{f"mtp{i+2}_acc": a for i, a in enumerate(mtp_accs)},
-            **{f"mtp{k}_code{s}_loss": l for (s, k), l in code_mtp_losses.items()},
-            **{f"mtp{k}_code{s}_acc": a for (s, k), a in code_mtp_accs.items()},
-            **{f"mtp{i+2}_uncond_loss": l for i, l in enumerate(uncond_mtp_losses)},
-            **{f"mtp{i+2}_uncond_acc": a for i, a in enumerate(uncond_mtp_accs)},
         }
         return total_loss, metrics
 
@@ -933,12 +606,12 @@ class QCuteZero(nn.Module):
         cos_b, sin_b = rope_cos_sin_for_positions(byte_pos, hd, cfg.rope_base, device)
         byte_mask = causal_mask(byte_pos, byte_pos, cfg.attn_window)
         x0 = self.embed(byte_ids)
-        h = self._run_blocks(0, x0, cos_b, sin_b, byte_mask)
+        h = self._run_blocks(x0, cos_b, sin_b, byte_mask)
 
         cur_h = h
         x_cross = h
         cum_K = 1
-        cond_logits_full = self.head(self.ln_f(h))  # uncond fallback if n_fuse==0
+        cond_logits_full = F.linear(self.ln_f(h), self.embed.weight)  # uncond fallback if n_fuse==0
         code_kv_cache = []
         for s in range(self.n_fuse):
             K_s = cfg.Ks[s]
@@ -948,20 +621,22 @@ class QCuteZero(nn.Module):
             if n_blocks < 1:
                 break
             code_h = cur_h[:, K_s - 1::K_s, :][:, :n_blocks, :]
-            onehot, code_embeds = self.quantizer.extract_greedy(code_h)
+            code_logits = F.linear(code_h, self.embed.weight)
+            onehot = gumbel_quantize(code_logits, cfg.gumbel_tau, hard=True, sample=False)
+            code_embeds = onehot @ self.embed.weight
 
             code_local_pos = torch.arange(n_blocks, device=device)
             cos_c, sin_c = rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base, device)
             code_mask = causal_mask(code_local_pos, code_local_pos, None)
-            h_code = self._run_blocks(s + 1, code_embeds, cos_c, sin_c, code_mask)
+            h_code = self._run_blocks(code_embeds, cos_c, sin_c, code_mask)
 
             code_pos_abs = (torch.arange(n_blocks, device=device) + 1) * cum_K - 1
             window_s = self.fuse_windows[s]
             fuse_mask = causal_mask(byte_pos, code_pos_abs, window_s)
             cos_k, sin_k = rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base, device)
             x_cross = self.fuse_stages[s](x_cross, h_code, cos_b, sin_b, cos_k, sin_k, fuse_mask)
-            x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, byte_mask)
-            cond_logits_full = self.fuse_stages[s].readout(x_cross, self.head.weight)
+            x_cross = self._run_blocks(x_cross, cos_b, sin_b, byte_mask)
+            cond_logits_full = self.fuse_stages[s].readout(x_cross, self.embed.weight)
             code_kv_cache += [(h_code, code_pos_abs, window_s)]
             cur_h = h_code
 
@@ -1030,13 +705,16 @@ class QCuteZero(nn.Module):
             L0 = all_bytes.shape[1]
             pos0 = torch.arange(L0, device=device_t)
             cos0, sin0 = rope_cos_sin_for_positions(pos0, hd, cfg.rope_base, device_t)
-            h0 = self._run_blocks(0, self.embed(all_bytes), cos0, sin0, causal_mask(pos0, pos0, cfg.attn_window))
+            h0 = self._run_blocks(self.embed(all_bytes), cos0, sin0, causal_mask(pos0, pos0, cfg.attn_window))
             code_h = h0[:, K - 1::K, :][:, :n_blocks_prev, :]
-            _, code_embeds_past = self.quantizer.extract_greedy(code_h)
+            onehot = gumbel_quantize(F.linear(code_h, self.embed.weight), cfg.gumbel_tau, hard=True, sample=False)
+            code_embeds_past = onehot @ self.embed.weight
             cpos = torch.arange(n_blocks_prev, device=device_t)
             ccos, csin = rope_cos_sin_for_positions(cpos, hd, cfg.rope_base, device_t)
-            h_code = self._run_blocks(1, code_embeds_past, ccos, csin, causal_mask(cpos, cpos, None))
-            _, next_code_embed = self.quantizer.sample_next(h_code[:, -1:, :])  # (B,1,D) -- sampled, not extracted
+            h_code = self._run_blocks(code_embeds_past, ccos, csin, causal_mask(cpos, cpos, None))
+            next_onehot = gumbel_quantize(F.linear(h_code[:, -1:, :], self.embed.weight),
+                                           cfg.gumbel_tau, hard=True, sample=False)
+            next_code_embed = next_onehot @ self.embed.weight  # (B, 1, D) -- sampled, not extracted
 
             # --- decode this new chunk's K bytes one at a time, cross-attending to the ONE
             # pre-sampled code (own-chunk, but never derived from its own bytes) ---
@@ -1046,14 +724,14 @@ class QCuteZero(nn.Module):
                 pos = torch.arange(L, device=device_t)
                 cos_b, sin_b = rope_cos_sin_for_positions(pos, hd, cfg.rope_base, device_t)
                 byte_mask = causal_mask(pos, pos, cfg.attn_window)
-                x = self._run_blocks(0, self.embed(buf), cos_b, sin_b, byte_mask)
+                x = self._run_blocks(self.embed(buf), cos_b, sin_b, byte_mask)
 
                 fuse_mask = (pos >= chunk_start).view(1, 1, L, 1)
                 code_pos = torch.tensor([chunk_start], device=device_t)
                 cos_k, sin_k = rope_cos_sin_for_positions(code_pos, hd, cfg.rope_base, device_t)
                 x_cross = self.fuse_stages[0](x, next_code_embed, cos_b, sin_b, cos_k, sin_k, fuse_mask)
-                x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, byte_mask)
-                logits = self.fuse_stages[0].readout(x_cross, self.head.weight)
+                x_cross = self._run_blocks(x_cross, cos_b, sin_b, byte_mask)
+                logits = self.fuse_stages[0].readout(x_cross, self.embed.weight)
                 # predict-next convention (matches forward()/generate_no_cache: position p's
                 # logits predict byte p+1) -- position chunk_start+t is buf's own not-yet-decided
                 # placeholder (still zero) at this point, so predicting FROM it (as an earlier
@@ -1106,14 +784,14 @@ class QCuteZero(nn.Module):
             pos = torch.arange(start_pos, start_pos + Tn, device=device_t)
             cos_b, sin_b = rope_cos_sin_for_positions(pos, hd, cfg.rope_base, device_t)
             h_new = self.embed(byte_chunk)
-            for l, block in enumerate(self.lms[0]):
+            for l, block in enumerate(self.blocks):
                 h_new, byte_caches[l] = block.forward_incremental(h_new, cos_b, sin_b, byte_caches[l], cfg.attn_window)
             h_new = self.ln_f(h_new)
             h_hist = h_new if h_hist is None else torch.cat([h_hist, h_new], dim=1)
 
             x_in = h_new
             cur_h_hist = h_hist
-            logits_full = self.head(x_in)  # uncond fallback if n_fuse==0
+            logits_full = F.linear(x_in, self.embed.weight)  # uncond fallback if n_fuse==0
             for s in range(self.n_fuse):
                 K_s = cfg.Ks[s]
                 n_blocks = cur_h_hist.shape[1] // K_s
@@ -1121,11 +799,13 @@ class QCuteZero(nn.Module):
                     # a new code boundary was crossed -- recompute this stage's short code
                     # sequence fresh (cheap: length n_blocks, not the full byte length)
                     code_h = cur_h_hist[:, K_s - 1::K_s, :][:, :n_blocks, :]
-                    _, code_embeds = self.quantizer.extract_greedy(code_h)
+                    code_logits = F.linear(code_h, self.embed.weight)
+                    onehot = gumbel_quantize(code_logits, cfg.gumbel_tau, hard=True, sample=False)
+                    code_embeds = onehot @ self.embed.weight
                     code_local_pos = torch.arange(n_blocks, device=device_t)
                     cos_c, sin_c = rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base, device_t)
                     code_mask = causal_mask(code_local_pos, code_local_pos, None)
-                    stage_h_hist[s] = self._run_blocks(s + 1, code_embeds, cos_c, sin_c, code_mask)
+                    stage_h_hist[s] = self._run_blocks(code_embeds, cos_c, sin_c, code_mask)
                 h_code = stage_h_hist[s]
                 n_blocks_now = h_code.shape[1]
 
@@ -1159,11 +839,11 @@ class QCuteZero(nn.Module):
                 fuse_mask = causal_mask(q_pos, code_pos_abs, window_s)
 
                 x_cross = self.fuse_stages[s](x_q, h_code, cos_q, sin_q, cos_k, sin_k, fuse_mask)
-                for l, block in enumerate(self.lms[0]):
+                for l, block in enumerate(self.blocks):
                     x_cross, refine_caches[s][l] = block.forward_incremental(
                         x_cross, cos_q, sin_q, refine_caches[s][l], cfg.attn_window)
                 x_cross = self.ln_f(x_cross)
-                logits_full = self.fuse_stages[s].readout(x_cross, self.head.weight)
+                logits_full = self.fuse_stages[s].readout(x_cross, self.embed.weight)
                 x_in = x_cross
                 cur_h_hist = h_code
             return logits_full
@@ -1372,17 +1052,6 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--cond_weight", type=float, default=1.0)
     p.add_argument("--mtp_heads", type=int, default=1)
     p.add_argument("--mtp_weight", type=float, default=1.0)
-    p.add_argument("--weight_tie", type=lambda x: x.lower() != "false", default=False)
-    p.add_argument("--seed_query_p", type=float, default=0.0)
-    p.add_argument("--seed_query_weight", type=float, default=1.0)
-    p.add_argument("--quant_type", type=str, default="simplex")
-    p.add_argument("--vocab", type=int, default=256)
-    p.add_argument("--pq_chunks", type=int, default=1)
-    p.add_argument("--share_lm", type=lambda x: x.lower() != "false", default=False)
-    p.add_argument("--mtp_heads_code", type=int, default=1)
-    p.add_argument("--mtp_weight_code", type=float, default=1.0)
-    p.add_argument("--mtp_heads_uncond", type=int, default=1)
-    p.add_argument("--mtp_weight_uncond", type=float, default=1.0)
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -1418,12 +1087,7 @@ def config_from_args(args) -> Config:
         attn_window=args.attn_window, fuse_window=args.fuse_window, input_preset=args.input_preset,
         gumbel_tau=args.gumbel_tau, code_hard=args.code_hard, code_sample=args.code_sample,
         code_ntp_weight=args.code_ntp_weight, cond_weight=args.cond_weight,
-        mtp_heads=args.mtp_heads, mtp_weight=args.mtp_weight, weight_tie=args.weight_tie,
-        seed_query_p=args.seed_query_p, seed_query_weight=args.seed_query_weight,
-        quant_type=args.quant_type, vocab=args.vocab, pq_chunks=args.pq_chunks,
-        share_lm=args.share_lm,
-        mtp_heads_code=args.mtp_heads_code, mtp_weight_code=args.mtp_weight_code,
-        mtp_heads_uncond=args.mtp_heads_uncond, mtp_weight_uncond=args.mtp_weight_uncond,
+        mtp_heads=args.mtp_heads, mtp_weight=args.mtp_weight,
     )
 
 

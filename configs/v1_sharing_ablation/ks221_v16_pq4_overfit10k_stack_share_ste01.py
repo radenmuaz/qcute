@@ -1,0 +1,52 @@
+"""v1_sharing_ablation/ks221_v16_pq4_overfit10k_stack_share_ste01: 6 of 8 in the
+weight-sharing ablation grid (2026-08-23) -- see ks21_v16_pq4_overfit10k_stack_noshare_ste01.py
+for the full grid description.
+
+This config: Ks=(2,2,1), decoder_type="stack" (sequential, default windows). share:
+kv_lm_mode="shared", decoder_own_stage_mode="shared" -- applies pervasively across both
+non-top levels: level0's own-stage LM/kv_lm reuse encoders[0].lm/encoders[1].lm, and level1's
+own-stage LM/kv_lm reuse encoders[1].lm/encoders[2].lm (track0_kv_lms, 2026-08-23 fix).
+byte_head_tied=False.
+
+uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_sharing_ablation/ks221_v16_pq4_overfit10k_stack_share_ste01.py
+
+# plot after training:
+uv run python scripts/plot_run.py logs/v1_sharing_ablation_ks221_v16_pq4_overfit10k_stack_share_ste01
+"""
+from pathlib import Path
+
+run_name = "v1_sharing_ablation_ks221_v16_pq4_overfit10k_stack_share_ste01"
+decoder_type = "stack"
+Ks = (2, 2, 1)
+d_model = 256
+n_layers = 1
+context_len = 256
+attn_window = -1
+code_hard = True
+code_sample = False
+quant_type = "simplex"
+vocab = 16
+pq_chunks = 4
+kv_lm_mode = "shared"
+decoder_own_stage_mode = "shared"
+byte_head_tied = False
+encoder_ste_p = 0.1
+input_preset = 8
+output_preset = 8
+entropy_reg_weight = 0.0
+
+steps = 3000
+
+data = Path("datasets/enwik8_1M.gz")
+n_bytes = 10000
+val_frac = 0.1
+
+batch_size = 16
+lr_peak = 6e-4
+warmup_steps = 100
+cosine_decay = False
+log_every = 20
+eval_every = 50
+eval_batches = 5
+
+qual_gen_bytes = 64

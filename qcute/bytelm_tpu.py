@@ -98,6 +98,7 @@ import contextlib
 import gzip
 import json
 import math
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -236,9 +237,27 @@ class Checkpointer:
 
 
 def load_enwik8(path: Path, n_bytes: int | None = None) -> torch.Tensor:
+    # Cache the parsed tensor next to the .gz (keyed by n_bytes) so repeat runs skip gunzip +
+    # tensor construction -- the full 100MB corpus took long enough at startup to be worth it.
+    cache_path = path.with_suffix(path.suffix + f".n{n_bytes or 'all'}.pt")
+    if cache_path.exists():
+        return torch.load(cache_path)
     with gzip.open(path, "rb") as f:
         data = f.read(n_bytes) if n_bytes else f.read()
-    return torch.tensor(list(data), dtype=torch.long)
+    # torch.frombuffer avoids materializing a Python list[int] first (list(data) + torch.tensor
+    # was the previous, much slower path for a 100MB corpus) -- needs a writable buffer, hence
+    # bytearray(data) rather than the read-only bytes object.
+    tensor = torch.frombuffer(bytearray(data), dtype=torch.uint8).long()
+    # Write to a per-process temp path then atomically rename into place -- multiple processes
+    # launched concurrently (e.g. a multi-chip sweep sharing one --data path) would otherwise all
+    # cache-miss and race to torch.save the *same* cache_path, corrupting it for whichever reader
+    # opens it mid-write (confirmed: EOFError, 2026-08-23). os.replace is atomic on POSIX, so any
+    # concurrent reader sees either the old file, nothing, or the fully-written new one, never a
+    # partial write.
+    tmp_path = cache_path.with_suffix(f".tmp{os.getpid()}")
+    torch.save(tensor, tmp_path)
+    tmp_path.replace(cache_path)
+    return tensor
 
 
 @dataclass
@@ -253,6 +272,8 @@ class LMConfig:
     mtp_heads: int = 8  # n parallel next-byte heads (bandwidth-matched to qcute.qcutelm's K)
     zero_kv_sink: bool = True  # prepend one all-zero K/V token, always attendable, before SDPA
     use_flash_attention: bool = False  # nightly-only (see module docstring); ignored if unavailable
+    layer_drop: float = 0.0  # per-block drop probability during training (stochastic depth), 0=off
+    resid_dropout: float = 0.0  # dropout on attn/mlp output before the residual add, 0=off (kernel-agnostic, unlike attn-weight dropout)
 
     @property
     def head_dim(self) -> int:
@@ -260,7 +281,10 @@ class LMConfig:
 
 
 PRESETS: dict[str, LMConfig] = {
-    # ~(4 + 2*mlp_mult) * d_model^2 * n_layers non-embedding params (vocab=256 is negligible)
+    # ~(4 + 3*mlp_mult) * d_model^2 * n_layers non-embedding params (vocab=256 is negligible) --
+    # the 3*mlp_mult term (not 2*mlp_mult) accounts for SwiGLU's 3 projections (gate/up/down),
+    # not a plain 2-projection MLP; verified against d512x16's own reported params=67.4M (formula
+    # gives 67.1M).
     "tiny": LMConfig(d_model=128, n_layers=4, n_heads=4, context=512, mtp_heads=4),  # ~0.9M — pipeline sanity check
     "xs": LMConfig(d_model=256, n_layers=4, n_heads=4, context=256, mtp_heads=4),  # ~3.7M, quick local/CPU runs
     "sm": LMConfig(d_model=256, n_layers=8, n_heads=4, mlp_mult=2, context=1024, mtp_heads=4),  # ~4.3M — narrow/deep, not wide
@@ -268,6 +292,12 @@ PRESETS: dict[str, LMConfig] = {
     "d512x16": LMConfig(d_model=512, n_layers=16, n_heads=8, mlp_mult=4, context=4096, mtp_heads=1),  # ~67M, SwiGLU — v6e-1 single-chip saturation target
     "sd": LMConfig(d_model=1024, n_layers=8, n_heads=16, context=2048),   # ~101M — the full-enwik8 TPU target
     "md": LMConfig(d_model=2048, n_layers=8, n_heads=16, context=2048),   # ~403M
+    # 2026-08-23 tpu4 model-size sweep, aimed at the ~250-350M anchor for near-1.0-bpb enwik8
+    # (Transformer-XL-large 277M, Perceiver-AR 358M) -- see docs/status.md.
+    "d1024x16_mlp4": LMConfig(d_model=1024, n_layers=16, n_heads=16, mlp_mult=4, context=8192, mtp_heads=1),  # ~268M — anchor-matched depth+width
+    "d1024x16_mlp2": LMConfig(d_model=1024, n_layers=16, n_heads=16, mlp_mult=2, context=8192, mtp_heads=1),  # ~168M — cheaper MLP, more steps/budget
+    "d1024x24_mlp4": LMConfig(d_model=1024, n_layers=24, n_heads=16, mlp_mult=4, context=8192, mtp_heads=1),  # ~403M — deeper, above anchor upper end
+    "d768x12_mlp4": LMConfig(d_model=768, n_layers=12, n_heads=12, mlp_mult=4, context=8192, mtp_heads=1),  # ~113M — actual GPT-2-small shape (768 width, not a power of 2)
 }
 
 
@@ -410,14 +440,24 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, cfg: LMConfig):
         super().__init__()
+        self.cfg = cfg
         self.ln1 = RMSNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
         self.ln2 = RMSNorm(cfg.d_model)
         self.mlp = MLP(cfg)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), cos, sin)
-        x = x + self.mlp(self.ln2(x))
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                keep: torch.Tensor | float = 1.0) -> torch.Tensor:
+        # keep: 0/(1/keep_prob) stochastic-depth gate (see ByteLM.forward) or plain 1.0 when
+        # layer_drop is off/at eval -- multiplicative, not a host-side skip, so the traced graph
+        # always contains the same ops regardless of which layers get zeroed out this step.
+        # resid_dropout: applied to each sublayer's output before the residual add -- kernel-
+        # agnostic (unlike attention-weight dropout, works identically whether attn used flash or
+        # plain SDPA), so it doesn't force off the fast flash-attention path the way SDPA's own
+        # dropout_p would.
+        p = self.cfg.resid_dropout
+        x = x + keep * F.dropout(self.attn(self.ln1(x), cos, sin), p, self.training)
+        x = x + keep * F.dropout(self.mlp(self.ln2(x)), p, self.training)
         return x
 
     def forward_step(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
@@ -460,8 +500,18 @@ class ByteLM(nn.Module):
         B, T = tokens.shape
         cos, sin = rope_cos_sin(T, self.cfg.head_dim, self.cfg.rope_base, tokens.device)
         x = self.tok_emb(tokens)
+        drop_p = self.cfg.layer_drop
         for block in self.blocks:
-            x = block(x, cos, sin)
+            if self.training and drop_p > 0:
+                # Inverted-dropout-style scaling (kept blocks scaled by 1/keep_prob) so the
+                # expected residual contribution matches eval time (keep=1, no scaling, every
+                # block always runs) -- torch.rand on-device, no .item()/host sync, so this stays
+                # inside the lazy XLA graph instead of forcing a per-layer device->host round trip.
+                keep_prob = 1.0 - drop_p
+                keep = (torch.rand((), device=x.device) < keep_prob).to(x.dtype) / keep_prob
+            else:
+                keep = 1.0
+            x = block(x, cos, sin, keep)
         x = self.ln_f(x)
         return torch.stack([head(x) for head in self.heads], dim=0)
 
@@ -540,14 +590,23 @@ def eval_bpb_full(model: nn.Module, data: torch.Tensor, batch_size: int, context
     if desc is not None:
         starts = tqdm(starts, desc=desc, leave=False, dynamic_ncols=True)
     for start in starts:
-        idxs = range(start, min(start + batch_size, n_windows))
+        idxs = list(range(start, min(start + batch_size, n_windows)))
+        real_n = len(idxs)
+        # Pad a ragged last batch by repeating the final real window, so every batch this
+        # function issues has the same fixed shape -- on XLA a differently-shaped last batch
+        # would trigger its own lazy-graph compile every single eval_every call. Padded rows are
+        # computed (wasted, harmless) but excluded from the accumulated metric below.
+        idxs += [idxs[-1]] * (batch_size - real_n)
         batch = torch.stack([data[i * seq_len:(i + 1) * seq_len] for i in idxs]).to(device)
         with autocast_ctx(device):
             logits = model(batch[:, :context])
-        _, head0_bpb = mtp_loss(logits, batch, context)
-        bsz = batch.size(0)
-        total += head0_bpb.item() * bsz
-        total_n += bsz
+        targets0 = batch[:, 1 : 1 + context]
+        nats_per_window = F.cross_entropy(
+            logits[0].reshape(-1, logits.size(-1)), targets0.reshape(-1), reduction="none"
+        ).reshape(batch_size, context).mean(dim=1)
+        bpb_per_window = nats_per_window / math.log(2)
+        total += bpb_per_window[:real_n].sum().item()
+        total_n += real_n
         mark_step(device)
     model.train()
     return total / total_n
@@ -791,6 +850,8 @@ def main():
     p.add_argument("--context", type=int, default=None, help="override preset's context length")
     p.add_argument("--mtp_heads", type=int, default=None, help="override preset's MTP head count")
     p.add_argument("--n_layers", type=int, default=None, help="override preset's transformer layer count")
+    p.add_argument("--layer_drop", type=float, default=None, help="override preset's stochastic-depth drop probability (per block, training only)")
+    p.add_argument("--resid_dropout", type=float, default=None, help="override preset's dropout on each sublayer's output before the residual add")
     p.add_argument("--no_zero_kv_sink", action="store_true", help="disable the (default-on) all-zero, always-attendable K/V sink token")
     p.add_argument("--no_torch_compile", action="store_true", help="disable the (default-on) torch.compile wrap (backend=openxla on xla, inductor on cpu)")
     p.add_argument("--use_flash_attention", action="store_true",
@@ -867,6 +928,10 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
             cfg.mtp_heads = args.mtp_heads
         if args.n_layers is not None:
             cfg.n_layers = args.n_layers
+        if args.layer_drop is not None:
+            cfg.layer_drop = args.layer_drop
+        if args.resid_dropout is not None:
+            cfg.resid_dropout = args.resid_dropout
         if args.no_zero_kv_sink:
             cfg.zero_kv_sink = False
         if args.use_flash_attention:
@@ -904,6 +969,7 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
     log(
         f"{preset_label}  params={count_params(model)/1e6:.1f}M  device={device}  xla={_HAS_XLA}"
         f"  context={cfg.context}  mtp_heads={cfg.mtp_heads}  zero_kv_sink={cfg.zero_kv_sink}"
+        f"  layer_drop={cfg.layer_drop}  resid_dropout={cfg.resid_dropout}"
         f"  use_flash_attention={cfg.use_flash_attention} (available={_HAS_FLASH_ATTENTION})"
         f"  torch_compile={not args.no_torch_compile}"
         + (f"  multichip=True world_size={world_size} global_batch={args.batch_size * world_size}" if args.multichip else "")
