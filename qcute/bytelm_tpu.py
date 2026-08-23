@@ -297,6 +297,10 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     # x: [B, H, T, head_dim], cos/sin: [T, head_dim]
+    # cos/sin are always fp32 (rope_cos_sin computes them outside autocast's op list) -- cast to
+    # x's dtype first, or bf16*fp32 promotion silently upcasts q/k back to fp32 while v (which
+    # skips rope) stays bf16, crashing SDPA on a dtype mismatch.
+    cos, sin = cos.to(x.dtype), sin.to(x.dtype)
     return x * cos[None, None] + rotate_half(x) * sin[None, None]
 
 

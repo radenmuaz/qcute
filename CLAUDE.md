@@ -73,12 +73,16 @@ long `\r`-joined blob when catted, but `tail -f` still shows new bytes
 arriving in real time, which is the actual goal. Use `pgrep -f "python3
 -m qcute.<module>"` to find the training process's PID (e.g. to kill it;
 `$!` after a background launch gives the wrapper/shell PID, not
-necessarily Python's). **After launching, give the user the PID and two
-`tail -f` commands**: one on that raw stdout/stderr file, and one on
-`logs/<run_name>/run.log` (the structured log `Logger` writes to at
-`--log_every`/`--eval_every` intervals, genuinely real-time since
-`Logger` opens and flushes that file directly, no pipe involved) — so
-they can watch it live themselves rather than relying on being told the
+necessarily Python's). **After launching, give the user the PID, two
+`tail -f` commands, and (when the run is in a `tmux` session, e.g. on a
+remote TPU node) a `tmux capture-pane` command**: one `tail -f` on that
+raw stdout/stderr file, one on `logs/<run_name>/run.log` (the structured
+log `Logger` writes to at `--log_every`/`--eval_every` intervals,
+genuinely real-time since `Logger` opens and flushes that file directly,
+no pipe involved), and `tmux capture-pane -t <session> -p -S -N` (peeks
+at the session's recent output without attaching — swap `-N` for how many
+lines back) alongside the `tmux attach -t <session>` command — so they
+can watch it live themselves rather than relying on being told the
 outcome later. Long runs have shown unpredictable throughput (observed: a
 nominal ~30-minute budget taking 2.5-3.5 hours instead) — watch actual
 elapsed time/step rate early on rather than assuming a run will finish on
