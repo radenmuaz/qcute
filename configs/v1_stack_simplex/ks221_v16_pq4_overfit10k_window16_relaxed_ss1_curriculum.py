@@ -1,8 +1,8 @@
 """v1_stack_simplex/ks221_v16_pq4_overfit10k_window16_relaxed_ss1_curriculum: same setup as
 ks221_v16_pq4_overfit10k_window16_relaxed_ss1.py (Ks=(2,2,1), window16_relaxed, vocab=16
 pq_chunks=4, scheduled_sampling_p=1.0, detach_ss_sample=False, uncertainty_weighting=False) but
-adds a level curriculum via the new curriculum_max_srcs/curriculum_step Config fields
-(qcute_v1_common.py): for step < curriculum_step (here steps/2 = 1500), every decode_level call
+adds a level curriculum via the new active_srcs_mode/active_srcs_until_step Config fields
+(qcute_v1_common.py): for step < active_srcs_until_step (here steps/2 = 1500), every decode_level call
 uses max_srcs=2, which caps level0's decode to its nearest upper track only (level1's code) --
 level2's cross-attn stage is skipped entirely, so the model trains like a ks21 submodel for the
 first half. From step 1500 onward, max_srcs reverts to None (full ks221, all cross-attn stages).
@@ -41,8 +41,8 @@ output_preset = 8
 entropy_reg_weight = 0.0
 
 steps = 3000
-curriculum_max_srcs = 2
-curriculum_step = steps // 2
+active_srcs_mode = 2
+active_srcs_until_step = steps // 2
 
 data = Path("datasets/enwik8_1M.gz")
 n_bytes = 10000

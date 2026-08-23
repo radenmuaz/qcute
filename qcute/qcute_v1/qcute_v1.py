@@ -111,20 +111,40 @@ class QCuteLM(nn.Module):
             encode_entropy_regs += [out["entropy_reg"]]
             seq_repr = out["code"]
 
-        # Pseudo scheduled sampling (cfg.scheduled_sampling_p, one flip per forward pass, training
-        # only): with probability p, non-top-level decode is fed the level-above's OWN sampled
-        # code prediction instead of the ground-truth code, closing some of the train/generation
-        # exposure-bias gap on the code that feeds decode (see docs/qcute_v1_plan.md).
-        c_list_for_decode = list(c_list)
-        if (torch.is_grad_enabled() and cfg.scheduled_sampling_p > 0
-                and torch.rand(()).item() < cfg.scheduled_sampling_p):
+        # encoder_ste_p (STE training of the level-above's own NTP head via decode's reconstruction
+        # loss as feedback -- not "consistency" in a reconstruction-comparison sense, see
+        # docs/status.md's 2026-08-23 rename note): with probability cfg.encoder_ste_p (one coin
+        # flip per forward pass), every non-top level's code is resampled from the level-above's OWN
+        # NTP prediction (sample_next(), STE unless detach_ss_sample) instead of the ground-truth
+        # code. cfg.encoder_ste_skip_real (default False) controls what happens to the real-code
+        # pass when this fires:
+        #   False (default, additive): the real-code decode pass below ALWAYS runs unconditionally;
+        #     when encoder_ste_p also fires, a SECOND, separate decode pass with the self-sampled
+        #     code runs too, its loss added UNWEIGHTED on top (encoder_ste_total) -- decode's own
+        #     gradient path is unaffected either way, only the code-producer sees this signal as
+        #     something new. Empirically more stable (2026-08-23 comparison) since the "official"
+        #     decode_losses/byte_acc never see anything but the real code.
+        #   True (skip, formerly cfg.scheduled_sampling_p): the self-sampled code REPLACES the
+        #     real-code pass entirely for this step -- one pass, either real or sampled, mutually
+        #     exclusive, same substitution behavior the old scheduled_sampling_p had (unified into
+        #     this one mechanism 2026-08-23 rather than keeping two separate flags). More faithful
+        #     to the true (100% self-sampled) generation-time conditioning distribution, but
+        #     empirically less stable -- the dominant training signal itself becomes noisy whenever
+        #     the upper encoder's own forecast is still bad.
+        run_ste = (torch.is_grad_enabled() and cfg.encoder_ste_p > 0 and self.n_levels > 1
+                   and torch.rand(()).item() < cfg.encoder_ste_p)
+        c_list_ste = None
+        if run_ste:
+            c_list_ste = list(c_list)
             for i in range(self.n_levels - 1):
                 h_upper = h_list[i + 1]
                 if h_upper.shape[1] < 2:
                     continue
                 enc_upper = self.encoders[i + 1]
                 predicted = enc_upper.quant.sample_next(enc_upper.lm, h_upper[:, :-1, :], cfg.vocab)
-                c_list_for_decode[i] = torch.cat([c_list[i][:, :1, :], predicted], dim=1)
+                c_list_ste[i] = torch.cat([c_list[i][:, :1, :], predicted], dim=1)
+        skip_real = run_ste and cfg.encoder_ste_skip_real
+        main_c_list = c_list_ste if skip_real else c_list
 
         decode_losses: list = [None] * self.n_levels
         decode_accs: list = [None] * self.n_levels
@@ -136,7 +156,7 @@ class QCuteLM(nn.Module):
 
         for i in reversed(range(self.n_levels)):
             max_srcs_i = max_srcs[i] if isinstance(max_srcs, (list, tuple)) else max_srcs
-            result = self.decoder.decode_level(self, i, x_list, c_list_for_decode, decode_derived_c,
+            result = self.decoder.decode_level(self, i, x_list, main_c_list, decode_derived_c,
                                                 compute_ntp, max_srcs_i, want_next_query)
             if result is None:
                 continue
@@ -147,16 +167,31 @@ class QCuteLM(nn.Module):
             decode_stage_extra_losses += result["extra_losses"]
             if i == 0:
                 next_query[i] = result["query_last"]
-            if max_srcs_i is None:
+            if max_srcs_i is None and result["code"] is not None:
                 decode_derived_c[i] = result["code"]
+
+        encoder_ste_losses: list = []
+        if run_ste and not skip_real:
+            decode_derived_c_ste: dict = {}
+            for i in reversed(range(self.n_levels)):
+                max_srcs_i = max_srcs[i] if isinstance(max_srcs, (list, tuple)) else max_srcs
+                result = self.decoder.decode_level(self, i, x_list, c_list_ste,
+                                                    decode_derived_c_ste, compute_ntp,
+                                                    max_srcs_i, False)
+                if result is not None:
+                    encoder_ste_losses.append(result["loss"])
+                    if max_srcs_i is None and result["code"] is not None:
+                        decode_derived_c_ste[i] = result["code"]
 
         return make_dict(encode_losses=encode_losses, encode_accs=encode_accs, decode_losses=decode_losses,
                           decode_accs=decode_accs, h_list=h_out, c_list=c_list, next_query=next_query,
                           decode_derived_c=decode_derived_c, h0_encode=h_list[0],
                           decode_stage_extra_losses=decode_stage_extra_losses,
+                          encoder_ste_losses=encoder_ste_losses,
                           encode_entropy_regs=encode_entropy_regs, embed_weights=embed_weights)
 
-    def forward(self, byte_ids: torch.Tensor, max_srcs: int | None | tuple = None) -> tuple:
+    def forward(self, byte_ids: torch.Tensor, max_srcs: int | None | tuple = None,
+                _skip_byte_consistency: bool = False) -> tuple:
         cfg = self.cfg
         result = self._run(byte_ids, max_srcs=max_srcs)
         encode_losses, encode_accs = result["encode_losses"], result["encode_accs"]
@@ -164,6 +199,7 @@ class QCuteLM(nn.Module):
         h0_encode = result["h0_encode"]
         encode_entropy_regs = result["encode_entropy_regs"]
         decode_stage_extra_losses = result["decode_stage_extra_losses"]
+        encoder_ste_losses = result["encoder_ste_losses"]
 
         byte_loss = decode_losses[0] if decode_losses[0] is not None else encode_losses[0]
         byte_acc = decode_accs[0] if decode_accs[0] is not None else encode_accs[0]
@@ -222,14 +258,40 @@ class QCuteLM(nn.Module):
         entropy_reg_total = (torch.stack(entropy_reg_terms).sum() if entropy_reg_terms
                               else byte_loss.new_zeros(()))
 
-        loss = encode_total + decode_total + decode_stage_extra_total + cfg.entropy_reg_weight * entropy_reg_total
+        encoder_ste_total = (torch.stack(encoder_ste_losses).sum() if encoder_ste_losses
+                              else byte_loss.new_zeros(()))
+
+        # byte_consistency_p (2026-08-23, "true" consistency training in byte space, distinct from
+        # encoder_ste_p's code-level swap): with probability cfg.byte_consistency_p (its own coin
+        # flip, independent of encoder_ste_p), argmax level0's own byte-level reconstruction logits,
+        # detach (no gradient into whatever produced them), and run the WHOLE model again on this
+        # self-predicted byte sequence -- self-supervised as always (the second pass reconstructs
+        # ITS OWN input, exactly like the first pass does), so this tests whole-model idempotence/
+        # stability under one round of self-feeding, not just decode's code-level robustness.
+        # _skip_byte_consistency=True guards the recursive call so this can only ever fire once per
+        # top-level forward() call, never cascading.
+        byte_consistency_total = byte_loss.new_zeros(())
+        if (not _skip_byte_consistency and torch.is_grad_enabled() and cfg.byte_consistency_p > 0
+                and torch.rand(()).item() < cfg.byte_consistency_p):
+            embed0 = (result["embed_weights"][0] if result["embed_weights"][0] is not None
+                      else self.encoders[0].embed.weight)
+            logits0 = F.linear(result["h_list"][0], embed0)
+            predicted_bytes = logits0.argmax(-1).detach()
+            byte_consistency_total, _ = self.forward(predicted_bytes, max_srcs=max_srcs,
+                                                       _skip_byte_consistency=True)
+
+        loss = (encode_total + decode_total + decode_stage_extra_total
+                + cfg.entropy_reg_weight * entropy_reg_total + encoder_ste_total
+                + byte_consistency_total)
         ntp_total = torch.stack(encode_losses + [l for l in decode_losses if l is not None]
                                  + decode_stage_extra_losses).sum()
         metrics = {
             "loss": loss, "byte_loss": byte_loss, "byte_loss_full": byte_loss_full, "byte_acc": byte_acc,
             "encode_total": encode_total, "decode_total": decode_total,
             "decode_stage_extra_total": decode_stage_extra_total, "ntp_loss_total": ntp_total,
-            "entropy_reg_total": entropy_reg_total, **uncertainty_sigmas,
+            "entropy_reg_total": entropy_reg_total, "encoder_ste_total": encoder_ste_total,
+            "byte_consistency_total": byte_consistency_total,
+            **uncertainty_sigmas,
             **{f"level{i}_ntp_loss_encode": l for i, l in enumerate(encode_losses)},
             **{f"level{i}_ntp_acc_encode": a for i, a in enumerate(encode_accs)},
             **{f"level{i}_ntp_loss_decode": l for i, l in enumerate(decode_losses) if l is not None},

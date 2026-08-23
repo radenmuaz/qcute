@@ -38,8 +38,9 @@ output_preset = 8
 entropy_reg_weight = 0.0
 
 steps = 1000
-curriculum_max_srcs = (1, None)   # own code only for level0, no conditioning on level1 (the top level)
-curriculum_step = steps + 1       # active for the WHOLE run -- not a phased curriculum
+# curriculum_max_srcs/curriculum_step (notoplevel exclusion) removed 2026-08-23 -- now baked
+# into StackDecoder.__init__ unconditionally, no curriculum needed (see qcute_v1_decoder.py's
+# StackDecoder docstring).
 
 data = Path("datasets/enwik8_1M.gz")
 n_bytes = 10000

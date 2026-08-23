@@ -1,7 +1,7 @@
 """v1_stack_simplex/ks221_v16_pq4_overfit10k_window16_relaxed_kvlm_fresh_curriculum: same as
 ks221_v16_pq4_overfit10k_window16_relaxed_kvlm_fresh_nocurriculum.py (kv_lm_mode="fresh" on top of
 the best confirmed non-curriculum recipe) but ALSO applies the validated curriculum
-(curriculum_max_srcs=(2,1,None), curriculum_step=steps//2 -- the recipe that first produced
+(active_srcs_mode=(2,1,None), active_srcs_until_step=steps//2 -- the recipe that first produced
 coherent ks221 generation, see ks221_v16_pq4_overfit10k_window16_relaxed_curriculum2_noss.py and
 docs/status.md's 2026-08-21/22 entry). Run after the no-curriculum kv_lm variant to see whether
 kv_lm alone already suffices (in which case this should look similar) or whether the curriculum is
@@ -38,8 +38,8 @@ output_preset = 8
 entropy_reg_weight = 0.0
 
 steps = 3000
-curriculum_max_srcs = (2, 1, None)
-curriculum_step = steps // 2
+active_srcs_mode = (2, 1, None)
+active_srcs_until_step = steps // 2
 
 data = Path("datasets/enwik8_1M.gz")
 n_bytes = 10000

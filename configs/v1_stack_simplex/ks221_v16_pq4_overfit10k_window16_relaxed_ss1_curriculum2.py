@@ -1,12 +1,12 @@
 """v1_stack_simplex/ks221_v16_pq4_overfit10k_window16_relaxed_ss1_curriculum2: fixes
 ks221_v16_pq4_overfit10k_window16_relaxed_ss1_curriculum.py's curriculum, which used a scalar
-curriculum_max_srcs=2 -- that only drops level2 from level0's upper tracks; level1 (only 1 upper
+active_srcs_mode=2 -- that only drops level2 from level0's upper tracks; level1 (only 1 upper
 track: level2) keeps seeing level2 regardless, since a scalar cap can't drop a level's OWN single
-nearest upper track without also zeroing level0's (see chat 2026-08-21). curriculum_max_srcs is
+nearest upper track without also zeroing level0's (see chat 2026-08-21). active_srcs_mode is
 now a per-level tuple (2, 1, None): level0 keeps only level1 (drops level2), level1 drops its
-only upper track (level2) too -- for step < curriculum_step, the model's decode genuinely has NO
+only upper track (level2) too -- for step < active_srcs_until_step, the model's decode genuinely has NO
 path from level2's code into anything, matching what a real standalone Ks=(2,1) ks21 model would
-see. From curriculum_step onward, max_srcs reverts to None (full ks221, uniform for every level).
+see. From active_srcs_until_step onward, max_srcs reverts to None (full ks221, uniform for every level).
 Same base setup otherwise: window16_relaxed, vocab=16 pq_chunks=4, scheduled_sampling_p=1.0,
 detach_ss_sample=False, uncertainty_weighting=False.
 
@@ -40,8 +40,8 @@ output_preset = 8
 entropy_reg_weight = 0.0
 
 steps = 3000
-curriculum_max_srcs = (2, 1, None)
-curriculum_step = steps // 2
+active_srcs_mode = (2, 1, None)
+active_srcs_until_step = steps // 2
 
 data = Path("datasets/enwik8_1M.gz")
 n_bytes = 10000

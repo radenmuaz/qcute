@@ -360,3 +360,7 @@ the actual value — never guess it).
 
 Keep chat replies terse. State results and next steps directly — no restating context the user
 already has, no padding, no multi-paragraph recaps. Save detail for docs/status.md, not the chat.
+
+When explaining a result from comparing two runs/configs that differ in more than one variable,
+flag causal claims as "suspect"/"maybe" rather than stating them as established — an unconfounded
+isolation (one variable changed at a time) is required before a cause can be stated as fact.

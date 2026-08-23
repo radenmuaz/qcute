@@ -124,11 +124,35 @@ class Config:
     track_dropout_ramp_steps: int | None = None
     track_dropout_schedule: str = "linear"
     use_self_code: bool = False
-    scheduled_sampling_p: float = 0.0
-    detach_ss_sample: bool = False
+    detach_ss_sample: bool = False  # detaches sample_next()'s STE sample (used by encoder_ste_p in
+    # either mode) so gradient never reaches the level-above encoder that produced it
+    encoder_ste_p: float = 0.0  # probability per forward pass of resampling every non-top level's
+    # code from the level-above's own NTP prediction (sample_next(), STE unless detach_ss_sample) --
+    # unifies the old separate scheduled_sampling_p mechanism (removed 2026-08-23) into one knob;
+    # see encoder_ste_skip_real below for the two modes. Not "consistency" in a reconstruction-
+    # comparison sense: it's STE training of the level-above's own NTP head via decode's
+    # reconstruction loss as feedback. 1.0 = every step.
+    encoder_ste_skip_real: bool = False  # False (default, additive): the real-code decode pass
+    # always runs; when encoder_ste_p also fires, a SEPARATE second decode pass with the
+    # self-sampled code runs too, added UNWEIGHTED on top (encoder_ste_total) -- decode's own
+    # gradient path is unaffected, only the code-producer sees new signal. More stable empirically
+    # (2026-08-23 comparison). True (skip, formerly scheduled_sampling_p's behavior): the
+    # self-sampled code REPLACES the real-code pass entirely this step, mutually exclusive -- more
+    # faithful to the true (100% self-sampled) generation-time distribution, but empirically less
+    # stable (destabilizes the dominant training signal itself). See docs/status.md's "code-level
+    # consistency training" discipline (#2/#3) for the motivating discussion.
+    byte_consistency_p: float = 0.0  # probability per forward pass of a SECOND, whole-model pass:
+    # argmax level0's own byte-level reconstruction logits, detach, feed that self-predicted byte
+    # sequence through the WHOLE model again (self-supervised as always, so it reconstructs ITS OWN
+    # input) -- tests whole-model idempotence/stability under one round of self-feeding, unlike
+    # encoder_ste_p's code-level-only swap. 1.0 = every step. See docs/status.md's 2026-08-23 entry.
     uncertainty_weighting: bool = False
-    curriculum_max_srcs: int | None | tuple = None
-    curriculum_step: int = 0
+    active_srcs_mode: int | None | tuple = None  # NOTE: excluding the topmost level's code from
+    # conditioning (the old "notoplevel" curriculum use, e.g. (1, None) for ks21 / (2, 1, None) for
+    # ks221) is now baked into StackDecoder.__init__ unconditionally (2026-08-23, see its
+    # docstring) -- these values are now no-ops for that purpose. Still useful for other max_srcs
+    # ablations (e.g. forcing max_srcs=1 to drop ALL upper conditioning, not just the top level).
+    active_srcs_until_step: int = 0
     kv_lm_mode: str = "identity"
     kv_lm_layers: int | None = None
 
@@ -1309,7 +1333,7 @@ def train(model, train_data: torch.Tensor, val_data: torch.Tensor, args, log, ru
                                                         args.track_dropout_schedule))
 
         ctx = sample_context(train_data, args.batch_size, model.cfg.context_len, device)
-        cur_max_srcs = (args.curriculum_max_srcs if step < args.curriculum_step else None)
+        cur_max_srcs = (args.active_srcs_mode if step < args.active_srcs_until_step else None)
         loss, metrics = model(ctx, max_srcs=cur_max_srcs)
         opt.zero_grad()
         loss.backward()
@@ -1464,16 +1488,28 @@ def build_argparser(description: str) -> tuple:
                          "of real self-code (breaks cross-block recurrence, see self_code_active); the "
                          "top level of a multi-level hierarchy always keeps real self-code regardless. "
                          "n_levels==1 with this False degenerates decode to an unconditioned LM (warns).")
-    p.add_argument("--scheduled_sampling_p", type=float, default=0.0,
-                    help="probability (0=always, default) that non-top-level decode is fed the "
-                         "level-above's OWN sampled code prediction instead of the ground-truth code "
-                         "(one flip per forward pass, training only) -- pseudo scheduled sampling to "
-                         "reduce the train/generation exposure-bias gap on the code that feeds decode.")
     p.add_argument("--detach_ss_sample", action="store_true", default=False,
-                    help="scheduled sampling's substitute code (sample_next()) goes through the same "
-                         "STE path as normal quantize() by default, so its decode loss backprops into "
-                         "the level-above encoder; set this to fall back to the old fully-detached "
-                         "(no gradient to that encoder) behavior.")
+                    help="encoder_ste_p's self-sampled code (sample_next()) goes through the same STE "
+                         "path as normal quantize() by default, so its decode loss backprops into the "
+                         "level-above encoder; set this to fall back to the old fully-detached (no "
+                         "gradient to that encoder) behavior.")
+    p.add_argument("--encoder_ste_p", type=float, default=0.0,
+                    help="probability (0=never, default; 1.0=every step) of resampling every non-top "
+                         "level's code from the level-above's own NTP prediction (sample_next()) instead "
+                         "of the ground-truth code. See --encoder_ste_skip_real for the two modes "
+                         "(additive second pass vs. substituting the real pass, formerly a separate "
+                         "scheduled_sampling_p flag, unified 2026-08-23).")
+    p.add_argument("--encoder_ste_skip_real", action="store_true", default=False,
+                    help="False (default, additive): the real-code decode pass always runs; when "
+                         "encoder_ste_p also fires, a separate second decode pass with the self-sampled "
+                         "code runs too, added unweighted on top. True (skip): the self-sampled code "
+                         "replaces the real-code pass entirely this step (mutually exclusive) -- the "
+                         "old scheduled_sampling_p behavior.")
+    p.add_argument("--byte_consistency_p", type=float, default=0.0,
+                    help="probability (0=never, default; 1.0=every step) of a second, whole-model "
+                         "forward pass on level0's own argmax'd (detached) byte-level reconstruction, "
+                         "fed back through the entire model self-supervised -- tests whole-model "
+                         "idempotence under self-feeding, unlike encoder_ste_p's code-level-only swap.")
     p.add_argument("--uncertainty_weighting", action="store_true", default=False,
                     help="Kendall/Gal/Cipolla 2018 homoscedastic uncertainty weighting: learn one "
                          "log-variance per NTP task (each level's own encode loss, each level's decode "
@@ -1482,17 +1518,22 @@ def build_argparser(description: str) -> tuple:
                          "differences (e.g. wider-vocab levels naturally producing bigger raw losses) "
                          "self-balance via gradient descent rather than manual tuning. Logged each "
                          "log_every step as train_uncertainty_sigma_<task>.")
-    p.add_argument("--curriculum_max_srcs", type=int, default=None,
-                    help="max_srcs passed to model(...) for steps < curriculum_step (default "
-                         "None: no curriculum). Scalar (e.g. 2, via CLI) broadcasts to every level's "
-                         "decode_level call; a per-level tuple (config-file only, e.g. (2, 1, None) on "
-                         "a Ks=(2,2,1) model) is required to genuinely drop ALL conditioning on a given "
-                         "coarser level -- a scalar cap can't do this since a level's OWN nearest upper "
-                         "track always survives any cap >=2, e.g. level1 (only 1 upper track: level2) "
-                         "still sees level2 under a global max_srcs=2 meant to hide it from level0.")
-    p.add_argument("--curriculum_step", type=int, default=0,
-                    help="step at which curriculum_max_srcs stops applying and training "
-                         "switches to full max_srcs=None (default 0: curriculum never active).")
+    p.add_argument("--active_srcs_mode", type=int, default=None,
+                    help="max_srcs passed to model(...) for steps < active_srcs_until_step -- a phased "
+                         "mode restricting which conditioning tracks/modules are active early in "
+                         "training (default None: no phasing, always full conditioning). Scalar (e.g. "
+                         "2, via CLI) broadcasts to every level's decode_level call; a per-level tuple "
+                         "(config-file only, e.g. (2, 1, None) on a Ks=(2,2,1) model) is required to "
+                         "genuinely drop ALL conditioning on a given coarser level -- a scalar cap "
+                         "can't do this since a level's OWN nearest upper track always survives any "
+                         "cap >=2, e.g. level1 (only 1 upper track: level2) still sees level2 under a "
+                         "global max_srcs=2 meant to hide it from level0. NOTE: excluding the topmost "
+                         "level specifically no longer needs this -- StackDecoder now hard-excludes it "
+                         "unconditionally (2026-08-23, see its docstring); this flag remains for other "
+                         "phased-conditioning ablations.")
+    p.add_argument("--active_srcs_until_step", type=int, default=0,
+                    help="step at which active_srcs_mode stops applying and training "
+                         "switches to full max_srcs=None (default 0: mode never active).")
     p.add_argument("--kv_lm_mode", choices=["identity", "fresh", "shared"], default="identity",
                     help="how upper-track cross-attention K/V is built from a coarser level's code "
                          "(StackDecoder only). 'identity' (default, prior behavior): raw per-position "
@@ -1607,11 +1648,13 @@ def config_from_args(args) -> Config:
         track_dropout_ramp_steps=args.track_dropout_ramp_steps,
         track_dropout_schedule=args.track_dropout_schedule,
         use_self_code=args.use_self_code,
-        scheduled_sampling_p=args.scheduled_sampling_p,
         detach_ss_sample=args.detach_ss_sample,
+        encoder_ste_p=args.encoder_ste_p,
+        encoder_ste_skip_real=args.encoder_ste_skip_real,
+        byte_consistency_p=args.byte_consistency_p,
         uncertainty_weighting=args.uncertainty_weighting,
-        curriculum_max_srcs=args.curriculum_max_srcs,
-        curriculum_step=args.curriculum_step,
+        active_srcs_mode=args.active_srcs_mode,
+        active_srcs_until_step=args.active_srcs_until_step,
         kv_lm_mode=args.kv_lm_mode,
         kv_lm_layers=args.kv_lm_layers,
     )

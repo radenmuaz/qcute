@@ -52,7 +52,13 @@ Differences from qcute.bytelm:
     ("sink") token before every real token, visible to every query unconditionally, before SDPA.
     A static (non-learned) attention sink, sometimes used to relieve softmax's requirement that
     attention weights sum to 1 even when no real key deserves much mass. Disable via
-    `LMConfig(zero_kv_sink=False)` / `--no_zero_kv_sink`.
+    `LMConfig(zero_kv_sink=False)` / `--no_zero_kv_sink`. **Mutually exclusive with
+    use_flash_attention in practice** — forces the explicit-mask SDPA path (O(T^2) memory)
+    regardless of the flash flag, since the Pallas kernel's causal=True needs q_len==kv_len
+    exactly *and* q_len divisible by its internal block size (1024, observed), and prepending
+    the sink can't satisfy both at once with no custom-mask escape hatch available. Pass
+    `--no_zero_kv_sink` to actually get flash-attention's memory savings (a startup warning
+    fires if both are left on).
   - RMSNorm (not LayerNorm) and SwiGLU MLP (gate+up+down, not a single-branch silu MLP) —
     LLaMA-style stack, all Linear layers already bias-free. Adopted 2026-08-22 to converge
     faster as a baseline, independent of whether any enwik8-bpb literature result used them.
@@ -87,6 +93,7 @@ SPMD/multiprocessing data-parallel wiring); that would be new infra, not impleme
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gzip
 import json
 import math
@@ -135,6 +142,16 @@ def resolve_device(name: str | None) -> torch.device:
         return torch_xla.device()
     except Exception:
         return torch.device("cpu")
+
+
+def autocast_ctx(device: torch.device):
+    # bf16 autocast on xla, no-op on cpu — halves-plus activation memory vs. plain fp32 (the
+    # default otherwise), which is what actually gates batch_size/context on a fixed-HBM chip,
+    # not attention memory (confirmed: flash-attention alone left batch_size=4 OOMing at
+    # context=4096 on a 67M-param model / 32GB v6e-1 chip, all in fp32).
+    if is_xla_device(device):
+        return torch.autocast(device_type="xla", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
 
 
 def mark_step(device: torch.device) -> None:
@@ -247,6 +264,7 @@ PRESETS: dict[str, LMConfig] = {
     "xs": LMConfig(d_model=256, n_layers=4, n_heads=4, context=256, mtp_heads=4),  # ~3.7M, quick local/CPU runs
     "sm": LMConfig(d_model=256, n_layers=8, n_heads=4, mlp_mult=2, context=1024, mtp_heads=4),  # ~4.3M — narrow/deep, not wide
     "fast": LMConfig(d_model=512, n_layers=8, n_heads=8, mlp_mult=2, context=1024, mtp_heads=4),  # ~16.9M — narrow/deep, not wide
+    "d512x16": LMConfig(d_model=512, n_layers=16, n_heads=8, mlp_mult=4, context=4096, mtp_heads=1),  # ~67M, SwiGLU — v6e-1 single-chip saturation target
     "sd": LMConfig(d_model=1024, n_layers=8, n_heads=16, context=2048),   # ~101M — the full-enwik8 TPU target
     "md": LMConfig(d_model=2048, n_layers=8, n_heads=16, context=2048),   # ~403M
 }
@@ -294,10 +312,18 @@ class CausalSelfAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)  # [3, B, H, T, hd]
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        # zero_kv_sink and use_flash_attention are mutually exclusive in practice: the Pallas
+        # kernel's causal=True requires q_len==kv_len exactly (a T vs T+1 mismatch from
+        # prepending the sink silently misaligns the mask — confirmed, max abs diff ~2.6 vs the
+        # explicit-mask reference) *and* q_len divisible by its internal block size (1024,
+        # observed) -- padding q to satisfy one breaks the other, and the kernel exposes no
+        # custom mask/segment-id path that reconciles both. So zero_kv_sink always forces the
+        # explicit-mask SDPA path below, even when use_flash_attention is set — see cfg
+        # validation in main() for a startup-time log/guard around this.
         if self.cfg.zero_kv_sink:
-            zero = torch.zeros(B, H, 1, hd, device=x.device, dtype=k.dtype)
-            k = torch.cat([zero, k], dim=2)
-            v = torch.cat([zero, v], dim=2)
+            zero_kv = torch.zeros(B, H, 1, hd, device=x.device, dtype=k.dtype)
+            k = torch.cat([zero_kv, k], dim=2)
+            v = torch.cat([zero_kv, v], dim=2)
             causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
             sink_col = torch.ones(T, 1, dtype=torch.bool, device=x.device)
             attn_mask = torch.cat([sink_col, causal], dim=1)  # [T, T+1] — sink always attendable
@@ -464,7 +490,8 @@ def eval_bpb(model: nn.Module, data_iter, context: int, n_batches: int, device: 
     total = 0.0
     for _ in range(n_batches):
         batch = next(data_iter)
-        logits = model(batch[:, :context])
+        with autocast_ctx(device):
+            logits = model(batch[:, :context])
         _, head0_bpb = mtp_loss(logits, batch, context)
         total += head0_bpb.item()
         mark_step(device)
@@ -491,7 +518,8 @@ def eval_bpb_full(model: nn.Module, data: torch.Tensor, batch_size: int, context
     for start in starts:
         idxs = range(start, min(start + batch_size, n_windows))
         batch = torch.stack([data[i * seq_len:(i + 1) * seq_len] for i in idxs]).to(device)
-        logits = model(batch[:, :context])
+        with autocast_ctx(device):
+            logits = model(batch[:, :context])
         _, head0_bpb = mtp_loss(logits, batch, context)
         bsz = batch.size(0)
         total += head0_bpb.item() * bsz
@@ -740,6 +768,7 @@ def main():
     p.add_argument("--mtp_heads", type=int, default=None, help="override preset's MTP head count")
     p.add_argument("--n_layers", type=int, default=None, help="override preset's transformer layer count")
     p.add_argument("--no_zero_kv_sink", action="store_true", help="disable the (default-on) all-zero, always-attendable K/V sink token")
+    p.add_argument("--no_torch_compile", action="store_true", help="disable the (default-on) torch.compile wrap (backend=openxla on xla, inductor on cpu)")
     p.add_argument("--use_flash_attention", action="store_true",
                     help="use torch_xla's Pallas flash-attention kernel in the training forward pass (nightly-only, see module docstring; silently falls back to plain SDPA if unavailable)")
     p.add_argument("--multichip", action="store_true",
@@ -804,6 +833,8 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
         model = ByteLM(cfg).to(device)
         model.load_state_dict(ckpt["model"])
         start_step = ckpt["step"]
+        if not args.no_torch_compile:
+            model = torch.compile(model, backend="openxla" if is_xla_device(device) else "inductor")
     else:
         cfg = PRESETS[args.preset]
         if args.context is not None:
@@ -816,8 +847,15 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
             cfg.zero_kv_sink = False
         if args.use_flash_attention:
             cfg.use_flash_attention = True
+        if cfg.zero_kv_sink and cfg.use_flash_attention:
+            print("WARNING: zero_kv_sink forces the explicit-mask SDPA attention path (O(T^2) "
+                  "memory) even with use_flash_attention on — the Pallas kernel can't do both "
+                  "(see CausalSelfAttention.forward docstring). Pass --no_zero_kv_sink to "
+                  "actually get flash-attention's memory savings.")
         model = ByteLM(cfg).to(device)
         start_step = 0
+        if not args.no_torch_compile:
+            model = torch.compile(model, backend="openxla" if is_xla_device(device) else "inductor")
 
     if args.run_name:
         run_name = args.run_name
@@ -837,6 +875,7 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
         f"{preset_label}  params={count_params(model)/1e6:.1f}M  device={device}  xla={_HAS_XLA}"
         f"  context={cfg.context}  mtp_heads={cfg.mtp_heads}  zero_kv_sink={cfg.zero_kv_sink}"
         f"  use_flash_attention={cfg.use_flash_attention} (available={_HAS_FLASH_ATTENTION})"
+        f"  torch_compile={not args.no_torch_compile}"
         + (f"  multichip=True world_size={world_size} global_batch={args.batch_size * world_size}" if args.multichip else "")
     )
 
@@ -868,6 +907,11 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
         # non-master ranks don't clutter shared stdout with duplicate progress bars.
         step_iter = tqdm(range(1, args.steps + 1), desc="train", dynamic_ncols=True) if is_master else range(1, args.steps + 1)
         for step in step_iter:
+            if step == 1 and is_master:
+                # First step pays a one-time trace+compile cost (XLA lazy compilation, plus
+                # torch.compile's own tracing if enabled) that dwarfs steady-state step time —
+                # timed and logged separately so it isn't mistaken for the real per-step rate.
+                compile_t0 = time.perf_counter()
             if args.cosine_decay:
                 lr = lr_at_warmup_constant_cosine(step, args.warmup_steps, args.constant_steps, args.lr_peak, args.steps)
             else:
@@ -876,7 +920,8 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
                 g["lr"] = lr
 
             batch = next(train_iter)
-            logits = model(batch[:, : cfg.context])
+            with autocast_ctx(device):
+                logits = model(batch[:, : cfg.context])
             loss, head0_bpb = mtp_loss(logits, batch, cfg.context)
 
             opt.zero_grad()
@@ -886,6 +931,9 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
 
             if not is_master:
                 continue
+            if step == 1:
+                first_step_s = time.perf_counter() - compile_t0
+                log(f"first_step_compile_s {first_step_s:.1f}", first_step_compile_s=first_step_s)
             step_iter.set_postfix(lr=f"{lr:.2e}", mtp_loss=f"{loss.item():.4f}", bpb=f"{head0_bpb.item():.4f}")
             if step % args.log_every == 0:
                 log(f"{step_iter}", step=step, lr=lr, mtp_loss=loss.item(), bpb=head0_bpb.item())

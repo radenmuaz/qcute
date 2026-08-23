@@ -40,15 +40,14 @@ quant_type = "simplex"
 vocab = 16
 pq_chunks = 4
 kv_lm_mode = "fresh"
-scheduled_sampling_p = 0.0
-detach_ss_sample = False
 input_preset = 8
 output_preset = 8
 entropy_reg_weight = 0.0
 
 steps = 3000
-curriculum_max_srcs = (2, 1, None)  # level0: own+level1 only; level1: own only; exclude level2 (top)
-curriculum_step = steps + 1         # active for the WHOLE run -- not a phased curriculum
+# curriculum_max_srcs/curriculum_step (notoplevel exclusion) removed 2026-08-23 -- now baked
+# into StackDecoder.__init__ unconditionally, no curriculum needed (see qcute_v1_decoder.py's
+# StackDecoder docstring).
 
 data = Path("datasets/enwik8_1M.gz")
 n_bytes = 10000

@@ -1,11 +1,11 @@
 """v1_stack_simplex/ks221_v16_pq4_overfit10k_window16_relaxed_curriculum2_noss: isolation test for
 ks221_v16_pq4_overfit10k_window16_relaxed_ss1_curriculum2.py (the first run to produce coherent
 real ks221 generation, see docs/status.md's 2026-08-21/22 entry) -- identical setup (Ks=(2,2,1),
-window16_relaxed, vocab=16 pq_chunks=4, curriculum_max_srcs=(2,1,None) for the first half of
+window16_relaxed, vocab=16 pq_chunks=4, active_srcs_mode=(2,1,None) for the first half of
 training then None/full for the second half) but scheduled_sampling_p=0 (no scheduled sampling at
 all, vs curriculum2's ss=1.0). curriculum2's base setup already had scheduled_sampling_p=1.0
 enabled from an earlier (failed on its own) lever-sweep -- this isolates whether the
-curriculum_max_srcs/curriculum_step mechanism alone is sufficient for the coherent-generation
+active_srcs_mode/active_srcs_until_step mechanism alone is sufficient for the coherent-generation
 result, or whether it needed full-strength scheduled sampling alongside it.
 
 uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks221_v16_pq4_overfit10k_window16_relaxed_curriculum2_noss.py
@@ -38,8 +38,8 @@ output_preset = 8
 entropy_reg_weight = 0.0
 
 steps = 3000
-curriculum_max_srcs = (2, 1, None)
-curriculum_step = steps // 2
+active_srcs_mode = (2, 1, None)
+active_srcs_until_step = steps // 2
 
 data = Path("datasets/enwik8_1M.gz")
 n_bytes = 10000

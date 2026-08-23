@@ -1335,21 +1335,10 @@ class StackDecoder(Decoder):
     no upper conditioning".
 
     `cfg.cond_depth` caps how many levels above own code each level actually conditions on --
-    -1 (default) = pervasive, every level above EXCEPT the topmost (n_levels-2-i tracks, see
-    below); 1 = one level up only, the minimal case (own code + a single upper track). Static,
-    unlike max_srcs (a per-forward-call ablation knob) -- it also caps how many cross-attn-stage
-    LMs __init__ allocates, so a shallow cond_depth means genuinely fewer parameters, not just
-    unused ones.
-
-    The topmost level's own code (index n_levels-1) is HARD-EXCLUDED from every other level's
-    conditioning, unconditionally (not gated by cond_depth/max_srcs/a curriculum) -- no LM above
-    it ever forecasts that code during real generation (it's produced solely by its own encoder's
-    self-NTP), so conditioning on it trains every lower level against a signal that free-rollout
-    generation can't actually supply reliably. Confirmed empirically (2026-08-23, ks21/ks221
-    "notoplevel" curriculum_max_srcs ablations, docs/status.md) that both hierarchies still
-    overfit cleanly -- and ks221 generates measurably better -- with this code excluded, so it's
-    now baked into __init__'s allocation (n_upper caps at n_levels-2-i, never n_levels-1-i) rather
-    than left as an opt-in curriculum knob."""
+    -1 (default) = pervasive, every level above (n_levels-1-i tracks); 1 = one level up only,
+    the minimal case (own code + a single upper track). Static, unlike max_srcs (a
+    per-forward-call ablation knob) -- it also caps how many cross-attn-stage LMs __init__
+    allocates, so a shallow cond_depth means genuinely fewer parameters, not just unused ones."""
 
     def __init__(self, cfg: Config, n_levels: int, encoders, d_models, n_layers_list, vocabs):
         super().__init__(cfg, n_levels)
@@ -1370,7 +1359,7 @@ class StackDecoder(Decoder):
         def make_level(i):
             if i == n_levels - 1:
                 return nn.ModuleList([make_own_stage(i)])
-            n_upper = max(0, n_levels - 2 - i)  # excludes the topmost level (n_levels-1), see class docstring
+            n_upper = n_levels - 1 - i
             if cfg.cond_depth != -1:
                 n_upper = min(n_upper, cfg.cond_depth)
             return nn.ModuleList([make_own_stage(i)] + [make_cross_stage(i) for _ in range(n_upper)])
@@ -1393,7 +1382,7 @@ class StackDecoder(Decoder):
         def make_level_kv(i):
             if i == n_levels - 1:
                 return nn.ModuleList([])
-            n_upper = max(0, n_levels - 2 - i)  # excludes the topmost level (n_levels-1), see class docstring
+            n_upper = n_levels - 1 - i
             if cfg.cond_depth != -1:
                 n_upper = min(n_upper, cfg.cond_depth)
             return nn.ModuleList([make_kv_lm(i, t) for t in range(n_upper)])
@@ -1491,9 +1480,7 @@ class StackDecoder(Decoder):
 
         upper_specs = []
         cum_K = K
-        # capped at n_levels-1, not n_levels: the topmost level's own code is hard-excluded from
-        # every other level's conditioning (see class docstring) -- must match __init__'s allocation.
-        j_max = (self.n_levels - 1) if cfg.cond_depth == -1 else min(self.n_levels - 1, i + 1 + cfg.cond_depth)
+        j_max = self.n_levels if cfg.cond_depth == -1 else min(self.n_levels, i + 1 + cfg.cond_depth)
         for j in range(i + 1, j_max):
             cum_K *= cfg.Ks[j]
             window = model.decode_windows[i][j - i]

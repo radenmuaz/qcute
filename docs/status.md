@@ -842,3 +842,91 @@ training produces `mtp{2,3,4}_loss`/`mtp{2,3,4}_acc` metrics and backprops clean
 `generate_no_cache`/`generate_kv_cache`/`generate_speculative` all still produce bit-identical
 output; `check_kv_cache_consistency` still reports `match_rate: 1.0`; a real 10-step training run
 via `ks21_overfit10k_mtp.py` completes and logs the new metrics correctly.
+
+## qcute_v1: abandon vocab=256/pq_chunks=1 as a base quant structure (2026-08-23)
+
+`quant_type="simplex"` with `vocab=256, pq_chunks=1` (single 256-way softmax code) is no longer
+used as a base for new `qcute_v1` configs -- consistently the weaker quant-structure choice
+throughout this investigation (see the earlier quant-structure sweep entry: `v16pq4` reached
+gt_byte_acc .99-1.0 and exact-match real generation under the same tinywindow handicap that
+v256pq1 mode-collapsed under; the ks221 hard-convergence-queue sweep found the same pattern).
+`vocab=16, pq_chunks=4` (4 independent 16-way softmaxes, matched combinatorial code width) is the
+new default base for `ks21` configs going forward -- see
+`ks21_v16_pq4_overfit10k_kvlm_fresh_notoplevel.py` and its `_ss1`/`_ss05`/`_consistency1` siblings.
+Existing `ks21_v256_pq1_*` configs are left as-is (historical), not migrated.
+
+## qcute_v1: unify scheduled_sampling_p and consistency_p into one encoder_ste_p mechanism (2026-08-23)
+
+Renamed `consistency_p` -> `encoder_ste_p` (not "consistency" in a reconstruction-comparison sense
+-- it's STE training of the level-above's own NTP head via decode's reconstruction loss as
+feedback, `c_list`/`decode_derived_c` naming updated to match). Then merged `scheduled_sampling_p`
+entirely into this one mechanism rather than keeping two separate flags/code paths doing
+overlapping things: new `Config.encoder_ste_skip_real: bool = False` selects the mode.
+- `False` (default, additive): the real-code decode pass always runs unconditionally; when
+  `encoder_ste_p` also fires (its own coin flip), a SEPARATE second decode pass with the
+  self-sampled code runs too, added UNWEIGHTED on top as `encoder_ste_total` -- decode's own
+  gradient path is unaffected, only the code-producer sees new signal. This is what was called
+  `consistency_p` before the rename.
+- `True` (skip): the self-sampled code REPLACES the real-code pass entirely for that step, mutually
+  exclusive -- exactly `scheduled_sampling_p`'s old substitution behavior, now reached via
+  `encoder_ste_p` + `encoder_ste_skip_real=True` instead of a separate flag.
+`Config.scheduled_sampling_p` removed outright (its argparser flag and `config_from_args`
+passthrough deleted); `detach_ss_sample` kept as-is since it's generic to `sample_next()`'s STE
+path, used by both modes. Old configs that still set `scheduled_sampling_p=...` at the top level
+silently no-op (unrecognized config key, filtered out by `load_config_module`'s known-keys check)
+rather than erroring -- `ks21_v16_pq4_overfit10k_kvlm_fresh_notoplevel_ss1.py`/`_ss05.py` were
+updated to the new `encoder_ste_p`/`encoder_ste_skip_real=True` fields so they stay directly
+re-runnable; other historical `*_ss1`/`*_curriculum*` configs using the old name are left as-is
+(already-run, historical).
+
+**Bias/stability framing (chat 2026-08-23)**: the two modes trade off differently against the true
+generation-time conditioning distribution (100% self-sampled, since there's no ground-truth code at
+inference). `encoder_ste_skip_real=True` (old `ss`) can make training match that distribution
+exactly at `p=1.0` -- zero distributional bias -- but empirically destabilizes the dominant training
+signal itself when the upper encoder's own forecast is still bad early on (this session's
+`ks21_v16_pq4_..._notoplevel_ss1`: 0/14 exact train matches, 95.53% train byte_acc, worse than the
+plain baseline's ~99%). `encoder_ste_skip_real=False` (default, additive) never touches the dominant
+signal at all -- it stays 100% ground-truth-conditioned regardless of `encoder_ste_p`, i.e. just as
+biased toward the easy (train-only) distribution as no intervention at all -- but empirically more
+stable (`_notoplevel_consistency1`, now `encoder_ste_p=1.0`: 3/17 exact matches, 97.61% train
+byte_acc, better than `ss1`). Net: less bias costs stability; more bias (relative to the true
+generation-time distribution) buys stability here, at least at this scale/config.
+
+**Comparison table so far** (`ks21`, `v16pq4`, `kv_lm_mode="fresh"`, notoplevel topology, exact
+train `modeks21` matches out of total qual samples logged, checked programmatically not by eye):
+
+| config | exact matches | final train byte_acc |
+|---|---|---|
+| plain notoplevel | 1/14ish | 99.00% |
+| `encoder_ste_p=1.0, skip_real=True` (old ss1) | 0/14 | 95.53% |
+| `encoder_ste_p=0.5, skip_real=True` (old ss05) | 2/18 | 97.44% |
+| `encoder_ste_p=1.0, skip_real=False` (old consistency1) | 3/17 | 97.61% |
+| `encoder_ste_p=0.1, skip_real=False` (consistency01) | not yet checked | -- |
+
+**Caveat (flagged directly, chat 2026-08-23)**: these runs differ in more than just the
+ss/encoder_ste knob (different random seeds, different qual-sample prompts each eval) -- the
+comparison above is suggestive, not a controlled ablation. Treat conclusions as "suspect"/"maybe"
+until an isolated, seed-matched comparison is run (see CLAUDE.md's Response format note on this).
+
+## qcute_v1: byte_consistency_p -- whole-model self-feeding consistency (2026-08-23)
+
+New, separate mechanism from `encoder_ste_p`: `Config.byte_consistency_p` (default 0.0). With
+probability p per forward pass (own independent coin flip): argmax level0's own byte-level
+reconstruction logits (`F.linear(result["h_list"][0], embed0)`), `.detach()` (no gradient into
+whatever produced them), then run the WHOLE model again (`self.forward(predicted_bytes, ...)`,
+recursive call) on this self-predicted byte sequence -- self-supervised as always, so the second
+pass reconstructs ITS OWN (self-predicted) input, exercising every level's encoder AND decoder, not
+just decode's code-level conditioning. A `_skip_byte_consistency` guard on the recursive call
+prevents cascading (fires at most once per top-level `forward()` call, verified with both
+`byte_consistency_p=1.0` and `encoder_ste_p=1.0` active simultaneously -- no exponential blowup,
+~2x a single pass as expected).
+
+This is qualitatively different from `encoder_ste_p`: that mechanism only perturbs the CODE fed
+into decode's cross-attention (a mid-stack swap); this one perturbs the actual BYTES at the very
+input, forcing every encoder in the stack to also cope with a self-predicted-then-detached input,
+not just decode. Real cost: doubles the ENTIRE forward pass (every level's encode + decode) whenever
+it fires, vs. `encoder_ste_p`'s cheaper decode_level-only second pass.
+
+Configs queued: `ks21_v16_pq4_overfit10k_kvlm_fresh_notoplevel_byteconsistency1.py` (p=1.0),
+`_byteconsistency05.py` (p=0.5), same `notoplevel`/`v16pq4`/`kv_lm_fresh` base as the
+`encoder_ste_p` comparison table above -- results pending.
