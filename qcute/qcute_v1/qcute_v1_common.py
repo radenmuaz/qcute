@@ -117,7 +117,14 @@ class Config:
     quant_dropout_decay_steps: int | None = None
     quant_dropout_schedule: str = "linear"
     decode_cross_stage_layers: int | None = None
-    share_encode_decode_self: bool = False
+    decoder_own_stage_mode: str = "shared"  # analogous to kv_lm_mode (2026-08-23, was
+    # share_encode_decode_self: bool = False, i.e. "copy" was the old default): level i's own-stage
+    # LM (track0's bb0 in make_own_stage/StackDecoder, own-code stage in ConcatDecoder) either
+    # reuses encoders[i].lm directly ("shared", default) or is an independently-initialized/trained
+    # LM ("copy"). Combined with kv_lm_mode's own default flip to "shared", the only genuinely NEW
+    # (non-encoder-reused) decoder parameters left by default are the cross-attention machinery
+    # itself (cross_attn_stage's per-layer cross-attn+MLP -- no encoder equivalent to reuse) and
+    # each level's own NTP/prediction head.
     cond_depth: int = -1
     pq_chunks: int = 1
     track_dropout_p0: float = 0.0
@@ -153,9 +160,44 @@ class Config:
     # docstring) -- these values are now no-ops for that purpose. Still useful for other max_srcs
     # ablations (e.g. forcing max_srcs=1 to drop ALL upper conditioning, not just the top level).
     active_srcs_until_step: int = 0
-    kv_lm_mode: str = "identity"
+    kv_lm_mode: str = "shared"  # reuse the coarser level's own (already-trained) encoder LM as the
+    # kv_lm by default (2026-08-23, was "identity") -- reasoning: level i's cross-attn stage
+    # already has its own dedicated submodule (cross_attn_stage's LM) to actually consume the
+    # code, so kv_lm's job is just producing a good K/V *representation* of that code, which the
+    # encoder that already models it well is the natural source for, rather than training a
+    # redundant "copy" LM from scratch. "identity" (no transform) and "copy" (renamed from
+    # "fresh" 2026-08-23 -- a separate LM, independently initialized/trained, not tied to the
+    # encoder) remain as alternatives.
     kv_lm_layers: int | None = None
-
+    decode_scope: str = "level0_only"  # which levels' OWN decode_level gets computed/trained
+    # (2026-08-23, default changed from implicit-pervasive) -- "level0_only" (default): only
+    # level0's decode runs, since it's the only one anything downstream actually consumes (final
+    # byte output); level i>0's OWN reconstruction of its own domain is never used by anything else
+    # -- level0's upper-track cross-attention conditions on c_list[j] (the ENCODER's output)
+    # directly, which stays fully available/trained via encode_losses regardless of whether level
+    # j's OWN decode runs (decode_level(i=0)'s j in decode_derived_c fallback already handles this,
+    # see qcute_v1.py). "pervasive": every level's own decode_level runs and contributes to
+    # decode_total, the original (pre-2026-08-23) behavior -- still useful if you actually want
+    # level i>0's own reconstruction quality as a training signal/diagnostic in its own right.
+    byte_head_tied: bool = False  # mirrors the existing cfg.ntp_head_tied (which already governs
+    # the CODE-level NTP head inside the quant classes, self.code_predict) but for the BYTE-level
+    # case, which had no equivalent knob at all -- ntp_loss_acc's is_byte_level branch always
+    # hardcoded F.linear(h, self.embed.weight), standard input/output tying, no alternative.
+    # Default False (untied, LM.byte_head is a genuine nn.Linear(D, V, bias=False)) so that every
+    # LM's byte-output projection is a free parameter by default, independent of whatever
+    # input-embedding sharing is happening at the whole-LM level (decoder_own_stage_mode/
+    # kv_lm_mode) -- 2026-08-23, chat: "instead of hard code F.linear use bb0.embed.weight / put
+    # tie weight false, make by default nn.Linear bias false a free param even in copy or no
+    # weight share". Motivated by a real gap: with decoder_own_stage_mode="shared", the encoder's
+    # own unconditional byte-NTP loss and decode's code-conditioned reconstruction loss landed on
+    # the EXACT SAME embed.weight tensor -- no head existed specific to "predict a byte from this
+    # code-informed hidden state," even though cross-attention+MLP had already transformed that
+    # hidden state into something semantically different from the unconditional case. True
+    # (opt-in): ties LM.byte_head to embed.weight, the old only-possible behavior. WARNING (see
+    # StackDecoder.__init__): combining byte_head_tied=True with decoder_own_stage_mode="shared"
+    # collapses track0's conditional and unconditional heads into one tensor -- allowed, but a
+    # printed warning recommends byte_head_tied=False whenever kv_lm_mode/decoder_own_stage_mode
+    # reuse an encoder, so at least the output head stays independent.
 
 def gumbel_quantize(logits: torch.Tensor, tau: float, hard: bool = True, sample: bool = False) -> torch.Tensor:
     if sample:
@@ -934,6 +976,13 @@ class LM(nn.Module):
         V = vocab
         self.embed = nn.Embedding(V, D)
         nn.init.normal_(self.embed.weight, std=0.02)
+        # byte_head: mirrors code_predict's ntp_head_tied pattern above, but for the byte-level
+        # output projection (ntp_loss_acc's is_byte_level branch) -- None (tied to self.embed.weight,
+        # standard input/output tying) when cfg.byte_head_tied, else a genuine independent
+        # nn.Linear(D, V, bias=False), the default (2026-08-23).
+        self.byte_head = None if cfg.byte_head_tied else nn.Linear(D, V, bias=False)
+        if self.byte_head is not None:
+            nn.init.normal_(self.byte_head.weight, std=0.02)
         # trainable per-block SEED TOKEN, prepended before every K-block in qcute_v1's non-top-level
         # decode (see docs/qcute_v1_plan.md) -- not "BOS" (a single sequence-start marker) or a
         # "sink" (a passive fallback key that itself predicts nothing): it's a full token, going
@@ -1005,10 +1054,18 @@ class LM(nn.Module):
         he_blocks = he.view(B, n_blocks, K + 1, D)
         return he_blocks[:, :, K, :]
 
+    @property
+    def byte_output_weight(self) -> torch.Tensor:
+        """The byte-level output projection -- self.byte_head.weight (independent, default) or
+        self.embed.weight (tied, cfg.byte_head_tied=True). The single source of truth every
+        byte-output call site (ntp_loss_acc, generation sampling, embed_weight dict fields) should
+        read from instead of hardcoding self.embed.weight (2026-08-23 fix)."""
+        return self.embed.weight if self.byte_head is None else self.byte_head.weight
+
     def ntp_loss_acc(self, h_query: torch.Tensor, target_repr: torch.Tensor, is_byte_level: bool) -> tuple:
         if is_byte_level:
             target = target_repr.reshape(-1)
-            logits = F.linear(h_query, self.embed.weight)
+            logits = F.linear(h_query, self.byte_output_weight)
             loss = F.cross_entropy(logits, target)
             with torch.no_grad():
                 acc = (logits.argmax(-1) == target).float().mean()
@@ -1430,8 +1487,15 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--binary_lfq", action="store_true")
     p.add_argument("--entropy_reg_weight", type=float, default=0.0)
     p.add_argument("--ntp_head_tied", action="store_true")
+    p.add_argument("--byte_head_tied", action="store_true",
+                    help="ties every LM's byte-level output projection to its own input embedding "
+                         "table (default False: independent nn.Linear(D, V, bias=False) byte_head). "
+                         "Mirrors --ntp_head_tied, which already does this for the code-level head.")
     p.add_argument("--decode_cross_stage_layers", type=int, default=None)
-    p.add_argument("--share_encode_decode_self", action="store_true")
+    p.add_argument("--decoder_own_stage_mode", choices=["copy", "shared"], default="shared",
+                    help="level i's own-stage decode LM (default since 2026-08-23: 'shared' -- "
+                         "reuses encoders[i].lm directly, was 'copy'/share_encode_decode_self=False). "
+                         "'copy': an independently-initialized/trained LM instead.")
     p.add_argument("--cond_depth", type=int, default=-1,
                     help="StackDecoder (--decoder_type stack) only: how many levels above own "
                          "code each non-top level conditions on. -1 (default) = pervasive, every "
@@ -1534,21 +1598,32 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--active_srcs_until_step", type=int, default=0,
                     help="step at which active_srcs_mode stops applying and training "
                          "switches to full max_srcs=None (default 0: mode never active).")
-    p.add_argument("--kv_lm_mode", choices=["identity", "fresh", "shared"], default="identity",
+    p.add_argument("--kv_lm_mode", choices=["identity", "copy", "shared"], default="shared",
                     help="how upper-track cross-attention K/V is built from a coarser level's code "
-                         "(StackDecoder only). 'identity' (default, prior behavior): raw per-position "
-                         "code embedding, no interaction between code positions. 'fresh': a new small "
-                         "LM (kv_lm_layers, own weights) causally self-attends over the embedded code "
-                         "sequence first, contextualizing each position from earlier codes in the same "
-                         "track, before it's used as K/V. 'shared': same causal pass, but reusing the "
-                         "producing level's OWN encoder LM weights (encoders[j].lm) instead of a fresh "
-                         "module -- cheaper, but ties this pass to whatever the encoder's own self-NTP "
-                         "loss shapes those weights toward (see chat 2026-08-22 for the gradient-"
-                         "interference concern this raises). Requires d_model to match across the "
-                         "levels involved.")
+                         "(StackDecoder only). 'shared' (default since 2026-08-23, was 'identity'): "
+                         "a causal pass over the embedded code sequence reusing the producing level's "
+                         "OWN encoder LM weights (encoders[j].lm) -- cheaper than 'copy', and level i's "
+                         "cross_attn_stage LM already has its own dedicated submodule to consume the "
+                         "code, so kv_lm just needs a good K/V representation, which the encoder that "
+                         "already models this code well is the natural source for (see chat 2026-08-22 "
+                         "for the gradient-interference concern this raises, still open). 'identity': "
+                         "raw per-position code embedding, no interaction between code positions (the "
+                         "old default). 'copy' (renamed from 'fresh' 2026-08-23): a new small LM "
+                         "(kv_lm_layers, own independently-trained weights, NOT tied to the encoder) "
+                         "causally self-attends over the embedded code sequence first, contextualizing "
+                         "each position from earlier codes in the same track, before it's used as K/V. "
+                         "'shared'/'copy' both require d_model to match across the levels involved.")
     p.add_argument("--kv_lm_layers", type=int, default=None,
-                    help="n_layers for kv_lm_mode='fresh's dedicated LM (default: same as this "
+                    help="n_layers for kv_lm_mode='copy's dedicated LM (default: same as this "
                          "level's own n_layers). Ignored for 'identity'/'shared'.")
+    p.add_argument("--decode_scope", choices=["level0_only", "pervasive"], default="level0_only",
+                    help="which levels' own decode_level runs (default since 2026-08-23: "
+                         "level0_only -- only level0's decode is trained/computed, since it's the "
+                         "only one anything downstream consumes; level i>0's own reconstruction of "
+                         "its own domain trains nothing that isn't already trained via its "
+                         "encode_loss + level0's cross-attention into c_list[i]. 'pervasive': every "
+                         "level's own decode runs and contributes to decode_total, the original "
+                         "(pre-2026-08-23) behavior.")
     p.add_argument("--dim_monitor_plateau_tol", type=float, default=0.01,
                     help="relative change in effective_dim below which two consecutive --eval_every "
                          "measurements are flagged as a plateau")
@@ -1633,8 +1708,9 @@ def config_from_args(args) -> Config:
         vocab=args.vocab, quant_type=args.quant_type, binary_bits=args.binary_bits, binary_lfq=args.binary_lfq,
         input_preset=args.input_preset, output_preset=args.output_preset,
         entropy_reg_weight=args.entropy_reg_weight, ntp_head_tied=args.ntp_head_tied,
+        byte_head_tied=args.byte_head_tied,
         decode_cross_stage_layers=args.decode_cross_stage_layers,
-        share_encode_decode_self=args.share_encode_decode_self,
+        decoder_own_stage_mode=args.decoder_own_stage_mode,
         cond_depth=args.cond_depth,
         grid_dq=args.grid_dq, grid_levels=args.grid_levels, grid_bound=args.grid_bound,
         grid_logistic_scale=args.grid_logistic_scale,
@@ -1657,6 +1733,7 @@ def config_from_args(args) -> Config:
         active_srcs_until_step=args.active_srcs_until_step,
         kv_lm_mode=args.kv_lm_mode,
         kv_lm_layers=args.kv_lm_layers,
+        decode_scope=args.decode_scope,
     )
 
 

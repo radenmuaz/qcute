@@ -52,13 +52,14 @@ Differences from qcute.bytelm:
     ("sink") token before every real token, visible to every query unconditionally, before SDPA.
     A static (non-learned) attention sink, sometimes used to relieve softmax's requirement that
     attention weights sum to 1 even when no real key deserves much mass. Disable via
-    `LMConfig(zero_kv_sink=False)` / `--no_zero_kv_sink`. **Mutually exclusive with
-    use_flash_attention in practice** — forces the explicit-mask SDPA path (O(T^2) memory)
-    regardless of the flash flag, since the Pallas kernel's causal=True needs q_len==kv_len
-    exactly *and* q_len divisible by its internal block size (1024, observed), and prepending
-    the sink can't satisfy both at once with no custom-mask escape hatch available. Pass
-    `--no_zero_kv_sink` to actually get flash-attention's memory savings (a startup warning
-    fires if both are left on).
+    `LMConfig(zero_kv_sink=False)` / `--no_zero_kv_sink`. **Compatible with use_flash_attention
+    only when `(context+1) % 1024 == 0`** (e.g. context=8191, not 8192) — the Pallas kernel's
+    causal=True needs q_len==kv_len exactly (satisfied by padding q with one dummy leading row
+    to match the sink-prepended kv_len=T+1, verified: max abs diff ~0.007-0.01 vs. the
+    explicit-mask reference, same as flash-attention's normal variance) *and* that common length
+    divisible by its internal block size (1024, observed). A context that doesn't satisfy this
+    falls back to the explicit-mask SDPA path (O(T^2) memory) instead, with a startup warning —
+    still correct, just not the fast path.
   - RMSNorm (not LayerNorm) and SwiGLU MLP (gate+up+down, not a single-branch silu MLP) —
     LLaMA-style stack, all Linear layers already bias-free. Adopted 2026-08-22 to converge
     faster as a baseline, independent of whether any enwik8-bpb literature result used them.
@@ -305,6 +306,10 @@ class CausalSelfAttention(nn.Module):
         self.cfg = cfg
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
         self.out = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        # Reused (not reallocated per forward call) for zero_kv_sink's dummy sink K/V and dummy
+        # leading Q row — a single [1,1,1,hd] buffer, cast + expand()ed (view, no copy) to the
+        # actual [B,H,1,hd] shape needed each call, instead of a fresh torch.zeros(...) every time.
+        self.register_buffer("_zero_sink", torch.zeros(1, 1, 1, cfg.head_dim), persistent=False)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -312,23 +317,38 @@ class CausalSelfAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)  # [3, B, H, T, hd]
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        # zero_kv_sink and use_flash_attention are mutually exclusive in practice: the Pallas
-        # kernel's causal=True requires q_len==kv_len exactly (a T vs T+1 mismatch from
-        # prepending the sink silently misaligns the mask — confirmed, max abs diff ~2.6 vs the
-        # explicit-mask reference) *and* q_len divisible by its internal block size (1024,
-        # observed) -- padding q to satisfy one breaks the other, and the kernel exposes no
-        # custom mask/segment-id path that reconciles both. So zero_kv_sink always forces the
-        # explicit-mask SDPA path below, even when use_flash_attention is set — see cfg
-        # validation in main() for a startup-time log/guard around this.
+        use_flash = self.cfg.use_flash_attention and _HAS_FLASH_ATTENTION and is_xla_device(x.device)
         if self.cfg.zero_kv_sink:
-            zero_kv = torch.zeros(B, H, 1, hd, device=x.device, dtype=k.dtype)
+            zero_kv = self._zero_sink.to(dtype=k.dtype).expand(B, H, 1, hd)
             k = torch.cat([zero_kv, k], dim=2)
             v = torch.cat([zero_kv, v], dim=2)
-            causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
-            sink_col = torch.ones(T, 1, dtype=torch.bool, device=x.device)
-            attn_mask = torch.cat([sink_col, causal], dim=1)  # [T, T+1] — sink always attendable
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        elif self.cfg.use_flash_attention and _HAS_FLASH_ATTENTION and is_xla_device(x.device):
+            # Only take the flash path if (T+1) is block-aligned (see below) -- otherwise the
+            # Pallas kernel raises its own ValueError rather than silently miscomputing anything,
+            # but crashing mid-run is still worse than a graceful fallback to the mask path, which
+            # is always correct regardless of T. (Bug fixed 2026-08-23: this check used to live
+            # only in main()'s startup warning, which printed but never actually forced the
+            # fallback -- confirmed crashing with context=8192 before this fix.)
+            if use_flash and (T + 1) % 1024 != 0:
+                use_flash = False
+            if use_flash:
+                # Padding q with one dummy leading row makes q_len==kv_len==T+1 exactly, which
+                # is required for the Pallas kernel's causal=True to compute the right diagonal
+                # (verified: max abs diff ~0.007-0.01 vs. the explicit-mask reference below, same
+                # as flash-attention's normal algorithmic variance). But the kernel ALSO requires
+                # that common length divisible by its internal block size (1024, observed) — so
+                # this only works when T+1 is itself a multiple of 1024 (e.g. context=8191, not
+                # 8192). Caller's responsibility to pick a compatible context; a bad choice fails
+                # loudly with the kernel's own "q_seq_len should be divisible by block_q_dq"
+                # ValueError rather than silently computing something wrong.
+                zero_q = self._zero_sink.to(dtype=q.dtype).expand(B, H, 1, hd)
+                q_padded = torch.cat([zero_q, q], dim=2)
+                y = _xla_flash_attention(q_padded, k, v, causal=True, sm_scale=1.0 / (hd ** 0.5))[:, :, 1:, :]
+            else:
+                causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+                sink_col = torch.ones(T, 1, dtype=torch.bool, device=x.device)
+                attn_mask = torch.cat([sink_col, causal], dim=1)  # [T, T+1] — sink always attendable
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        elif use_flash:
             y = _xla_flash_attention(q, k, v, causal=True, sm_scale=1.0 / (hd ** 0.5))
         else:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)       # [B, H, T, hd]
@@ -847,11 +867,12 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
             cfg.zero_kv_sink = False
         if args.use_flash_attention:
             cfg.use_flash_attention = True
-        if cfg.zero_kv_sink and cfg.use_flash_attention:
-            print("WARNING: zero_kv_sink forces the explicit-mask SDPA attention path (O(T^2) "
-                  "memory) even with use_flash_attention on — the Pallas kernel can't do both "
-                  "(see CausalSelfAttention.forward docstring). Pass --no_zero_kv_sink to "
-                  "actually get flash-attention's memory savings.")
+        if cfg.zero_kv_sink and cfg.use_flash_attention and (cfg.context + 1) % 1024 != 0:
+            print(f"WARNING: zero_kv_sink+use_flash_attention needs (context+1) divisible by "
+                  f"1024 to use the fast path (got context={cfg.context}, context+1="
+                  f"{cfg.context + 1}) — falling back to the explicit-mask SDPA path (O(T^2) "
+                  f"memory) for this run. Pick context=1024*k-1 (e.g. 8191, not 8192) to actually "
+                  f"get flash-attention's memory savings with the sink on.")
         model = ByteLM(cfg).to(device)
         start_step = 0
         if not args.no_torch_compile:
@@ -870,7 +891,12 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
     else:
         log = lambda msg="", **record: None  # noqa: E731 — non-master ranks do no file/console I/O
     preset_label = f"loaded_from={args.checkpoint_path} (step {start_step})" if args.checkpoint_path else f"preset={args.preset}"
-    world_size = xr.addressable_runtime_device_count() if (args.multichip and _HAS_XLA) else 1
+    # xr.addressable_runtime_device_count() returns the CALLING process's own local device count
+    # (1, inside an already-spawned multichip worker) -- xr.world_size() is the real replica
+    # count across all processes. Confirmed bug (logged world_size=1 despite 4 workers actually
+    # running) on 2026-08-23 while verifying --multichip works on the stable torch_xla==2.9.0
+    # pin (see docs/bytelm_tpu_setup.md).
+    world_size = xr.world_size() if (args.multichip and _HAS_XLA) else 1
     log(
         f"{preset_label}  params={count_params(model)/1e6:.1f}M  device={device}  xla={_HAS_XLA}"
         f"  context={cfg.context}  mtp_heads={cfg.mtp_heads}  zero_kv_sink={cfg.zero_kv_sink}"

@@ -109,6 +109,10 @@ working suddenly can't be reached (hang, `Connection refused`, `No route to host
 retrying, or standing up a replacement node (don't — see above). Full setup and copy-pasteable
 commands: [docs/tpu_direct_ssh.md](docs/tpu_direct_ssh.md).
 **Never create/start a TPU yourself** — only use nodes already listed in TPU.md/already running.
+**Never edit TPU.md itself** — it's the user's own list of queued-resource create commands, not a
+session log; per-node details discovered while connecting (external IP, actual node name behind
+a queued-resource name, accelerator type) go in a session's own working notes/commands, not
+written back into TPU.md.
 Full scp-to-running-training walkthrough (uv/torch_xla install, common failure modes, `qcute.
 bytelm_tpu` smoke test): [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md). **Any long-running
 or user-monitorable remote command (installs, training) goes inside a `tmux` session on the TPU
@@ -122,15 +126,19 @@ commands.
 **`qcute.bytelm_tpu`'s `--use_flash_attention` needs a nightly torch/torch_xla build** (the
 stable pin's `libtpu==0.0.21` is too old for the Pallas kernel) — full install steps, confirmed
 working on a `v4-8` node: [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md)'s "Optional:
-nightly build" section. **`--multichip` (collective data-parallel across chips) is confirmed
-broken** (hangs in PJRT rendezvous on that same nightly+v4-8 combo) — static code review found
-nothing wrong in our own collective usage, so the leading hypothesis (untested as of 2026-08-22)
-is a nightly-build-specific PJRT bug: next thing to try, once a chip is free, is `--multichip`
-*without* `--use_flash_attention` on the **stable** `torch==2.9.0`/`torch_xla==2.9.0` pin instead
-of nightly (see docs/bytelm_tpu_setup.md's "Optional: multiple TPU chips on one host" section).
-For using more than one chip on a host today, launch independent single-chip processes instead, one per chip, via
-`TPU_VISIBLE_CHIPS=<i>` (verified working, no collectives needed) — see that doc's "Optional:
-multiple TPU chips on one host" section for the exact pattern. Check real addressable device
+nightly build" section. **`--multichip` (collective data-parallel across chips) WORKS on the
+stable `torch==2.9.0`/`torch_xla==2.9.0` pin** (confirmed 2026-08-23 on a fresh `v4-8` node: 4
+real worker processes, steadily climbing CPU time, a full run completed cleanly with
+`world_size=4 global_batch=64` correctly reported after fixing a real bug — `world_size` must
+come from `xr.world_size()`, not `xr.addressable_runtime_device_count()`, which returns 1 inside
+an already-spawned worker) — the earlier "confirmed broken" hang was specific to the **nightly**
+`torch_xla==2.10.0.dev0` build (only needed for `--use_flash_attention`), not this project's own
+wiring, exactly as the 2026-08-22 static-code-review hypothesis predicted. `--multichip` +
+`--use_flash_attention` together (nightly-only) is still untested. See
+docs/bytelm_tpu_setup.md's "Optional: multiple TPU chips on one host" section for the full
+writeup. For single-chip-per-process (embarrassingly-parallel, e.g. a hparam sweep) instead of
+collective multichip, launch independent processes one per chip via `TPU_VISIBLE_CHIPS=<i>`
+(also verified working) — see that same doc section for the exact pattern. Check real addressable device
 count first (`torch_xla.runtime.addressable_runtime_device_count()` / `ls /dev/accel*` /
 `tpu-info`) — a slice's "-N" suffix (e.g. `v4-8`) counts TensorCores, not addressable devices.
 **Multi-chip runs get one named `tmux` session per chip**, not backgrounded `&` jobs in a single
@@ -138,6 +146,16 @@ shell (those all die if that one shell's session ends) — `tmux ls` lists every
 node, `tmux capture-pane -t <session> -p -S -N` peeks at any one without attaching (swap
 `<session>` per run), `-t muaz@<ip> "tmux attach -t <session>"` (note the `-t` before the ssh
 target, for a real pty) attaches interactively.
+
+**`qcute.bytelm_tpu`'s `zero_kv_sink` (default on) and `--use_flash_attention` don't mix well**:
+a correctness fix exists (pad Q by one dummy row + pick `context=1024*k-1`) but even the correct
+version costs ~25x steady-state throughput (10s/it vs. 0.4s/it) — confirmed not a `torch.compile`
+or tensor-allocation artifact, and a from-scratch JAX reimplementation
+(`qcute/bytelm_jax.py`) didn't rescue it either (a properly controlled sink-on/off test in JAX
+showed the sink made no measurable difference there, ~0.33-0.35 it/s regardless — JAX's own
+floor has an unidentified separate cause). Use `--no_zero_kv_sink` whenever
+`--use_flash_attention` is on. Full investigation: docs/bytelm_tpu_setup.md's "zero_kv_sink +
+flash-attention: investigation" section.
 
 ## Architecture
 

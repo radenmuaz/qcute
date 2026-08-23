@@ -74,3 +74,18 @@ ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute
 - `pgrep -f`/`pkill -f` run over ssh will self-match the ssh command's own argument string if
   the pattern is a substring of the command you're running it from — use `ps aux | grep -i
   <name>` to eyeball real PIDs first when in doubt.
+- **A `gcloud compute tpus queued-resources ssh ... --command="echo ok"` reconnect call (used to
+  fix a stale/dropped ControlMaster before re-establishing direct ssh) may kill a lingering `tmux`
+  session and everything running inside it, with no error and no trace in the training process's
+  own log** — observed directly (2026-08-23): a multi-hour training run in a `tmux` session
+  stopped mid-step with no traceback, and by the next check-in the `tmux` server itself was gone
+  (`tmux ls` → "no server running"), `ps aux` showed no trace of the training process, `uptime`
+  showed no VM reboot — this happened shortly after a `gcloud ... ssh --command="echo ok"`
+  reconnect call (its "preparing node" step re-preps the instance, which appears able to reset the
+  user session tmux is attached to). Root cause not fully confirmed, but the correlation was
+  clean and reproduced the pattern described as "risky" for a `tmux`-hosted long-running job.
+  **Mitigation**: prefer reconnecting via the plain SSH commands in this doc (steps 2/3 above)
+  over re-running `gcloud ... ssh --command=...` on a node with a long-running `tmux` session, if
+  at all avoidable; if a `gcloud ... ssh` call is unavoidable for reconnect, check the `tmux`
+  session's actual liveness (`tmux ls`, `ps aux | grep python3`) right after, don't assume it
+  survived just because the reconnect itself succeeded.

@@ -17,6 +17,15 @@ Sizing, from live probes on this node (2026-08-23):
     --steps once real throughput at this exact config/step is confirmed early in the run (watch
     actual elapsed-time/it-rate, don't trust this estimate blindly -- see CLAUDE.md).
 
+This run (lr_peak=3e-4) showed clear overfitting and was separately killed by an unrelated infra
+issue before a stop-for-overfitting decision was made (tmux server died mid-run at step ~51000,
+no traceback in qcute's own log -- see docs/tpu_direct_ssh.md). val_bpb bottomed at step 18000
+(1.220, preserved at ~/qcute/checkpoints/bytelm_tpu_v6e1_d512_16L_saturate/best.pt on the node)
+then rose for 3 consecutive evals (27000: 1.232, 36000: 1.275, 45000: 1.348, worse than the very
+first eval). Retuned with a lower lr_peak in bytelm_tpu_v6e1_d512_16L_lr1e4.py (distinct
+run_name, doesn't touch this run's checkpoint) -- that's the config to use going forward, this
+one is kept only as the as-run historical record.
+
     TPU_VISIBLE_CHIPS=0 uv run python -m qcute.bytelm_tpu --config configs/bytelm_tpu/bytelm_tpu_v6e1_d512_16L_saturate.py --device xla --no_zero_kv_sink
 
     # plot after/during training:

@@ -930,3 +930,272 @@ it fires, vs. `encoder_ste_p`'s cheaper decode_level-only second pass.
 Configs queued: `ks21_v16_pq4_overfit10k_kvlm_fresh_notoplevel_byteconsistency1.py` (p=1.0),
 `_byteconsistency05.py` (p=0.5), same `notoplevel`/`v16pq4`/`kv_lm_fresh` base as the
 `encoder_ste_p` comparison table above -- results pending.
+
+## 2026-08-23: code one level above the top hard-excluded from decode conditioning (structural)
+
+**Naming note (added retroactively, see this date's later "naming fix" entry): this section
+originally said "the topmost level's own code" throughout, which is backwards** -- the code
+excluded here is `c_list[n_levels-1]`, which under the corrected convention (a code is named by
+the level that owns it as input, not the level that produced it) is "level n_levels's code": the
+domain one level ABOVE the real topmost level, that nothing actually owns as input since no
+`encoders[n_levels]` exists. Left the numbers/results below as originally written; only the
+level-naming language is corrected here.
+
+The `notoplevel` curriculum experiments above (`curriculum_max_srcs=(1,None)` for `ks21`,
+`(2,1,None)` for `ks221`, held active the whole run) confirmed both hierarchies still overfit
+cleanly, and `ks221` generated measurably better, with that one-above-the-top code excluded from
+every level's cross-attention conditioning -- motivated by nothing being above the real top to
+forecast/validate that code, so conditioning on it trains against a signal free-rollout
+generation can't reliably reproduce.
+
+Made this permanent and structural in `StackDecoder.__init__` (`qcute_v1_decoder.py`) rather than
+an opt-in curriculum knob: `n_upper` now caps at `n_levels-2-i` (was `n_levels-1-i`), so the
+cross-attn-stage LM and kv_lm for that one-above-the-top code are never even allocated -- genuinely
+fewer params (`ks221`: 10.482M -> 6.988M), not just an unused capacity. `decode_level`'s
+`j_max` capped the same way to match. Renamed `curriculum_max_srcs`/`curriculum_step` ->
+`active_srcs_mode`/`active_srcs_until_step` (clearer name now that "exclude the topmost level" is
+no longer this flag's job -- it remains for other phased-conditioning ablations). Backup of the
+pre-change decoder at `qcute_v1_decoder.py.bak_notoplevel_20260823`.
+
+**Bug caught while wiring this up**: `qcute_v1.py`'s `_run` unconditionally stored
+`decode_derived_c[i] = result["code"]` whenever `max_srcs_i is None`, even when `result["code"]`
+was `None` -- which now happens for the second-to-top level (it has zero upper tracks left, so
+`decode_level`'s `code_final` never gets set). The `None` then got picked up by the level below
+instead of falling back to the real ground-truth code (`c_list[j]`), crashing with `TypeError:
+linear(): argument 'input' ... NoneType`. Fixed both write sites (main pass + `encoder_ste_p`'s
+second pass) to only store the key when `result["code"] is not None`.
+
+Requeued the full `ks221` `encoder_ste_p`/`encoder_ste_skip_real` ablation under the new
+hardcoded-exclusion decoder (`_hardexcl` run names) to confirm no regression -- all four completed
+without crashing, numbers track the pre-change curriculum-based runs closely (small run-to-run
+noise, different code path but same effective masking):
+
+| config | exact matches (train) | final train byte_acc |
+|---|---|---|
+| base (`encoder_ste_p=0`) | 10/50 (~20%) | 99.80% |
+| `encoder_ste_p=0.1` | 21/53 (~40%) | 99.31% |
+| `encoder_ste_p=1.0` | 31/51 (~61%) | 98.84% |
+| `encoder_ste_p=0.5`, `encoder_ste_skip_real=True` | 18/50 (~36%) | 98.60% |
+
+Same monotonic trend as before: more `encoder_ste_p` -> more exact-match generations, small
+byte_acc cost. `skip_real=True` at p=0.5 lands between the two additive endpoints, consistent with
+it being a fuller substitution than a mild additive nudge but less aggressive than full p=1.0
+additive.
+
+## 2026-08-23: StackDecoderLocal (fully parallel block-local decode) -- architecture question, then a real generation bug
+
+Question raised (chat): given the topmost-level exclusion above, is a FULLY parallel decode
+possible -- mask each block's same-level decode so it never sees any OTHER block's bytes at all
+(cross-attend only to its own code, plus optionally a small window of neighboring codes from the
+level above), so all blocks decode in one parallel batched call instead of sequentially? And does
+teacher-forced bpb/loss stay a valid bound under that structure?
+
+Confirmed this already exists (`StackDecoderLocal`, `--decoder_type stack_local`,
+`block_local_track0_decode`) and generalizes to both level0 and level1 in `ks221` (only `_track0`
+is overridden; `decode_level`'s n_levels handling is untouched, and since the code one level above
+the top is now hard-excluded, level1 -- itself the level right below the real top -- already has
+zero upper tracks regardless of decoder type). On validity: yes,
+still a proper (Gibbs-inequality) bound on the per-byte conditional entropy -- BUT the codebase's
+own `bpb`/`bpb_full` metrics only cover `decode_losses[0]` (level0's own reconstruction), never
+`encode_losses[1:]` (the code streams' own transmission cost) -- a pre-existing gap that applies
+equally to the sequential `StackDecoder`, not introduced by parallelism.
+
+Queued three `ks221` `stack_local` configs (`v16pq4`, `kvlm_fresh`, topmost hard-excluded by
+default): window=1 (own block's level1 code only), window=2 (own + 1 neighbor), window=2 +
+`encoder_ste_p=0.1`. All three trained fine, no crashes, ~99.5% teacher-forced train byte_acc --
+but **all three generated pure repetitive garbage** (`0/52`, `0/54`, `0/48` exact matches; qual
+samples like `"srsr    irtrssisssssssssesereeeeeeeeeeeeeeeee"`, `"[[[[[[llii[[[annttiitiniuu"`),
+despite byte_acc comparable to or better than the sequential decoder's runs. High teacher-forced
+accuracy gave zero warning -- only checking real free-rollout samples caught this (the same
+`bpb`/`byte_acc`-isn't-the-whole-story caveat from the validity discussion above, now with a
+concrete instance).
+
+**Root cause (confirmed by code inspection, not just capacity/multi-modality speculation)**:
+`_stack_generate_blockwise` -- the method every generation path (`generate_no_cache`,
+`generate_kv_cache`, and therefore every qual sample) actually calls -- hardcodes
+`encode_like_self_attn_decode`/`seed_query_decode` (the sequential mechanism) for track0's
+byte-by-byte generation, completely bypassing the `_track0` override point. `StackDecoderLocal`
+only overrides `_track0`, which is used by `decode_level` (training) -- generation therefore ran
+under a decode mechanism the model was never trained with. `block_local_track0_decode`'s own
+docstring proves the seed token's same-block self-attention contribution is provably always
+exactly zero during training (block-diagonal, causal, can't see anything before its own block's
+start) -- but generation fed the seed real cross-block self-attention K/V from every prior block,
+signal the model never learned to produce or consume. A genuine train/inference mismatch, not a
+fundamental non-autoregressive-decode limitation.
+
+**Fix**: added `StackDecoderLocal._stack_generate_blockwise`, an override that computes every new
+block's track0 hidden state via `block_local_track0_decode` called with `n_blocks=1` on just that
+one block's own bytes -- identical computation to training, zero cross-block visibility, matching
+`_track0` exactly. Everything else (code sourcing via level1's own NTP, upper-track chaining) is
+unchanged from the base class. Smoke-tested (30 steps, no crash, correct dispatch confirmed via
+Python's dynamic `self._stack_generate_blockwise` resolution in `generate_no_cache`/
+`generate_kv_cache`) -- too few steps to judge generation quality yet. Requeued all three configs
+under `_genfix` run names for a full comparison against the `0/52`/`0/54`/`0/48` broken baseline.
+
+**Result: fix confirmed working.** Exact matches went `0/52,0/54,0/48` -> `1/48,2/47,1/41`
+(w1/w2/w2_ste01, all clean single-invocation logs), and more importantly the qual samples
+themselves flipped from pure repetitive garbage to genuinely coherent English -- e.g.
+`b"ers'' are unnecessary and lishZe fKre]erd thene they believent o"` and one exact-length
+reconstruction (`b'8029</id>\n      </contributor>\n      <minor />\n      <comment>ad'`), vs. the
+pre-fix `b"srsr    irtrssisssssssssesereeeeeeeeeeeeeeeee"`. Still well below the sequential
+`StackDecoder`'s 20-60% exact-match range on the same `ks221` setup -- but that gap now looks like
+a real capacity difference (block-local decode genuinely has strictly less cross-block information
+available by design, per the validity discussion above) rather than a bug: partial matches now
+degrade gracefully into plausible-looking word fragments instead of collapsing to repeated
+characters. `encoder_ste_p=0.1` (w2_ste01) didn't clearly help here (1/41, similar to w1's 1/48) --
+suspect the sequential decoder's `encoder_ste_p` win doesn't transfer cleanly to the parallel case,
+but this is a single run each, not an isolated ablation.
+
+## 2026-08-23: naming fix -- a code belongs to the level that owns it as input, not the level that produced it
+
+Chat caught a real, systemic naming bug across this file, `CLAUDE.md`, `qcute_v1_decoder.py`'s
+docstrings, and the architecture artifact: `c_list[N]` (the code array at codebase index N,
+produced by `encoders[N]`) was being called "level N's own code" throughout. It should be "level
+(N+1)'s code" -- provable directly from `Encoder.forward`'s own docstring ("seq_repr -- level0's
+own bytes, or level j's own INPUT (= level (j-1)'s code stream) for j>0"): the encoder's own words
+say `c_list[j-1]` IS level j's own input, i.e. a code is owned by whoever treats it as their input
+domain, not by whoever emitted it. Concretely: level i's decoder never conditions on anything of
+its own beyond what it's reconstructing (bytes for i=0) -- every code it cross-attends to,
+including what this codebase's variable/function names call "track0"/"own code" (e.g.
+`own_block_cross_attn_decode`), is really level (i+1)'s code. That function's "own" is a different,
+still-correct concept (this SAME BLOCK's code, temporal/spatial locality within the stream) --
+only the LEVEL-ownership claims were wrong, not every "own" in the codebase.
+
+Consequence for the earlier `ks21`/`ks221` cross-attn-track counts discussed in chat: previously
+stated as "ks21: level0 has 0 upper tracks (own code only), ks221: level0 has 1 upper track
+(level1's own code)" -- both undercounted by one and mislabeled the remaining track. Corrected:
+`ks21`'s level0 decoder cross-attends to exactly 1 code (level 1's code, via the always-present
+track0 mechanism -- never removed by the 2026-08-23 hard-exclusion, which drops a *second*,
+now-nonexistent track to level 2's code). `ks221`'s level0 decoder cross-attends to exactly 2
+codes (level 1's and level 2's), with a third track to level 3's code excluded. General rule: level
+0's decoder always has exactly as many tracks as there are real levels above it, with one further
+track (to the code nothing owns as input) permanently excluded -- matches this date's earlier
+"hard-excluded" entry above (now corrected to use this same language) and its `n_upper =
+max(0, n_levels-2-i)` formula exactly.
+
+Fixed: `StackDecoder`'s class docstring (`qcute_v1_decoder.py`, `cond_depth`/hard-exclusion
+paragraphs rewritten with correct level-ownership language, plus a permanent naming note at the
+top of the docstring), this file's two 2026-08-23 entries above, and the published architecture
+artifact (`qcute_architecture.html` -- relabeled every `c` superscript, "own code" ->
+"level N's code" throughout, corrected exclusion counts in both `ks21`/`ks221` figures and the
+footer). Not touched: the ~40 other "own code"/"own-code" occurrences in `qcute_v1_decoder.py` and
+`CLAUDE.md` that refer to block-locality (a level's own self-extraction, or "this same block's
+code") -- those are a different, correct usage, verified case-by-case before leaving them alone.
+
+## 2026-08-23: track0 window decoupled (self_window, cross_window); found a pre-existing unit mismatch
+
+Chat wanted `ks41` (Ks=(4,1)) with level0's cross-attention into level 1's code capped to a
+genuine FIFO window of 4 codes -- but `decode_windows[i][0]` was a SHARED knob (per StackDecoder's
+docstring): the same raw number gated both track0's own byte self-attention window AND its
+cross-attention window into level (i+1)'s code, no way to set them independently.
+
+Implemented: `decode_windows[i][0]` now accepts either a scalar/None (unchanged, backward
+compatible, broadcasts to both) or a `(self_window, cross_window)` 2-tuple (`qcute_v1.py`'s
+`_norm_track0`). Threaded through every call site that used to write `track0_window, track0_window`
+via a new `split_track0_window` helper (`qcute_v1_decoder.py`) -- `_track0` (training),
+`_stack_generate_blockwise` (generation), and both diagnostic functions that build the same
+context (`check_blockwise_gen_consistency`, `_decode_gt_context`) -- specifically so training and
+generation windowing can't silently diverge, the same class of bug as the `StackDecoderLocal`
+generation mismatch found earlier today.
+
+**Pre-existing bug caught while smoke-testing (unrelated to the tuple feature)**: `ks21`-shaped
+(n_levels==2) configs now crash in `check_blockwise_gen_consistency`/`_decode_gt_context` --
+`self.stage_lms[0][1]` (bb1, the second stage) no longer exists once level0 has zero upper tracks
+(the 2026-08-23 hard-exclusion). Both diagnostics assumed a bare 2-level model always has an upper
+track, true before the hard-exclusion, false after. Fixed: both now skip gracefully
+(`len(self.stage_lms[0]) < 2`) instead of crashing -- `check_roundtrip_consistency` was already
+safe (never touches `stage_lms[0][1]` directly).
+
+**Pre-existing SEMANTIC mismatch caught while regression-testing the print fix (predates today,
+not introduced by the tuple feature)**: track0's cross-attention window
+(`encode_like_self_attn_decode`'s `block_lag < win` mask) compares the raw `decode_windows[i][0]`
+value directly against a CODE-COUNT (`block_lag`, a block-index difference) -- unlike every upper
+track (`cross_attn_stage`), which compares against a raw BYTE-position difference, requiring
+`n_codes = window // cum_K`. The old diagnostic print applied the byte-position formula
+uniformly to every track, including track0 -- silently UNDERSTATING track0's real code-visibility
+by a factor of `cum_K` for every "windowN" config ever run (e.g. `ks221`'s
+`window16_relaxed`-family configs: printed "16codes" for level0's track0, actually 32 -- the
+trained models' real behavior was never wrong, only the accounting/mental-model was). Fixed the
+print (`qcute_v1.py`) to use the raw value directly for track0's cross-window component. Not
+re-audited: whether any config's WINDOW VALUE was originally hand-picked based on the wrong
+(understated) code-count -- out of scope for today, flagging for whoever revisits window sizing.
+
+Built `ks41_v16pq4_overfit10k_level1_window4.py` (Ks=(4,1), current-standard `v16pq4`, `decode
+attn_window[0] = (self_window=-1, cross_window=4)` -- level0's own byte self-attention stays
+unbounded, level1's code visibility capped to the most recent 4 codes, FIFO). Smoke-tested clean
+(`decode effective codes level0: K=4:4codes`, confirming the fix); queued for a full run.
+
+## 2026-08-23: maximal encoder/decoder weight reuse -- decode_scope, kv_lm_mode/decoder_own_stage_mode defaults flipped, track0_kv_lm added, byte_head decoupled
+
+Chat pushed the "how much of the decoder is genuinely new vs reused from the encoder" question to
+its conclusion, in stages:
+
+**`decode_scope`** (new `Config` field, default `"level0_only"`, alt `"pervasive"`): only level0's
+`decode_level` runs by default -- nothing downstream ever consumes level i>0's own reconstruction,
+since level0's upper-track cross-attention already conditions on `c_list[j]` (the ENCODER's
+output) directly, available regardless of whether level j's own decode runs (the
+`decode_derived_c` fallback already handled this). `pervasive` restores the original behavior
+(every level's own decode runs, useful as its own diagnostic/training signal). Gated in
+`qcute_v1.py`'s `_run` via a shared `decode_levels` range reused by both the main decode pass and
+the `encoder_ste_p` second pass.
+
+**`kv_lm_mode`/`decoder_own_stage_mode` defaults flipped to `"shared"`** (were `"identity"` and
+`share_encode_decode_self=False`/"copy"): reasoning -- level i's cross-attn stage already has its
+own dedicated submodule to consume a code, so kv_lm's/track0's job is just producing a good
+*representation*, which the encoder that already models that exact sequence is the natural source
+for, rather than training a redundant independent LM. `kv_lm_mode`'s third mode renamed
+`"fresh"` -> `"copy"` (same behavior, all 19 existing configs setting it updated). Verified via
+direct parameter inspection (not just docstring claims): with both new defaults, the *only*
+decoder-namespace parameters not tied to an encoder are `stage_lms[i][1:]` (the `cross_attn_stage`
+LMs for genuine upper tracks) -- for `ks21` specifically, that's **zero** parameters (level0's
+decoder is entirely the encoder, reused).
+
+**Bug found and fixed**: `make_kv_lm`'s `"shared"` mode reused `encoders[j].lm` to contextualize
+`c_list[j]` -- but under the corrected naming (see the earlier 2026-08-23 naming-fix entry),
+`c_list[j]` is "level `(j+1)`'s" code, owned by `encoders[j+1]` (which self-attends over it as its
+own input), not `encoders[j]` (which self-attends over `c_list[j-1]`, a different sequence
+entirely). A direct inheritance of the same pre-fix naming confusion, just embedded in indexing
+logic this time instead of prose -- never caught by the earlier naming-fix pass since that pass
+only touched docstrings/diagrams. Fixed: `encoders[j+1].lm`.
+
+**Gap found and fixed**: track0's cross-attention target (`c_list[i]`, level `(i+1)`'s code) never
+went through any kv_lm at all, regardless of `kv_lm_mode` -- only upper tracks (`stage_lms[i][1:]`)
+got the optional causally-contextualized K/V; track0's code embedding went straight from
+`quant.embed_for_decode` into cross-attention. Added `StackDecoder.track0_kv_lms` (one per non-top
+level, same three modes, sharing `make_kv_lm`'s now-fixed encoder-choice logic) and wired it into
+every place that computes track0's `code_embeds0` -- `decode_level` (training), the base
+`_stack_generate_blockwise`, `check_blockwise_gen_consistency`, `_decode_gt_context`, and
+`StackDecoderLocal`'s `_stack_generate_blockwise` override -- specifically so training and
+generation can't silently diverge on this, the same class of bug as the earlier `StackDecoderLocal`
+generation mismatch.
+
+**A second, deeper gap found while verifying the above**: even with both `shared` defaults, the
+output head used for decode's code-conditioned prediction (`ntp_loss_acc`'s `is_byte_level`
+branch) was hardcoded as `F.linear(h, self.embed.weight)` -- so when `decoder_own_stage_mode=
+"shared"` ties track0's whole backbone to the encoder, this ALSO ties the encoder's unconditional
+byte-NTP head and decode's code-conditioned reconstruction head to the exact same tensor, even
+though cross-attention+MLP had already transformed the hidden state into something semantically
+different from the unconditional case -- no parameter existed that was specific to "predict a
+byte given this code-informed hidden state." Fixed by mirroring the *already-existing* pattern for
+the CODE-level head (`cfg.ntp_head_tied`/`self.code_predict`, untouched) with a new, analogous
+byte-level one: `cfg.byte_head_tied: bool = False` (default untied) and `LM.byte_head`, a genuine
+independent `nn.Linear(D, V, bias=False)` used via a new `LM.byte_output_weight` property (`self.
+embed.weight` if tied, else `self.byte_head.weight`) -- the single source of truth every byte-
+output call site (loss, generation sampling, the `embed_weight`/`embed_weight_final` dict fields)
+now reads from, replacing ~19 hardcoded `.embed.weight` call sites across `qcute_v1.py`/
+`qcute_v1_decoder.py`. Verified precisely (not assumed) that `cross_attn_stage`'s own LM never
+calls `.embed_input`/`.embed(...)` at all -- its `embed` submodule was already vestigial as an
+*input* embedding for that role, only ever touched via the old hardcoded output-tying; `byte_head`
+gives it (and track0) a real, dedicated output parameter regardless. Since `byte_head` lives on the
+shared `LM` class, this applies uniformly to every LM instance (every encoder, every decode stage)
+with no special-casing per role.
+
+**Allowed but warned**: combining `byte_head_tied=True` with `decoder_own_stage_mode="shared"` or
+`kv_lm_mode="shared"` collapses track0's conditional and unconditional heads back into one tensor
+(the exact gap just fixed) -- `StackDecoder.__init__` now prints a warning recommending
+`byte_head_tied=False` in that case, without blocking it.
+
+All changes smoke-tested clean (`ks21` `decode_scope=level0_only` default, `ks221`
+`decode_scope=pervasive`, `byte_head_tied` on and off, the warning firing correctly) -- no crashes,
+param counts move in the expected direction each time (independent heads/kv_lms add params, shared
+ones remove them).

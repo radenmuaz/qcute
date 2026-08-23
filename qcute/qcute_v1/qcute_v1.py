@@ -38,6 +38,24 @@ class QCuteLM(nn.Module):
         assert seq_lens[-1] % cfg.Ks[-1] == 0
         self.seq_lens = seq_lens
 
+        def _norm_w(x):
+            return None if x == -1 else x
+
+        def _norm_track0(x0):
+            # track0's window is a SHARED knob by default (same value gates both its own byte/
+            # code self-attention AND its cross-attention into level (i+1)'s code, see
+            # StackDecoder's docstring) -- but a (self_window, cross_window) 2-tuple here lets a
+            # config decouple them (2026-08-23, chat: "impl so that give nested tuple, each level
+            # decoder can fine grained how much window from level 0 to last"). Threaded through as
+            # a 2-tuple end to end (decode_windows[i][0], _track0/encode_like_self_attn_decode's
+            # self_window/own_code_window params, _stack_generate_blockwise's matching call) so
+            # training and generation windowing never diverge -- see chat 2026-08-23's earlier
+            # StackDecoderLocal generation-mismatch bug for why that divergence matters.
+            if isinstance(x0, (tuple, list)):
+                assert len(x0) == 2, f"track0 window must be a scalar or (self_window, cross_window), got {x0!r}"
+                return (_norm_w(x0[0]), _norm_w(x0[1]))
+            return _norm_w(x0)
+
         raw_windows = cfg.attn_window if isinstance(cfg.attn_window, (tuple, list)) else (cfg.attn_window,) * self.n_levels
         assert len(raw_windows) == self.n_levels
         windows: list = []
@@ -48,29 +66,15 @@ class QCuteLM(nn.Module):
                 ew, dw = w
             else:
                 ew = dw = w
-            windows += [None if ew == -1 else ew]
+            windows += [_norm_w(ew)]
             if isinstance(dw, (tuple, list)):
                 assert len(dw) == n_sources
-                decode_windows += [[None if x == -1 else x for x in dw]]
+                decode_windows += [[_norm_track0(dw[0])] + [_norm_w(x) for x in dw[1:]]]
             else:
-                decode_windows += [[None if dw == -1 else dw] * n_sources]
+                decode_windows += [[_norm_track0(dw)] + [_norm_w(dw)] * (n_sources - 1)]
         self.windows = windows
         self.decode_windows = decode_windows
 
-        for i, dwlist in enumerate(decode_windows):
-            cum_K, per_track, invisible_srcs = 1, [], []
-            for src_offset, dwindow in enumerate(dwlist):
-                cum_K *= cfg.Ks[i + src_offset]
-                if dwindow is None:
-                    per_track += [f"K={cum_K}:full"]
-                else:
-                    n_codes = dwindow // cum_K
-                    per_track += [f"K={cum_K}:{n_codes}codes"]
-                    if dwindow != 0 and n_codes == 0:
-                        invisible_srcs += [cum_K]
-            print(f"decode effective codes level{i}: " + ", ".join(per_track))
-            if invisible_srcs:
-                print(f"WARNING: level{i} decode_window too small for cumulative K in {invisible_srcs}")
         for i, (L, window) in enumerate(zip(seq_lens, windows)):
             if window is not None:
                 assert L % window == 0 or L <= window
@@ -78,6 +82,43 @@ class QCuteLM(nn.Module):
         self.encoders = nn.ModuleList([Encoder(cfg, self.d_models[i], self.n_layers_list[i], self.vocabs[i])
                                         for i in range(self.n_levels)])
         self.decoder = make_decoder(cfg, self.n_levels, self.encoders, self.d_models, self.n_layers_list, self.vocabs)
+
+        # Printed AFTER decoder construction (2026-08-23 fix): decode_windows' own n_sources
+        # (n_levels-i) is a nominal upper bound, computed before StackDecoder-family decoders'
+        # own hard-exclusion of the topmost level's code from conditioning -- printing straight
+        # from decode_windows silently overstated real track counts (e.g. ks21 showed 2 tracks,
+        # own+level1, when level0 actually has zero upper tracks; ks221 showed 3, own+level1+
+        # level2, when level0 actually has 2). Truncate to len(self.decoder.stage_lms[i]) --
+        # own-code stage + real upper tracks -- when the decoder exposes that per-level structure
+        # (StackDecoder family); other decoder types (e.g. concat) keep the nominal count as-is.
+        for i, dwlist in enumerate(decode_windows):
+            stage_lms = getattr(self.decoder, "stage_lms", None)
+            if stage_lms is not None and i < len(stage_lms) and hasattr(stage_lms[i], "__len__"):
+                n_real = len(stage_lms[i])  # own-code stage + real upper tracks
+                dwlist = dwlist[:n_real]
+            cum_K, per_track, invisible_srcs = 1, [], []
+            for src_offset, dwindow in enumerate(dwlist):
+                cum_K *= cfg.Ks[i + src_offset]
+                self_w = None
+                is_track0 = src_offset == 0
+                if is_track0 and isinstance(dwindow, tuple):
+                    self_w, dwindow = dwindow  # track0: (self_window, cross_window)
+                if dwindow is None:
+                    tag = "full"
+                else:
+                    # track0's cross_window is already a code-count (compared against block_lag in
+                    # encode_like_self_attn_decode) -- unlike every other track, which is measured
+                    # in raw byte-position units (window // cum_K), see split_track0_window.
+                    n_codes = dwindow if is_track0 else dwindow // cum_K
+                    tag = f"{n_codes}codes"
+                    if dwindow != 0 and n_codes == 0:
+                        invisible_srcs += [cum_K]
+                if self_w is not None:
+                    tag += f" (self_window={self_w})"
+                per_track += [f"K={cum_K}:{tag}"]
+            print(f"decode effective codes level{i}: " + ", ".join(per_track))
+            if invisible_srcs:
+                print(f"WARNING: level{i} decode_window too small for cumulative K in {invisible_srcs}")
 
         # Uncertainty weighting (Kendall/Gal/Cipolla 2018): one learnable log-variance per NTP task,
         # replacing byte_ntp_weight/code_ntp_weight/decode_ntp_weight's fixed scalars when enabled.
@@ -154,7 +195,8 @@ class QCuteLM(nn.Module):
         embed_weights: list = [None] * self.n_levels
         decode_stage_extra_losses: list = []
 
-        for i in reversed(range(self.n_levels)):
+        decode_levels = range(1) if cfg.decode_scope == "level0_only" else range(self.n_levels)
+        for i in reversed(decode_levels):
             max_srcs_i = max_srcs[i] if isinstance(max_srcs, (list, tuple)) else max_srcs
             result = self.decoder.decode_level(self, i, x_list, main_c_list, decode_derived_c,
                                                 compute_ntp, max_srcs_i, want_next_query)
@@ -173,7 +215,7 @@ class QCuteLM(nn.Module):
         encoder_ste_losses: list = []
         if run_ste and not skip_real:
             decode_derived_c_ste: dict = {}
-            for i in reversed(range(self.n_levels)):
+            for i in reversed(decode_levels):
                 max_srcs_i = max_srcs[i] if isinstance(max_srcs, (list, tuple)) else max_srcs
                 result = self.decoder.decode_level(self, i, x_list, c_list_ste,
                                                     decode_derived_c_ste, compute_ntp,
@@ -213,7 +255,7 @@ class QCuteLM(nn.Module):
             D0 = h0_encode.shape[-1]
             h0_partial = h0_encode[:, :K0 - 1, :].reshape(-1, D0)
             tgt0_partial = byte_ids[:, 1:K0].reshape(-1)
-            logits0 = F.linear(h0_partial, self.encoders[0].embed.weight)
+            logits0 = F.linear(h0_partial, self.encoders[0].byte_output_weight)
             enc_partial_loss = F.cross_entropy(logits0, tgt0_partial)
             n_enc, n_dec = K0 - 1, byte_ids.shape[1] - K0
             byte_loss_full = (enc_partial_loss * n_enc + decode_losses[0] * n_dec) / (n_enc + n_dec)
@@ -274,7 +316,7 @@ class QCuteLM(nn.Module):
         if (not _skip_byte_consistency and torch.is_grad_enabled() and cfg.byte_consistency_p > 0
                 and torch.rand(()).item() < cfg.byte_consistency_p):
             embed0 = (result["embed_weights"][0] if result["embed_weights"][0] is not None
-                      else self.encoders[0].embed.weight)
+                      else self.encoders[0].byte_output_weight)
             logits0 = F.linear(result["h_list"][0], embed0)
             predicted_bytes = logits0.argmax(-1).detach()
             byte_consistency_total, _ = self.forward(predicted_bytes, max_srcs=max_srcs,

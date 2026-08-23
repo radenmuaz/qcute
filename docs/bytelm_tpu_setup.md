@@ -266,27 +266,33 @@ version bump, don't assume it still works.
 
 ## Optional: multiple TPU chips on one host
 
-A multi-chip TPU slice (e.g. `v4-8` = 4 chips) exposes more than one device on a single VM, but
+A multi-chip TPU slice (e.g. `v4-8` = 4 chips) exposes more than one device on a single VM.
+
 **`qcute.bytelm_tpu --multichip` (true collective data-parallel training via `torch_xla.launch`)
-hangs on this session's nightly-build + `v4-8` combination** — all worker processes spin up then
-go idle (CPU time stops climbing) with no further progress, consistent with a stuck PJRT
-multi-process rendezvous. Not resolved; treat `--multichip` as unverified/broken until someone
-debugs the rendezvous further.
+WORKS on the stable `torch==2.9.0`/`torch_xla==2.9.0` pin** — confirmed directly on a fresh `v4-8`
+node (2026-08-23, `tiny` preset, `--no_torch_compile`, `--no_flash_attention`): `ps aux` during the
+run showed 4 real `multiprocessing.spawn_main` worker processes, each with steadily climbing CPU
+time (not the stuck-at-launch symptom below), a 2000-step run completed cleanly (`TRAIN_EXIT=0`,
+val_bpb converged 7.7→2.46), and the log correctly reported `world_size=4 global_batch=64` (after
+fixing a real bug found along the way: `world_size` was computed via
+`xr.addressable_runtime_device_count()`, which returns the *calling process's own* local device
+count — 1, inside an already-spawned worker — not the total across all processes; fixed to
+`xr.world_size()`, the actual global replica count). **Previously reported as "confirmed broken"
+below — that finding was specific to the nightly `torch_xla==2.10.0.dev0` build, not a bug in this
+project's multichip wiring**, exactly as the static-review hypothesis from 2026-08-22 predicted.
+`--use_flash_attention` + `--multichip` together (on nightly, the only build where flash-attention
+works) is still untested — do that next if both are wanted simultaneously.
 
-**Static code review (2026-08-22, no live TPU test yet — see below for why)**: the training loop
-itself looks correct for collective use — every rank reaches `optimizer_step`'s all-reduce in
-lockstep every step (the `if not is_master: continue` guard sits *after* `optimizer_step`, so it
-only skips file I/O/eval/logging, never the collective itself), and no other collective
-(`rendezvous`/`all_reduce`/`all_gather`/`broadcast`) appears anywhere in the file. This points away
-from our own code and toward the PJRT client bootstrap itself (before any Python-level collective
-runs) — plausibly specific to the **nightly** `torch_xla==2.10.0.dev0` build (only installed for
-`--use_flash_attention`'s Pallas kernel requirement, see above), not the stable `2.9.0` pin.
-**Next thing to actually try, once a chip is free**: run `--multichip` (without
-`--use_flash_attention`) on the **stable** `torch==2.9.0`/`torch_xla==2.9.0` install instead of the
-nightly one — isolates whether the hang is a nightly-build-specific PJRT bug or a real bug in this
-project's multichip wiring. Untested hypothesis, not yet confirmed either way.
+**Nightly-build-specific hang** (`torch_xla==2.10.0.dev0`, needed only for
+`--use_flash_attention`, see above) — kept for reference in case the nightly build is used again:
+all worker processes spin up then go idle (CPU time stops climbing) with no further progress,
+consistent with a stuck PJRT multi-process rendezvous specific to that build. Static code review
+(2026-08-22) found nothing wrong in this project's own collective usage (every rank reaches
+`optimizer_step`'s all-reduce in lockstep every step, no other collective appears anywhere in the
+file) — consistent with the now-confirmed conclusion that the bug lives in the nightly PJRT
+client bootstrap itself, not in `qcute.bytelm_tpu`.
 
-**What does work**: independent single-chip processes via `TPU_VISIBLE_CHIPS`, confirmed directly
+**What else works**: independent single-chip processes via `TPU_VISIBLE_CHIPS`, confirmed directly
 — two concurrent single-device processes with `TPU_VISIBLE_CHIPS=0` and `TPU_VISIBLE_CHIPS=1` both
 ran and computed correctly with no conflict, no collectives, no rendezvous needed. This is
 embarrassingly-parallel, not larger-batch data-parallel: each process is a fully independent
@@ -349,12 +355,88 @@ at a larger model scale.
 - **Pareto point: N≈250-300M params, context≈4096-8192, ~180-200 epochs.**
 
 **Critical caveat**: this budget assumes all 8 chips combine into one data-parallel run via
-`--multichip`, which is currently broken (see below) — only independent single-chip runs are
-verified working. On one chip alone the same math gives `~4.1e18 FLOPs` → `N*D<=6.9e17`, roughly
-4-5x short of the anchor above; realistic single-chip outcome in 12h is closer to `N≈60-90M`,
-landing bpb ~1.1-1.2, not confidently 1.0. Fixing `--multichip` (or working around it, e.g.
-manual gradient averaging across independent per-chip runs) is the real gate on hitting 1.0 bpb
-in-budget, not step count or context length alone.
+`--multichip`. Update 2026-08-23: `--multichip` is now **confirmed working** on the stable
+`torch==2.9.0`/`torch_xla==2.9.0` pin (see "Optional: multiple TPU chips on one host" below) — the
+8-chip budget above is achievable in principle, not blocked on a broken collective anymore. On one
+chip alone the same math gives `~4.1e18 FLOPs` → `N*D<=6.9e17`, roughly 4-5x short of the anchor
+above; realistic single-chip outcome in 12h is closer to `N≈60-90M`, landing bpb ~1.1-1.2, not
+confidently 1.0. Still untested: `--multichip` + `--use_flash_attention` together (nightly-only,
+needed for the flash-attention memory savings this doc's zero_kv_sink section below relies on).
+
+## zero_kv_sink + flash-attention: investigation (2026-08-23)
+
+`qcute.bytelm_tpu`'s `zero_kv_sink` (default on) prepends one all-zero, always-attendable K/V
+token before every real token, freshly re-concatenated at **every attention layer, every step**
+(a static, non-learned attention sink, not a learnable BOS token). Combining it with
+`--use_flash_attention` turned out to be a multi-stage investigation, ending in: **don't** —
+plain flash-attention without the sink wins on every axis tried.
+
+**Stage 1 — naive combination crashes.** The Pallas kernel's `causal=True` assumes `q_len==kv_len`
+(diagonal-aligned); the sink makes `kv_len=T+1` while `q_len=T`, silently misaligning the mask
+(confirmed: max abs diff ~2.6 vs. the explicit-mask SDPA reference — not the ~0.01 normal
+flash-attention variance, a real correctness bug, not noise). `CausalSelfAttention.forward` (in
+`qcute/bytelm_tpu.py`) used to just always fall back to the O(T²)-memory explicit-mask SDPA path
+whenever `zero_kv_sink` was on, regardless of the flash flag.
+
+**Stage 2 — the "square" fix.** Padding `q` with one dummy leading row (`q_padded =
+cat([zero, q])`) makes `q_len==kv_len==T+1` exactly, restoring correctness — verified against the
+explicit-mask reference (max abs diff ~0.007-0.01, matching flash-attention's normal algorithmic
+variance). But the kernel *also* requires that common length divisible by its internal block size
+(`1024`, observed via the exact error message `q_seq_len=N should be divisible by block_q_dq=1024`)
+— so this only works when `context+1` is itself a multiple of 1024 (e.g. `context=8191`, not
+`8192`). Implemented in `CausalSelfAttention.forward`, gated on `(T+1) % 1024 == 0`; falls back to
+the explicit-mask path otherwise (a real bug was found and fixed here too: the fallback check
+originally lived only in `main()`'s startup warning, which printed the warning but never actually
+disabled the flash path, so a misconfigured `context` crashed instead of gracefully falling back
+— fixed by moving the check into `forward()` itself).
+
+**Stage 3 — it's correct but ~25x too slow.** At `context=8191, batch=4`: **10.0-10.06s/it**,
+vs. **0.4s/it** for plain flash-attention without the sink — confirmed identical slowdown with and
+without `torch.compile` (10.01s/it uncompiled, 12.2-24s/it compiled, `torch.compile` actually made
+it *worse*, not better), and confirmed a pre-allocated `register_buffer` for the zero tensor
+(avoiding a fresh `torch.zeros(...)` allocation every call) made **no measurable difference**
+(10.06s/it either way) — so the cost is the `torch.cat` itself materializing new
+`[B,H,T+1,hd]` K/V/Q tensors at every layer, every step, not allocation overhead or compile
+strategy.
+
+**Stage 4 — cheaper alternatives considered, none viable without changing what the sink is.**
+- Moving the padding to the *end* of Q instead of the front (to avoid slicing) is **not just
+  slower, it's incorrect**: with the sink at kv-index 0 and real queries kept at their original
+  (unshifted) indices, every real query systematically misses attending to its own current-byte
+  key (worked example: for `T=3`, query 0 attends only `{sink}`, query 1 only `{sink, k0}`, etc.
+  — never including its own key). The front-padding version is the only one that's both
+  length-compatible and correct.
+- A true zero-cost "attention sink" (the off-by-one-softmax / additive-denominator-bias trick from
+  the StreamingLLM-style literature — no extra K/V token at all, just a constant added to the
+  softmax denominator) isn't implementable through this kernel's exposed API (`ab`/`segment_ids`
+  operate on the existing q/kv grid, not on the softmax normalizer).
+- The genuinely cheap restructuring — prepend the sink **once**, at the input embedding stage
+  (like a normal learnable BOS/CLS token), not re-injected per-layer — uses the plain,
+  already-fast flash-attention path unchanged. But it changes what the mechanism *is*: a
+  per-layer static zero anchor becomes a single learnable token that evolves through the residual
+  stream like any other position. Not implemented (out of scope of the investigation, would need
+  `ByteLM.forward`-level restructuring, not just the attention module) — worth doing later if the
+  sink's benefit is ever actually verified to matter for convergence.
+
+**Stage 5 — a from-scratch JAX reimplementation didn't rescue it either.** `qcute/bytelm_jax.py`
+(pure JAX, same architecture, same enwik8 data, single `jax.jit`-compiled train step — the
+natural JAX pattern, unlike torch_xla's per-step lazy-graph tracing plus a Pallas-kernel
+`jax.jit` re-invocation from *inside* a torch custom op on every call, visible in the crash
+traceback from Stage 1) measured **~3.03s/it** for the sink+flash combination — ~3.3x faster than
+torch_xla's 10s/it, suggesting the torch_xla wrapper itself carries real overhead. But a properly
+controlled follow-up (sink on/off × fp32/bf16, all 4 combinations) showed **the sink made no
+measurable difference in JAX at all** — 0.330, 0.332, and 0.350 it/s across all four variants,
+all within noise of each other. So the initial "3.3x faster, confirms the wrapper is the problem"
+read was wrong/confounded: JAX's own ~3s/it floor has some other, unidentified cause unrelated to
+the sink (candidates not yet investigated: host/device pipelining, the flash kernel's behavior
+under `jax.jit` tracing for this exact shape — genuinely unresolved, not chased further since it's
+tangential to the main goal).
+
+**Bottom line**: no variant of `zero_kv_sink`-with-flash-attention (torch_xla or JAX, any dtype)
+beat plain flash-attention without the sink (0.4s/it on torch_xla) at this model scale. Use
+`--no_zero_kv_sink` when `--use_flash_attention` is on, or accept `context=1024*k-1` and the
+~25x throughput cost if the sink's architectural benefit is later confirmed to matter enough to
+justify it.
 
 ## Monitoring a multi-hour run
 

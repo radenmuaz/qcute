@@ -407,6 +407,19 @@ def own_block_decode_loss(bb: LM, h_full: torch.Tensor, x_real: torch.Tensor, K:
     return bb.ntp_loss_acc(h_q.reshape(-1, D), x_real, is_byte_level)
 
 
+def split_track0_window(track0_window) -> tuple:
+    """track0_window (model.decode_windows[i][0]) is either a scalar/None (broadcasts to both
+    self_window and own_code_window, the historical shared-knob behavior) or a
+    (self_window, own_code_window) 2-tuple (2026-08-23, decouples track0's own byte/code
+    self-attention window from its cross-attention window into level (i+1)'s code -- see
+    qcute_v1.py's _norm_track0). Every call site that used to write `track0_window, track0_window`
+    should use this instead, so training (_track0) and generation (_stack_generate_blockwise) never
+    diverge on which window applies where."""
+    if isinstance(track0_window, tuple):
+        return track0_window
+    return track0_window, track0_window
+
+
 def encode_like_self_attn_decode(bb: LM, x0: torch.Tensor, code_kv: torch.Tensor, K: int,
                                   self_window: int | None, own_code_window: int | None) -> dict:
     """StackDecoder pass 1 (2026-08-20, "don't interleave seed tokens" design -- see
@@ -616,10 +629,10 @@ def code_context_pass(bb: LM, code_embeds: torch.Tensor) -> torch.Tensor:
 
 
 class KVContextLM(nn.Module):
-    """kv_lm_mode="fresh"/"shared": wraps an LM's transformer blocks so cross-attention K/V comes
+    """kv_lm_mode="copy"/"shared": wraps an LM's transformer blocks so cross-attention K/V comes
     from a causally-contextualized code representation (code_context_pass) instead of an isolated
     per-position code embedding. Same calling convention as nn.Identity() (kv_lm_mode="identity",
-    the default -- unchanged prior behavior): embeds in, embeds out."""
+    the pre-2026-08-23 default): embeds in, embeds out."""
     def __init__(self, bb: LM):
         super().__init__()
         self.bb = bb
@@ -698,7 +711,7 @@ class Decoder(nn.Module):
         enc0 = model.encoders[0]
         for _ in range(n_new_bytes):
             out = enc0(all_bytes, level=0, window=model.windows[0], compute_ntp=False)
-            next_byte = sample_next_byte(enc0.embed.weight, out["hidden"][:, -1, :])
+            next_byte = sample_next_byte(enc0.byte_output_weight, out["hidden"][:, -1, :])
             all_bytes = torch.cat([all_bytes, next_byte.unsqueeze(1)], dim=1)
         if was_training:
             model.train()
@@ -772,7 +785,7 @@ class Decoder(nn.Module):
                 h_self_full = bos_interleaved_self_attn(bb_self, x0, K, self_window, strip_bos=False)
                 h_full = own_block_cross_attn_decode(bb_cross, h_self_full, code_embeds, K, own_code_window)
                 h = h_full.view(buf.shape[0], n_blocks, K + 1, -1)[:, :, :K, :]
-                next_byte = sample_next_byte(bb_cross.embed.weight, h[:, -1, t, :])
+                next_byte = sample_next_byte(bb_cross.byte_output_weight, h[:, -1, t, :])
                 buf = buf.clone()
                 buf[:, n_blocks_prev * K + t] = next_byte
             all_bytes = buf
@@ -843,7 +856,7 @@ class Decoder(nn.Module):
             h_self_full = bos_interleaved_self_attn(bb_self, x0, K, self_window, strip_bos=False)
             h_full = own_block_cross_attn_decode(bb_cross, h_self_full, code_embeds, K, own_code_window)
             h = h_full.view(predicted.shape[0], n_blocks, K + 1, -1)[:, :, :K, :]
-            next_byte = sample_next_byte(bb_cross.embed.weight, h[:, :, t, :])
+            next_byte = sample_next_byte(bb_cross.byte_output_weight, h[:, :, t, :])
             predicted = predicted.view(predicted.shape[0], n_blocks, K).clone()
             predicted[:, prompt_len // K:, t] = next_byte[:, prompt_len // K:]
             predicted = predicted.view(predicted.shape[0], n_blocks * K)
@@ -881,7 +894,7 @@ class Decoder(nn.Module):
         block_aligned_only = model.n_levels >= 2
 
         result_tf = model._run(full_bytes, compute_ntp=False, max_srcs=None, want_next_query=False)
-        embed0 = result_tf["embed_weights"][0] if result_tf["embed_weights"][0] is not None else model.encoders[0].embed.weight
+        embed0 = result_tf["embed_weights"][0] if result_tf["embed_weights"][0] is not None else model.encoders[0].byte_output_weight
         logits_tf_all = F.linear(result_tf["h_list"][0][0], embed0)
 
         n_mismatch, n_checked = 0, 0
@@ -893,7 +906,7 @@ class Decoder(nn.Module):
                 continue
             padded = full_bytes[:, :t]
             result_gen = model._run(padded, compute_ntp=False, max_srcs=None, want_next_query=True)
-            embed_gen = result_gen["embed_weights"][0] if result_gen["embed_weights"][0] is not None else model.encoders[0].embed.weight
+            embed_gen = result_gen["embed_weights"][0] if result_gen["embed_weights"][0] is not None else model.encoders[0].byte_output_weight
             query_gen = result_gen["next_query"][0] if result_gen["next_query"][0] is not None else result_gen["h_list"][0][:, -1, :]
             logits_gen = F.linear(query_gen[0], embed_gen)
             n_checked += 1
@@ -955,7 +968,7 @@ class Decoder(nn.Module):
             h_self_full = bos_interleaved_self_attn(bb_self, x0, K, self_window, strip_bos=False)
             h_full = own_block_cross_attn_decode(bb_cross, h_self_full, code_embeds, K, own_code_window)
             h = h_full.view(predicted.shape[0], n_blocks, K + 1, -1)[:, :, :K, :]
-            next_byte = sample_next_byte(bb_cross.embed.weight, h[:, :, t, :])
+            next_byte = sample_next_byte(bb_cross.byte_output_weight, h[:, :, t, :])
             predicted = predicted.view(predicted.shape[0], n_blocks, K)
             predicted = predicted.clone()
             predicted[:, :, t] = next_byte
@@ -1033,7 +1046,7 @@ class Decoder(nn.Module):
                 h_self_full = bos_interleaved_self_attn(bb_self, x0, K, self_window, strip_bos=False)
                 h_full = own_block_cross_attn_decode(bb_cross, h_self_full, code_embeds, K, own_code_window)
                 h = h_full.view(B, n_cmp, K + 1, -1)[:, :, :K, :]
-                next_byte = sample_next_byte(bb_cross.embed.weight, h[:, :, t, :])
+                next_byte = sample_next_byte(bb_cross.byte_output_weight, h[:, :, t, :])
                 buf = buf.view(B, n_cmp, K).clone()
                 buf[:, :, t] = next_byte
                 buf = buf.view(B, n_cmp * K)
@@ -1108,7 +1121,8 @@ class Decoder(nn.Module):
         # its only upper track). Use the genuine per-level truncation instead: drop the real top
         # level from every non-top level's conditioning entirely (own code + at most the next
         # coarser level that ISN'T the real top), the actual submodel a shallower Ks would train --
-        # see qcute_v1_common.py's Config.curriculum_max_srcs docstring, chat 2026-08-21.
+        # see qcute_v1_common.py's Config.active_srcs_mode docstring (renamed from
+        # curriculum_max_srcs 2026-08-23), chat 2026-08-21.
         n = model.n_levels
         ks21_equiv = tuple((1 + max(0, (n - 2) - i)) if i < n - 1 else None for i in range(n))
         for tag, max_srcs in (("ks21", ks21_equiv), ("full", None)):
@@ -1185,7 +1199,7 @@ class ConcatDecoder(Decoder):
 
         code = bb.extract_code(h, x0, K, model.windows[i])["code"]
         return make_dict(hidden=h, query_last=query_last, loss=loss, acc=acc, code=code,
-                          extra_losses=[], embed_weight=bb.embed.weight)
+                          extra_losses=[], embed_weight=bb.byte_output_weight)
 
 
 class StackDecoderV1(Decoder):
@@ -1209,11 +1223,12 @@ class StackDecoderV1(Decoder):
         super().__init__(cfg, n_levels)
 
         def make_self_stage(i):
-            # share_encode_decode_self: reuse encode's own LM (embed, blocks, self_code_const --
-            # everything except decode's separate cross-attention stage) for decode's self-attn
-            # stage, for BOTH top (unchanged v5 behavior) and non-top levels (bb_self only --
-            # bb_cross always stays a separate LM regardless of this flag).
-            bb = encoders[i].lm if cfg.share_encode_decode_self else LM(cfg, d_models[i], n_layers_list[i], vocabs[i])
+            # decoder_own_stage_mode="shared" (default, 2026-08-23): reuse encode's own LM (embed,
+            # blocks, self_code_const -- everything except decode's separate cross-attention stage)
+            # for decode's self-attn stage, for BOTH top (unchanged v5 behavior) and non-top levels
+            # (bb_self only -- bb_cross always stays a separate LM regardless of this setting).
+            # "copy" (was share_encode_decode_self=False, the old default) trains an independent LM.
+            bb = encoders[i].lm if cfg.decoder_own_stage_mode == "shared" else LM(cfg, d_models[i], n_layers_list[i], vocabs[i])
             if not hasattr(bb, "merged_cache"):
                 bb.merged_cache = {}
             return bb
@@ -1257,7 +1272,7 @@ class StackDecoderV1(Decoder):
             code = bb.extract_code(h, x0, K, window)["code"]
             valid_next_query = want_next_query and i == 0 and L_i % K == 0
             return make_dict(hidden=h, query_last=(query_last if valid_next_query else None),
-                              loss=loss, acc=acc, code=code, extra_losses=[], embed_weight=bb.embed.weight)
+                              loss=loss, acc=acc, code=code, extra_losses=[], embed_weight=bb.byte_output_weight)
 
         n_blocks = L_i // K
         if n_blocks < 1:
@@ -1281,7 +1296,7 @@ class StackDecoderV1(Decoder):
         else:
             loss, acc = h.new_zeros(()), h.new_zeros(())
         return make_dict(hidden=h, query_last=None, loss=loss, acc=acc, code=None,
-                          extra_losses=[], embed_weight=bb_cross.embed.weight)
+                          extra_losses=[], embed_weight=bb_cross.byte_output_weight)
 
 
 def encode_like_decode_loss(bb: LM, h_real: torch.Tensor, h_seed: torch.Tensor, x_real: torch.Tensor,
@@ -1302,60 +1317,83 @@ def encode_like_decode_loss(bb: LM, h_real: torch.Tensor, h_seed: torch.Tensor, 
 class StackDecoder(Decoder):
     """qcute_v1 (2026-08-20, "every upper code conditioning"): "like v5's [old] StackDecoder except
     no self code" -- chains v5-style staged cross-attention (cross_attn_stage: cross-attn + MLP per
-    layer, one stage per additional coarser code) on top of a non-interleaved own-code mechanism.
-    Supersedes an earlier, single-track-only StackDecoder draft (own code, no upper conditioning
+    layer, one stage per additional coarser code) on top of a non-interleaved track0 mechanism.
+    Supersedes an earlier, single-track-only StackDecoder draft (track0 only, no upper conditioning
     at all) -- that shape is now just this class's cfg.cond_depth=1 special case, not a separate
     class; see cond_depth below.
 
-    Track 0 (own code, cum_K=Ks[i]) uses encode_like_self_attn_decode + seed_query_decode: a single
-    per-level LM (no separate bb_self/bb_cross split -- 'feed back the kv' means reusing the SAME
-    weights and SAME K/V, not recomputing them in a second LM) runs two passes -- plain causal
-    self-attn over real bytes, literally the encode pass, with own-code cross-attention spliced in
-    per layer (encode_like_self_attn_decode), saving each layer's self-attention K/V; then a
-    per-block trainable seed token reuses those saved K/V directly as its cross-attention source
-    (seed_query_decode), never recomputing or re-interleaving them, and never falling back to a
-    self-code substitute the way v5's old StackDecoder/_SELF_CONST could -- own code is always real
-    (self_code_active no longer gates this, same as StackDecoderV1). Causal, static-shape, and
-    KV-cache-able -- see chat 2026-08-20 for the validity argument. Top level unchanged (the genuine
-    self-code-recurrent NTP path, no seed token involved either way).
+    NAMING (fixed 2026-08-23, was backwards throughout this file/CLAUDE.md/docs/status.md before
+    that date): a code is named by the level that owns it AS INPUT, not the level that produced it
+    -- Encoder.forward's own docstring says this of itself ("level j's own INPUT = level (j-1)'s
+    code stream"). So `c_list[N]` is always level (N+1)'s code, never level N's -- level i's
+    decoder never has anything of its own to condition on beyond the bytes/values it's
+    reconstructing; every code it cross-attends to, including "track0", belongs to the level above.
+    Calling track0 "own code" throughout this file means "this SAME BLOCK's code" (temporal/spatial
+    locality within the code stream, as in own_block_cross_attn_decode) -- a different, still-valid
+    "own" than the level-ownership one that was wrong; left as-is, only level-ownership claims were
+    fixed.
 
-    Tracks 1..T-1 (coarser codes j=i+1..n_levels-1) each run a SEPARATE cross_attn_stage LM, staged
+    Track 0 (cum_K=Ks[i], conditions on level (i+1)'s code) uses encode_like_self_attn_decode +
+    seed_query_decode: a single per-level LM (no separate bb_self/bb_cross split -- 'feed back the
+    kv' means reusing the SAME weights and SAME K/V, not recomputing them in a second LM) runs two
+    passes -- plain causal self-attn over real bytes, literally the encode pass, with cross-attention
+    to level (i+1)'s code spliced in per layer (encode_like_self_attn_decode), saving each layer's
+    self-attention K/V; then a per-block trainable seed token reuses those saved K/V directly as its
+    cross-attention source (seed_query_decode), never recomputing or re-interleaving them, and never
+    falling back to a self-code substitute the way v5's old StackDecoder/_SELF_CONST could -- track0's
+    code is always real (self_code_active no longer gates this, same as StackDecoderV1). Causal,
+    static-shape, and KV-cache-able -- see chat 2026-08-20 for the validity argument. Top level
+    unchanged (the genuine self-code-recurrent NTP path, no seed token involved either way).
+
+    Tracks 1..T-1 (level i+t+1's code, t=1..T-1) each run a SEPARATE cross_attn_stage LM, staged
     sequentially -- track t's query is track (t-1)'s output, so gradient depth grows with the
     number of levels above (same n_layers*(1+n_tracks) depth tradeoff the old v5 StackDecoder had,
     see CLAUDE.md's Architecture section).
 
     `decode_windows[i][0]` doubles as BOTH track0's self-attention window (pass1's causal chain)
-    AND its own-code cross-attention window -- a deliberate collapse of the two separate knobs an
-    own-code-only decode would need into v5/ConcatDecoder's one-window-per-track convention, so
-    decode_windows keeps its existing n_sources-length shape unchanged (no plumbing changes needed
-    in qcute_v1.py). `decode_windows[i][t]` for t>=1 is track t's (level i+t's code)
-    cross-attention window, same meaning as v5's StackDecoder. Track0 is never dropped/pruned
+    AND its cross-attention window into level (i+1)'s code -- a deliberate collapse of the two
+    separate knobs a track0-only decode would need into v5/ConcatDecoder's one-window-per-track
+    convention, so decode_windows keeps its existing n_sources-length shape unchanged (no plumbing
+    changes needed in qcute_v1.py). `decode_windows[i][t]` for t>=1 is track t's (level i+t+1's
+    code) cross-attention window, same meaning as v5's StackDecoder. Track0 is never dropped/pruned
     (every later stage is built on it); tracks 1..T-1 are subject to apply_track_dropout +
-    max_srcs, same policy as v5, counted so max_srcs==1 means "own code only,
+    max_srcs, same policy as v5, counted so max_srcs==1 means "track0 (level i+1's code) only,
     no upper conditioning".
 
-    `cfg.cond_depth` caps how many levels above own code each level actually conditions on --
-    -1 (default) = pervasive, every level above EXCEPT the topmost (n_levels-2-i tracks, see
-    below); 1 = one level up only, the minimal case (own code + a single upper track). Static,
-    unlike max_srcs (a per-forward-call ablation knob) -- it also caps how many cross-attn-stage
-    LMs __init__ allocates, so a shallow cond_depth means genuinely fewer parameters, not just
-    unused ones.
+    `cfg.cond_depth` caps how many levels above level (i+1) each level actually conditions on --
+    -1 (default) = pervasive, every level above EXCEPT one past the current top (n_levels-2-i
+    tracks, see below); 1 = track0 only, the minimal case (just level i+1's code, no further
+    tracks). Static, unlike max_srcs (a per-forward-call ablation knob) -- it also caps how many
+    cross-attn-stage LMs __init__ allocates, so a shallow cond_depth means genuinely fewer
+    parameters, not just unused ones.
 
-    The topmost level's own code (index n_levels-1) is HARD-EXCLUDED from every other level's
-    conditioning, unconditionally (not gated by cond_depth/max_srcs/a curriculum) -- no LM above
-    it ever forecasts that code during real generation (it's produced solely by its own encoder's
-    self-NTP), so conditioning on it trains every lower level against a signal that free-rollout
-    generation can't actually supply reliably. Confirmed empirically (2026-08-23, ks21/ks221
-    "notoplevel" curriculum_max_srcs ablations, docs/status.md) that both hierarchies still
-    overfit cleanly -- and ks221 generates measurably better -- with this code excluded, so it's
-    now baked into __init__'s allocation (n_upper caps at n_levels-2-i, never n_levels-1-i) rather
-    than left as an opt-in curriculum knob."""
+    The code one level above the topmost real level (`c_list[n_levels-1]`, i.e. "level n_levels" --
+    a domain nothing actually owns as input, since no `encoders[n_levels]` exists) is
+    HARD-EXCLUDED from every level's conditioning, unconditionally (not gated by
+    cond_depth/max_srcs/a curriculum) -- no LM ever forecasts that code during real generation
+    (it's produced solely by the topmost level's own encoder's self-NTP, self-extracted, never
+    consumed as anyone's input), so conditioning on it trains every level against a signal that
+    free-rollout generation can't actually supply reliably. Confirmed empirically (2026-08-23,
+    ks21/ks221 "notoplevel" curriculum_max_srcs ablations, docs/status.md) that both hierarchies
+    still overfit cleanly -- and ks221 generates measurably better -- with this code excluded, so
+    it's now baked into __init__'s allocation (n_upper caps at n_levels-2-i, never n_levels-1-i)
+    rather than left as an opt-in curriculum knob."""
 
     def __init__(self, cfg: Config, n_levels: int, encoders, d_models, n_layers_list, vocabs):
         super().__init__(cfg, n_levels)
 
+        if (cfg.decoder_own_stage_mode == "shared" or cfg.kv_lm_mode == "shared") and cfg.byte_head_tied:
+            print("WARNING: decoder_own_stage_mode/kv_lm_mode='shared' reuses an encoder's weights "
+                  "for track0's self-attention/code-contextualization -- combined with "
+                  "byte_head_tied=True, track0's conditional (code-informed) and the encoder's "
+                  "unconditional byte-output projections collapse to the exact same tensor, "
+                  "leaving no parameter specific to 'predict a byte given this cross-attended "
+                  "hidden state'. Allowed, but byte_head_tied=False (the default) is recommended "
+                  "whenever kv_lm_mode/decoder_own_stage_mode reuse an encoder, so the output head "
+                  "stays independent even when the backbone doesn't.")
+
         def make_own_stage(i):
-            bb = encoders[i].lm if cfg.share_encode_decode_self else LM(cfg, d_models[i], n_layers_list[i], vocabs[i])
+            bb = encoders[i].lm if cfg.decoder_own_stage_mode == "shared" else LM(cfg, d_models[i], n_layers_list[i], vocabs[i])
             if not hasattr(bb, "merged_cache"):
                 bb.merged_cache = {}
             return bb
@@ -1377,16 +1415,20 @@ class StackDecoder(Decoder):
 
         self.stage_lms = nn.ModuleList([make_level(i) for i in range(n_levels)])
 
-        def make_kv_lm(i, t):
-            # j = the coarser level (i+1+t) whose code this kv_lm contextualizes for level i's
-            # decode. "shared" reuses that level's own encoder LM (same var, no new module, per
-            # chat 2026-08-22) -- requires d_models[i]==d_models[j], since the result is used
-            # directly as level i's stage K/V.
-            j = i + 1 + t
+        def make_kv_lm(i, j):
+            # j = the code array index (c_list[j]) this kv_lm contextualizes for level i's decode
+            # -- under the corrected naming (2026-08-23, see StackDecoder's docstring), c_list[j]
+            # is "level (j+1)"'s code: the domain encoders[j+1] treats as its own input. "shared"
+            # therefore reuses encoders[j+1].lm (FIXED 2026-08-23 -- was encoders[j].lm, a bug
+            # inherited from the pre-fix naming convention where c_list[j] was wrongly thought of
+            # as "level j's own code", making encoders[j].lm look like the natural choice when it
+            # actually self-attends over c_list[j-1], not c_list[j]) -- requires
+            # d_models[i]==d_models[j+1], since the result is used directly as level i's stage K/V.
             if cfg.kv_lm_mode == "identity":
                 return nn.Identity()
             if cfg.kv_lm_mode == "shared":
-                return KVContextLM(encoders[j].lm)
+                return KVContextLM(encoders[j + 1].lm)
+            assert cfg.kv_lm_mode == "copy", f"kv_lm_mode must be identity|copy|shared, got {cfg.kv_lm_mode!r}"
             layers = cfg.kv_lm_layers if cfg.kv_lm_layers is not None else n_layers_list[i]
             return KVContextLM(LM(cfg, d_models[i], layers, vocabs[i]))
 
@@ -1396,9 +1438,21 @@ class StackDecoder(Decoder):
             n_upper = max(0, n_levels - 2 - i)  # excludes the topmost level (n_levels-1), see class docstring
             if cfg.cond_depth != -1:
                 n_upper = min(n_upper, cfg.cond_depth)
-            return nn.ModuleList([make_kv_lm(i, t) for t in range(n_upper)])
+            return nn.ModuleList([make_kv_lm(i, i + 1 + t) for t in range(n_upper)])
 
         self.kv_lms = nn.ModuleList([make_level_kv(i) for i in range(n_levels)])
+
+        # track0's own kv_lm (2026-08-23, chat: "shouldn't kvlm if enabled exist to process level 1
+        # code for level 0 decoder" -- it should, and this was a real gap: track0's cross-attention
+        # target (c_list[i], "level (i+1)"'s code) never went through ANY kv_lm, unlike every upper
+        # track, regardless of kv_lm_mode. Applies to every non-top level i (not just level0), so it
+        # generalizes to decode_scope="pervasive" automatically -- module allocation here doesn't
+        # depend on decode_scope, only on which levels HAVE a track0 to begin with.
+        def make_track0_kv_lm(i):
+            return make_kv_lm(i, i)
+
+        self.track0_kv_lms = nn.ModuleList([make_track0_kv_lm(i) if i < n_levels - 1 else nn.Identity()
+                                             for i in range(n_levels)])
 
     def _track0(self, bb0: LM, x_list_i: torch.Tensor, code_embeds0: torch.Tensor, K: int, n_blocks: int,
                 track0_window: int | None, is_byte_level: bool, compute_ntp: bool) -> tuple:
@@ -1415,10 +1469,11 @@ class StackDecoder(Decoder):
         shifted alignment (h[p] predicts x_real[p+1]) -- h0_shifted is the re-derived view for that
         handoff (see the comment inline below for why/how)."""
         D = bb0.d_model
+        self_w, cross_w = split_track0_window(track0_window)
         pass1 = encode_like_self_attn_decode(bb0, bb0.embed_input(x_list_i, is_byte_level), code_embeds0,
-                                              K, track0_window, track0_window)
+                                              K, self_w, cross_w)
         h_seed = seed_query_decode(bb0, pass1["saved_k"], pass1["saved_v"], code_embeds0, n_blocks, K,
-                                    track0_window, track0_window)
+                                    self_w, cross_w)
 
         B = x_list_i.shape[0]
         L_used = n_blocks * K
@@ -1460,7 +1515,7 @@ class StackDecoder(Decoder):
 
         if is_top:
             D = bb0.d_model
-            window = model.decode_windows[i][0]
+            window, _ = split_track0_window(model.decode_windows[i][0])  # top has no cross target
             n_blocks = L_i // K
             if window == 0 or n_blocks < 1:
                 return None
@@ -1476,7 +1531,7 @@ class StackDecoder(Decoder):
             code = bb0.extract_code(h, x0, K, window)["code"]
             valid_next_query = want_next_query and i == 0 and L_i % K == 0
             return make_dict(hidden=h, query_last=(query_last if valid_next_query else None),
-                              loss=loss, acc=acc, code=code, extra_losses=[], embed_weight=bb0.embed.weight)
+                              loss=loss, acc=acc, code=code, extra_losses=[], embed_weight=bb0.byte_output_weight)
 
         n_blocks = L_i // K
         if n_blocks < 1:
@@ -1486,6 +1541,7 @@ class StackDecoder(Decoder):
 
         source_c0 = c_list[i][:, :n_blocks, :]
         code_embeds0 = bb0.quant.embed_for_decode(bb0, source_c0)
+        code_embeds0 = self.track0_kv_lms[i](code_embeds0)
         h0, h0_shifted, loss0, acc0 = self._track0(bb0, x_list[i], code_embeds0, K, n_blocks,
                                                      track0_window, is_byte_level, compute_ntp)
 
@@ -1513,7 +1569,7 @@ class StackDecoder(Decoder):
 
         x = h0_shifted
         loss_final, acc_final, code_final = loss0, acc0, None
-        embed_weight_final = bb0.embed.weight
+        embed_weight_final = bb0.byte_output_weight
         extra_losses = []
         for t, (orig_idx, (source_c, cum_K, window)) in enumerate(indexed):
             bb = stage_bbs[orig_idx + 1]
@@ -1524,7 +1580,7 @@ class StackDecoder(Decoder):
             x = stage_result["hidden"]
             if is_last:
                 loss_final, acc_final, code_final = stage_result["loss"], stage_result["acc"], stage_result["code"]
-                embed_weight_final = bb.embed.weight
+                embed_weight_final = bb.byte_output_weight
             else:
                 extra_losses += [stage_result["loss"]]
 
@@ -1584,7 +1640,7 @@ class StackDecoder(Decoder):
         bb0 = stage_bbs[0]
         n_upper_avail = len(stage_bbs) - 1
         n_upper = n_upper_avail if max_srcs is None else max(0, min(n_upper_avail, max_srcs - 1))
-        track0_window = model.decode_windows[0][0]
+        track0_self_w, track0_cross_w = split_track0_window(model.decode_windows[0][0])
         D = bb0.d_model
         all_bytes = prompt_bytes[:, :prompt_bytes.shape[1] // K * K]
 
@@ -1619,6 +1675,7 @@ class StackDecoder(Decoder):
             code_parts += [next_code]
             code0 = torch.cat(code_parts, dim=1)
             code_embeds0 = bb0.quant.embed_for_decode(bb0, code0)
+            code_embeds0 = self.track0_kv_lms[0](code_embeds0)
             n_blocks = n_blocks_prev + 1
 
             # Each active upper track j's OWN code over the level-(j-1) code stream -- never
@@ -1634,9 +1691,9 @@ class StackDecoder(Decoder):
             buf = torch.cat([all_bytes, all_bytes.new_zeros(all_bytes.shape[0], K)], dim=1)
             for t in range(K):
                 x0 = bb0.embed_input(buf, True)
-                pass1 = encode_like_self_attn_decode(bb0, x0, code_embeds0, K, track0_window, track0_window)
+                pass1 = encode_like_self_attn_decode(bb0, x0, code_embeds0, K, track0_self_w, track0_cross_w)
                 h_seed = seed_query_decode(bb0, pass1["saved_k"], pass1["saved_v"], code_embeds0, n_blocks, K,
-                                            track0_window, track0_window)
+                                            track0_self_w, track0_cross_w)
                 h_real_b = pass1["hidden"].view(buf.shape[0], n_blocks, K, D)
                 h_query = h_seed[:, -1, :] if t == 0 else h_real_b[:, -1, t - 1, :]
 
@@ -1644,7 +1701,7 @@ class StackDecoder(Decoder):
                 h_final = h_query.unsqueeze(1)
                 for bb_j, code_embeds_j, cum_Kj in zip(stage_bbs[1:n_upper + 1], upper_code_embeds, cum_Ks):
                     h_final = upper_track_step(bb_j, h_final, pos, code_embeds_j, cum_Kj)
-                embed_weight_final = stage_bbs[n_upper].embed.weight
+                embed_weight_final = stage_bbs[n_upper].byte_output_weight
                 next_byte = sample_next_byte(embed_weight_final, h_final[:, 0, :])
                 buf = buf.clone()
                 buf[:, pos] = next_byte
@@ -1701,9 +1758,10 @@ class StackDecoder(Decoder):
 
         bb0, bb1 = self.stage_lms[0][0], self.stage_lms[0][1]
         cum_K1 = K * cfg.Ks[1]
-        track0_window = model.decode_windows[0][0]
+        track0_self_w, track0_cross_w = split_track0_window(model.decode_windows[0][0])
         D = bb0.d_model
         code_embeds0 = bb0.quant.embed_for_decode(bb0, code0)
+        code_embeds0 = self.track0_kv_lms[0](code_embeds0)
         code1 = model.encoders[1](code0, level=1, window=model.windows[1], compute_ntp=False)["code"]
         code_embeds1 = bb1.quant.embed_for_decode(bb1, code1)
 
@@ -1712,9 +1770,9 @@ class StackDecoder(Decoder):
         pos_all = torch.arange(n_blocks * K, device=device)
         for t in range(K):
             x0 = bb0.embed_input(predicted, True)
-            pass1 = encode_like_self_attn_decode(bb0, x0, code_embeds0, K, track0_window, track0_window)
+            pass1 = encode_like_self_attn_decode(bb0, x0, code_embeds0, K, track0_self_w, track0_cross_w)
             h_seed = seed_query_decode(bb0, pass1["saved_k"], pass1["saved_v"], code_embeds0, n_blocks, K,
-                                        track0_window, track0_window)
+                                        track0_self_w, track0_cross_w)
             h_real_b = pass1["hidden"].view(predicted.shape[0], n_blocks, K, D)
             h_query = h_seed if t == 0 else h_real_b[:, :, t - 1, :]  # (B, n_blocks, D)
 
@@ -1722,7 +1780,7 @@ class StackDecoder(Decoder):
             for b in range(prompt_len // K, n_blocks):
                 pos = b * K + t
                 h_final = upper_track_step(bb1, h_query[:, b:b + 1, :], pos, code_embeds1, cum_K1)
-                new_bytes[:, b] = sample_next_byte(bb1.embed.weight, h_final[:, 0, :])
+                new_bytes[:, b] = sample_next_byte(bb1.byte_output_weight, h_final[:, 0, :])
             predicted = predicted.view(predicted.shape[0], n_blocks, K).clone()
             predicted[:, prompt_len // K:, t] = new_bytes[:, prompt_len // K:]
             predicted = predicted.view(predicted.shape[0], n_blocks * K)
@@ -1745,10 +1803,17 @@ class StackDecoder(Decoder):
         comment), just inside a diagnostic instead of real generation. Delegates to
         check_blockwise_gen_consistency (code_source='pred', the real generation-time signal)
         instead -- tol is unused (byte-exact comparison, not a logit tolerance). n_levels==2 only
-        (matching _stack_generate_blockwise's scope) -- skips rather than crashing otherwise."""
+        (matching _stack_generate_blockwise's scope) -- skips rather than crashing otherwise.
+        Also needs level0 to actually have an upper track (`stage_lms[0][1]`, i.e. level 2's code)
+        -- since the hard-exclusion (2026-08-23) that track no longer exists for a bare 2-level
+        model, so this specifically-two-track diagnostic has nothing left to check there either."""
         prefix = f"blockwise_gen_consistency_pred_{label}" if label else "blockwise_gen_consistency_pred"
         if self.n_levels != 2:
             log(f"{prefix}: skipped (StackDecoder's check only covers n_levels==2 so far)")
+            return 0
+        if len(self.stage_lms[0]) < 2:
+            log(f"{prefix}: skipped (level0 has no upper track since the hard-exclusion -- "
+                f"nothing this two-track check can compare)")
             return 0
         return self.check_blockwise_gen_consistency(model, full_bytes, device, prompt_len=prompt_len,
                                                       code_source="pred", log=log, label=label)
@@ -1813,12 +1878,13 @@ class StackDecoder(Decoder):
         K = cfg.Ks[0]
         bb0, bb1 = self.stage_lms[0][0], self.stage_lms[0][1]
         cum_K1 = K * cfg.Ks[1]
-        track0_window = model.decode_windows[0][0]
+        track0_self_w, track0_cross_w = split_track0_window(model.decode_windows[0][0])
         D = bb0.d_model
         n_blocks = (prompt_len + n_new_bytes) // K
         context = full_bytes[:, :n_blocks * K]
         real_code = model.encoders[0](context, level=0, window=model.windows[0], compute_ntp=False)["code"]
         code_embeds0 = bb0.quant.embed_for_decode(bb0, real_code)
+        code_embeds0 = self.track0_kv_lms[0](code_embeds0)
         code1 = model.encoders[1](real_code, level=1, window=model.windows[1], compute_ntp=False)["code"]
         code_embeds1 = bb1.quant.embed_for_decode(bb1, code1)
 
@@ -1826,9 +1892,9 @@ class StackDecoder(Decoder):
         scored = context.clone()
         for t in range(K):
             x0 = bb0.embed_input(context, True)
-            pass1 = encode_like_self_attn_decode(bb0, x0, code_embeds0, K, track0_window, track0_window)
+            pass1 = encode_like_self_attn_decode(bb0, x0, code_embeds0, K, track0_self_w, track0_cross_w)
             h_seed = seed_query_decode(bb0, pass1["saved_k"], pass1["saved_v"], code_embeds0, n_blocks, K,
-                                        track0_window, track0_window)
+                                        track0_self_w, track0_cross_w)
             h_real_b = pass1["hidden"].view(context.shape[0], n_blocks, K, D)
             h_query = h_seed if t == 0 else h_real_b[:, :, t - 1, :]
 
@@ -1836,7 +1902,7 @@ class StackDecoder(Decoder):
             for b in range(pos_start_block, n_blocks):
                 pos = b * K + t
                 h_final = upper_track_step(bb1, h_query[:, b:b + 1, :], pos, code_embeds1, cum_K1)
-                new_bytes[:, b] = sample_next_byte(bb1.embed.weight, h_final[:, 0, :])
+                new_bytes[:, b] = sample_next_byte(bb1.byte_output_weight, h_final[:, 0, :])
             scored = scored.view(scored.shape[0], n_blocks, K).clone()
             scored[:, pos_start_block:, t] = new_bytes[:, pos_start_block:]
             scored = scored.view(scored.shape[0], n_blocks * K)
@@ -1850,10 +1916,15 @@ class StackDecoder(Decoder):
         code-quality upper bound, via _decode_gt_context) and once via real autoregressive
         generation from level1's own sampled code predictions (pred mode, the real
         generation-time signal, via _stack_generate_blockwise) -- report byte accuracy against ground
-        truth for each. n_levels==2 only."""
+        truth for each. n_levels==2 only, and needs level0 to have an upper track (`stage_lms[0][1]`,
+        level 2's code) -- gone for a bare 2-level model since the hard-exclusion (2026-08-23)."""
         prefix = f"decode_modes_{label}" if label else "decode_modes"
         if self.n_levels != 2:
             log(f"{prefix}: skipped (StackDecoder's check only covers n_levels==2 so far)")
+            return {}
+        if len(self.stage_lms[0]) < 2:
+            log(f"{prefix}: skipped (level0 has no upper track since the hard-exclusion -- "
+                f"nothing this two-track check can compare)")
             return {}
         was_training = model.training
         model.eval()
@@ -1984,6 +2055,102 @@ class StackDecoderLocal(StackDecoder):
         h0_shifted = torch.cat([h_real_b[:, :, :K - 1, :], next_block_seed.unsqueeze(2)],
                                 dim=2).reshape(B, L_used, D)
         return h0, h0_shifted, loss0, acc0
+
+    @torch.no_grad()
+    def _stack_generate_blockwise(self, model, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
+                             code_source: str = "pred", gt_full_bytes: torch.Tensor | None = None,
+                             max_srcs: int | None = None) -> dict:
+        """Override of StackDecoder._stack_generate_blockwise (2026-08-23 bugfix): the base version
+        hardcodes encode_like_self_attn_decode/seed_query_decode for track0's byte-by-byte
+        generation, which lets the seed token's self-attention reach K/V from EVERY prior block --
+        but this decoder was trained with block_local_track0_decode, whose own docstring proves
+        the seed's same-block self-attention contribution is ALWAYS EXACTLY ZERO (own-block causal
+        self-attn can never see a same-block key from before the block's own start). Generation was
+        therefore feeding the model real cross-block self-attention signal it never learned to
+        produce or consume -- a genuine train/inference mismatch (found via qual sample generation
+        collapsing to repetitive garbage at ~99.5% teacher-forced byte_acc, 2026-08-23), not a
+        capacity/architecture limitation. Fix: every new block's track0 hidden state is computed by
+        calling block_local_track0_decode on JUST that one block (n_blocks=1) -- identical
+        computation to training, zero visibility into any other block, matching _track0 above
+        exactly. Everything else (code sourcing, upper-track chaining) is unchanged from the base
+        class; only the inner byte loop's track0 call differs."""
+        was_training = model.training
+        model.eval()
+        prompt_bytes = prompt_bytes.to(device)
+        if prompt_bytes.dim() == 1:
+            prompt_bytes = prompt_bytes.unsqueeze(0)
+        cfg = self.cfg
+        K = cfg.Ks[0]
+        stage_bbs = self.stage_lms[0]
+        bb0 = stage_bbs[0]
+        n_upper_avail = len(stage_bbs) - 1
+        n_upper = n_upper_avail if max_srcs is None else max(0, min(n_upper_avail, max_srcs - 1))
+        all_bytes = prompt_bytes[:, :prompt_bytes.shape[1] // K * K]
+
+        n_blocks_prompt = all_bytes.shape[1] // K
+        code_parts = [model.encoders[0](all_bytes, level=0, window=model.windows[0],
+                                         compute_ntp=False)["code"][:, :n_blocks_prompt, :]] if n_blocks_prompt > 0 else []
+
+        cum_Ks = []
+        cum = K
+        for j in range(1, n_upper + 1):
+            cum *= cfg.Ks[j]
+            cum_Ks += [cum]
+
+        n_new_blocks = -(-n_new_bytes // K)
+        for _ in range(n_new_blocks):
+            n_blocks_prev = all_bytes.shape[1] // K
+            if code_source == "gt":
+                gt = gt_full_bytes.to(device)
+                if gt.dim() == 1:
+                    gt = gt.unsqueeze(0)
+                real_code = model.encoders[0](gt[:, :(n_blocks_prev + 1) * K], level=0,
+                                               window=model.windows[0], compute_ntp=False)["code"]
+                next_code = real_code[:, n_blocks_prev:n_blocks_prev + 1, :]
+            elif code_source == "pred":
+                codes = encode_up_to(model, all_bytes, level=1)
+                enc1 = model.encoders[1]
+                out1 = enc1(codes, level=1, window=model.windows[1], compute_ntp=False)
+                sampled = enc1.quant.sample_next(enc1.lm, out1["hidden"][:, -1, :], cfg.vocab)
+                next_code = sampled.unsqueeze(1)
+            else:
+                raise ValueError(f"code_source must be 'gt' or 'pred', got {code_source!r}")
+            code_parts += [next_code]
+            code0 = torch.cat(code_parts, dim=1)
+            code_embeds0 = bb0.quant.embed_for_decode(bb0, code0)
+            code_embeds0 = self.track0_kv_lms[0](code_embeds0)
+            own_code_embed = code_embeds0[:, -1:, :]  # just this new block's own code
+
+            # Each active upper track j's OWN code over the level-(j-1) code stream -- never
+            # circular, a plain function of the level below, unlike track0's own code.
+            upper_code_embeds = []
+            seq_repr = code0
+            for t, j in enumerate(range(1, n_upper + 1)):
+                seq_repr = model.encoders[j](seq_repr, level=j, window=model.windows[j], compute_ntp=False)["code"]
+                bb_j = stage_bbs[t + 1]
+                code_embeds_j = bb_j.quant.embed_for_decode(bb_j, seq_repr)
+                upper_code_embeds += [self.kv_lms[0][t](code_embeds_j)]
+
+            buf = torch.cat([all_bytes, all_bytes.new_zeros(all_bytes.shape[0], K)], dim=1)
+            for t in range(K):
+                cur_block_bytes = buf[:, -K:]  # this new block only -- never any other block's bytes
+                out = block_local_track0_decode(bb0, cur_block_bytes, own_code_embed, K, 1, True)
+                h_query = out["h_seed"][:, 0, :] if t == 0 else out["h_real"][:, 0, t - 1, :]
+
+                pos = n_blocks_prev * K + t
+                h_final = h_query.unsqueeze(1)
+                for bb_j, code_embeds_j, cum_Kj in zip(stage_bbs[1:n_upper + 1], upper_code_embeds, cum_Ks):
+                    h_final = upper_track_step(bb_j, h_final, pos, code_embeds_j, cum_Kj)
+                embed_weight_final = stage_bbs[n_upper].byte_output_weight
+                next_byte = sample_next_byte(embed_weight_final, h_final[:, 0, :])
+                buf = buf.clone()
+                buf[:, pos] = next_byte
+            all_bytes = buf
+
+        all_bytes = all_bytes[:, :prompt_bytes.shape[1] + n_new_bytes]
+        if was_training:
+            model.train()
+        return make_dict(bytes=all_bytes, code_used=torch.cat(code_parts, dim=1))
 
 
 class StackDecoderSync(StackDecoder):

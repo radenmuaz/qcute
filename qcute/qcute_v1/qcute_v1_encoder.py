@@ -18,6 +18,10 @@ class Encoder(nn.Module):
     def quant(self):
         return self.lm.quant
 
+    @property
+    def byte_output_weight(self):
+        return self.lm.byte_output_weight
+
     def forward(self, seq_repr: torch.Tensor, level: int, window: int | None, compute_ntp: bool = True,
                 compute_code: bool = True) -> dict:
         """NOTE for generation (chat 2026-08-20, to stop this being re-derived/re-confused every
