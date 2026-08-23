@@ -885,8 +885,10 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
         + (f"  test_bytes={len(test_data)}" if test_data is not None else "  test_bytes=0 (no --test_frac)"))
     if not args.eval_only:
         seq_len = cfg.context + cfg.mtp_heads
-        epochs = args.steps * args.batch_size * seq_len / len(train_data)
-        log(f"~{epochs:.1f} epochs over train_bytes (steps={args.steps} batch_size={args.batch_size} seq_len={seq_len}, "
+        steps_per_epoch = len(train_data) / (args.batch_size * seq_len)
+        epochs = args.steps / steps_per_epoch
+        log(f"~{steps_per_epoch:.1f} steps/epoch  ~{epochs:.1f} epochs over train_bytes "
+            f"(steps={args.steps} batch_size={args.batch_size} seq_len={seq_len}, "
             f"random-with-replacement sampling — see batch_iter)")
     val_iter = batch_iter(val_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
 
