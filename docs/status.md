@@ -584,3 +584,29 @@ compounding-error pattern as `qcute_v1`'s original free-rollout collapse, now re
 single block rather than across blocks. Not yet fixed (would need scheduled sampling or a
 free-running local-decode loss term analogous to how `own_block_decode_loss`/`code-level` training
 addressed the cross-block version).
+
+## 2026-08-24: `blocklocal_glat_p` -- GLAT-style scheduled sampling for the local-decode gap
+
+Implemented the fix for the above: a second, additive local-decode pass (chat: "swap sampling by
+input gt teacher force, argmax out all output, then with probability swap ... re input back") --
+pass 1 (unchanged, fully teacher-forced) computes `local_logits`; with per-position probability
+`cfg.blocklocal_glat_p`, pass 2 reruns the SAME block-local self-attention on an input where each
+within-block byte is swapped for pass 1's own argmax prediction at that position, via an STE
+(`pred_hard.detach() + pred_soft - pred_soft.detach()`, `pred_soft = softmax(logits) @ embed.weight`)
+so pass 2's loss gradient flows back into pass 1's `local_logits`/head -- both passes' losses always
+summed (additive, not skip-real, matching `encoder_ste_p`'s more-stable variant per this file's
+existing ablation). New metrics: `blocklocal{s}_seed_acc`, `blocklocal{s}_local_acc`,
+`blocklocal{s}_glat_acc` (all correctly 0 under `no_grad`/eval, verified). Unlike `encoder_ste_p`
+(bridges a genuinely discrete quantized code), this needs no bridge for the *forward* value at all
+-- `argmax` already blocks gradient on its own; the STE here exists purely to route gradient
+INTO pass 1's logits, which plain `argmax` + embedding lookup would not do.
+
+**Real bug caught before the first real run**: `blocklocal_glat_p` was added to `Config` but never
+registered in `build_argparser`'s CLI args nor threaded through `config_from_args` -- `set_defaults`
+filters the config file's attributes by `{a.dest for a in p._actions}`, so the config file's
+`blocklocal_glat_p = 0.2` was silently dropped and the first `ks81_overfit10k_blocklocal_glat02`
+run trained with GLAT fully disabled (`glat_acc=0.0` at every step, config bug not a metric bug --
+confirmed via a smoke run with `torch.is_grad_enabled()` explicitly True). Fixed by adding
+`p.add_argument("--blocklocal_glat_p", ...)` and `blocklocal_glat_p=args.blocklocal_glat_p` to
+`config_from_args`; a 20-step smoke run afterward shows `glat_acc` tracking `local_acc` closely and
+rising together, confirming the fix. Re-launched the real run.
