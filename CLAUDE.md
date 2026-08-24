@@ -125,7 +125,11 @@ command back so they can watch it live themselves — see that doc's own tmux se
 launch/attach/peek incantations. **For a multi-hour run, check in periodically (roughly hourly)
 and pull back only `run.jsonl` (not `run.log` or checkpoints) to the matching local `logs/<run_name>/`
 path to save egress** — see that doc's "Monitoring a multi-hour run" section for the exact
-commands.
+commands. **Report periodic pulls as one combined table** (columns: node, run, step, elapsed,
+train_bpb, val_bpb, test_bpb — one row per active run across every node), not per-node prose —
+keep the surrounding text to a one-line note on whether any run is approaching/crossed 1.0 bpb,
+plus anything notable (new best, a run finished, a crash). Only fall back to fuller prose when
+something needs explaining (e.g. the overfitting-response policy actually triggering).
 
 **`qcute.bytelm_tpu`'s `--use_flash_attention` needs a nightly torch/torch_xla build** (the
 stable pin's `libtpu==0.0.21` is too old for the Pallas kernel) — full install steps, confirmed

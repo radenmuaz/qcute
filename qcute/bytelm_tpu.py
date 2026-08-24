@@ -274,6 +274,7 @@ class LMConfig:
     use_flash_attention: bool = False  # nightly-only (see module docstring); ignored if unavailable
     layer_drop: float = 0.0  # per-block drop probability during training (stochastic depth), 0=off
     resid_dropout: float = 0.0  # dropout on attn/mlp output before the residual add, 0=off (kernel-agnostic, unlike attn-weight dropout)
+    label_smoothing: float = 0.0  # F.cross_entropy label_smoothing, training loss only (val/test bpb stays unsmoothed)
 
     @property
     def head_dim(self) -> int:
@@ -298,6 +299,13 @@ PRESETS: dict[str, LMConfig] = {
     "d1024x16_mlp2": LMConfig(d_model=1024, n_layers=16, n_heads=16, mlp_mult=2, context=8192, mtp_heads=1),  # ~168M — cheaper MLP, more steps/budget
     "d1024x24_mlp4": LMConfig(d_model=1024, n_layers=24, n_heads=16, mlp_mult=4, context=8192, mtp_heads=1),  # ~403M — deeper, above anchor upper end
     "d768x12_mlp4": LMConfig(d_model=768, n_layers=12, n_heads=12, mlp_mult=4, context=8192, mtp_heads=1),  # ~113M — actual GPT-2-small shape (768 width, not a power of 2)
+    # 2026-08-24 power-of-2 shape ablation at matched param count (~335.5M each) -- wide/shallow
+    # vs narrow/deep at the same total params, both power-of-2 widths/depths (unlike d768x12_mlp4
+    # above). Likely need --grad_accum_steps to fit a useful effective batch (untested memory
+    # profile, bench-probe batch_size/grad_accum before a real launch).
+    "d2048x8_mlp2": LMConfig(d_model=2048, n_layers=8, n_heads=16, mlp_mult=2, context=8192, mtp_heads=1),  # ~335.5M — wide, shallow
+    "d1024x32_mlp2": LMConfig(d_model=1024, n_layers=32, n_heads=16, mlp_mult=2, context=8192, mtp_heads=1),  # ~335.5M — narrow, deep (matched params vs d2048x8_mlp2). CONFIRMED UNUSABLE 2026-08-24 on tpu4/v4-8+flash: bs=1/2 stall at ~66s/it (a real, disproportionate per-step slowdown, not explained by FLOPs -- d1024x24_mlp4 at 24 layers/2x the MLP width ran ~1.1-1.3s/it on the same node), bs=4 genuinely OOMs (50.87G required vs 31.75G HBM). Don't use for real training; kept only as a documented negative result.
+    "d1024x24_mlp2": LMConfig(d_model=1024, n_layers=24, n_heads=16, mlp_mult=2, context=8192, mtp_heads=1),  # ~251.7M — less extreme deep alternative to d1024x32_mlp2 above
 }
 
 
@@ -521,17 +529,22 @@ def bits_per_byte(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return nats / math.log(2)
 
 
-def mtp_loss(logits: torch.Tensor, tokens: torch.Tensor, context: int):
+def mtp_loss(logits: torch.Tensor, tokens: torch.Tensor, context: int, label_smoothing: float = 0.0):
     """logits: [n_heads, B, context, vocab] from model(tokens[:, :context]).
     tokens: [B, context + n_heads]. Returns (mean loss over all heads, head-0 bpb — the standard
-    next-byte metric comparable to qcute.bytelm/qcute.qcutelm)."""
+    next-byte metric comparable to qcute.bytelm/qcute.qcutelm). head0_bpb is always computed from
+    the unsmoothed loss so it stays comparable to eval_bpb/eval_bpb_full regardless of
+    label_smoothing."""
     n_heads = logits.size(0)
     losses = []
     for i in range(n_heads):
         targets_i = tokens[:, i + 1 : i + 1 + context]
-        losses.append(F.cross_entropy(logits[i].reshape(-1, logits.size(-1)), targets_i.reshape(-1)))
+        flat_logits = logits[i].reshape(-1, logits.size(-1))
+        flat_targets = targets_i.reshape(-1)
+        losses.append(F.cross_entropy(flat_logits, flat_targets, label_smoothing=label_smoothing))
+        if i == 0:
+            head0_bpb = F.cross_entropy(flat_logits, flat_targets) / math.log(2)
     losses = torch.stack(losses)
-    head0_bpb = losses[0] / math.log(2)
     return losses.mean(), head0_bpb
 
 
@@ -852,6 +865,7 @@ def main():
     p.add_argument("--n_layers", type=int, default=None, help="override preset's transformer layer count")
     p.add_argument("--layer_drop", type=float, default=None, help="override preset's stochastic-depth drop probability (per block, training only)")
     p.add_argument("--resid_dropout", type=float, default=None, help="override preset's dropout on each sublayer's output before the residual add")
+    p.add_argument("--label_smoothing", type=float, default=None, help="override preset's cross_entropy label_smoothing (training loss only)")
     p.add_argument("--no_zero_kv_sink", action="store_true", help="disable the (default-on) all-zero, always-attendable K/V sink token")
     p.add_argument("--no_torch_compile", action="store_true", help="disable the (default-on) torch.compile wrap (backend=openxla on xla, inductor on cpu)")
     p.add_argument("--use_flash_attention", action="store_true",
@@ -871,6 +885,9 @@ def main():
     p.add_argument("--constant_steps", type=int, default=1000, help="steps held at peak LR before cosine decay begins")
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--weight_decay", type=float, default=0.1)
+    p.add_argument("--grad_accum_steps", type=int, default=1, help="micro-batches accumulated per optimizer step (effective batch = batch_size * grad_accum_steps); use to fit a bigger model/batch in memory")
+    p.add_argument("--beta1", type=float, default=0.9, help="AdamW beta1")
+    p.add_argument("--beta2", type=float, default=0.95, help="AdamW beta2")
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--eval_every", type=int, default=200)
     p.add_argument("--eval_batches", type=int, default=10)
@@ -932,6 +949,8 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
             cfg.layer_drop = args.layer_drop
         if args.resid_dropout is not None:
             cfg.resid_dropout = args.resid_dropout
+        if args.label_smoothing is not None:
+            cfg.label_smoothing = args.label_smoothing
         if args.no_zero_kv_sink:
             cfg.zero_kv_sink = False
         if args.use_flash_attention:
@@ -969,7 +988,7 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
     log(
         f"{preset_label}  params={count_params(model)/1e6:.1f}M  device={device}  xla={_HAS_XLA}"
         f"  context={cfg.context}  mtp_heads={cfg.mtp_heads}  zero_kv_sink={cfg.zero_kv_sink}"
-        f"  layer_drop={cfg.layer_drop}  resid_dropout={cfg.resid_dropout}"
+        f"  layer_drop={cfg.layer_drop}  resid_dropout={cfg.resid_dropout}  label_smoothing={cfg.label_smoothing}"
         f"  use_flash_attention={cfg.use_flash_attention} (available={_HAS_FLASH_ATTENTION})"
         f"  torch_compile={not args.no_torch_compile}"
         + (f"  multichip=True world_size={world_size} global_batch={args.batch_size * world_size}" if args.multichip else "")
@@ -981,11 +1000,12 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
         + (f"  test_bytes={len(test_data)}" if test_data is not None else "  test_bytes=0 (no --test_frac)"))
     if not args.eval_only:
         seq_len = cfg.context + cfg.mtp_heads
-        steps_per_epoch = len(train_data) / (args.batch_size * seq_len)
+        effective_batch = args.batch_size * args.grad_accum_steps
+        steps_per_epoch = len(train_data) / (effective_batch * seq_len)
         epochs = args.steps / steps_per_epoch
         log(f"~{steps_per_epoch:.1f} steps/epoch  ~{epochs:.1f} epochs over train_bytes "
-            f"(steps={args.steps} batch_size={args.batch_size} seq_len={seq_len}, "
-            f"random-with-replacement sampling — see batch_iter)")
+            f"(steps={args.steps} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
+            f"effective_batch={effective_batch} seq_len={seq_len}, random-with-replacement sampling — see batch_iter)")
     val_iter = batch_iter(val_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
 
     if args.eval_only:
@@ -995,7 +1015,9 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
             log(f"eval_only_full_{args.eval_split}set  {args.eval_split}_bpb {eval_bpb_val:.4f}",
                 **{f"{args.eval_split}_bpb": eval_bpb_val})
     else:
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
+        if is_master:
+            log(f"lr_peak={args.lr_peak}  weight_decay={args.weight_decay}  betas=({args.beta1}, {args.beta2})  grad_clip={args.grad_clip}")
         train_iter = batch_iter(train_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
         checkpointer = Checkpointer(args.checkpoint_dir / run_name, args.save_every_n_evals, minimize=True) if is_master else None
 
@@ -1017,13 +1039,19 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
             for g in opt.param_groups:
                 g["lr"] = lr
 
-            batch = next(train_iter)
-            with autocast_ctx(device):
-                logits = model(batch[:, : cfg.context])
-            loss, head0_bpb = mtp_loss(logits, batch, cfg.context)
-
             opt.zero_grad()
-            loss.backward()
+            for micro in range(args.grad_accum_steps):
+                batch = next(train_iter)
+                with autocast_ctx(device):
+                    logits = model(batch[:, : cfg.context])
+                loss, head0_bpb = mtp_loss(logits, batch, cfg.context, cfg.label_smoothing)
+                (loss / args.grad_accum_steps).backward()
+                # Under XLA's lazy execution nothing actually runs until a sync -- without this,
+                # grad_accum_steps microbatches' forward+backward graphs all pile up unexecuted
+                # into one HLO graph instead of freeing memory between them, multiplying peak HBM
+                # by grad_accum_steps (confirmed directly: OOM'd at ~4x/2x a single microbatch's
+                # memory for grad_accum_steps=4/2 before this was added).
+                mark_step(device)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer_step(opt, device)
 

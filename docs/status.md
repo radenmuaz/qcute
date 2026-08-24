@@ -396,3 +396,191 @@ substituted for these blocks instead of relying on this incidental zero-fallback
 generation path in this codebase currently requires at least one real block of prompt for exactly
 this reason (`all_bytes = prompt_bytes[:, :prompt_bytes.shape[1] // K * K]`, then asserts
 non-empty) -- true zero-context "mid-sentence" init isn't attempted anywhere yet.
+
+## 2026-08-24: `qcute_zero` wavefront lockstep decode — draft (unverified) + drafted-and-verified (`generate_wavefront_mtp`) + training-time loss
+
+**Mechanism**: `wavefront_mask(timestep, region)` (module-level fn) splits a K-byte block into
+`n_waves` regions of `region_len=K/n_waves`, decoded in lockstep "timesteps": a query can attend
+to any strictly-earlier-timestep key regardless of region, plus same-timestep keys in its OWN
+region only (parallel across waves, causal within a wave). Bootstrapped with no seed token: wave
+0's first token is the ordinary head0 readout off `h_last`; wave `g>=1`'s first token comes from
+`extra_heads[g*region_len-1]` (offset `g*region_len+1`), so `cfg.mtp_heads >=
+(n_waves-1)*region_len+1` is required. Degenerates exactly to plain AR when `n_waves=1`
+(`check_wavefront_consistency`, `match_rate=1.0`), and — a fact derived and confirmed this
+session — **also degenerates exactly to plain MTP-heads drafting when `region_len=1`** (e.g.
+`n_waves=K`): with no lockstep loop to run, the "block" is just the bootstrap step, same heads,
+same source hidden state (`h_last`), byte-identical draft (confirmed on matched prompts: accept
+rate and drafted bytes identical on 15/15 trials). The wavefront-specific independence assumption
+only bites once `region_len>1`.
+
+**`generate_wavefront`** (unverified): drafts a full K-byte block via the lockstep mechanism, no
+correction against the true model. `buf`'s layout is already true left-to-right byte order (wave
+`g`'s slots sit at absolute positions `P+g*region_len..P+(g+1)*region_len-1`), so no reordering
+needed. Refactored the per-block draft logic into `_wavefront_draft_block`, shared with:
+
+**`generate_wavefront_mtp`** (drafted-and-verified, the actually-useful mode): drafts a K-byte
+block the same way, then verifies it byte-by-byte in true order against the exact incremental
+stepper (`_make_incremental_stepper`) — same accept/reject-to-first-mismatch scheme
+`generate_speculative` already uses for plain MTP drafts, so output is guaranteed byte-identical to
+`generate_no_cache` regardless of draft quality (the speculative-decoding correctness guarantee).
+Verified exact on every trial run this session (15/15, both checkpoints, `n_waves` ∈ {2,8}).
+
+**Training-time wavefront loss** (`Config.wavefront_weight/wavefront_K/wavefront_n_waves`,
+default off): `wavefront_mask` was previously used ONLY at generation time — `forward()`'s loss
+never exercised it, so generation-time lockstep hidden states were out-of-distribution for the
+trunk's self-attention. New loss tiles the block-local timestep/region structure across the WHOLE
+training sequence in one pass (block `b`'s timestep = `b*region_len+local_j`, keeping blocks
+strictly ordered relative to each other) and adds an ordinary next-byte CE loss at every
+within-block position except each region's own last local step (whose "next" would cross into a
+different region) and excluding each region's own first local step (the MTP-bootstrapped position,
+already covered by `mtp_heads`' own loss). Confirmed via direct isolation test (feeding the
+lockstep-fill step the TRUE ground-truth bootstrap token rather than a predicted one, scoring
+against real val data): lockstep-fill accuracy alone improved **0.354 -> 0.392** after adding this
+loss (`ks1_overfit10k_wavefront2` vs `_trained`, `K=8/n_waves=2/mtp_heads=5`, overfit10k scale).
+
+**But this did NOT make unverified `generate_wavefront(n_waves=2)` free-run output exact or even
+close to `generate_no_cache`'s own trajectory** (byte-match rate ~0.13-0.14 either way, no
+measurable change) — diagnosed as bottlenecked by the BOOTSTRAP step, not the lockstep mechanism:
+`val_mtp5_acc≈0.15-0.16` (the far-offset MTP head bootstrapping wave 1's first token) badly
+overfits train and doesn't generalize to val, and since wave 1's entire region is built on that one
+weak prediction, its error dominates and swamps the lockstep mechanism's own real (if modest)
+improvement in the full free-run comparison. Increasing `mtp_heads` 5->8 (`ks1_overfit10k_
+wavefront2_mtp8`, also testing whether extra head capacity/offset coverage helps) did NOT fix
+far-offset generalization either — `val_mtp2_acc≈0.25` down to `val_mtp8_acc≈0.12`, same decay
+shape as the 5-head run.
+
+**Clean same-checkpoint, same-prompt accept-rate comparison** (`ks1_overfit10k_wavefront2_mtp8`,
+15 matched trials, all exact 15/15 via the verifier): plain mtp `accept_rate=0.775`, wavefront-mtp
+`n_waves=8` (degenerate, `region_len=1`) `accept_rate=0.775` (identical, as derived above),
+wavefront-mtp `n_waves=2` (trained lockstep, `region_len=4`) `accept_rate=0.827` — the ONLY real,
+reproducible gain from this whole mechanism is the trained lockstep refinement at `region_len>1`;
+`n_waves=K` buys nothing over plain MTP since it IS plain MTP. (An earlier same-session in-chat
+report of `n_waves=8` beating plain mtp, 0.712 vs 0.682, was a measurement artifact — the two
+loops drew different random prompts via separate `torch.randint` calls — corrected once caught.)
+
+**Bottom line**: `generate_wavefront_mtp` is a correct, exact, and (at `region_len>1`, once
+trained) genuinely-better-than-plain-MTP draft mechanism. Unverified `generate_wavefront` itself is
+not a productive target for exactness at this scale — it's fundamentally gated by the same
+far-offset MTP generalization ceiling every bootstrap-style mechanism in this file hits, not by the
+wavefront mask/loss itself.
+
+New configs: `configs/qcute_zero/ks1_overfit10k_wavefront2_trained.py` (adds `wavefront_weight`),
+`configs/qcute_zero/ks1_overfit10k_wavefront2_mtp8.py` (`mtp_heads=8`). `scripts/
+qual_wavefront_check.py` now shows all four modes (ntp/mtp/wavefront-ntp/wavefront-mtp) side by
+side with accept-rate and exact-match-vs-ntp for the verified ones.
+
+## 2026-08-24: `generate_early_exit`, `own_block_seed_weight` (stack_local, shift-by-1), `generate_free_rollout` causality fix
+
+**`generate_early_exit`** (`_generate_cascade_early_exit`): confidence-threshold skip of deeper
+fuse stages, using a shallower stage's own real cond prediction (not a blind uncond guess) when
+its softmax max-prob clears the threshold. No exactness guarantee (documented explicitly, unlike
+the verified drafters). On a genuine 2-stage `ks221` cascade (`ks221_overfit10k_mtp8`,
+`Ks=(2,2,1)`), `threshold=0.9` skipped stage 1 entirely on 27/40 positions while still matching
+`generate_no_cache` exactly on that trial — a real, measured compute saving, not just a PoC.
+
+**`own_block_seed_weight`: stack_local-style block-diagonal decode, generalized to every fuse
+stage, then corrected for validity twice.** Initial version (single stage, interleaved
+seed+bytes under one FULL causal self-attention mask) let a seed see every real byte from every
+earlier block — decoding a block still needed the entire prior byte history, no locality/speed win
+at all (chat: "no speedup vs usual causal ntp"). Fixed via `qcute_v1`'s `StackDecoderLocal`
+trick (`block_local_track0_decode`): fold `n_blocks` into the batch dimension, run ordinary causal
+self-attention within each `cum_Ks[s]`-length block independently — true block-diagonal, LOCAL
+positions, zero cross-block byte visibility (directly verified: perturbing block 0's bytes leaves
+every block's seed hidden state, including block 0's own, bit-identical *before* cross-attention —
+matches `qcute_v1`'s own proof that a block-local seed's self-attention contribution is exactly
+zero). `code_window` as a separate hparam was removed — `cfg.attn_window` is reused directly for
+the code cross-attention's window (same byte-position units, no conversion).
+
+**But the block-diagonal version still cross-attended to the block's OWN code** (`h_code_s` at its
+own position, `code_pos_abs` reused as both query and key for an "offset 0" trick) — which is
+circular for a real bpb claim: that code is pooled from the block's own real bytes, including the
+very byte being predicted (see chat's `Ks=(2,1)`, `abcdef` walkthrough: `code(e,f)` used to predict
+`e` is using the answer, plus more of the future on top, to predict itself — not even a valid
+bound, since the conditioning set isn't a subset of the past). Two ideas floated for fixing this
+without abandoning validity — STE-on-the-predicted-code (single sample, causally clean but still
+Jensen-biased vs. the true marginal) and exact marginalization (sum over the full code
+distribution, provably exact but costs `n_blocks × vocab^pq_chunks` extra forward passes per
+step — `~2.1M×` for `v16pq4` at `context_len=256`, clearly infeasible; `~8192×` even for flat
+`v256pq1` — both ruled out as impractical) — were superseded by a much simpler fix (chat: "cant
+just you shift-by-1 this stack local, just like mtp... dont follow v1 as is, mod it so that it is
+shift by 1 and causal"): cross-attend to `code_{b-1}` (the PREVIOUS block's real code, offset 1,
+exactly what the ordinary non-own-block cond path already uses for a block's first byte) instead
+of the block's own code. `code_{b-1}` is a real, already-causal, deterministic quantity — no
+sampling, no marginalization needed, and the result is EXACT (not a bound): every conditioning
+variable is now a deterministic function of strictly-earlier real data. Block 0 has no `code_{-1}`,
+excluded from the seed loss (`n_blocks_s>=2` required). Directly re-verified block-diagonal
+isolation AND the shift's forward-only propagation: perturbing block 4's bytes leaves blocks 1-4's
+seed predictions bit-identical and changes blocks 5+'s, exactly the expected causal shape.
+
+Confirmed `own_block_losses`/`wavefront_loss` were never part of the reported/canonical bpb metrics
+(`final_loss`/`uncond_loss`/`cond_loss`) in the first place — both are auxiliary `total_loss` terms
+with their own weights, so neither corrupted the "official" bpb number even before this fix; the
+fix matters for the mechanism's OWN validity (own-block-seed-based generation), not for the
+headline bpb reported elsewhere.
+
+**`generate_free_rollout` rewritten a third time to match** (causality fix, then true locality,
+then shift-by-1): since `code_{b-1}` always already exists once block `b-1` is real, the code-level
+NTP's SAMPLING step (`sample_next`) is no longer needed at all -- "free rollout" is a bit of a
+misnomer now (nothing is sampled ahead of its own bytes) but the mechanism's actual value survives:
+block-LOCAL self-attention (fresh, bounded `K+1`-sized cache every block, thrown away after) +
+cheap cross-attention to the short code-level history -- decoding block `b` costs `O(K)` +
+`O(n_blocks_so_far)` for the code history, never `O(L)` full self-attention over the raw byte
+history. Two real bugs caught via full-recompute consistency checks while building this: (1)
+conflating the LOCAL hidden state with the GLOBAL one for code EXTRACTION (the code-level LM was
+trained on codes extracted via the ordinary GLOBAL `cur_h[:,K-1::K,:]` convention, a completely
+separate computation from the local decode mechanism — mixing them broke consistency 6/8 before
+the fix, 8/8 after); (2) `hc_hist`/`cpos_hist` (the cross-attention KV) never grew across the outer
+loop after the shift-by-1 rewrite, so every new block was seeing only the prompt's original codes
+— caught via a multi-block (6-block) consistency re-check, fixed by appending each new block's own
+code-level output/position every iteration, re-verified 8/8.
+
+`n_fuse==1` only; needs `>=2*K0` real prompt bytes now (shift-by-1 needs a real `code_{b-1}`, i.e.
+at least one complete prior block beyond the very first). Not yet re-trained/quality-tested on a
+real checkpoint under this final design — `ks81_overfit10k_ownblock`'s existing checkpoint used
+the pre-shift-by-1 (circular) mechanism and needs a rerun.
+
+## 2026-08-24: `own_block_seed_weight` renamed to `blocklocal_seed_weight`
+
+Caught as misleading (chat: "but is it still ownblock, misleading") once shift-by-1 landed: the
+mechanism no longer cross-attends to a block's own code at all (that was exactly the circularity
+just fixed) -- it cross-attends to the PREVIOUS block's code. The defining, still-true property is
+the block-diagonal self-attention (the actual source of the locality/speed win), not anything
+"own". Renamed throughout: `blocklocal_seed_weight`, `blocklocal_dual_mode`,
+`blocklocal_losses`/`blocklocal_accs`, `blocklocal{s}_loss/acc` metrics,
+`configs/qcute_zero/ks81_overfit10k_blocklocal.py` (renamed from `_ownblock.py`,
+`run_name=qcute_zero_ks81_overfit10k_blocklocal`). Re-verified forward()/backward still work
+post-rename before relaunching training.
+
+## 2026-08-24: `generate_free_rollout` first real quality check (post shift-by-1)
+
+`ks81_overfit10k_blocklocal` trained 1000 steps, converged as expected for overfit10k:
+`train_byte_acc≈0.987`, `train_blocklocal0_acc≈0.78-0.81` (val is low as always at this scale, not
+a generalization test). Compared `generate_free_rollout` against `generate_no_cache` (exact
+reference) on 2 held-out prompts, 32 new bytes each: `generate_no_cache` exactly reproduces the
+memorized training continuation both times (as expected). `generate_free_rollout` diverges from it
+early (~55% exact byte match both prompts) but stays qualitatively plausible -- output is still
+well-formed wiki-XML-like fragments drawn from elsewhere in the training corpus (e.g.
+`<text xml:space...`, `<namespace key="10">`), not garbage/repetition. Verdict: the mechanism is
+wired correctly (causally valid per the shift-by-1 fix, block-local decode confirmed working
+end-to-end) but not yet high-fidelity at this scale/step budget -- consistent with
+`blocklocal0_acc` topping out around 0.8 rather than ~0.99 like the main byte-level NTP loss.
+Script: `check_free_rollout.py` (scratchpad, not checked in) -- loads `last.pt`, runs both
+generators on the same prompt, reports byte-level exact-match rate.
+
+Follow-up diagnostic (chat: "did you check what if you input the gt codes... to sanity generation
+code"): split `generate_free_rollout`'s new bytes into seed (first-of-block, cross-attends to real
+`code_{b-1}`) vs local (rest-of-block, autoregressive within the block) and compared against
+`forward()`'s own teacher-forced `blocklocal0_seed_acc`/`blocklocal0_local_acc` (added as new
+metrics keys this session, same pattern as the existing `blocklocal0_acc`). Free-run seed_acc
+(~0.5) tracks teacher-forced seed_acc (~0.57) reasonably well; free-run local_acc collapses to
+~0.036 vs teacher-forced ~0.68 -- looked like a generation bug at first. Ruled out by teacher-
+forcing the TRUE bytes into `generate_free_rollout`'s own incremental local-decode code path
+(same KV cache, same `forward_incremental` calls) instead of its own argmax: reproduced ~0.71,
+matching training almost exactly, confirming the code is correct. Root cause is a genuine training
+gap: `blocklocal_local_loss` is 100% teacher-forced (always fed ground-truth within-block bytes),
+no scheduled sampling, so once free-running commits one wrong byte mid-block every later
+prediction in that block is conditioned on a context distribution the model never saw -- the same
+compounding-error pattern as `qcute_v1`'s original free-rollout collapse, now reproduced inside a
+single block rather than across blocks. Not yet fixed (would need scheduled sampling or a
+free-running local-decode loss term analogous to how `own_block_decode_loss`/`code-level` training
+addressed the cross-block version).

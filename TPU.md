@@ -21,13 +21,13 @@ gcloud compute tpus queued-resources list --project raden-tpu --zone us-east1-d
 ```
 
 ```
-gcloud compute tpus queued-resources create tpu5 --node-id tpunode5 --project raden-tpu --zone us-central2-b --accelerator-type v4-8 --runtime-version tpu-ubuntu2204-base
+gcloud compute tpus queued-resources create tpu7 --node-id tpunode7 --project raden-tpu --zone us-central2-b --accelerator-type v4-8 --runtime-version tpu-ubuntu2204-base
 
 gcloud compute tpus queued-resources describe tpu1 --project raden-tpu --zone us-central2-b
 
 gcloud compute tpus queued-resources delete tpu3 --project raden-tpu  --zone us-central2-b --force --async
 
-gcloud compute tpus queued-resources ssh tpu5 --project raden-tpu --zone us-central2-b
+gcloud compute tpus queued-resources ssh tpu6 --project raden-tpu --zone us-central2-b
 ```
 
 

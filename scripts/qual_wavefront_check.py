@@ -8,11 +8,11 @@ side by side (chat 2026-08-24's "later for wavefront there are more modes" plan)
                     This is a genuinely DIFFERENT generative process (own MTP-bootstrapped wave
                     starts, cross-region visibility), so it is NOT expected to match ntp exactly --
                     a plausibility/quality check, not a consistency check.
-  - wavefront-mtp: NOT YET IMPLEMENTED. Would need a new accept/reject-to-first-mismatch verifier
-                    (same scheme generate_speculative already uses for ntp) fed from
-                    generate_wavefront's lockstep draft instead of plain MTP heads -- i.e. a
-                    genuine wavefront-based speculative decoder with the same exactness guarantee
-                    mtp has. Left as a clear next step, not attempted here.
+  - wavefront-mtp: generate_wavefront_mtp -- wavefront-DRAFTED (region_len passes/block), byte-by-byte
+                    VERIFIED against the same exact stepper generate_speculative uses (guaranteed
+                    identical to ntp; accept_rate expected <= plain mtp's once region_len>1, since
+                    only then does the lockstep independence assumption actually bite -- see
+                    generate_wavefront_mtp's own docstring).
 
 Also checks the checkpoint's own check_wavefront_consistency (n_waves=1 degenerate case, which
 MUST match ntp exactly -- see generate_wavefront's own docstring).
@@ -57,7 +57,8 @@ def main() -> None:
     out_ntp = model.generate_no_cache(prompt, args.n_new_bytes, args.device)
     out_mtp, spec_stats = model.generate_speculative(prompt, args.n_new_bytes, args.device, return_stats=True)
     out_wave_ntp = model.generate_wavefront(prompt, K=8, n_waves=2, n_new_bytes=args.n_new_bytes, device=args.device)
-    # wavefront-mtp: not yet implemented (see module docstring) -- would go here.
+    out_wave_mtp, wave_spec_stats = model.generate_wavefront_mtp(
+        prompt, K=8, n_waves=2, n_new_bytes=args.n_new_bytes, device=args.device, return_stats=True)
 
     def to_text(t: torch.Tensor) -> str:
         return pack_words(t.tolist(), cfg.input_preset).decode("latin-1", errors="replace")
@@ -67,7 +68,8 @@ def main() -> None:
     print(f"mtp (accept_rate={spec_stats['accept_rate']:.2f}, matches ntp={torch.equal(out_ntp, out_mtp)}): "
           f"{to_text(out_mtp)!r}")
     print(f"wavefront-ntp:       {to_text(out_wave_ntp)!r}")
-    print("wavefront-mtp:       not yet implemented (needs a wavefront-drafted verifier)")
+    print(f"wavefront-mtp (accept_rate={wave_spec_stats['accept_rate']:.2f}, "
+          f"matches ntp={torch.equal(out_ntp, out_wave_mtp)}): {to_text(out_wave_mtp)!r}")
 
 
 if __name__ == "__main__":
