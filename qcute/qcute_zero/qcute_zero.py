@@ -252,6 +252,21 @@ def causal_mask(query_pos: torch.Tensor, key_pos: torch.Tensor, window: int | No
     return allow.view(1, 1, *allow.shape)
 
 
+def wavefront_mask(timestep: torch.Tensor, region: torch.Tensor) -> torch.Tensor:
+    """(1, 1, L, L) bool mask, True=visible (chat 2026-08-24's wavefront/diagonal parallel-decode
+    scheme). j visible to i iff j is at a STRICTLY earlier timestep (any region -- this is what
+    lets region carry cross-region information for free), OR j is at the SAME timestep in the
+    SAME region (ordinary within-region causal self-inclusion, including i==j). Same timestep,
+    DIFFERENT region = mutually invisible; that asymmetry is the entire mechanism. Degenerates to
+    plain causal_mask when every position has a unique timestep (n_waves==1, or any config where
+    no two positions share a timestep)."""
+    earlier = timestep.view(-1, 1) > timestep.view(1, -1)
+    same_step_same_region = ((timestep.view(-1, 1) == timestep.view(1, -1)) &
+                              (region.view(-1, 1) == region.view(1, -1)))
+    allow = earlier | same_step_same_region
+    return allow.view(1, 1, *allow.shape)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-6):
         super().__init__()
@@ -413,27 +428,64 @@ class Quantizer(nn.Module):
     own module shapes: dedicated code_head/code_embed/code_predict instead of a stage_lm object's
     attributes). Categorical code via gumbel-softmax STE, product-quantized: pq_chunks independent
     vocab-way softmaxes concatenated (total code width = vocab*pq_chunks), combinatorial capacity
-    vocab**pq_chunks. Constraint: vocab**pq_chunks >= 256 (must be able to represent at least a
-    byte). Default vocab=256, pq_chunks=1 is functionally the original single 256-way softmax,
-    now with its own dedicated weights rather than literally reusing self.embed/self.head."""
-    def __init__(self, D: int, vocab: int, pq_chunks: int, gumbel_tau: float, code_hard: bool, code_sample: bool):
+    vocab**pq_chunks. Constraint: vocab**pq_chunks >= unit_vocab (2**input_preset -- must be able
+    to represent at least one real trunk unit, byte/nibble/bit/whatever input_preset is). Default
+    vocab=256, pq_chunks=1 (with unit_vocab=256, i.e. byte trunk) is functionally the original
+    single 256-way softmax, now with its own dedicated weights rather than literally reusing
+    self.embed/self.head -- UNLESS global_tie requests otherwise (see below).
+
+    global_tie (2026-08-24, `qcute_zero_simple`'s original design as a special case of this more
+    general architecture): only representable as a literal shared-tensor tie when vocab==unit_vocab
+    and pq_chunks==1 (width==unit_vocab exactly, matching self.embed/self.head's own shape) -- then
+    code_head/code_predict directly reference tied_head_weight and code_embed multiplies directly
+    against tied_embed_weight (matmul, not nn.Linear -- see _embed() below), exactly like the
+    original pre-quantizer-refactor code (`onehot @ self.embed.weight`). For any other config
+    (pq_chunks>1 or vocab!=unit_vocab), a literal tensor tie is impossible (code_head's per-chunk
+    concatenated logit space and a flat unit_vocab-wide embed table are different shapes/objects,
+    and solving code_embed's single linear layer to reproduce all unit_vocab embed rows via a
+    sparse pq-chunk one-hot is a generally underdetermined system when chunks' index-ranges
+    overlap across different unit values) -- global_tie is a no-op there: only the reserved-index
+    *convention* holds (the first unit_vocab combinatorial ids, per to_ids()'s place-value order,
+    are nominally "real unit values"; ids >= unit_vocab are free/bonus codes with no unit meaning),
+    as documentation/bookkeeping, not an enforced numerical correspondence -- training decides
+    what the reserved sub-range actually ends up encoding."""
+    def __init__(self, D: int, vocab: int, pq_chunks: int, gumbel_tau: float, code_hard: bool, code_sample: bool,
+                 unit_vocab: int = 256, global_tie: bool = False,
+                 tied_head_weight: torch.Tensor | None = None, tied_embed_weight: torch.Tensor | None = None):
         super().__init__()
-        assert vocab ** pq_chunks >= 256, (
+        assert vocab ** pq_chunks >= unit_vocab, (
             f"quantizer code space too small: vocab**pq_chunks = {vocab}**{pq_chunks} = "
-            f"{vocab ** pq_chunks} < 256 (must represent at least a byte)")
+            f"{vocab ** pq_chunks} < unit_vocab ({unit_vocab}) -- must represent at least one real "
+            f"trunk unit (byte/nibble/bit/etc., per input_preset)")
         self.vocab = vocab
         self.pq_chunks = pq_chunks
         self.width = vocab * pq_chunks
+        self.unit_vocab = unit_vocab
         self.tau = gumbel_tau
         self.hard = code_hard
         self.sample = code_sample
 
-        self.code_head = nn.Linear(D, self.width, bias=False)
-        nn.init.normal_(self.code_head.weight, std=0.02)
-        self.code_embed = nn.Linear(self.width, D, bias=False)
-        nn.init.normal_(self.code_embed.weight, std=0.02)
-        self.code_predict = nn.Linear(D, self.width, bias=False)
-        nn.init.normal_(self.code_predict.weight, std=0.02)
+        self.exact_tie = global_tie and vocab == unit_vocab and pq_chunks == 1
+        if self.exact_tie:
+            assert tied_head_weight is not None and tied_embed_weight is not None
+            self.code_head = nn.Linear(D, self.width, bias=False)
+            self.code_head.weight = tied_head_weight       # (width, D) == (unit_vocab, D), same shape as self.head
+            self.code_predict = nn.Linear(D, self.width, bias=False)
+            self.code_predict.weight = tied_head_weight
+            self.code_embed = None                          # embedding done via direct matmul, see _embed()
+            self._tied_embed_weight = tied_embed_weight      # (unit_vocab, D), same convention as self.embed.weight
+        else:
+            self.code_head = nn.Linear(D, self.width, bias=False)
+            nn.init.normal_(self.code_head.weight, std=0.02)
+            self.code_embed = nn.Linear(self.width, D, bias=False)
+            nn.init.normal_(self.code_embed.weight, std=0.02)
+            self.code_predict = nn.Linear(D, self.width, bias=False)
+            nn.init.normal_(self.code_predict.weight, std=0.02)
+
+    def _embed(self, onehot: torch.Tensor) -> torch.Tensor:
+        if self.exact_tie:
+            return onehot @ self._tied_embed_weight
+        return self.code_embed(onehot)
 
     def _chunked(self, x: torch.Tensor) -> torch.Tensor:
         """(..., width) -> (..., pq_chunks, vocab) -- pure reshape, no data movement."""
@@ -447,7 +499,7 @@ class Quantizer(nn.Module):
             onehot = gumbel_quantize(logits, self.tau, self.hard, self.sample)
         else:
             onehot = gumbel_quantize(self._chunked(logits), self.tau, self.hard, self.sample).reshape(logits.shape)
-        return onehot, self.to_ids(onehot), self.code_embed(onehot)
+        return onehot, self.to_ids(onehot), self._embed(onehot)
 
     def extract_greedy(self, h: torch.Tensor) -> tuple:
         """Same as extract() but always hard=True/sample=False -- generation-time greedy code
@@ -458,7 +510,7 @@ class Quantizer(nn.Module):
             onehot = gumbel_quantize(logits, self.tau, hard=True, sample=False)
         else:
             onehot = gumbel_quantize(self._chunked(logits), self.tau, hard=True, sample=False).reshape(logits.shape)
-        return onehot, self.code_embed(onehot)
+        return onehot, self._embed(onehot)
 
     def to_ids(self, code_repr: torch.Tensor) -> torch.Tensor:
         chunk_ids = self._chunked(code_repr).argmax(-1)
@@ -483,7 +535,7 @@ class Quantizer(nn.Module):
         LM's own hidden state (not extracted from real bytes) -- e.g. generate_free_rollout."""
         logits = self._chunked(self.code_predict(h_query))
         onehot = gumbel_quantize(logits, self.tau, hard=True, sample=False).reshape(*h_query.shape[:-1], self.width)
-        return onehot, self.code_embed(onehot)
+        return onehot, self._embed(onehot)
 
 
 # ----------------------------------------------------------------------------
@@ -523,8 +575,8 @@ class Config:
     mtp_weight: float = 1.0                  # weight for the extra heads' mean loss
     mtp_heads_code: int = 1                  # extra code-ahead heads reading the code-sequence
                                               # LM's own hidden state (h_code), predicting further
-                                              # future codes (1 = disabled). One shared set reused
-                                              # across every fuse stage, same as self.quantizer.
+                                              # future codes (1 = disabled). Per-stage by default,
+                                              # like the quantizer itself (share_lm=True shares both).
     mtp_weight_code: float = 1.0
     mtp_heads_uncond: int = 1                # extra byte-ahead heads reading the BASE trunk
                                               # hidden state h (before any fuse cross-attention --
@@ -534,7 +586,17 @@ class Config:
     weight_tie: bool = False                 # default untied: byte output head is its own
                                               # nn.Linear(D, V, bias=False), separate params from
                                               # self.embed. True: head.weight literally refs
-                                              # embed.weight (shared tensor, not a copy).
+                                              # embed.weight (shared tensor, not a copy). "local"
+                                              # tie -- level 0 only.
+    global_tie: bool = False                 # requires weight_tie=True. Extends the tie to every
+                                              # level's Quantizer too (qcute_zero_simple's original
+                                              # one-shared-table design, as a special case of this
+                                              # more general architecture) -- exact/literal only
+                                              # when that stage's vocab==unit_vocab and pq_chunks==1
+                                              # (e.g. v256pq1 for a byte trunk); otherwise a no-op
+                                              # beyond the reserved-index convention (see Quantizer's
+                                              # own docstring) -- no numerical weight forcing, since
+                                              # that system is underdetermined once pq_chunks>1.
     seed_query_p: float = 0.0                # fraction of byte positions sampled each training
                                               # step for the sparse any-timestep seed-token
                                               # auxiliary loss (0 = disabled). At a sampled
@@ -705,14 +767,28 @@ class QCuteZero(nn.Module):
             self.lms = nn.ModuleList(
                 [nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
                  for _ in range(n_lms)])
-        self.ln_f = RMSNorm(D)
+        # per-level final norm -- previously a single shared self.ln_f regardless of share_lm, an
+        # oversight relative to per-level independence (each level's own blocks got independence,
+        # its final norm didn't); now follows the exact same share_lm-controlled pattern as lms.
+        if cfg.share_lm:
+            first_ln = RMSNorm(D)
+            self.ln_fs = nn.ModuleList([first_ln] * n_lms)
+        else:
+            self.ln_fs = nn.ModuleList([RMSNorm(D) for _ in range(n_lms)])
 
         # byte-output head: untied (own nn.Linear) by default; weight_tie=True makes it literally
         # reference self.embed.weight (shared tensor -- PyTorch's .parameters() dedupes by
-        # identity, so this doesn't double-count params). Code extraction/code-NTP still read
-        # self.embed.weight directly (codes live in embed space until the quantizer refactor).
+        # identity, so this doesn't double-count params). Code extraction/code-NTP have their own
+        # dedicated weights entirely separate from self.embed -- see Quantizer's code_head/
+        # code_predict/code_embed below, wired in during the quantizer port.
+        assert not cfg.global_tie or cfg.weight_tie, "global_tie requires weight_tie=True"
         self.head = nn.Linear(D, V, bias=False)
         if cfg.weight_tie:
+            assert cfg.head_word_bits is None or cfg.head_word_bits == cfg.input_preset, (
+                "weight_tie=True ties self.head to self.embed, which only makes sense when the "
+                "output head predicts the SAME format the input embeds (head_word_bits must match "
+                f"input_preset, e.g. byte-in/byte-out) -- got input_preset={cfg.input_preset}, "
+                f"head_word_bits={cfg.head_word_bits}")
             self.head.weight = self.embed.weight
         else:
             nn.init.normal_(self.head.weight, std=0.02)
@@ -730,15 +806,38 @@ class QCuteZero(nn.Module):
         self.seed_embed = nn.Parameter(torch.zeros(D))
         nn.init.normal_(self.seed_embed, std=0.02)
 
+        # per-stage quantizer + code-MTP heads -- previously one global instance shared across every
+        # fuse stage regardless of share_lm, the same oversight as ln_f above; now follows the same
+        # share_lm-controlled pattern as lms/ln_fs.
         assert cfg.quant_type == "simplex", f"only quant_type='simplex' is ported so far, got {cfg.quant_type!r}"
-        self.quantizer = Quantizer(D, cfg.vocab, cfg.pq_chunks, cfg.gumbel_tau, cfg.code_hard, cfg.code_sample)
-        self.extra_heads_code = nn.ModuleList(
-            [nn.Linear(D, self.quantizer.width, bias=False) for _ in range(max(0, cfg.mtp_heads_code - 1))])
+
+        def _make_quantizer():
+            return Quantizer(D, cfg.vocab, cfg.pq_chunks, cfg.gumbel_tau, cfg.code_hard, cfg.code_sample,
+                              unit_vocab=V, global_tie=cfg.global_tie,
+                              tied_head_weight=self.head.weight, tied_embed_weight=self.embed.weight)
+
+        if cfg.share_lm:
+            first_q = _make_quantizer()
+            self.quantizers = nn.ModuleList([first_q] * max(1, self.n_fuse))
+        else:
+            self.quantizers = nn.ModuleList([_make_quantizer() for _ in range(max(1, self.n_fuse))])
+        self.quantizer = self.quantizers[0]   # convenience alias, e.g. for .width below
+
+        if cfg.share_lm:
+            first_ehc = nn.ModuleList(
+                [nn.Linear(D, self.quantizer.width, bias=False) for _ in range(max(0, cfg.mtp_heads_code - 1))])
+            self.extra_heads_code_per_stage = nn.ModuleList([first_ehc] * max(1, self.n_fuse))
+        else:
+            self.extra_heads_code_per_stage = nn.ModuleList([nn.ModuleList(
+                [nn.Linear(D, self.quantizer.width, bias=False) for _ in range(max(0, cfg.mtp_heads_code - 1))])
+                for _ in range(max(1, self.n_fuse))])
+
+        self.word_head = WordHead(D, cfg.input_preset, cfg.head_word_bits) if cfg.head_word_bits is not None else None
 
     def _run_blocks(self, level: int, x: torch.Tensor, cos, sin, attn_mask) -> torch.Tensor:
         for block in self.lms[level]:
             x = block(x, cos, sin, attn_mask)
-        return self.ln_f(x)
+        return self.ln_fs[level](x)
 
     def forward(self, byte_ids: torch.Tensor) -> tuple:
         cfg = self.cfg
@@ -755,9 +854,14 @@ class QCuteZero(nn.Module):
         x0 = self.embed(byte_ids)
         h = self._run_blocks(0, x0, cos_b, sin_b, byte_mask)
 
-        uncond_logits = self.head(h[:, :-1, :])
-        uncond_loss = F.cross_entropy(uncond_logits.reshape(-1, V), byte_ids[:, 1:].reshape(-1))
-        uncond_acc = (uncond_logits.argmax(-1) == byte_ids[:, 1:]).float().mean()
+        if self.word_head is not None:
+            uncond_loss, uncond_acc = self.word_head.loss_acc(h, byte_ids)
+            uncond_loss = uncond_loss if uncond_loss is not None else h.new_zeros(())
+            uncond_acc = uncond_acc if uncond_acc is not None else h.new_zeros(())
+        else:
+            uncond_logits = self.head(h[:, :-1, :])
+            uncond_loss = F.cross_entropy(uncond_logits.reshape(-1, V), byte_ids[:, 1:].reshape(-1))
+            uncond_acc = (uncond_logits.argmax(-1) == byte_ids[:, 1:]).float().mean()
 
         # uncond-level-0 MTP heads: cheap/coarse extra byte-ahead heads reading the BASE trunk
         # hidden state h, before any fuse cross-attention -- same pattern as the byte-level extra
@@ -790,9 +894,10 @@ class QCuteZero(nn.Module):
             if n_blocks < 1:
                 break
 
-            # code extraction: pluggable Quantizer (own code_head/code_embed, STE hard sample)
+            quantizer = self.quantizers[s]
+            # code extraction: pluggable per-stage Quantizer (own code_head/code_embed, STE hard sample)
             code_h = cur_h[:, K_s - 1::K_s, :][:, :n_blocks, :]
-            onehot, code_ids, code_embeds = self.quantizer.extract(code_h)
+            onehot, code_ids, code_embeds = quantizer.extract(code_h)
 
             # this stage's own code-sequence NTP pass -- SAME shared blocks, causal, unbounded
             # (short sequence: n_blocks = cur_len // K_s)
@@ -802,19 +907,18 @@ class QCuteZero(nn.Module):
             h_code = self._run_blocks(s + 1, code_embeds, cos_c, sin_c, code_mask)
 
             if n_blocks >= 2:
-                code_ntp_loss, code_ntp_acc = self.quantizer.ntp_loss_acc(h_code[:, :-1, :], onehot[:, 1:, :])
+                code_ntp_loss, code_ntp_acc = quantizer.ntp_loss_acc(h_code[:, :-1, :], onehot[:, 1:, :])
                 fuse_ntp_losses += [code_ntp_loss]
                 fuse_ntp_accs += [code_ntp_acc]
 
             # code-level MTP heads: extra code-ahead heads reading h_code, predicting further
-            # future codes (offset i+2..) -- one shared set reused across every fuse stage, same
-            # as self.quantizer itself.
-            for i, head_c in enumerate(self.extra_heads_code):
+            # future codes (offset i+2..) -- this stage's own set (per-stage, like the quantizer).
+            for i, head_c in enumerate(self.extra_heads_code_per_stage[s]):
                 k = i + 2
                 if n_blocks <= k:
                     continue
-                logits_c = self.quantizer._chunked(head_c(h_code[:, :-k, :])).reshape(-1, self.quantizer.vocab)
-                target_c = self.quantizer._chunked(onehot[:, k:, :]).argmax(-1).reshape(-1)
+                logits_c = quantizer._chunked(head_c(h_code[:, :-k, :])).reshape(-1, quantizer.vocab)
+                target_c = quantizer._chunked(onehot[:, k:, :]).argmax(-1).reshape(-1)
                 code_mtp_losses[(s, k)] = F.cross_entropy(logits_c, target_c)
                 code_mtp_accs[(s, k)] = (logits_c.argmax(-1) == target_c).float().mean()
 
@@ -851,11 +955,17 @@ class QCuteZero(nn.Module):
             # own cond readout (and before the next stage's cross-attn query input) -- i.e. fuse
             # cross-attn+own-mlp -> shared self-attn/mlp -> this stage's own cond NTP head.
             x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, byte_mask)
-            cond_logits_full = self.fuse_stages[s].readout(x_cross, self.head.weight)
 
-            cond_logits = cond_logits_full[:, :-1, :]
-            cond_loss = F.cross_entropy(cond_logits.reshape(-1, V), byte_ids[:, 1:].reshape(-1))
-            cond_acc = (cond_logits.argmax(-1) == byte_ids[:, 1:]).float().mean()
+            if self.word_head is not None:
+                h_normed = self.fuse_stages[s].ln_out(x_cross)
+                cond_loss, cond_acc = self.word_head.loss_acc(h_normed, byte_ids)
+                cond_loss = cond_loss if cond_loss is not None else x_cross.new_zeros(())
+                cond_acc = cond_acc if cond_acc is not None else x_cross.new_zeros(())
+            else:
+                cond_logits_full = self.fuse_stages[s].readout(x_cross, self.head.weight)
+                cond_logits = cond_logits_full[:, :-1, :]
+                cond_loss = F.cross_entropy(cond_logits.reshape(-1, V), byte_ids[:, 1:].reshape(-1))
+                cond_acc = (cond_logits.argmax(-1) == byte_ids[:, 1:]).float().mean()
             cond_losses += [cond_loss]
             cond_accs += [cond_acc]
 
@@ -938,7 +1048,7 @@ class QCuteZero(nn.Module):
         cur_h = h
         x_cross = h
         cum_K = 1
-        cond_logits_full = self.head(self.ln_f(h))  # uncond fallback if n_fuse==0
+        cond_logits_full = self.head(h)  # uncond fallback if n_fuse==0 -- h already normed by _run_blocks
         code_kv_cache = []
         for s in range(self.n_fuse):
             K_s = cfg.Ks[s]
@@ -948,7 +1058,7 @@ class QCuteZero(nn.Module):
             if n_blocks < 1:
                 break
             code_h = cur_h[:, K_s - 1::K_s, :][:, :n_blocks, :]
-            onehot, code_embeds = self.quantizer.extract_greedy(code_h)
+            onehot, code_embeds = self.quantizers[s].extract_greedy(code_h)
 
             code_local_pos = torch.arange(n_blocks, device=device)
             cos_c, sin_c = rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base, device)
@@ -1032,11 +1142,11 @@ class QCuteZero(nn.Module):
             cos0, sin0 = rope_cos_sin_for_positions(pos0, hd, cfg.rope_base, device_t)
             h0 = self._run_blocks(0, self.embed(all_bytes), cos0, sin0, causal_mask(pos0, pos0, cfg.attn_window))
             code_h = h0[:, K - 1::K, :][:, :n_blocks_prev, :]
-            _, code_embeds_past = self.quantizer.extract_greedy(code_h)
+            _, code_embeds_past = self.quantizers[0].extract_greedy(code_h)
             cpos = torch.arange(n_blocks_prev, device=device_t)
             ccos, csin = rope_cos_sin_for_positions(cpos, hd, cfg.rope_base, device_t)
             h_code = self._run_blocks(1, code_embeds_past, ccos, csin, causal_mask(cpos, cpos, None))
-            _, next_code_embed = self.quantizer.sample_next(h_code[:, -1:, :])  # (B,1,D) -- sampled, not extracted
+            _, next_code_embed = self.quantizers[0].sample_next(h_code[:, -1:, :])  # (B,1,D) -- sampled, not extracted
 
             # --- decode this new chunk's K bytes one at a time, cross-attending to the ONE
             # pre-sampled code (own-chunk, but never derived from its own bytes) ---
@@ -1070,6 +1180,109 @@ class QCuteZero(nn.Module):
         if was_training:
             self.train()
         return all_bytes[0]
+
+    @torch.no_grad()
+    def generate_wavefront(self, prompt_bytes: torch.Tensor, K: int, n_waves: int, n_new_bytes: int,
+                            device: str) -> torch.Tensor:
+        """2026-08-24 PoC (chat's "try first impl without seed token" request): byte-level-only
+        (self.lms[0]/self.head, no fuse-stage cross-attention -- this tests the wavefront mechanism
+        itself, not the full cascade), full-recompute (like generate_no_cache, not KV-cached).
+
+        No seed token: each of the n_waves regions' OWN first token is bootstrapped from the
+        SAME committed hidden state (h_last, at the last already-decided position) via MTP heads
+        -- wave 0 continues normally (offset+1, the ordinary head0 readout); wave g>=1's first
+        token sits at offset g*region_len+1 ahead of h_last, read via self.extra_heads[g*region_len-1]
+        (extra_heads[i] predicts offset i+2, per Config.mtp_heads' own convention). The largest
+        offset needed is wave (n_waves-1)'s: (n_waves-1)*region_len+1 -- hence the assert below.
+
+        Once every wave's first token exists, the remaining region_len-1 steps run in lockstep:
+        at each shared local timestep tau, every wave's tau-th token is predicted simultaneously
+        from its OWN (tau-1)-th position's hidden state (ordinary next-token convention), with
+        wavefront_mask giving every wave visibility into every OTHER wave's already-decided
+        (strictly earlier local timestep) tokens for free -- see wavefront_mask's own docstring.
+        Degenerates exactly to ordinary AR when n_waves==1 (verified via check_wavefront_consistency)."""
+        cfg = self.cfg
+        assert K % n_waves == 0, f"K ({K}) must be evenly divisible by n_waves ({n_waves})"
+        region_len = K // n_waves
+        max_offset = (n_waves - 1) * region_len + 1
+        assert cfg.mtp_heads >= max_offset, (
+            f"generate_wavefront needs cfg.mtp_heads >= (n_waves-1)*region_len+1 = {max_offset} "
+            f"to bootstrap the last wave's first token (got mtp_heads={cfg.mtp_heads})")
+        hd = cfg.d_model // cfg.n_heads
+        device_t = torch.device(device)
+        was_training = self.training
+        self.eval()
+
+        prompt_bytes = prompt_bytes.to(device)
+        if prompt_bytes.dim() == 1:
+            prompt_bytes = prompt_bytes.unsqueeze(0)
+        all_bytes = prompt_bytes
+
+        n_new_blocks = -(-n_new_bytes // K)
+        for _ in range(n_new_blocks):
+            P = all_bytes.shape[1]
+
+            # --- bootstrap every wave's first token from h_last (position P-1), no seed token ---
+            pos_prefix = torch.arange(P, device=device_t)
+            cos_p, sin_p = rope_cos_sin_for_positions(pos_prefix, hd, cfg.rope_base, device_t)
+            h_prefix = self._run_blocks(0, self.embed(all_bytes), cos_p, sin_p,
+                                        causal_mask(pos_prefix, pos_prefix, cfg.attn_window))
+            h_last = h_prefix[:, -1:, :]                              # (B, 1, D)
+            wave_firsts = [self.head(h_last).argmax(-1)]              # wave 0: ordinary head0
+            for g in range(1, n_waves):
+                offset = g * region_len + 1
+                head_g = self.extra_heads[offset - 2]
+                wave_firsts.append(F.linear(h_last, head_g.weight).argmax(-1))
+            # buf layout: prefix ++ wave0's region_len slots ++ wave1's ++ ... ++ wave(n_waves-1)'s
+            buf = torch.cat([all_bytes, all_bytes.new_zeros(all_bytes.shape[0], K)], dim=1)
+            for g in range(n_waves):
+                buf[:, P + g * region_len] = wave_firsts[g][:, 0]
+
+            # --- logical clock: prefix keeps its own raw index; every wave shares the SAME
+            # region_len-long timestep sequence (P, P+1, ..., P+region_len-1) -- lockstep ---
+            per_wave_timestep = P + torch.arange(region_len, device=device_t)
+            timestep = torch.cat([pos_prefix, per_wave_timestep.repeat(n_waves)])
+            region = torch.cat([pos_prefix.new_full((P,), -1),
+                                 torch.arange(n_waves, device=device_t).repeat_interleave(region_len)])
+
+            # --- lockstep decode: tau=2..region_len, every wave's tau-th token simultaneously ---
+            for tau in range(2, region_len + 1):
+                cos_t, sin_t = rope_cos_sin_for_positions(timestep, hd, cfg.rope_base, device_t)
+                mask = wavefront_mask(timestep, region)
+                h = self._run_blocks(0, self.embed(buf), cos_t, sin_t, mask)
+                for g in range(n_waves):
+                    prev_idx = P + g * region_len + (tau - 1) - 1     # wave g's (tau-1)-th position
+                    next_byte = self.head(h[:, prev_idx:prev_idx + 1, :]).argmax(-1)
+                    buf[:, P + g * region_len + tau - 1] = next_byte[:, 0]
+
+            all_bytes = buf
+
+        all_bytes = all_bytes[:, :prompt_bytes.shape[1] + n_new_bytes]
+        if was_training:
+            self.train()
+        return all_bytes[0]
+
+    @torch.no_grad()
+    def check_wavefront_consistency(self, val_data: torch.Tensor, device: str, n_checks: int = 3,
+                                     prompt_len: int = 8, K: int = 8, n_new_bytes: int = 16) -> dict:
+        """Diagnostic: generate_wavefront(n_waves=1) MUST match generate_no_cache bit-exactly --
+        n_waves=1 has no two positions sharing a timestep, so wavefront_mask degenerates to plain
+        causal_mask and the whole mechanism collapses to ordinary AR generation. Anything less
+        than match_rate=1.0 means the timestep/region/mask arithmetic has a real bug."""
+        was_training = self.training
+        self.eval()
+        n_match = 0
+        for i in range(n_checks):
+            pl = max(1, prompt_len - i * (prompt_len // max(1, n_checks)))
+            start = torch.randint(0, max(1, val_data.shape[0] - pl - n_new_bytes), (1,)).item()
+            prompt = val_data[start:start + pl].to(device)
+            out_full = self.generate_no_cache(prompt, n_new_bytes, device)
+            out_wave = self.generate_wavefront(prompt, K, 1, n_new_bytes, device)
+            if torch.equal(out_full, out_wave):
+                n_match += 1
+        if was_training:
+            self.train()
+        return {"match_rate": n_match / n_checks, "n_checks": n_checks}
 
     @torch.no_grad()
     def _make_incremental_stepper(self, Bsz: int, device_t: torch.device):
@@ -1108,7 +1321,7 @@ class QCuteZero(nn.Module):
             h_new = self.embed(byte_chunk)
             for l, block in enumerate(self.lms[0]):
                 h_new, byte_caches[l] = block.forward_incremental(h_new, cos_b, sin_b, byte_caches[l], cfg.attn_window)
-            h_new = self.ln_f(h_new)
+            h_new = self.ln_fs[0](h_new)
             h_hist = h_new if h_hist is None else torch.cat([h_hist, h_new], dim=1)
 
             x_in = h_new
@@ -1121,7 +1334,7 @@ class QCuteZero(nn.Module):
                     # a new code boundary was crossed -- recompute this stage's short code
                     # sequence fresh (cheap: length n_blocks, not the full byte length)
                     code_h = cur_h_hist[:, K_s - 1::K_s, :][:, :n_blocks, :]
-                    _, code_embeds = self.quantizer.extract_greedy(code_h)
+                    _, code_embeds = self.quantizers[s].extract_greedy(code_h)
                     code_local_pos = torch.arange(n_blocks, device=device_t)
                     cos_c, sin_c = rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base, device_t)
                     code_mask = causal_mask(code_local_pos, code_local_pos, None)
@@ -1162,7 +1375,7 @@ class QCuteZero(nn.Module):
                 for l, block in enumerate(self.lms[0]):
                     x_cross, refine_caches[s][l] = block.forward_incremental(
                         x_cross, cos_q, sin_q, refine_caches[s][l], cfg.attn_window)
-                x_cross = self.ln_f(x_cross)
+                x_cross = self.ln_fs[0](x_cross)
                 logits_full = self.fuse_stages[s].readout(x_cross, self.head.weight)
                 x_in = x_cross
                 cur_h_hist = h_code
@@ -1347,6 +1560,29 @@ def train(model, train_data, val_data, args, log, run_name: str, device: str) ->
             log(f"{pbar}  {val_str}  best_val_loss={checkpointer.best_metric:.4f}",
                 step=step, **{f"val_{k}": v for k, v in val.items()}, best_val_loss=checkpointer.best_metric)
 
+            if args.eval_decode_mtp_verify and model.cfg.mtp_heads > 1:
+                # MTP-drafted speculative decode, verified byte-by-byte against the exact NTP
+                # stepper (generate_speculative already does this -- see its own docstring) --
+                # show both NTP (generate_no_cache, the ground-truth reference) and the MTP-
+                # verified decode side by side, plus the accept_rate, so MTP draft quality is
+                # visible during training, not just at a separate manual generation step. The two
+                # texts should be IDENTICAL (verification guarantees this) -- shown together as a
+                # direct check of that guarantee, not just trusted from the accept_rate number.
+                prompt = val_data[:args.eval_decode_prompt_len]
+                n_new = model.cfg.mtp_heads   # one full draft round's worth -- MTP's own max
+                out_ntp = model.generate_no_cache(prompt, n_new, device)
+                out_mtp, spec_stats = model.generate_speculative(prompt, n_new, device, return_stats=True)
+                text_ntp = pack_words(out_ntp.tolist(), model.cfg.input_preset).decode("latin-1", errors="replace")
+                text_mtp = pack_words(out_mtp.tolist(), model.cfg.input_preset).decode("latin-1", errors="replace")
+                match = "MATCH" if torch.equal(out_ntp, out_mtp) else "MISMATCH (bug!)"
+                log(f"{pbar}  mtp_verify accept_rate={spec_stats['accept_rate']:.4f} "
+                    f"n_draft_checks={spec_stats['n_draft_checks']}  ntp/mtp {match}\n"
+                    f"    ntp: {text_ntp!r}\n"
+                    f"    mtp: {text_mtp!r}",
+                    step=step, mtp_accept_rate=spec_stats["accept_rate"],
+                    mtp_n_draft_checks=spec_stats["n_draft_checks"],
+                    ntp_text=text_ntp, mtp_text=text_mtp, ntp_mtp_match=(match == "MATCH"))
+
 
 def build_argparser(description: str) -> tuple:
     pre = argparse.ArgumentParser(add_help=False)
@@ -1373,6 +1609,7 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--mtp_heads", type=int, default=1)
     p.add_argument("--mtp_weight", type=float, default=1.0)
     p.add_argument("--weight_tie", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--global_tie", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--seed_query_p", type=float, default=0.0)
     p.add_argument("--seed_query_weight", type=float, default=1.0)
     p.add_argument("--quant_type", type=str, default="simplex")
@@ -1383,6 +1620,7 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--mtp_weight_code", type=float, default=1.0)
     p.add_argument("--mtp_heads_uncond", type=int, default=1)
     p.add_argument("--mtp_weight_uncond", type=float, default=1.0)
+    p.add_argument("--head_word_bits", type=int, default=None)
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -1397,6 +1635,8 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--eval_every", type=int, default=50)
     p.add_argument("--eval_batches", type=int, default=5)
     p.add_argument("--save_every_n_evals", type=int, default=1)
+    p.add_argument("--eval_decode_mtp_verify", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--eval_decode_prompt_len", type=int, default=16)
     p.add_argument("--logs_dir", type=Path, default=Path("logs"))
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--device", type=str, default=None)
@@ -1419,11 +1659,13 @@ def config_from_args(args) -> Config:
         gumbel_tau=args.gumbel_tau, code_hard=args.code_hard, code_sample=args.code_sample,
         code_ntp_weight=args.code_ntp_weight, cond_weight=args.cond_weight,
         mtp_heads=args.mtp_heads, mtp_weight=args.mtp_weight, weight_tie=args.weight_tie,
+        global_tie=args.global_tie,
         seed_query_p=args.seed_query_p, seed_query_weight=args.seed_query_weight,
         quant_type=args.quant_type, vocab=args.vocab, pq_chunks=args.pq_chunks,
         share_lm=args.share_lm,
         mtp_heads_code=args.mtp_heads_code, mtp_weight_code=args.mtp_weight_code,
         mtp_heads_uncond=args.mtp_heads_uncond, mtp_weight_uncond=args.mtp_weight_uncond,
+        head_word_bits=args.head_word_bits,
     )
 
 

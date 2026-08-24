@@ -16,6 +16,14 @@ step 900 -- at 115000 steps that would be ~127 evals, ~4.3h of pure eval overhea
 (~23 evals, ~47min overhead). warmup_steps/constant_steps restored to the resid_dropout sweep's
 1000/5000 (appropriate again now that steps is back in that ~60-115k range).
 
+**Relaunched 2026-08-24 with resid_dropout=0.1, layer_drop=0.1 added** after the unregularized
+first attempt (preserved at logs/bytelm_tpu_v4-8_d768x12_mlp4_24h_noreg,
+checkpoints/bytelm_tpu_v4-8_d768x12_mlp4_24h_noreg) clearly overfit: val_bpb bottomed at step
+15000 (1.248) then rose for 5 consecutive evals in a row (20000: 1.265, 25000: 1.316, 30000:
+1.431, 35000: 1.559, 40000: 1.681) -- same combo (resid_dropout+layer_drop) that was winning the
+parallel tpu5 regularization sweep at the time (val_bpb 1.157 vs. the unregularized baseline's
+1.890, both at ~step 27000/36000).
+
     TPU_VISIBLE_CHIPS=0 uv run python -m qcute.bytelm_tpu --config configs/bytelm_tpu/bytelm_tpu_v4-8_d768x12_mlp4_24h.py --device xla
 
     # plot after/during training:
@@ -31,6 +39,8 @@ context = 8192
 use_flash_attention = True
 no_zero_kv_sink = True
 no_torch_compile = True
+resid_dropout = 0.1
+layer_drop = 0.1
 steps = 115000
 batch_size = 4
 lr_peak = 1e-4

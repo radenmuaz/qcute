@@ -15,6 +15,14 @@ rounded to 75000 -- at batch_size=2, seq_len=8193 this covers ~1.23B bytes, ~13.
 above the other three siblings' 2-2.9 epochs. eval_every raised from an initial 900 to 5000
 (~15 evals). warmup_steps/constant_steps restored to the resid_dropout sweep's 1000/5000.
 
+**Relaunched 2026-08-24 with resid_dropout=0.1, layer_drop=0.1 added** after the unregularized
+first attempt (preserved at logs/bytelm_tpu_v4-8_d1024x24_mlp4_24h_noreg,
+checkpoints/bytelm_tpu_v4-8_d1024x24_mlp4_24h_noreg) turned over after 3 straight decreases:
+val_bpb bottomed at step 20000 (1.225) then rose at step 25000 (1.279) -- the mildest overfitting
+signal of the four siblings, but relaunched with the same regularization for a fair, consistent
+comparison across the sweep (same combo winning the parallel tpu5 regularization sweep at the
+time).
+
     TPU_VISIBLE_CHIPS=3 uv run python -m qcute.bytelm_tpu --config configs/bytelm_tpu/bytelm_tpu_v4-8_d1024x24_mlp4_24h.py --device xla
 
     # plot after/during training:
@@ -30,6 +38,8 @@ context = 8192
 use_flash_attention = True
 no_zero_kv_sink = True
 no_torch_compile = True
+resid_dropout = 0.1
+layer_drop = 0.1
 steps = 75000
 batch_size = 2
 lr_peak = 1e-4
