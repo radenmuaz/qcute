@@ -1,7 +1,26 @@
-"""qcute.bytelm_tpu — single-file fork of qcute.bytelm for CPU/TPU (torch_xla) use.
+"""qcute.bytelm_fineweb — single-file fork of qcute.bytelm_tpu for FineWeb-Edu (sample-10BT) training.
 
-Standalone on purpose (not an import of qcute.bytelm) so it can be read/debugged/deployed to a
+Standalone on purpose (not an import of qcute.bytelm_tpu) so it can be read/debugged/deployed to a
 TPU VM without dragging in the rest of the repo's device-selection assumptions.
+
+**Differences from qcute.bytelm_tpu** (see that module's own docstring for everything not listed
+here — model architecture, flash-attention, multichip, KV-cache generation, etc. are unchanged):
+
+  - **Data**: FineWeb-Edu is ~27GB, too big for `bytelm_tpu.py`'s in-RAM-tensor `load_enwik8`
+    pattern. `--train_data`/`--val_data` point at flat `uint8` binaries produced by
+    `scripts/prep_fineweb_edu_bytes.py` (byte-encoded text, no separator by default — no BPE
+    tokenizer, byte-level only; a GPT-2-BPE-vocab mode is a planned follow-on, not built here),
+    mmap'd via `load_byte_bin` (`np.memmap`, mode="r") instead of loaded whole — each batch is a
+    numpy gather over random windows + one `torch.from_numpy`, so the OS page cache does the heavy
+    lifting instead of holding the whole corpus in process memory. `batch_iter` runs on a
+    background thread (`PrefetchLoader`, one-item double-buffer via `queue.Queue`) so the next
+    batch's memmap gather + host->device copy overlaps the current step's XLA execution.
+  - **Metrics**: loss (nats, head-0, unsmoothed cross-entropy) is the primary metric everywhere
+    (training postfix, log lines, `Checkpointer` selection) — bpb (`loss / ln(2)`) is still
+    computed and logged on every line as a secondary, directly-derived field, so bpb-based
+    comparisons against other runs stay readable.
+  - No `--val_frac`/`--test_frac`/chronological split — `scripts/prep_fineweb_edu_bytes.py`
+    already writes separate `train.bin`/`val.bin` (val = the corpus's trailing shard).
 
 **Optional flash-attention kernel (`--use_flash_attention`), default off.**
 `torch_xla.experimental.custom_kernel.flash_attention` (a JAX Pallas TPU kernel under
@@ -68,41 +87,26 @@ Otherwise the model (plain pre-norm transformer, RoPE, MTP heads), training loop
 code (plain AR / KV-cache / self-speculative) are the same as qcute.bytelm — see that module's
 own docstring for the full design rationale (handover doc §5/§1.6 baseline framing).
 
-## sd preset (8 layers, ~101M params) full-enwik8 TPU run
-
-`PRESETS["sd"]` (d_model=1024, n_layers=8, n_heads=16, context=2048, mtp_heads=8) is the target
-config for this module: ~101M non-embedding params, aimed at sub-1.0 bpb on full enwik8
-(datasets/enwik8.gz, 100,000,000 bytes) within a 12h budget on a single TPU chip.
-
-FLOPs-vs-data budget check (see qcute/bytelm.py's own docstring for the underlying FLOPs grid):
-6*N_params*tokens (standard fwd+bwd approximation) means a single v6e-1 chip at a conservative
-~40% MFU of its ~918 TFLOPS/s bf16 peak processes on the order of 10^10 tokens in 12h — one to
-two orders of magnitude more than the ~2*10^9 tokens (~20 epochs over enwik8's ~95M-byte train
-split) that compute-optimal scaling (~20 tokens/param) would call for. In other words: for this
-model size, the full-enwik8 corpus (not compute) is almost certainly the binding constraint —
-convergence to sub-1.0 bpb should be a training-stability/epochs question, not a raw-FLOPs one.
-That said, this estimate is a priori (no real TPU torch_xla throughput measured yet for this
-module) — watch actual it/s on the very first run and retune `--steps` from there, per this
+FineWeb-Edu sample-10BT is ~10^10 bytes/tokens — watch actual it/s on the very first run and
+retune `--steps` from there, per this
 repo's standing "long runs have shown unpredictable throughput" caution (CLAUDE.md).
 
-If a single TPU chip can't reach sub-1.0 bpb in 12h in practice, the natural next step is a
-4-chip pod — but this module is single-process/single-device only (no torch_xla
-SPMD/multiprocessing data-parallel wiring); that would be new infra, not implemented here.
-
-    uv run python -m qcute.bytelm_tpu --config configs/bytelm/bytelm_tpu_sd_full_enwik8.py
+    uv run python -m qcute.bytelm_fineweb --config configs/bytelm_fineweb/sd_fineweb10b_bytes.py
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
-import gzip
 import json
 import math
 import os
+import queue
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -236,28 +240,33 @@ class Checkpointer:
             torch.save(state, self.last_path)
 
 
-def load_enwik8(path: Path, n_bytes: int | None = None) -> torch.Tensor:
-    # Cache the parsed tensor next to the .gz (keyed by n_bytes) so repeat runs skip gunzip +
-    # tensor construction -- the full 100MB corpus took long enough at startup to be worth it.
-    cache_path = path.with_suffix(path.suffix + f".n{n_bytes or 'all'}.pt")
-    if cache_path.exists():
-        return torch.load(cache_path)
-    with gzip.open(path, "rb") as f:
-        data = f.read(n_bytes) if n_bytes else f.read()
-    # torch.frombuffer avoids materializing a Python list[int] first (list(data) + torch.tensor
-    # was the previous, much slower path for a 100MB corpus) -- needs a writable buffer, hence
-    # bytearray(data) rather than the read-only bytes object.
-    tensor = torch.frombuffer(bytearray(data), dtype=torch.uint8).long()
-    # Write to a per-process temp path then atomically rename into place -- multiple processes
-    # launched concurrently (e.g. a multi-chip sweep sharing one --data path) would otherwise all
-    # cache-miss and race to torch.save the *same* cache_path, corrupting it for whichever reader
-    # opens it mid-write (confirmed: EOFError, 2026-08-23). os.replace is atomic on POSIX, so any
-    # concurrent reader sees either the old file, nothing, or the fully-written new one, never a
-    # partial write.
-    tmp_path = cache_path.with_suffix(f".tmp{os.getpid()}")
-    torch.save(tensor, tmp_path)
-    tmp_path.replace(cache_path)
-    return tensor
+def load_byte_bin(path: Path) -> np.memmap:
+    # mode="r" -- mmap'd, not loaded into RAM. scripts/prep_fineweb_edu_bytes.py writes these as a
+    # flat uint8 stream; random windows are gathered straight off disk (OS page cache handles hot
+    # pages), since the ~27GB corpus doesn't fit as one in-RAM tensor the way enwik8 did.
+    return np.memmap(path, dtype=np.uint8, mode="r")
+
+
+class PrefetchLoader:
+    """Wraps a batch_iter generator with a one-item-lookahead background thread, so the next
+    batch's memmap gather + host->device copy overlaps the current step's XLA execution instead
+    of blocking it."""
+
+    def __init__(self, gen, maxsize: int = 2):
+        self._gen = gen
+        self._q: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._thread = threading.Thread(target=self._produce, daemon=True)
+        self._thread.start()
+
+    def _produce(self) -> None:
+        for batch in self._gen:
+            self._q.put(batch)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self._q.get()
 
 
 @dataclass
@@ -531,69 +540,62 @@ def bits_per_byte(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
 
 def mtp_loss(logits: torch.Tensor, tokens: torch.Tensor, context: int, label_smoothing: float = 0.0):
     """logits: [n_heads, B, context, vocab] from model(tokens[:, :context]).
-    tokens: [B, context + n_heads]. Returns (mean loss over all heads, head-0 bpb — the standard
-    next-byte metric comparable to qcute.bytelm/qcute.qcutelm). head0_bpb is always computed from
-    the unsmoothed loss so it stays comparable to eval_bpb/eval_bpb_full regardless of
-    label_smoothing."""
+    tokens: [B, context + n_heads]. Returns (mean loss over all heads, head-0 loss in nats — the
+    primary metric this module reports/selects checkpoints on). head0_loss is always the
+    unsmoothed cross-entropy so it stays comparable to eval_metrics/eval_metrics_full regardless
+    of label_smoothing; bpb (secondary metric) is derived from it by callers via /math.log(2),
+    not recomputed with a second cross_entropy call."""
     n_heads = logits.size(0)
     losses = []
     for i in range(n_heads):
         targets_i = tokens[:, i + 1 : i + 1 + context]
         flat_logits = logits[i].reshape(-1, logits.size(-1))
         flat_targets = targets_i.reshape(-1)
-        losses.append(F.cross_entropy(flat_logits, flat_targets, label_smoothing=label_smoothing))
         if i == 0:
-            head0_bpb = F.cross_entropy(flat_logits, flat_targets) / math.log(2)
+            head0_loss = F.cross_entropy(flat_logits, flat_targets)
+            losses.append(head0_loss if label_smoothing == 0.0 else
+                          F.cross_entropy(flat_logits, flat_targets, label_smoothing=label_smoothing))
+        else:
+            losses.append(F.cross_entropy(flat_logits, flat_targets, label_smoothing=label_smoothing))
     losses = torch.stack(losses)
-    return losses.mean(), head0_bpb
+    return losses.mean(), head0_loss
 
 
-def batch_iter(data: torch.Tensor, batch_size: int, context: int, n_heads: int, device: torch.device):
+def batch_iter(data: np.memmap, batch_size: int, context: int, n_heads: int, device: torch.device):
     seq_len = context + n_heads  # n_heads bytes of lookahead beyond the context window
     n = (len(data) - 1) // seq_len
     while True:
-        starts = torch.randint(0, n, (batch_size,))
-        batch = torch.stack([data[i * seq_len : (i + 1) * seq_len] for i in starts])
-        yield batch.to(device)
-
-
-def split_train_val_test(
-    data: torch.Tensor, val_frac: float, test_frac: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Chronological split: test (if test_frac>0) is the trailing test_frac of bytes, val is the
-    val_frac before that, train is everything before both — so val/test never overlap regardless
-    of which fractions are requested. test is None (not just empty) when test_frac<=0, so callers
-    can tell "no test split configured" apart from "test split came out empty"."""
-    n_val = max(1, int(len(data) * val_frac))
-    if test_frac <= 0:
-        return data[:-n_val], data[-n_val:], None
-    n_test = max(1, int(len(data) * test_frac))
-    return data[: -(n_val + n_test)], data[-(n_val + n_test) : -n_test], data[-n_test:]
+        starts = np.random.randint(0, n, size=batch_size)
+        rows = np.stack([data[i * seq_len : (i + 1) * seq_len] for i in starts])
+        yield torch.from_numpy(rows.astype(np.int64)).to(device)
 
 
 @torch.no_grad()
-def eval_bpb(model: nn.Module, data_iter, context: int, n_batches: int, device: torch.device) -> float:
+def eval_metrics(model: nn.Module, data_iter, context: int, n_batches: int, device: torch.device) -> tuple[float, float]:
+    """Returns (loss_nats, bpb) averaged over n_batches — loss is the primary metric, bpb is
+    derived (loss / ln(2)) for logging alongside it."""
     model.eval()
     total = 0.0
     for _ in range(n_batches):
         batch = next(data_iter)
         with autocast_ctx(device):
             logits = model(batch[:, :context])
-        _, head0_bpb = mtp_loss(logits, batch, context)
-        total += head0_bpb.item()
+        _, head0_loss = mtp_loss(logits, batch, context)
+        total += head0_loss.item()
         mark_step(device)
     model.train()
-    return total / n_batches
+    loss = total / n_batches
+    return loss, loss / math.log(2)
 
 
 @torch.no_grad()
-def eval_bpb_full(model: nn.Module, data: torch.Tensor, batch_size: int, context: int, n_heads: int,
-                   device: torch.device, desc: str | None = None) -> float:
-    """Deterministic full-val-set pass: non-overlapping seq_len windows, walked in fixed
-    chronological order starting at byte 0 (never random), each byte scored exactly once.
-    `desc`, if given, shows a live tqdm bar over the eval batches (e.g. "val_full"/"test_full") —
-    off by default since a full pass is normally a few seconds to tens of seconds, but useful to
-    see it's actually progressing (not stuck) on a slow/large eval."""
+def eval_metrics_full(model: nn.Module, data: np.memmap, batch_size: int, context: int, n_heads: int,
+                       device: torch.device, desc: str | None = None) -> tuple[float, float]:
+    """Deterministic full-val-set pass: non-overlapping seq_len windows, walked in fixed order
+    starting at byte 0 (never random), each byte scored exactly once. Returns (loss_nats, bpb).
+    `desc`, if given, shows a live tqdm bar over the eval batches (e.g. "val_full") — off by
+    default since a full pass is normally a few seconds to tens of seconds, but useful to see
+    it's actually progressing (not stuck) on a slow/large eval."""
     model.eval()
     seq_len = context + n_heads
     n_windows = (len(data) - 1) // seq_len
@@ -610,19 +612,20 @@ def eval_bpb_full(model: nn.Module, data: torch.Tensor, batch_size: int, context
         # would trigger its own lazy-graph compile every single eval_every call. Padded rows are
         # computed (wasted, harmless) but excluded from the accumulated metric below.
         idxs += [idxs[-1]] * (batch_size - real_n)
-        batch = torch.stack([data[i * seq_len:(i + 1) * seq_len] for i in idxs]).to(device)
+        rows = np.stack([data[i * seq_len:(i + 1) * seq_len] for i in idxs])
+        batch = torch.from_numpy(rows.astype(np.int64)).to(device)
         with autocast_ctx(device):
             logits = model(batch[:, :context])
         targets0 = batch[:, 1 : 1 + context]
         nats_per_window = F.cross_entropy(
             logits[0].reshape(-1, logits.size(-1)), targets0.reshape(-1), reduction="none"
         ).reshape(batch_size, context).mean(dim=1)
-        bpb_per_window = nats_per_window / math.log(2)
-        total += bpb_per_window[:real_n].sum().item()
+        total += nats_per_window[:real_n].sum().item()
         total_n += real_n
         mark_step(device)
     model.train()
-    return total / total_n
+    loss = total / total_n
+    return loss, loss / math.log(2)
 
 
 def lr_at(step: int, warmup: int, peak: float) -> float:
@@ -856,7 +859,7 @@ def main():
     pre_args, _ = pre.parse_known_args()
 
     p = argparse.ArgumentParser(
-        description="Byte-level causal transformer + MTP-head LM baseline (BPB), CPU/TPU only", parents=[pre]
+        description="Byte-level causal transformer + MTP-head LM on FineWeb-Edu (loss primary, bpb secondary), CPU/TPU only", parents=[pre]
     )
     p.add_argument("--preset", choices=list(PRESETS), default="sd")
     p.add_argument("--seed", type=int, default=1234, help="torch.manual_seed value (weight init, layer_drop/dropout masks, batch sampling)")
@@ -873,11 +876,8 @@ def main():
                     help="use torch_xla's Pallas flash-attention kernel in the training forward pass (nightly-only, see module docstring; silently falls back to plain SDPA if unavailable)")
     p.add_argument("--multichip", action="store_true",
                     help="data-parallel across all locally-addressable TPU devices via torch_xla.launch (--batch_size is per-process; global batch = batch_size * world_size)")
-    p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
-    p.add_argument("--n_bytes", type=int, default=None, help="prefix of the corpus to load (default: all)")
-    p.add_argument("--val_frac", type=float, default=0.1)
-    p.add_argument("--test_frac", type=float, default=0.0,
-                    help="held-out test fraction, chronologically before val (default 0: no test split)")
+    p.add_argument("--train_data", type=Path, default=Path("datasets/fineweb_edu_10BT/train.bin"))
+    p.add_argument("--val_data", type=Path, default=Path("datasets/fineweb_edu_10BT/val.bin"))
     p.add_argument("--steps", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr_peak", type=float, default=6e-4)
@@ -899,7 +899,7 @@ def main():
     p.add_argument("--checkpoint_dir", type=Path, default=Path("checkpoints"))
     p.add_argument("--save_every_n_evals", type=int, default=1)
     p.add_argument("--eval_only", action="store_true")
-    p.add_argument("--eval_split", choices=["train", "val", "test"], default="val")
+    p.add_argument("--eval_split", choices=["train", "val"], default="val")
     p.add_argument("--checkpoint_path", type=Path, default=None)
     p.add_argument("--qual_gen_bytes", type=int, default=0)
     p.add_argument("--qual_source", choices=["train", "val", "user"], default="val")
@@ -915,8 +915,6 @@ def main():
         p.error("--eval_only requires --checkpoint_path")
     if args.qual_gen_bytes > 0 and args.qual_source == "user" and not args.qual_user_text:
         p.error("--qual_source user requires --qual_user_text")
-    if args.eval_split == "test" and args.test_frac <= 0:
-        p.error("--eval_split test requires --test_frac > 0")
     if args.multichip and not _HAS_XLA:
         p.error("--multichip requires torch_xla")
 
@@ -997,10 +995,9 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
         + (f"  multichip=True world_size={world_size} global_batch={args.batch_size * world_size}" if args.multichip else "")
     )
 
-    data = load_enwik8(args.data, args.n_bytes)
-    train_data, val_data, test_data = split_train_val_test(data, args.val_frac, args.test_frac)
-    log(f"train_bytes={len(train_data)}  val_bytes={len(val_data)}"
-        + (f"  test_bytes={len(test_data)}" if test_data is not None else "  test_bytes=0 (no --test_frac)"))
+    train_data = load_byte_bin(args.train_data)
+    val_data = load_byte_bin(args.val_data)
+    log(f"train_bytes={len(train_data)}  val_bytes={len(val_data)}")
     if not args.eval_only:
         seq_len = cfg.context + cfg.mtp_heads
         effective_batch = args.batch_size * args.grad_accum_steps
@@ -1009,19 +1006,19 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
         log(f"~{steps_per_epoch:.1f} steps/epoch  ~{epochs:.1f} epochs over train_bytes "
             f"(steps={args.steps} batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
             f"effective_batch={effective_batch} seq_len={seq_len}, random-with-replacement sampling — see batch_iter)")
-    val_iter = batch_iter(val_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
+    val_iter = PrefetchLoader(batch_iter(val_data, args.batch_size, cfg.context, cfg.mtp_heads, device))
 
     if args.eval_only:
         if is_master:
-            eval_data = {"train": train_data, "val": val_data, "test": test_data}[args.eval_split]
-            eval_bpb_val = eval_bpb_full(model, eval_data, args.batch_size, cfg.context, cfg.mtp_heads, device, desc=f"{args.eval_split}_full")
-            log(f"eval_only_full_{args.eval_split}set  {args.eval_split}_bpb {eval_bpb_val:.4f}",
-                **{f"{args.eval_split}_bpb": eval_bpb_val})
+            eval_data = {"train": train_data, "val": val_data}[args.eval_split]
+            eval_loss, eval_bpb = eval_metrics_full(model, eval_data, args.batch_size, cfg.context, cfg.mtp_heads, device, desc=f"{args.eval_split}_full")
+            log(f"eval_only_full_{args.eval_split}set  {args.eval_split}_loss {eval_loss:.4f}  {args.eval_split}_bpb {eval_bpb:.4f}",
+                **{f"{args.eval_split}_loss": eval_loss, f"{args.eval_split}_bpb": eval_bpb})
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
         if is_master:
             log(f"lr_peak={args.lr_peak}  weight_decay={args.weight_decay}  betas=({args.beta1}, {args.beta2})  grad_clip={args.grad_clip}")
-        train_iter = batch_iter(train_data, args.batch_size, cfg.context, cfg.mtp_heads, device)
+        train_iter = PrefetchLoader(batch_iter(train_data, args.batch_size, cfg.context, cfg.mtp_heads, device))
         checkpointer = Checkpointer(args.checkpoint_dir / run_name, args.save_every_n_evals, minimize=True) if is_master else None
 
         model.train()
@@ -1047,7 +1044,7 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
                 batch = next(train_iter)
                 with autocast_ctx(device):
                     logits = model(batch[:, : cfg.context])
-                loss, head0_bpb = mtp_loss(logits, batch, cfg.context, cfg.label_smoothing)
+                loss, head0_loss = mtp_loss(logits, batch, cfg.context, cfg.label_smoothing)
                 (loss / args.grad_accum_steps).backward()
                 # Under XLA's lazy execution nothing actually runs until a sync -- without this,
                 # grad_accum_steps microbatches' forward+backward graphs all pile up unexecuted
@@ -1063,56 +1060,36 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
             if step == 1:
                 first_step_s = time.perf_counter() - compile_t0
                 log(f"first_step_compile_s {first_step_s:.1f}", first_step_compile_s=first_step_s)
-            step_iter.set_postfix(lr=f"{lr:.2e}", mtp_loss=f"{loss.item():.4f}", bpb=f"{head0_bpb.item():.4f}")
+            step_iter.set_postfix(lr=f"{lr:.2e}", loss=f"{head0_loss.item():.4f}", bpb=f"{head0_loss.item()/math.log(2):.4f}")
             if step % args.log_every == 0:
-                log(f"{step_iter}", step=step, lr=lr, mtp_loss=loss.item(), bpb=head0_bpb.item())
+                log(f"{step_iter}", step=step, lr=lr, mtp_loss=loss.item(), loss=head0_loss.item(), bpb=head0_loss.item()/math.log(2))
             if step % args.eval_every == 0 or step == args.steps:
                 if args.full_val_eval:
                     # Chunked through args.batch_size (never a single-giant-batch -1 pass) to
                     # avoid OOM — same per-process batch size already proven safe in the training
                     # forward pass itself, and eval has no backward-pass memory to worry about.
                     # desc= shows a live tqdm bar (visible progress + timing, not stuck-vs-slow
-                    # guesswork) and elapsed time gets logged alongside the bpb numbers below.
+                    # guesswork) and elapsed time gets logged alongside the numbers below.
                     t0 = time.perf_counter()
-                    val_bpb = eval_bpb_full(model, val_data, args.batch_size, cfg.context, cfg.mtp_heads, device, desc="val_full")
+                    val_loss, val_bpb = eval_metrics_full(model, val_data, args.batch_size, cfg.context, cfg.mtp_heads, device, desc="val_full")
                     val_eval_s = time.perf_counter() - t0
                 else:
-                    val_bpb = eval_bpb(model, val_iter, cfg.context, args.eval_batches, device)
+                    val_loss, val_bpb = eval_metrics(model, val_iter, cfg.context, args.eval_batches, device)
                     val_eval_s = None
-                log_line = f"step {step:5d}  val_bpb {val_bpb:.4f}"
-                log_fields = {"step": step, "val_bpb": val_bpb}
+                log_line = f"step {step:5d}  val_loss {val_loss:.4f}  val_bpb {val_bpb:.4f}"
+                log_fields = {"step": step, "val_loss": val_loss, "val_bpb": val_bpb}
                 if val_eval_s is not None:
                     log_line += f"  val_eval_s {val_eval_s:.1f}"
                     log_fields["val_eval_s"] = val_eval_s
-                if args.full_val_eval and test_data is not None:
-                    # Logged for observability only — never drives checkpoint selection (that
-                    # stays val_bpb-only below), so this doesn't compromise test as a genuinely
-                    # held-out number; it just gets watched throughout training instead of only
-                    # once at the end.
-                    t0 = time.perf_counter()
-                    test_bpb_now = eval_bpb_full(model, test_data, args.batch_size, cfg.context, cfg.mtp_heads, device, desc="test_full")
-                    test_eval_s = time.perf_counter() - t0
-                    log_line += f"  test_bpb {test_bpb_now:.4f}  test_eval_s {test_eval_s:.1f}"
-                    log_fields["test_bpb"] = test_bpb_now
-                    log_fields["test_eval_s"] = test_eval_s
                 log(log_line, **log_fields)
                 checkpointer.step(
-                    {"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "cfg": asdict(cfg), "val_bpb": val_bpb},
-                    val_bpb,
+                    {"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "cfg": asdict(cfg), "val_loss": val_loss, "val_bpb": val_bpb},
+                    val_loss,
                 )
         if is_master:
             log(
-                f"checkpoints: best={checkpointer.best_path} (val_bpb {checkpointer.best_metric:.4f})  last={checkpointer.last_path}"
+                f"checkpoints: best={checkpointer.best_path} (val_loss {checkpointer.best_metric:.4f})  last={checkpointer.last_path}"
             )
-        if test_data is not None and is_master:
-            # Held out from both training and every val_bpb-driven checkpoint/LR decision, so
-            # unlike val_bpb this number was never used to pick anything during the run — load
-            # the val-selected best checkpoint back and score it on test exactly once, at the end.
-            best_ckpt = torch.load(checkpointer.best_path, map_location="cpu")
-            model.load_state_dict(best_ckpt["model"])
-            test_bpb = eval_bpb_full(model, test_data, args.batch_size, cfg.context, cfg.mtp_heads, device, desc="final_test_full")
-            log(f"final_test_bpb (best-val checkpoint, step {best_ckpt['step']})  test_bpb {test_bpb:.4f}",
-                test_bpb=test_bpb, test_bpb_from_step=best_ckpt["step"])
 
     if not is_master:
         return

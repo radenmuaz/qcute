@@ -10,3 +10,4 @@ build/
 datasets/
 logs/
 checkpoints/
+.env

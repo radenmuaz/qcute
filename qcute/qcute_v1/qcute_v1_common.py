@@ -1698,6 +1698,7 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--logs_dir", type=Path, default=Path("logs"))
     p.add_argument("--save_every_n_evals", type=int, default=1)
     p.add_argument("--device", type=str, default=None, choices=["cpu", "mps", "cuda"])
+    p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--compile", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--eval_only", action="store_true")
     p.add_argument("--eval_split", choices=["train", "val"], default="val")
@@ -1779,6 +1780,7 @@ def config_from_args(args) -> Config:
 
 def run_main(QCuteLM) -> None:
     args, pre_args = build_argparser("qcute_v1: shared Encoder, pluggable concat/stack Decoder")
+    torch.manual_seed(args.seed)
     device = args.device or ("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     cfg = config_from_args(args)
     model = QCuteLM(cfg).to(device)

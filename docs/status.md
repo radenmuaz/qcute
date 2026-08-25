@@ -610,3 +610,97 @@ confirmed via a smoke run with `torch.is_grad_enabled()` explicitly True). Fixed
 `p.add_argument("--blocklocal_glat_p", ...)` and `blocklocal_glat_p=args.blocklocal_glat_p` to
 `config_from_args`; a 20-step smoke run afterward shows `glat_acc` tracking `local_acc` closely and
 rising together, confirming the fix. Re-launched the real run.
+
+**Results**: `ks81_overfit10k_blocklocal_glat02` (`blocklocal_glat_p=0.2`) trained 1000 steps,
+`blocklocal0_local_acc≈0.76` (pass 1, teacher-forced) vs `blocklocal0_glat_acc≈0.69` (pass 2,
+20%-self-fed) -- tracks closely, as expected for a mild swap rate. `generate_free_rollout` exact-
+match-vs-`generate_no_cache` on the same 2 prompts as the base run: base 0.547/0.562 (avg ~0.55) ->
+glat02 0.516/0.703 (avg ~0.61) -- mixed at the individual-prompt level (one prompt slightly worse,
+one clearly better) but directionally positive on average; sample size (2 prompts, 32 new bytes
+each) is too small to call this a confirmed win rather than noise. Suggestive that
+`blocklocal_glat_p` helps but not yet a clean isolated result -- would need more prompts/seeds (and
+possibly a higher `p`, given the gap it's meant to close was originally ~0.68 teacher-forced vs
+~0.036 free-run, a much bigger swap rate than 0.2 might be needed) before drawing a firm conclusion.
+
+**Confound found and controlled for** (chat: "is there a random seed involved, is it truly
+improved"): neither run above had a fixed seed -- `qcute_zero.py`/`qcute_v1_common.py` had NO
+`torch.manual_seed` anywhere at all, so the two checkpoints being compared had independently random
+init + data order, a real confound. Added `--seed` (default `1234`) + `torch.manual_seed(args.seed)`
+in both `qcute_zero.py`'s and `qcute_v1`'s `main()`/`run_main()`, right before model construction.
+Reran both `ks81_overfit10k_blocklocal` and `_glat02` with explicit `--seed 0` (identical init +
+data order, only `blocklocal_glat_p` differs) as `..._seed0` run_names. Controlled result: base avg
+exact-match 0.547 (0.531/0.562), glat02 avg 0.594 (0.516/0.672) -- still directionally favors GLAT,
+but **the offset=500 "improvement" is not a clean quality win**: glat02's `generate_free_rollout`
+output there is a genuinely degenerate repetition loop (`"espace kespace kespace k..."`), which
+happens to byte-match `generate_no_cache`'s correct memorized continuation at a higher rate purely
+by coincidence of the repeated substring overlapping the true text's structure, not because
+generation is actually better. The naive exact-match-vs-no_cache metric can be gamed by repetition
+collapse. Net honest read: still inconclusive whether `blocklocal_glat_p=0.2` genuinely helps --
+the controlled comparison is closer to a wash (0.531 vs 0.516 on the non-degenerate offset=0 prompt
+favors BASE slightly) than a confirmed win, and a repetition-quality check (not just byte-match
+rate) is needed before trusting any future comparison here.
+
+**Dose comparison, p=0.05 vs p=0.5, 2x steps (2026-08-25)**: reran with `blocklocal_glat_p=0.05`
+and `0.5` (both `--seed 0`, `steps=2000`, double the original budget) --
+`configs/qcute_zero/ks81_overfit10k_blocklocal_glat005_2x.py`/`_glat05_2x.py`. Final train
+`blocklocal0_local_acc`/`blocklocal0_glat_acc`: p=0.05 ~0.77-0.82 / ~0.75 (tracks closely, as
+expected for a mild dose); p=0.5 ~0.74-0.78 / ~0.60-0.61 (bigger gap, as expected for a much harder
+partially-self-fed task). `generate_free_rollout` exact-match vs `generate_no_cache`, same 2
+prompts: p=0.05 avg 0.547 (0.516/0.578), p=0.5 avg 0.625 (0.531/0.719) -- p=0.5 ahead this time,
+and unlike the earlier p=0.2 comparison neither output shows repetition-collapse (`p0.5`'s
+offset=500 output `'pace>\n        <id>\n     ername>\n'` and p=0.05's are both plausible
+wiki-markup fragments, not degenerate loops) -- checked explicitly this time given the prior false
+positive. **Caveat**: the original seed0 baseline (`blocklocal_glat_p=0`, `qcute_zero_ks81_overfit10k_blocklocal_seed0`)
+was NOT rerun at the matching 2000-step budget -- its checkpoint directory was gone by the time
+this comparison ran (logs/ dir no longer had it, likely cleaned up between sessions, not
+intentionally deleted), so this is p=0.05-vs-p=0.5 only, no zero-GLAT control at this step count.
+Suggestive that a heavier dose (0.5) may help more than a light one (0.05), but still just 2 test
+prompts and no matched baseline -- not a confirmed result.
+
+**Zero-GLAT baseline rerun at matching budget (2026-08-25)**: reran `ks81_overfit10k_blocklocal`
+(`blocklocal_glat_p=0`) at `--steps 2000 --seed 0` (`qcute_zero_ks81_overfit10k_blocklocal_2x_seed0`)
+to complete the p=0/0.05/0.5 comparison. Train `blocklocal0_local_acc`~0.74 (matches the other two
+runs' range, as expected -- same seed/budget, only `blocklocal_glat_p` differs). `generate_free_rollout`
+avg exact-match: **0.625** (0.547/0.703) -- nominally tied with p=0.5's 0.625, both above p=0.05's
+0.547. **But this p=0 result is itself contaminated by a repetition-collapse artifact**: its
+offset=0 output is `'ism also     <idism also     <id'` -- the same 16-byte substring repeated
+twice verbatim, inflating its byte-match score the same way the very first (p=0.2) comparison's
+degenerate case did. Neither p=0.05's nor p=0.5's two outputs show this pattern. Excluding the
+contaminated point, p=0's one clean data point is 0.703, p=0.05's clean avg is 0.547, p=0.5's clean
+avg is 0.625 -- no consistent ordering survives once the artifact is excluded; the three doses are
+indistinguishable within the noise of a 2-prompt sample, and REPETITION COLLAPSE can apparently
+happen regardless of `blocklocal_glat_p` (not something GLAT training is specifically causing or
+specifically preventing, based on this data). **Overall verdict on `blocklocal_glat_p`**: still not
+demonstrated to help, at any of the three doses tried (0, 0.05, 0.2, 0.5) -- every comparison run
+so far has been confounded by either RNG (pre-seed runs) or repetition-collapse artifacts landing
+unevenly across the tiny prompt sample. A real answer would need many more test prompts (10+, not
+2) with an automated repetition-collapse detector (e.g. flag any output containing a repeated
+substring of length >= K) rather than eyeballing each one, before trusting any accept/reject
+verdict on this mechanism.
+
+## 2026-08-25: `qcute_zero.py` pruned back to mtp + speculative decode only
+
+Per chat request, every parallel-decode-strategy experiment from the last several sessions was
+removed from `qcute_zero.py`: wavefront (`wavefront_mask`, training loss, `generate_wavefront`/
+`_wavefront_draft_block`/`generate_wavefront_mtp`/`check_wavefront_consistency`), blocklocal/GLAT
+(`blocklocal_seed_weight`/`blocklocal_dual_mode`/`blocklocal_glat_p`, the whole blocklocal training
+block, `generate_free_rollout`), `seed_query_p`'s sparse auxiliary loss, and `generate_early_exit`/
+`_generate_cascade_early_exit`. `self.seed_embed` removed (only those two mechanisms used it).
+Dead code cleaned up alongside: `x_cross_pre_stage`/`cum_Ks_list` tracking in `forward()`'s cascade
+(only fed blocklocal), `Quantizer.sample_next` (only called by the removed `generate_free_rollout`).
+Kept, unchanged: the core cascade (embed/Quantizer/FuseStage, per-stage code-sequence NTP loss,
+cond/uncond loss), `mtp_heads`/`mtp_heads_code`/`mtp_heads_uncond` (all three MTP variants kept --
+not explicitly named for removal, and orthogonal to the decode-strategy experiments), and the full
+generation/verification stack: `generate_no_cache`, `generate_kv_cache`/`_make_incremental_stepper`,
+`generate_speculative`, `check_kv_cache_consistency`. Full pre-prune snapshot preserved at
+`qcute/qcute_zero/backups/qcute_zero_parallel_attempt1.py`.
+
+Also pruned: every comment/docstring over the project's 2-line limit, across the whole file (was
+never enforced this strictly before -- caught via a scripted scan, not manual reading). Module
+docstring rewritten from ~75 lines of accumulated design history down to one tight paragraph.
+
+Verified via direct comparison: `Config(Ks=(2,1), ...)` forward-pass loss is bit-identical before
+and after the prune (`16.85413360595703`, same seed/inputs) -- confirms the retained computation
+graph is untouched, only dead code was removed. `check_kv_cache_consistency` (match_rate=1.0) and
+`generate_speculative` (exact match vs `generate_no_cache`) reverified across `Ks=(2,1)`,
+`Ks=(2,2,1)`, and `Ks=(1,)` (degenerate no-fuse-stage case) post-prune. File shrank 1986 -> 1218 lines.

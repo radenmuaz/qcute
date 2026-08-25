@@ -169,6 +169,44 @@ floor has an unidentified separate cause). Use `--no_zero_kv_sink` whenever
 `--use_flash_attention` is on. Full investigation: docs/bytelm_tpu_setup.md's "zero_kv_sink +
 flash-attention: investigation" section.
 
+**Current TPU run status (as of 2026-08-25, this is a living status block — update it, don't append
+to it, as runs finish/change)**: 3 nodes in play, `tpu4`/`tpu5`/`tpu6` (all v4-8, `us-central2-b`),
+each running up to 4 independent single-chip `qcute.bytelm_tpu` sweeps via
+`TPU_VISIBLE_CHIPS=<0-3>`, one tmux session per chip. Last known external IPs: tpu4
+`35.186.15.67`, tpu5 `35.186.33.7`, tpu6 `35.186.110.50` — re-verify via `gcloud compute tpus
+queued-resources describe <name> --project raden-tpu --zone us-central2-b` if a connection fails
+(spot instances, can be preempted; see above). All runs use `qcute.bytelm_tpu`'s `--seed 1234`
+(added this session), `mtp_heads=8`.
+
+- **tpu4** — `configs/bytelm_tpu/power2_heavyreg_sweep/` (4 configs, power-of-2 sizes 68M-340M,
+  heavy regularization). Tmux sessions `train_d512_heavyreg`, `train_d1024x16mlp4_heavyreg`,
+  `train_d2048x8_wideshallow`, `train_d1024x24_deep`. Healthy and improving as of last check
+  (best val_bpb ~1.31-1.46 across the 4, still trending down).
+- **tpu5** — `configs/bytelm_tpu/modelsize_48h_lrsweep/` (4 configs, 115M-405M, varied
+  lr_peak/grad_clip). **STOPPED 2026-08-25**: all 4 runs' val_bpb turned flat-or-increasing
+  simultaneously around step ~28-32k/~10h elapsed (e.g. `d768x12_mlp4_48h` went 1.51 best -> 3.67;
+  full trajectories in session transcript), no NaN/traceback in any log, processes killed cleanly.
+  The simultaneity across differently-sized models/LRs suggests something node-level (bad data
+  batch, host issue) rather than 4 independent per-config instabilities — not confirmed. Open
+  question raised: is this seed-sensitivity (this sweep is a revival of an earlier unseeded/
+  mtp_heads=1/lighter-reg run that reportedly reached ~1.1 bpb) — inconclusive, too many confounds
+  changed at once (seed added, mtp_heads 1->8, regularization added) to isolate seed as the cause;
+  the failure *pattern* (clean training for hours then simultaneous divergence) doesn't look
+  seed-like. **tpu5 is currently idle, no decision yet on how to relaunch it** — ask the user
+  before restarting anything there.
+- **tpu6** — `configs/bytelm_tpu/d1024x16_mlp2_reg_smoothing_sweep/` (4 configs, all 170M, varying
+  dropout/layer_drop/label_smoothing mix). Tmux sessions `train_reg_full_smooth`,
+  `train_resid_light_smooth`, `train_layerdrop_heavy_nosmooth`, `train_resid_heavy_smooth`.
+  Healthy; `layerdrop_heavy_nosmooth` is the best run across all 3 nodes as of last check
+  (val_bpb ~1.23, still improving).
+
+Standing monitoring routine established this session (see hourly hand-off pattern in transcript,
+not yet a persistent cron across session restarts): pull each active run's `run.jsonl` via `scp`
+into local `logs/<run_name>/`, print one combined table (node, params, run, step, elapsed,
+train_bpb, val_bpb, test_bpb), and silently check each node's runs for flat-or-increasing val_bpb
+over their last 4-5 evals — only surface/act on it if it actually triggers (stop that node, report
+the sequence, ask before redesigning/relaunching — don't do it unilaterally).
+
 ## Architecture
 
 **`qcute_zero` (`qcute/qcute_zero/`, single file) — new monolithic single-shared-LM lineage,

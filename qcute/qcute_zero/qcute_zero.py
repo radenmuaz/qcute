@@ -1,70 +1,17 @@
 """qcute_zero: a monolithic, single-LM alternative to qcute_v1's multi-encoder StackDecoder
-lineage (see CLAUDE.md's Architecture section for qcute_v1; this is a separate lineage, not a
-fork of it). Design, restated (chat 2026-08-22):
-
-There is exactly ONE transformer LM (level0, byte space). Every K bytes it summarizes its own
-just-produced hidden state into a discrete code -- via the SAME tied embed/output head bytes
-already use (byte vocab and code vocab are the same space, so "extracting a code" is literally
-"predict a byte-shaped distribution and take a differentiable (STE) hard sample of it"). That
-code sequence is then run through the SAME shared blocks again (a second, much shorter forward
-pass) to get (a) a genuine NTP loss on the code sequence itself (predict the next code from
-previous codes, using the identical loss machinery as byte NTP -- "free" via weight reuse, no
-separate per-level encoder needed) and (b) contextualized representations that become the K/V for
-a cross-attention stage feeding back into the byte-level query stream. Repeat for every entry in
-`Ks` (len(Ks)-1 "fuse" stages total, one per cumulative period Ks[0], Ks[0]*Ks[1], ... -- same Ks
-semantics as qcute_v1) -- each stage's codes are built FROM the previous stage's own contextualized
-hidden state, a genuine cascade, not independent re-samples of the raw byte hidden state.
-
-Causality: every code's causal boundary is its CUMULATIVE byte-span (`cum_K*(block_idx+1)-1`, in
-absolute byte-position coordinates), never its local index within whatever intermediate sequence
-produced it -- getting this wrong (comparing local code-sequence indices directly against absolute
-byte query positions) is the one way this design could accidentally become circular; using the
-cumulative boundary throughout keeps every stage strictly non-circular (verified by hand, chat
-2026-08-22: a code can only ever inform prediction of bytes strictly after every byte it was
-itself computed from, never any byte it depends on).
-
-Zero-KV sink (mandatory on every attention call, self- and cross-): a fixed (non-trainable) all-
-zero key/value pair is always prepended and always visible, so every query row has >=1 valid key
-even when every real key is masked out (e.g. a query before any periodic code's causal boundary
-has been reached -- true for every query strictly before Ks[0]-1, and again before every deeper
-stage's own first boundary). Softmax over a single visible key is always weight 1 regardless of
-its score, so when the sink is the ONLY visible key the attention output is exactly zero -- a
-provably clean no-op contribution, not an arbitrary bias, and immune to NaN. Because the sink's
-value is exactly zero, whether it's "rotated" by RoPE is moot (a zero vector rotates to itself);
-it's simplest to just prepend it after RoPE has been applied to the real keys.
-
-No curriculum needed by design (unlike qcute_v1's max_srcs/curriculum_max_srcs hack): every fuse
-stage's code source is the SAME shared, already-training backbone from step 1 (nothing is a fresh,
-untouched, randomly-initialized module the way each qcute_v1 encoder level was), and the zero-sink
-lets a stage's own freshly-initialized cross-attention weights learn to suppress themselves early
-(put softmax weight on the sink) and gradually rely on real codes as those weights improve -- an
-emergent, learned on-ramp instead of a hand-scheduled one. Expected, not yet proven -- the whole
-point of the ks21/ks221-no-curriculum runs this file's plan calls for.
-
-Query for "what predicts a new position" is the ordinary previous-token hidden state (no seed/BOS
-token at all, unlike qcute_v1) -- pure standard AR continuation, causal by construction.
-
-Real incremental KV caching (`generate_kv_cache`): byte-level self.blocks self-attention and each
-fuse stage's post-cross-attn refinement self.blocks pass are cached across generation steps
-(O(1) attention work per new byte instead of full O(L) recompute) -- see `Attn.forward_incremental`/
-`Block.forward_incremental`. The short code-sequence self-attention (kvlm) pass and the fuse
-cross-attention itself are still recomputed fresh whenever a new code appears (every Ks[s] bytes),
-since code sequences are short (length ~ L/prod(Ks[:s+1])) -- not worth incrementally caching.
-Produces the exact same argmax choices as `generate_no_cache` (verified by direct comparison),
-just asymptotically cheaper for long generations.
-
-MTP heads (`Config.mtp_heads`, 2026-08-22): optional extra `nn.Linear(D, V)` heads reading the
-SAME final hidden state head0's own cond/uncond readout already uses -- pervasive (every position,
-every step) and cheap (zero extra attention FLOPs), unlike the query_vec/`parallel_decode`
-mechanism this superseded (one query_vec slot cost a full attention-stack pass, and only covered
-`parallel_decode_n_blocks` sampled clusters per step). `generate_speculative` drafts via these
-heads now. The query_vec idea itself is preserved as its own standalone testbed, forked onto the
-simpler `qcute.bytelm` trunk: `qcute/bytelm_queryvec/bytelm_queryvec.py` (`qcute/qcute_zero_parallel/`,
-the original fork of this file holding that mechanism, is now redundant/archived).
-
-Single file by design for now (explicitly asked: "make thing single file first refactor later") --
-copies/adapts primitives from qcute_v1_common.py (Block/RoPE/Logger/data-loading/train-loop shapes)
-rather than importing them, since this is meant to stay a separate, prunable lineage.
+lineage. One transformer LM (level0, byte space); every K bytes it summarizes its own hidden state
+into a discrete code (STE hard sample via the tied embed/head), runs that code sequence through
+the SAME shared blocks for a genuine code-NTP loss + contextualized K/V, then cross-attends that
+K/V back into the byte-level query stream. Repeats per entry in `Ks` (a real cascade -- each
+stage's codes are built from the PREVIOUS stage's own contextualized hidden state). Causality:
+every code's boundary is its cumulative byte-span, never a local code-sequence index. Zero-KV sink
+on every attention call (self- and cross-) keeps early/pre-boundary queries NaN-free with a
+provably-zero no-op contribution. `Config.mtp_heads` + `generate_speculative` implement MTP-style
+speculative decoding, verified exact against `generate_kv_cache`'s incremental stepper. Simplified
+2026-08-25: every parallel-decode-strategy experiment (wavefront, blocklocal/GLAT, free rollout,
+early exit, seed_query) pruned -- see backups/qcute_zero_parallel_attempt1.py for that lineage,
+docs/status.md for the full history. Single file by design, primitives adapted from
+qcute_v1_common.py rather than imported.
 
 uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks21_overfit10k.py
 uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks221_overfit10k.py
@@ -83,9 +30,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
-# ----------------------------------------------------------------------------
 # small shared utilities (copied/trimmed from qcute_v1_common.py)
-# ----------------------------------------------------------------------------
 
 def make_dict(**kwargs) -> dict:
     return kwargs
@@ -197,14 +142,10 @@ def load_config_module(path: Path) -> dict:
     return {k: v for k, v in ns.items() if not k.startswith("_")}
 
 
-# ----------------------------------------------------------------------------
 # RoPE + attention primitives
-# ----------------------------------------------------------------------------
 
 def rope_cos_sin_for_positions(position_ids: torch.Tensor, head_dim: int, base: float, device: torch.device):
-    """position_ids: (T,) shared across the whole batch (the common case), or (Bv, T) -- one
-    absolute-position row per batch element (block-folded parallel-decode training, where
-    different folded blocks sit at different real byte positions)."""
+    """position_ids: (T,) shared across the batch, or (Bv, T) one row per batch element."""
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     freqs = position_ids.float().unsqueeze(-1) * inv_freq  # (..., T, hd/2), generalizes torch.outer
     emb = torch.cat([freqs, freqs], dim=-1)
@@ -227,12 +168,8 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 
 def sdpa_with_sink(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
-    """Mandatory zero-value/zero-key sink, prepended to every attention call (self- and cross-) in
-    this model: guarantees every query row has >=1 valid key (avoids NaN when a row's real keys
-    are all masked False, e.g. before a periodic code's causal boundary is reached), and gives a
-    provably clean zero contribution when it's the only visible key (softmax of one element is
-    always weight 1, so output = 1*0 = 0) -- see chat 2026-08-22. attn_mask: bool, True=visible,
-    shape (..., T, S) broadcastable to (B, H, T, S)."""
+    """Zero-value/zero-key sink prepended to every attention call -- guarantees >=1 valid key per
+    query row, provably-zero contribution when it's the only one visible. attn_mask: bool, True=visible."""
     B, H, T, hd = q.shape
     sink_k = k.new_zeros(B, H, 1, hd)
     sink_v = v.new_zeros(B, H, 1, hd)
@@ -249,16 +186,6 @@ def causal_mask(query_pos: torch.Tensor, key_pos: torch.Tensor, window: int | No
     allow = key_pos.view(1, -1) <= query_pos.view(-1, 1)
     if window is not None:
         allow = allow & ((query_pos.view(-1, 1) - key_pos.view(1, -1)) < window)
-    return allow.view(1, 1, *allow.shape)
-
-
-def wavefront_mask(timestep: torch.Tensor, region: torch.Tensor) -> torch.Tensor:
-    """(1,1,L,L) bool mask: j visible to i iff strictly-earlier timestep, or same timestep+region.
-    Degenerates to causal_mask when every timestep is unique. See docs/status.md 2026-08-24."""
-    earlier = timestep.view(-1, 1) > timestep.view(1, -1)
-    same_step_same_region = ((timestep.view(-1, 1) == timestep.view(1, -1)) &
-                              (region.view(-1, 1) == region.view(1, -1)))
-    allow = earlier | same_step_same_region
     return allow.view(1, 1, *allow.shape)
 
 
@@ -279,9 +206,7 @@ class RMSNorm(nn.Module):
 
 
 class Attn(nn.Module):
-    """Self- and cross-attention share this: same QKV/out projections, sdpa_with_sink mandatory
-    either way. forward() = self-attention (Q,K,V all from x); forward_cross() = cross-attention
-    (Q from x, K/V from a separate kv sequence)."""
+    """Shared QKV/out projections for self- (forward) and cross-attention (forward_cross)."""
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
         self.n_heads = n_heads
@@ -301,13 +226,8 @@ class Attn(nn.Module):
 
     def forward_incremental(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
                              cache, window: int | None):
-        """Incremental self-attention: x_new is only the NEW position(s) (Tn=1 per generation
-        step, or the whole prompt on the priming call); cache is None (nothing yet) or (k_prev,
-        v_prev) from earlier calls. Returns (out, new_cache) -- new_cache is trimmed to the last
-        `window` entries when windowed, so a subsequent call only ever pays for what's visible.
-        Mask uses LOCAL (call-relative) positions -- only relative order matters for causality,
-        and cos/sin (computed from true absolute positions by the caller) is what actually encodes
-        real distance, so this stays exactly consistent with the full-recompute path."""
+        """x_new: only the NEW position(s). cache: None or (k_prev, v_prev). Mask uses LOCAL
+        (call-relative) positions -- cos/sin (true absolute positions) is what encodes real distance."""
         B, Tn, D = x_new.shape
         H, hd = self.n_heads, self.head_dim
         qkv = self.qkv(x_new).reshape(B, Tn, 3, H, hd).permute(2, 0, 3, 1, 4)
@@ -359,9 +279,8 @@ class SwiGLU(nn.Module):
 
 
 class Block(nn.Module):
-    """"block regular": self-attention + MLP. Shared (same weights) across the byte-level pass and
-    every fuse stage's own code-sequence NTP pass -- this IS the "single LM" the whole design
-    hinges on."""
+    """Self-attention + MLP, shared across the byte-level pass and every fuse stage's own
+    code-sequence NTP pass -- this IS the "single LM" the whole design hinges on."""
     def __init__(self, d_model: int, n_heads: int, mlp_mult: int):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
@@ -383,10 +302,8 @@ class Block(nn.Module):
 
 
 class FuseStage(nn.Module):
-    """"block fuse": cross-attention + MLP, one instance per periodic-fusion stage, own weights
-    throughout (no cross-stage sharing) -- including this stage's own final LayerNorm feeding its
-    own cond NTP readout (logits via the shared tied embed weight, passed in). Cheap: called with
-    the code sequence's length (L/cum_K), not the byte sequence's."""
+    """Cross-attention + MLP, one instance per fuse stage, own weights throughout. Cheap: called
+    with the code sequence's length (L/cum_K), not the byte sequence's."""
     def __init__(self, d_model: int, n_heads: int, mlp_mult: int, n_layers: int):
         super().__init__()
         self.ln1 = nn.ModuleList([RMSNorm(d_model) for _ in range(n_layers)])
@@ -423,32 +340,8 @@ def gumbel_quantize(logits: torch.Tensor, tau: float, hard: bool = True, sample:
 
 
 class Quantizer(nn.Module):
-    """Pluggable code representation for every fuse stage's own code (ported from
-    qcute_v1_common.py's SimplexQuant, quant_type="simplex" only for now -- adapted to this file's
-    own module shapes: dedicated code_head/code_embed/code_predict instead of a stage_lm object's
-    attributes). Categorical code via gumbel-softmax STE, product-quantized: pq_chunks independent
-    vocab-way softmaxes concatenated (total code width = vocab*pq_chunks), combinatorial capacity
-    vocab**pq_chunks. Constraint: vocab**pq_chunks >= unit_vocab (2**input_preset -- must be able
-    to represent at least one real trunk unit, byte/nibble/bit/whatever input_preset is). Default
-    vocab=256, pq_chunks=1 (with unit_vocab=256, i.e. byte trunk) is functionally the original
-    single 256-way softmax, now with its own dedicated weights rather than literally reusing
-    self.embed/self.head -- UNLESS global_tie requests otherwise (see below).
-
-    global_tie (2026-08-24, `qcute_zero_simple`'s original design as a special case of this more
-    general architecture): only representable as a literal shared-tensor tie when vocab==unit_vocab
-    and pq_chunks==1 (width==unit_vocab exactly, matching self.embed/self.head's own shape) -- then
-    code_head/code_predict directly reference tied_head_weight and code_embed multiplies directly
-    against tied_embed_weight (matmul, not nn.Linear -- see _embed() below), exactly like the
-    original pre-quantizer-refactor code (`onehot @ self.embed.weight`). For any other config
-    (pq_chunks>1 or vocab!=unit_vocab), a literal tensor tie is impossible (code_head's per-chunk
-    concatenated logit space and a flat unit_vocab-wide embed table are different shapes/objects,
-    and solving code_embed's single linear layer to reproduce all unit_vocab embed rows via a
-    sparse pq-chunk one-hot is a generally underdetermined system when chunks' index-ranges
-    overlap across different unit values) -- global_tie is a no-op there: only the reserved-index
-    *convention* holds (the first unit_vocab combinatorial ids, per to_ids()'s place-value order,
-    are nominally "real unit values"; ids >= unit_vocab are free/bonus codes with no unit meaning),
-    as documentation/bookkeeping, not an enforced numerical correspondence -- training decides
-    what the reserved sub-range actually ends up encoding."""
+    """Pluggable per-fuse-stage code: categorical via gumbel-softmax STE, product-quantized.
+    global_tie ties to the shared byte embed/head only when vocab==unit_vocab and pq_chunks==1."""
     def __init__(self, D: int, vocab: int, pq_chunks: int, gumbel_tau: float, code_hard: bool, code_sample: bool,
                  unit_vocab: int = 256, global_tie: bool = False,
                  tied_head_weight: torch.Tensor | None = None, tied_embed_weight: torch.Tensor | None = None):
@@ -502,9 +395,7 @@ class Quantizer(nn.Module):
         return onehot, self.to_ids(onehot), self._embed(onehot)
 
     def extract_greedy(self, h: torch.Tensor) -> tuple:
-        """Same as extract() but always hard=True/sample=False -- generation-time greedy code
-        extraction, regardless of cfg.code_hard/code_sample (matches the old gumbel_quantize(...,
-        hard=True, sample=False) calls every generate_* method used at code-extraction sites)."""
+        """Same as extract() but always hard=True/sample=False -- generation-time greedy extraction."""
         logits = self.code_head(h)
         if self.pq_chunks == 1:
             onehot = gumbel_quantize(logits, self.tau, hard=True, sample=False)
@@ -529,18 +420,8 @@ class Quantizer(nn.Module):
             acc = (logits.argmax(-1) == target).float().mean()
         return loss, acc
 
-    def sample_next(self, h_query: torch.Tensor) -> tuple:
-        """For generation: greedy per-chunk argmax over code_predict's logits -> STE one-hot ->
-        code_embed. Used wherever generation needs to sample the NEXT code from the code-sequence
-        LM's own hidden state (not extracted from real bytes) -- e.g. generate_free_rollout."""
-        logits = self._chunked(self.code_predict(h_query))
-        onehot = gumbel_quantize(logits, self.tau, hard=True, sample=False).reshape(*h_query.shape[:-1], self.width)
-        return onehot, self._embed(onehot)
 
-
-# ----------------------------------------------------------------------------
 # Config + model
-# ----------------------------------------------------------------------------
 
 @dataclass
 class Config:
@@ -568,63 +449,23 @@ class Config:
                                               # 256/1 is functionally the old tied-embed code
     code_ntp_weight: float = 1.0             # weight for each fuse stage's own code-sequence NTP loss
     cond_weight: float = 1.0                 # weight for each stage's post-fusion byte NTP loss
-    mtp_heads: int = 1                       # extra byte-ahead heads reading the SAME final hidden
-                                              # state (post-cascade), MTP-style (see qcute.bytelm) --
-                                              # 1 = disabled (only the existing head0 next-byte
-                                              # prediction). >1 heads predict t+2..t+mtp_heads.
-    mtp_weight: float = 1.0                  # weight for the extra heads' mean loss
-    mtp_heads_code: int = 1                  # extra code-ahead heads reading the code-sequence
-                                              # LM's own hidden state (h_code), predicting further
-                                              # future codes (1 = disabled). Per-stage by default,
-                                              # like the quantizer itself (share_lm=True shares both).
+    mtp_heads: int = 1                       # extra byte-ahead heads off the final hidden state
+                                              # (1=disabled); generate_speculative drafts via these.
+    mtp_weight: float = 1.0
+    mtp_heads_code: int = 1                  # extra code-ahead heads off h_code (1=disabled)
     mtp_weight_code: float = 1.0
-    mtp_heads_uncond: int = 1                # extra byte-ahead heads reading the BASE trunk
-                                              # hidden state h (before any fuse cross-attention --
-                                              # the cheap/coarse "uncond" signal), predicting
-                                              # future bytes (1 = disabled).
+    mtp_heads_uncond: int = 1                # extra byte-ahead heads off pre-fusion h (1=disabled)
     mtp_weight_uncond: float = 1.0
-    weight_tie: bool = False                 # default untied: byte output head is its own
-                                              # nn.Linear(D, V, bias=False), separate params from
-                                              # self.embed. True: head.weight literally refs
-                                              # embed.weight (shared tensor, not a copy). "local"
-                                              # tie -- level 0 only.
-    global_tie: bool = False                 # requires weight_tie=True. Extends the tie to every
-                                              # level's Quantizer too (qcute_zero_simple's original
-                                              # one-shared-table design, as a special case of this
-                                              # more general architecture) -- exact/literal only
-                                              # when that stage's vocab==unit_vocab and pq_chunks==1
-                                              # (e.g. v256pq1 for a byte trunk); otherwise a no-op
-                                              # beyond the reserved-index convention (see Quantizer's
-                                              # own docstring) -- no numerical weight forcing, since
-                                              # that system is underdetermined once pq_chunks>1.
-    seed_query_p: float = 0.0                # fraction of positions using the sparse context-free
-                                              # seed-token auxiliary loss (0=disabled); see docs/status.md.
-    seed_query_weight: float = 1.0
-    wavefront_weight: float = 0.0            # training-time wavefront_mask loss (0=disabled), see
-                                              # docs/status.md 2026-08-24 for the full design/rationale.
-    wavefront_K: int = 8
-    wavefront_n_waves: int = 2
-    blocklocal_seed_weight: float = 0.0       # stack_local-style block-diagonal decode, shift-by-1
-                                              # (0=disabled); see docs/status.md 2026-08-24.
-    blocklocal_dual_mode: bool = True         # stage s>0: train both mask/rollout modes if True,
-                                              # mask only if False; see docs/status.md 2026-08-24.
-    blocklocal_glat_p: float = 0.0            # per-position prob of a GLAT-style second local-decode
-                                              # pass with STE self-predicted bytes swapped in (0=off);
-                                              # see docs/status.md 2026-08-24.
-    share_lm: bool = False                   # default unshared: each level gets its own Block
-                                              # stack; True ties every level to the same one (ALBERT-style).
-    head_word_bits: int | None = None        # None = same as input_preset. Decouples output-head
-                                              # granularity from trunk word size; see WordHead/docs/status.md.
+    weight_tie: bool = False                 # True: head.weight literally refs embed.weight
+    global_tie: bool = False                 # requires weight_tie=True; extends the tie to every
+                                              # level's Quantizer (exact only if vocab==unit_vocab, pq_chunks==1)
+    share_lm: bool = False                   # True ties every level to the same Block stack
+    head_word_bits: int | None = None        # None = same as input_preset; see WordHead
 
 
 class WordHead(nn.Module):
-    """Pluggable output-head granularity, decoupled from the trunk's own per-position word size
-    (unit_bits = input_preset). word_bits==unit_bits: plain linear head, unchanged. word_bits>
-    unit_bits (coarser): predicts group_size=word_bits//unit_bits FUTURE unit positions jointly as
-    one combined classification (place-value combination, same convention as Quantizer.to_ids'
-    PQ combination). word_bits<unit_bits (finer): factorizes one position's own unit word into
-    n_sub=unit_bits//word_bits independent sub-word chunks -- literally Quantizer's own PQ
-    pattern, reused directly for the byte-output head instead of the code head."""
+    """Output-head granularity decoupled from the trunk's word size: word_bits>unit_bits predicts
+    multiple future positions jointly; word_bits<unit_bits factorizes one position into PQ-style sub-chunks."""
     def __init__(self, D: int, unit_bits: int, word_bits: int | None):
         super().__init__()
         self.unit_bits = unit_bits
@@ -693,9 +534,7 @@ class WordHead(nn.Module):
         return loss, acc
 
     def sample(self, h_last: torch.Tensor) -> torch.Tensor:
-        """h_last: (B, D) or (B, 1, D) final hidden state -> (B, group_size) next unit ids
-        (group_size==1 in the equal/finer cases -- a single next id, reconstructed via factorized
-        argmax when n_sub>1, exactly like Quantizer.to_ids)."""
+        """h_last: (B, D) or (B, 1, D) -> (B, group_size) next unit ids."""
         squeeze = h_last.dim() == 2
         h_last = h_last.unsqueeze(1) if squeeze else h_last
         logits = self.proj(h_last)                                        # (B, 1, sub_vocab*n_sub)
@@ -729,10 +568,7 @@ class QCuteZero(nn.Module):
         self.embed = nn.Embedding(V, D)
         nn.init.normal_(self.embed.weight, std=0.02)
 
-        # per-level LM stacks: level 0 = byte pass (+ every fuse stage's post-cross-attn
-        # refinement pass), level s+1 = fuse stage s's own code-sequence NTP pass. Unshared by
-        # default (each level its own independent Block stack); share_lm=True makes every entry
-        # literally the same module instance (nn.ModuleList dedupes params by identity).
+        # level 0 = byte pass + refinement; level s+1 = fuse stage s's code-sequence NTP pass.
         n_lms = self.n_fuse + 1
         if cfg.share_lm:
             first = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
@@ -741,20 +577,12 @@ class QCuteZero(nn.Module):
             self.lms = nn.ModuleList(
                 [nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
                  for _ in range(n_lms)])
-        # per-level final norm -- previously a single shared self.ln_f regardless of share_lm, an
-        # oversight relative to per-level independence (each level's own blocks got independence,
-        # its final norm didn't); now follows the exact same share_lm-controlled pattern as lms.
         if cfg.share_lm:
             first_ln = RMSNorm(D)
             self.ln_fs = nn.ModuleList([first_ln] * n_lms)
         else:
             self.ln_fs = nn.ModuleList([RMSNorm(D) for _ in range(n_lms)])
 
-        # byte-output head: untied (own nn.Linear) by default; weight_tie=True makes it literally
-        # reference self.embed.weight (shared tensor -- PyTorch's .parameters() dedupes by
-        # identity, so this doesn't double-count params). Code extraction/code-NTP have their own
-        # dedicated weights entirely separate from self.embed -- see Quantizer's code_head/
-        # code_predict/code_embed below, wired in during the quantizer port.
         assert not cfg.global_tie or cfg.weight_tie, "global_tie requires weight_tie=True"
         self.head = nn.Linear(D, V, bias=False)
         if cfg.weight_tie:
@@ -777,12 +605,6 @@ class QCuteZero(nn.Module):
         self.extra_heads_uncond = nn.ModuleList(
             [nn.Linear(D, V, bias=False) for _ in range(max(0, cfg.mtp_heads_uncond - 1))])
 
-        self.seed_embed = nn.Parameter(torch.zeros(D))
-        nn.init.normal_(self.seed_embed, std=0.02)
-
-        # per-stage quantizer + code-MTP heads -- previously one global instance shared across every
-        # fuse stage regardless of share_lm, the same oversight as ln_f above; now follows the same
-        # share_lm-controlled pattern as lms/ln_fs.
         assert cfg.quant_type == "simplex", f"only quant_type='simplex' is ported so far, got {cfg.quant_type!r}"
 
         def _make_quantizer():
@@ -837,9 +659,7 @@ class QCuteZero(nn.Module):
             uncond_loss = F.cross_entropy(uncond_logits.reshape(-1, V), byte_ids[:, 1:].reshape(-1))
             uncond_acc = (uncond_logits.argmax(-1) == byte_ids[:, 1:]).float().mean()
 
-        # uncond-level-0 MTP heads: cheap/coarse extra byte-ahead heads reading the BASE trunk
-        # hidden state h, before any fuse cross-attention -- same pattern as the byte-level extra
-        # heads below, just off a cheaper/earlier hidden state.
+        # cheap/coarse extra byte-ahead heads off the pre-fusion hidden state h.
         uncond_mtp_losses, uncond_mtp_accs = [], []
         for i, head_u in enumerate(self.extra_heads_uncond):
             k = i + 2
@@ -850,54 +670,17 @@ class QCuteZero(nn.Module):
             uncond_mtp_losses.append(F.cross_entropy(logits_u.reshape(-1, V), targets_u.reshape(-1)))
             uncond_mtp_accs.append((logits_u.argmax(-1) == targets_u).float().mean())
 
-        # training-time wavefront loss: tiles wavefront_mask across the whole sequence (one
-        # K-block per tile). See docs/status.md 2026-08-24.
-        wavefront_loss = h.new_zeros(())
-        wavefront_acc = h.new_zeros(())
-        if cfg.wavefront_weight > 0:
-            Kw, n_waves = cfg.wavefront_K, cfg.wavefront_n_waves
-            assert Kw % n_waves == 0, f"wavefront_K ({Kw}) must be evenly divisible by wavefront_n_waves ({n_waves})"
-            region_len = Kw // n_waves
-            n_full_blocks = L // Kw
-            if region_len > 1 and n_full_blocks > 0:
-                Lc = n_full_blocks * Kw
-                wpos = torch.arange(Lc, device=device)
-                local_i = wpos % Kw
-                w_region = local_i // region_len
-                local_j = local_i % region_len
-                w_timestep = (wpos // Kw) * region_len + local_j
-                w_mask = wavefront_mask(w_timestep, w_region)
-                cos_w, sin_w = rope_cos_sin_for_positions(wpos, hd, cfg.rope_base, device)
-                h_wave = self._run_blocks(0, self.embed(byte_ids[:, :Lc]), cos_w, sin_w, w_mask)
-                logits_wave = self.head(h_wave)
-                valid = local_j < (region_len - 1)         # exclude each region's own last local step
-                target_idx = torch.clamp(wpos + 1, max=Lc - 1)
-                target_wave = byte_ids[:, target_idx]
-                logits_v = logits_wave[:, valid, :]
-                target_v = target_wave[:, valid]
-                wavefront_loss = F.cross_entropy(logits_v.reshape(-1, V), target_v.reshape(-1))
-                wavefront_acc = (logits_v.argmax(-1) == target_v).float().mean()
-
         # --- cascade through fuse stages ---
         cur_h = h                # source hidden states to extract this stage's codes from
         x_cross = h              # running byte-level query stream, refined by each fuse stage
         cum_K = 1
         fuse_ntp_losses, fuse_ntp_accs = [], []
         cond_losses, cond_accs = [], []
-        seed_losses, seed_accs = [], []
-        code_mtp_losses, code_mtp_accs = {}, {}   # keyed by (stage, k) -- see below for why
-        code_kv_cache = []       # (h_code_s, code_pos_abs, window) per stage
-        cum_Ks_list = []         # cum_K AT each stage (byte span of one stage-s code)
-        x_cross_pre_stage = []   # x_cross value entering stage s, BEFORE stage s's own cross-attn
-                                  # -- i.e. reflects real ground-truth refinement from stages 0..s-1
-                                  # only, never stage s's own code (blocklocal_seed_weight's "rollout"
-                                  # mode input, see below)
+        code_mtp_losses, code_mtp_accs = {}, {}   # keyed by (stage, k)
 
         for s in range(self.n_fuse):
-            x_cross_pre_stage.append(x_cross)
             K_s = cfg.Ks[s]
             cum_K *= K_s
-            cum_Ks_list.append(cum_K)
             cur_len = cur_h.shape[1]
             n_blocks = cur_len // K_s
             if n_blocks < 1:
@@ -920,8 +703,7 @@ class QCuteZero(nn.Module):
                 fuse_ntp_losses += [code_ntp_loss]
                 fuse_ntp_accs += [code_ntp_acc]
 
-            # code-level MTP heads: extra code-ahead heads reading h_code, predicting further
-            # future codes (offset i+2..) -- this stage's own set (per-stage, like the quantizer).
+            # extra code-ahead heads off h_code, this stage's own set.
             for i, head_c in enumerate(self.extra_heads_code_per_stage[s]):
                 k = i + 2
                 if n_blocks <= k:
@@ -931,39 +713,15 @@ class QCuteZero(nn.Module):
                 code_mtp_losses[(s, k)] = F.cross_entropy(logits_c, target_c)
                 code_mtp_accs[(s, k)] = (logits_c.argmax(-1) == target_c).float().mean()
 
-            # cross-attn: byte-level query stream attends into h_code, causal on CUMULATIVE
-            # (absolute-byte) boundary, never this stage's local code-sequence index (chat
-            # 2026-08-22: using the local index here would be the one way this becomes circular).
+            # causal boundary is the CUMULATIVE (absolute-byte) position, never a local code index.
             code_pos_abs = (torch.arange(n_blocks, device=device) + 1) * cum_K - 1
             window_s = self.fuse_windows[s]
             fuse_mask = causal_mask(byte_pos, code_pos_abs, window_s)
             cos_q, sin_q = cos_b, sin_b
             cos_k, sin_k = rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base, device)
 
-            # sparse any-timestep seed-token auxiliary loss: sample a subset of positions, replace
-            # their query with the learned seed embedding (no real byte context at all -- not even
-            # self-attention), cross-attend to the SAME code KV/mask a real query at that position
-            # would see, and predict that position's OWN byte (not p+1 -- there is no "from"
-            # context here, this is a cold-start prediction of p given only the code).
-            if cfg.seed_query_p > 0:
-                n_sample = max(1, int(round(L * cfg.seed_query_p)))
-                sel = torch.randperm(L, device=device)[:n_sample].sort().values
-                seed_q = self.seed_embed.view(1, 1, D).expand(B, n_sample, D)
-                cos_sq, sin_sq = cos_b[sel], sin_b[sel]
-                mask_sq = fuse_mask[:, :, sel, :]
-                seed_out = self.fuse_stages[s](seed_q, h_code, cos_sq, sin_sq, cos_k, sin_k, mask_sq)
-                seed_logits = self.fuse_stages[s].readout(seed_out, self.head.weight)
-                seed_targets = byte_ids[:, sel]
-                seed_loss = F.cross_entropy(seed_logits.reshape(-1, V), seed_targets.reshape(-1))
-                seed_acc = (seed_logits.argmax(-1) == seed_targets).float().mean()
-                seed_losses += [seed_loss]
-                seed_accs += [seed_acc]
-
             x_cross = self.fuse_stages[s](x_cross, h_code, cos_q, sin_q, cos_k, sin_k, fuse_mask)
-            # another pass through the SAME shared self-attn+MLP LM blocks before this stage's
-            # own cond readout (and before the next stage's cross-attn query input) -- i.e. fuse
-            # cross-attn+own-mlp -> shared self-attn/mlp -> this stage's own cond NTP head.
-            x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, byte_mask)
+            x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, byte_mask)   # refinement pass
 
             if self.word_head is not None:
                 h_normed = self.fuse_stages[s].ln_out(x_cross)
@@ -978,97 +736,9 @@ class QCuteZero(nn.Module):
             cond_losses += [cond_loss]
             cond_accs += [cond_acc]
 
-            code_kv_cache += [(h_code, code_pos_abs, window_s)]
             cur_h = h_code
 
-        # Stack_local-style block-diagonal decode per fuse stage, seed cross-attends to code_{b-1}
-        # (shift-by-1, exact/causal). mask_lower selects raw-embed vs x_cross_pre_stage self-attn
-        # input for stage s>0. See docs/status.md 2026-08-24 for the full design/rationale.
-        blocklocal_losses, blocklocal_accs = {}, {}   # keyed by (s, mask_lower) -- both modes trained
-        blocklocal_seed_accs, blocklocal_local_accs = {}, {}
-        blocklocal_glat_accs = {}
-        if cfg.blocklocal_seed_weight > 0:
-            for s in range(self.n_fuse):
-                if s >= len(code_kv_cache):
-                    break
-                cum_K_s = cum_Ks_list[s]
-                n_blocks_s = L // cum_K_s
-                if n_blocks_s < 2:      # need >=2 blocks: block 0 has no code_{-1} to shift to
-                    continue
-                h_code_s, code_pos_abs_s, _window_s = code_kv_cache[s]
-                Lc_s = n_blocks_s * cum_K_s
-                seed_emb = self.seed_embed.view(1, 1, D).expand(B * n_blocks_s, 1, D)
-                block_start_pos = torch.arange(n_blocks_s, device=device) * cum_K_s  # real byte position of each block's own start
-
-                # s==0: both modes are identical (no lower level to mask/not-mask), run once
-                modes = [True, False] if (s > 0 and cfg.blocklocal_dual_mode) else [True]
-                for mask_lower in modes:
-                    base = self.embed(byte_ids[:, :Lc_s]) if (mask_lower or s == 0) else x_cross_pre_stage[s][:, :Lc_s]
-                    base_blocks = base.reshape(B * n_blocks_s, cum_K_s, D)
-                    block_seq = torch.cat([seed_emb, base_blocks], dim=1)   # (B*n_blocks_s, cum_K_s+1, D)
-                    local_pos = torch.arange(cum_K_s + 1, device=device)
-                    cos_l, sin_l = rope_cos_sin_for_positions(local_pos, hd, cfg.rope_base, device)
-                    local_mask = causal_mask(local_pos, local_pos, None)   # block-local causal, batched -- never crosses blocks
-                    h_local = self._run_blocks(0, block_seq, cos_l, sin_l, local_mask)
-                    h_local = h_local.view(B, n_blocks_s, cum_K_s + 1, D)
-
-                    seed_h = h_local[:, 1:, 0, :]                # (B, n_blocks_s-1, D) -- blocks 1..n_blocks_s-1's seeds
-                    # cross-attend block b's seed to code_{b-1} (SHIFTED, offset 1) + a window of
-                    # further-back codes, controlled by attn_window
-                    cos_q, sin_q = rope_cos_sin_for_positions(block_start_pos[1:], hd, cfg.rope_base, device)
-                    cos_k, sin_k = rope_cos_sin_for_positions(code_pos_abs_s[:-1], hd, cfg.rope_base, device)
-                    own_mask = causal_mask(block_start_pos[1:], code_pos_abs_s[:-1], cfg.attn_window)
-                    seed_cross = self.fuse_stages[s](seed_h, h_code_s[:, :-1, :], cos_q, sin_q, cos_k, sin_k, own_mask)
-                    seed_logits = self.fuse_stages[s].readout(seed_cross, self.head.weight)
-                    seed_targets = byte_ids[:, cum_K_s:Lc_s:cum_K_s]        # blocks 1..n_blocks_s-1's own FIRST byte
-                    seed_loss = F.cross_entropy(seed_logits.reshape(-1, V), seed_targets.reshape(-1))
-                    seed_acc = (seed_logits.argmax(-1) == seed_targets).float().mean()
-
-                    # rest of the block: block-local NTP (local step i+1 from step i), no cross-attn
-                    if cum_K_s >= 2:
-                        local_logits = self.head(h_local[:, :, 1:cum_K_s, :])
-                        local_targets = byte_ids[:, :Lc_s].view(B, n_blocks_s, cum_K_s)[:, :, 1:]
-                        local_loss = F.cross_entropy(local_logits.reshape(-1, V), local_targets.reshape(-1))
-                        local_acc = (local_logits.argmax(-1) == local_targets).float().mean()
-                    else:
-                        local_loss, local_acc = h.new_zeros(()), h.new_zeros(())
-
-                    # GLAT-style second pass: swap in STE self-predicted bytes (from local_logits
-                    # above) at each within-block position w.p. blocklocal_glat_p, rerun the same
-                    # block-local decode, add its loss unconditionally (additive, not skip-real --
-                    # see docs/status.md 2026-08-24, mirrors encoder_ste_p's more-stable variant).
-                    if cfg.blocklocal_glat_p > 0 and cum_K_s >= 2 and torch.is_grad_enabled():
-                        pred_idx = local_logits.argmax(-1)                       # (B, n_blocks_s, cum_K_s-1)
-                        pred_hard = self.embed(pred_idx)
-                        pred_soft = F.softmax(local_logits, dim=-1) @ self.embed.weight
-                        pred_ste = pred_hard.detach() + pred_soft - pred_soft.detach()
-                        swap_mask = (torch.rand(pred_idx.shape, device=device) < cfg.blocklocal_glat_p).unsqueeze(-1)
-                        base_view = base_blocks.view(B, n_blocks_s, cum_K_s, D)
-                        swapped_tail = torch.where(swap_mask, pred_ste, base_view[:, :, 1:, :])
-                        base_blocks_glat = torch.cat([base_view[:, :, :1, :], swapped_tail], dim=2).reshape(B * n_blocks_s, cum_K_s, D)
-                        block_seq_glat = torch.cat([seed_emb, base_blocks_glat], dim=1)
-                        h_local_glat = self._run_blocks(0, block_seq_glat, cos_l, sin_l, local_mask)
-                        h_local_glat = h_local_glat.view(B, n_blocks_s, cum_K_s + 1, D)
-                        local_logits_glat = self.head(h_local_glat[:, :, 1:cum_K_s, :])
-                        local_loss_glat = F.cross_entropy(local_logits_glat.reshape(-1, V), local_targets.reshape(-1))
-                        local_acc_glat = (local_logits_glat.argmax(-1) == local_targets).float().mean()
-                    else:
-                        local_loss_glat, local_acc_glat = h.new_zeros(()), h.new_zeros(())
-
-                    blocklocal_losses[(s, mask_lower)] = seed_loss + local_loss + local_loss_glat
-                    blocklocal_accs[(s, mask_lower)] = (seed_acc + local_acc) / 2
-                    blocklocal_seed_accs[(s, mask_lower)] = seed_acc
-                    blocklocal_glat_accs[(s, mask_lower)] = local_acc_glat
-                    blocklocal_local_accs[(s, mask_lower)] = local_acc
-
-        # --- optional: MTP heads, reading the SAME final hidden state (x_cross, post-cascade --
-        # equal to h if n_fuse==0) that head0's own cond/uncond readout already uses. Each extra
-        # head i (0-indexed here, predicting offset i+2 since head0 already covers offset+1) is a
-        # separate untied nn.Linear(D, V) -- cheap (O(mtp_heads * D * V) params, zero extra
-        # attention FLOPs), pervasive (computed at every position, not just sampled clusters),
-        # unlike the pruned query_vec/parallel_decode mechanism (see qcute.bytelm_queryvec for
-        # that preserved lineage) which consumed a full attention-stack pass per drafted position
-        # and only covered `parallel_decode_n_blocks` sampled clusters per step.
+        # MTP heads: extra byte-ahead heads off the final post-cascade hidden state.
         final_h = x_cross
         mtp_losses, mtp_accs = [], []
         for i, head in enumerate(self.extra_heads):
@@ -1087,24 +757,16 @@ class QCuteZero(nn.Module):
             total_loss = total_loss + cfg.code_ntp_weight * torch.stack(fuse_ntp_losses).sum()
         if mtp_losses:
             total_loss = total_loss + cfg.mtp_weight * torch.stack(mtp_losses).mean()
-        if seed_losses:
-            total_loss = total_loss + cfg.seed_query_weight * torch.stack(seed_losses).sum()
         if code_mtp_losses:
             total_loss = total_loss + cfg.mtp_weight_code * torch.stack(list(code_mtp_losses.values())).mean()
         if uncond_mtp_losses:
             total_loss = total_loss + cfg.mtp_weight_uncond * torch.stack(uncond_mtp_losses).mean()
-        if cfg.wavefront_weight > 0:
-            total_loss = total_loss + cfg.wavefront_weight * wavefront_loss
-        if blocklocal_losses:
-            total_loss = total_loss + cfg.blocklocal_seed_weight * torch.stack(list(blocklocal_losses.values())).mean()
 
         metrics = {
             "loss": total_loss, "final_loss": final_loss, "byte_acc": final_acc,
             "uncond_loss": uncond_loss, "uncond_acc": uncond_acc,
             **{f"cond{s}_loss": l for s, l in enumerate(cond_losses)},
             **{f"cond{s}_acc": a for s, a in enumerate(cond_accs)},
-            **{f"seed{s}_loss": l for s, l in enumerate(seed_losses)},
-            **{f"seed{s}_acc": a for s, a in enumerate(seed_accs)},
             **{f"fuse{s}_ntp_loss": l for s, l in enumerate(fuse_ntp_losses)},
             **{f"fuse{s}_ntp_acc": a for s, a in enumerate(fuse_ntp_accs)},
             **{f"mtp{i+2}_loss": l for i, l in enumerate(mtp_losses)},
@@ -1113,31 +775,13 @@ class QCuteZero(nn.Module):
             **{f"mtp{k}_code{s}_acc": a for (s, k), a in code_mtp_accs.items()},
             **{f"mtp{i+2}_uncond_loss": l for i, l in enumerate(uncond_mtp_losses)},
             **{f"mtp{i+2}_uncond_acc": a for i, a in enumerate(uncond_mtp_accs)},
-            "wavefront_loss": wavefront_loss, "wavefront_acc": wavefront_acc,
-            **{(f"blocklocal{s}_loss" if ml else f"blocklocal{s}_rollout_loss"): l
-               for (s, ml), l in blocklocal_losses.items()},
-            **{(f"blocklocal{s}_acc" if ml else f"blocklocal{s}_rollout_acc"): a
-               for (s, ml), a in blocklocal_accs.items()},
-            **{(f"blocklocal{s}_seed_acc" if ml else f"blocklocal{s}_rollout_seed_acc"): a
-               for (s, ml), a in blocklocal_seed_accs.items()},
-            **{(f"blocklocal{s}_local_acc" if ml else f"blocklocal{s}_rollout_local_acc"): a
-               for (s, ml), a in blocklocal_local_accs.items()},
-            **{(f"blocklocal{s}_glat_acc" if ml else f"blocklocal{s}_rollout_glat_acc"): a
-               for (s, ml), a in blocklocal_glat_accs.items()},
         }
         return total_loss, metrics
 
     @torch.no_grad()
     def _generate_cascade(self, byte_ids: torch.Tensor) -> tuple:
-        """Shared no-grad cascade for generation (full recompute, no incremental state): same
-        computation as forward()'s cascade minus the loss terms. Returns (cond_logits_full,
-        code_kv_cache, final_h) -- cond_logits_full is the final stage's full per-position logits
-        (uncond fallback if n_fuse==0), code_kv_cache is the per-stage (h_code, code_pos_abs,
-        window) list, final_h is the raw final hidden state (pre-readout) generate_speculative's
-        MTP-head drafting reads from. Used by _forward_next_byte_logits so there is exactly one
-        generation-time code path, not two drifting copies -- unlike qcute_v1's
-        generate_no_cache/_stack_generate_blockwise split (see docs/status.md's 2026-08-21/22
-        generation-bug entry for why that split is risky)."""
+        """Shared no-grad full-recompute cascade for generation. Returns (cond_logits_full,
+        code_kv_cache, final_h) -- the single source of truth _forward_next_byte_logits reads from."""
         cfg = self.cfg
         B, L = byte_ids.shape
         D = cfg.d_model
@@ -1182,91 +826,6 @@ class QCuteZero(nn.Module):
         return cond_logits_full, code_kv_cache, x_cross
 
     @torch.no_grad()
-    def _generate_cascade_early_exit(self, byte_ids: torch.Tensor, confidence_threshold: float) -> tuple:
-        """Same cascade as _generate_cascade, stops early once a stage's cond prediction clears
-        confidence_threshold. NO exactness guarantee, unlike generate_speculative/wavefront_mtp.
-        Returns (logits_at_last_pos, exit_stage); -1=uncond. See docs/status.md 2026-08-24."""
-        cfg = self.cfg
-        B, L = byte_ids.shape
-        D = cfg.d_model
-        hd = D // cfg.n_heads
-        device = byte_ids.device
-        byte_pos = torch.arange(L, device=device)
-        cos_b, sin_b = rope_cos_sin_for_positions(byte_pos, hd, cfg.rope_base, device)
-        byte_mask = causal_mask(byte_pos, byte_pos, cfg.attn_window)
-        x0 = self.embed(byte_ids)
-        h = self._run_blocks(0, x0, cos_b, sin_b, byte_mask)
-
-        cur_h = h
-        x_cross = h
-        cum_K = 1
-        logits_last = self.head(h[:, -1:, :])
-        exit_stage = -1
-        if F.softmax(logits_last, dim=-1).max(-1).values.min() >= confidence_threshold:
-            return logits_last[:, 0, :], exit_stage
-
-        for s in range(self.n_fuse):
-            K_s = cfg.Ks[s]
-            cum_K *= K_s
-            cur_len = cur_h.shape[1]
-            n_blocks = cur_len // K_s
-            if n_blocks < 1:
-                break
-            code_h = cur_h[:, K_s - 1::K_s, :][:, :n_blocks, :]
-            onehot, code_embeds = self.quantizers[s].extract_greedy(code_h)
-
-            code_local_pos = torch.arange(n_blocks, device=device)
-            cos_c, sin_c = rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base, device)
-            code_mask = causal_mask(code_local_pos, code_local_pos, None)
-            h_code = self._run_blocks(s + 1, code_embeds, cos_c, sin_c, code_mask)
-
-            code_pos_abs = (torch.arange(n_blocks, device=device) + 1) * cum_K - 1
-            window_s = self.fuse_windows[s]
-            fuse_mask = causal_mask(byte_pos, code_pos_abs, window_s)
-            cos_k, sin_k = rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base, device)
-            x_cross = self.fuse_stages[s](x_cross, h_code, cos_b, sin_b, cos_k, sin_k, fuse_mask)
-            x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, byte_mask)
-            logits_last = self.fuse_stages[s].readout(x_cross[:, -1:, :], self.head.weight)
-            exit_stage = s
-            is_last_stage = (s == self.n_fuse - 1)
-            if is_last_stage or F.softmax(logits_last, dim=-1).max(-1).values.min() >= confidence_threshold:
-                break
-            cur_h = h_code
-
-        return logits_last[:, 0, :], exit_stage
-
-    @torch.no_grad()
-    def generate_early_exit(self, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
-                             confidence_threshold: float = 0.9, return_stats: bool = False,
-                             verbose: bool = False) -> torch.Tensor:
-        """Full-recompute generation using _generate_cascade_early_exit every step. Not
-        guaranteed to match generate_no_cache -- compare directly to measure agreement."""
-        was_training = self.training
-        self.eval()
-        prompt_bytes = prompt_bytes.to(device)
-        if prompt_bytes.dim() == 1:
-            prompt_bytes = prompt_bytes.unsqueeze(0)
-        all_bytes = prompt_bytes
-        exit_counts = {}
-        for _ in range(n_new_bytes):
-            logits, exit_stage = self._generate_cascade_early_exit(all_bytes, confidence_threshold)
-            next_byte = logits.argmax(-1, keepdim=True)
-            exit_counts[exit_stage] = exit_counts.get(exit_stage, 0) + 1
-            all_bytes = torch.cat([all_bytes, next_byte], dim=1)
-            if verbose:
-                print(f"    pos {all_bytes.shape[1]-1}: exit_stage={exit_stage} byte={_fmt_bytes(next_byte[0])!r}")
-        if was_training:
-            self.train()
-        seq = all_bytes[0]
-        if verbose or return_stats:
-            n_stages_avail = self.n_fuse
-            print(f"[early_exit summary] exit_stage histogram={exit_counts} "
-                  f"(-1=uncond, 0..{n_stages_avail-1}=stage index, {n_stages_avail-1}=ran full cascade)")
-        if return_stats:
-            return seq, {"exit_counts": exit_counts}
-        return seq
-
-    @torch.no_grad()
     def _forward_next_byte_logits(self, byte_ids: torch.Tensor) -> torch.Tensor:
         """Full recompute over the whole sequence so far, returns logits for the NEXT byte
         (position L, i.e. the last position's post-fusion prediction)."""
@@ -1291,287 +850,8 @@ class QCuteZero(nn.Module):
             self.train()
         return all_bytes[0]
 
-    @torch.no_grad()
-    def generate_free_rollout(self, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> torch.Tensor:
-        """Block-local decode: seed cross-attends to code_{b-1} (shift-by-1, exact/causal), then
-        block-local self-attention for the rest. Needs blocklocal_seed_weight>0 training,
-        n_fuse==1, >=2*K0 prompt bytes. See docs/status.md 2026-08-24."""
-        assert self.n_fuse == 1, "generate_free_rollout PoC only supports a single fuse stage (n_fuse==1)"
-        cfg = self.cfg
-        D = cfg.d_model
-        hd = D // cfg.n_heads
-        device_t = torch.device(device)
-        was_training = self.training
-        self.eval()
-        K = cfg.Ks[0]
-
-        prompt_bytes = prompt_bytes.to(device)
-        if prompt_bytes.dim() == 1:
-            prompt_bytes = prompt_bytes.unsqueeze(0)
-        all_bytes = prompt_bytes[:, :prompt_bytes.shape[1] // K * K]
-        assert all_bytes.shape[1] >= 2 * K, "generate_free_rollout (shift-by-1) needs at least 2*K0 real prompt bytes"
-        Bsz = all_bytes.shape[0]
-
-        # one-off pass to extract the prompt's own real codes (not a persistent cache)
-        L = all_bytes.shape[1]
-        pos0 = torch.arange(L, device=device_t)
-        cos0, sin0 = rope_cos_sin_for_positions(pos0, hd, cfg.rope_base, device_t)
-        h0 = self._run_blocks(0, self.embed(all_bytes), cos0, sin0, causal_mask(pos0, pos0, cfg.attn_window))
-        n_blocks_prev = L // K
-        code_h = h0[:, K - 1::K, :][:, :n_blocks_prev, :]
-        _, code_embeds_past = self.quantizers[0].extract_greedy(code_h)
-
-        # global byte-level cache: NOT used for decoding, only to keep code extraction on the
-        # same global-hidden-state convention the code-level LM was trained on
-        byte_caches = [None] * cfg.n_layers
-        h_g = self.embed(all_bytes)
-        for l, block in enumerate(self.lms[0]):
-            h_g, byte_caches[l] = block.forward_incremental(h_g, cos0, sin0, byte_caches[l], cfg.attn_window)
-
-        # code-level cache; hc_hist/cpos_hist keep every position's output (attn_window may reach
-        # back further than one block, so the last one alone isn't enough)
-        code_caches = [None] * cfg.n_layers
-        cpos0 = torch.arange(n_blocks_prev, device=device_t)
-        ccos0, csin0 = rope_cos_sin_for_positions(cpos0, hd, cfg.rope_base, device_t)
-        hc = code_embeds_past
-        for l, block in enumerate(self.lms[1]):
-            hc, code_caches[l] = block.forward_incremental(hc, ccos0, csin0, code_caches[l], None)
-        hc_hist = self.ln_fs[1](hc)                          # (B, n_blocks_prev, D)
-        cpos_hist = cpos0 * K + (K - 1)                       # code_pos_abs convention, (n_blocks_prev,)
-
-        n_new_blocks = -(-n_new_bytes // K)
-        for _ in range(n_new_blocks):
-            # own-block seed: cross-attend to code_{b-1} (shifted, real), block-local self-attn
-            local_caches = [None] * cfg.n_layers
-            block_start_pos = torch.tensor([n_blocks_prev * K], device=device_t)
-            local_pos = torch.tensor([0], device=device_t)
-            cos_l, sin_l = rope_cos_sin_for_positions(local_pos, hd, cfg.rope_base, device_t)
-            x_seed = self.seed_embed.view(1, 1, D).expand(Bsz, 1, D)
-            for l, block in enumerate(self.lms[0]):
-                x_seed, local_caches[l] = block.forward_incremental(x_seed, cos_l, sin_l, local_caches[l], cfg.attn_window)
-            seed_h = self.ln_fs[0](x_seed)
-
-            cos_q, sin_q = rope_cos_sin_for_positions(block_start_pos, hd, cfg.rope_base, device_t)
-            cos_k, sin_k = rope_cos_sin_for_positions(cpos_hist, hd, cfg.rope_base, device_t)
-            own_mask = causal_mask(block_start_pos, cpos_hist, cfg.attn_window)
-            seed_cross = self.fuse_stages[0](seed_h, hc_hist, cos_q, sin_q, cos_k, sin_k, own_mask)
-            first_byte_logits = self.fuse_stages[0].readout(seed_cross, self.head.weight)
-            first_byte = first_byte_logits[:, 0, :].argmax(-1, keepdim=True)
-
-            # commit the first byte into the local cache (local position 1)
-            pos_fb = torch.tensor([1], device=device_t)
-            cos_fb, sin_fb = rope_cos_sin_for_positions(pos_fb, hd, cfg.rope_base, device_t)
-            x_fb = self.embed(first_byte)
-            for l, block in enumerate(self.lms[0]):
-                x_fb, local_caches[l] = block.forward_incremental(x_fb, cos_fb, sin_fb, local_caches[l], cfg.attn_window)
-            h_last = self.ln_fs[0](x_fb)
-            all_bytes = torch.cat([all_bytes, first_byte], dim=1)
-
-            # remaining K-1 bytes: block-local self-attention only, no cross-attention
-            for t in range(1, K):
-                next_byte = self.head(h_last).argmax(-1)
-                all_bytes = torch.cat([all_bytes, next_byte], dim=1)
-                pos_t = torch.tensor([t + 1], device=device_t)
-                cos_t, sin_t = rope_cos_sin_for_positions(pos_t, hd, cfg.rope_base, device_t)
-                x_t = self.embed(next_byte)
-                for l, block in enumerate(self.lms[0]):
-                    x_t, local_caches[l] = block.forward_incremental(x_t, cos_t, sin_t, local_caches[l], cfg.attn_window)
-                h_last = self.ln_fs[0](x_t)
-
-            # block now real: feed bytes through the global cache, extract code, grow code history
-            new_block_bytes = all_bytes[:, -K:]
-            pos_g = torch.arange(L, L + K, device=device_t)
-            cos_g, sin_g = rope_cos_sin_for_positions(pos_g, hd, cfg.rope_base, device_t)
-            x_g = self.embed(new_block_bytes)
-            for l, block in enumerate(self.lms[0]):
-                x_g, byte_caches[l] = block.forward_incremental(x_g, cos_g, sin_g, byte_caches[l], cfg.attn_window)
-            h_g_last = self.ln_fs[0](x_g)[:, -1:, :]
-            L += K
-            n_blocks_prev += 1
-            _, code_embed_new = self.quantizers[0].extract_greedy(h_g_last)
-            cpos_new = torch.tensor([n_blocks_prev - 1], device=device_t)
-            ccos_new, csin_new = rope_cos_sin_for_positions(cpos_new, hd, cfg.rope_base, device_t)
-            hc_new = code_embed_new
-            for l, block in enumerate(self.lms[1]):
-                hc_new, code_caches[l] = block.forward_incremental(hc_new, ccos_new, csin_new, code_caches[l], None)
-            hc_hist = torch.cat([hc_hist, self.ln_fs[1](hc_new)], dim=1)   # grow the cross-attn KV history
-            cpos_hist = torch.cat([cpos_hist, cpos_new * K + (K - 1)], dim=0)
-
-        all_bytes = all_bytes[:, :prompt_bytes.shape[1] + n_new_bytes]
-        if was_training:
-            self.train()
-        return all_bytes[0]
-
-    @torch.no_grad()
-    def _wavefront_draft_block(self, all_bytes: torch.Tensor, K: int, n_waves: int,
-                                device_t: torch.device) -> torch.Tensor:
-        """Shared by generate_wavefront/generate_wavefront_mtp: drafts K bytes via lockstep
-        wavefront decode (MTP bootstrap + region_len-1 lockstep passes). buf is already in true
-        left-to-right byte order, no reordering needed. See docs/status.md 2026-08-24."""
-        cfg = self.cfg
-        assert K % n_waves == 0, f"K ({K}) must be evenly divisible by n_waves ({n_waves})"
-        region_len = K // n_waves
-        max_offset = (n_waves - 1) * region_len + 1
-        assert cfg.mtp_heads >= max_offset, (
-            f"wavefront draft needs cfg.mtp_heads >= (n_waves-1)*region_len+1 = {max_offset} "
-            f"to bootstrap the last wave's first token (got mtp_heads={cfg.mtp_heads})")
-        hd = cfg.d_model // cfg.n_heads
-        P = all_bytes.shape[1]
-
-        # --- bootstrap every wave's first token from h_last (position P-1), no seed token ---
-        pos_prefix = torch.arange(P, device=device_t)
-        cos_p, sin_p = rope_cos_sin_for_positions(pos_prefix, hd, cfg.rope_base, device_t)
-        h_prefix = self._run_blocks(0, self.embed(all_bytes), cos_p, sin_p,
-                                    causal_mask(pos_prefix, pos_prefix, cfg.attn_window))
-        h_last = h_prefix[:, -1:, :]                              # (B, 1, D)
-        wave_firsts = [self.head(h_last).argmax(-1)]              # wave 0: ordinary head0
-        for g in range(1, n_waves):
-            offset = g * region_len + 1
-            head_g = self.extra_heads[offset - 2]
-            wave_firsts.append(F.linear(h_last, head_g.weight).argmax(-1))
-        # buf layout: prefix ++ wave0's region_len slots ++ wave1's ++ ... ++ wave(n_waves-1)'s
-        buf = torch.cat([all_bytes, all_bytes.new_zeros(all_bytes.shape[0], K)], dim=1)
-        for g in range(n_waves):
-            buf[:, P + g * region_len] = wave_firsts[g][:, 0]
-
-        # --- logical clock: prefix keeps its own raw index; every wave shares the SAME
-        # region_len-long timestep sequence (P, P+1, ..., P+region_len-1) -- lockstep ---
-        per_wave_timestep = P + torch.arange(region_len, device=device_t)
-        timestep = torch.cat([pos_prefix, per_wave_timestep.repeat(n_waves)])
-        region = torch.cat([pos_prefix.new_full((P,), -1),
-                             torch.arange(n_waves, device=device_t).repeat_interleave(region_len)])
-
-        # --- lockstep decode: tau=2..region_len, every wave's tau-th token simultaneously ---
-        for tau in range(2, region_len + 1):
-            cos_t, sin_t = rope_cos_sin_for_positions(timestep, hd, cfg.rope_base, device_t)
-            mask = wavefront_mask(timestep, region)
-            h = self._run_blocks(0, self.embed(buf), cos_t, sin_t, mask)
-            for g in range(n_waves):
-                prev_idx = P + g * region_len + (tau - 1) - 1     # wave g's (tau-1)-th position
-                next_byte = self.head(h[:, prev_idx:prev_idx + 1, :]).argmax(-1)
-                buf[:, P + g * region_len + tau - 1] = next_byte[:, 0]
-
-        return buf[:, P:P + K]
-
-    @torch.no_grad()
-    def generate_wavefront(self, prompt_bytes: torch.Tensor, K: int, n_waves: int, n_new_bytes: int,
-                            device: str) -> torch.Tensor:
-        """Byte-level-only, full-recompute, UNVERIFIED wavefront draft (see generate_wavefront_mtp
-        for the verified counterpart). Degenerates to ordinary AR at n_waves==1."""
-        device_t = torch.device(device)
-        was_training = self.training
-        self.eval()
-
-        prompt_bytes = prompt_bytes.to(device)
-        if prompt_bytes.dim() == 1:
-            prompt_bytes = prompt_bytes.unsqueeze(0)
-        all_bytes = prompt_bytes
-
-        n_new_blocks = -(-n_new_bytes // K)
-        for _ in range(n_new_blocks):
-            draft_block = self._wavefront_draft_block(all_bytes, K, n_waves, device_t)
-            all_bytes = torch.cat([all_bytes, draft_block], dim=1)
-
-        all_bytes = all_bytes[:, :prompt_bytes.shape[1] + n_new_bytes]
-        if was_training:
-            self.train()
-        return all_bytes[0]
-
-    @torch.no_grad()
-    def check_wavefront_consistency(self, val_data: torch.Tensor, device: str, n_checks: int = 3,
-                                     prompt_len: int = 8, K: int = 8, n_new_bytes: int = 16) -> dict:
-        """Diagnostic: generate_wavefront(n_waves=1) MUST match generate_no_cache bit-exactly --
-        n_waves=1 has no two positions sharing a timestep, so wavefront_mask degenerates to plain
-        causal_mask and the whole mechanism collapses to ordinary AR generation. Anything less
-        than match_rate=1.0 means the timestep/region/mask arithmetic has a real bug."""
-        was_training = self.training
-        self.eval()
-        n_match = 0
-        for i in range(n_checks):
-            pl = max(1, prompt_len - i * (prompt_len // max(1, n_checks)))
-            start = torch.randint(0, max(1, val_data.shape[0] - pl - n_new_bytes), (1,)).item()
-            prompt = val_data[start:start + pl].to(device)
-            out_full = self.generate_no_cache(prompt, n_new_bytes, device)
-            out_wave = self.generate_wavefront(prompt, K, 1, n_new_bytes, device)
-            if torch.equal(out_full, out_wave):
-                n_match += 1
-        if was_training:
-            self.train()
-        return {"match_rate": n_match / n_checks, "n_checks": n_checks}
-
-    @torch.no_grad()
-    def generate_wavefront_mtp(self, prompt_bytes: torch.Tensor, K: int, n_waves: int, n_new_bytes: int,
-                                device: str, return_stats: bool = False, verbose: bool = False):
-        """Wavefront-drafted speculative decode: drafts a K-byte block via _wavefront_draft_block,
-        verifies byte-by-byte against the exact incremental stepper (same guarantee as
-        generate_speculative). Degenerates to plain MTP draft at region_len==1. n_fuse==0 only."""
-        cfg = self.cfg
-        assert self.n_fuse == 0, "generate_wavefront_mtp only supports byte-level-only configs (n_fuse==0) so far"
-        device_t = torch.device(device)
-        was_training = self.training
-        self.eval()
-        prompt_bytes = prompt_bytes.to(device)
-        if prompt_bytes.dim() == 1:
-            prompt_bytes = prompt_bytes.unsqueeze(0)
-
-        step = self._make_incremental_stepper(prompt_bytes.shape[0], device_t)
-        all_bytes = prompt_bytes
-        logits_all = step(all_bytes, 0)          # prime the verifier with the prompt
-        next_logits = logits_all[:, -1, :]
-
-        target_len = prompt_bytes.shape[1] + n_new_bytes
-        n_accepted, n_checked, n_rounds, n_draft_passes = 0, 0, 0, 0
-        region_len = K // n_waves       # passes per round: 1 bootstrap + (region_len-1) lockstep
-
-        while all_bytes.shape[1] < target_len:
-            remaining = target_len - all_bytes.shape[1]
-            draft_block = self._wavefront_draft_block(all_bytes, K, n_waves, device_t)
-            draft_block = draft_block[:, :min(K, remaining)]
-            n_rounds += 1
-            n_draft_passes += region_len
-            if verbose:
-                print(f"[wavefront-mtp round {n_rounds}] draft_passes={region_len} "
-                      f"(region_len={region_len}) draft={_fmt_bytes(draft_block[0])!r}")
-
-            # --- verify: one real position at a time, in true order, against the SAME exact
-            # incremental stepper generate_kv_cache/generate_speculative use ---
-            for i in range(draft_block.shape[1]):
-                n_checked += 1
-                real_byte = next_logits.argmax(-1, keepdim=True)
-                draft_byte = draft_block[:, i:i + 1]
-                agree = torch.equal(real_byte, draft_byte)
-                accepted_byte = draft_byte if agree else real_byte
-                if verbose:
-                    tag = "ACCEPT" if agree else "REJECT"
-                    print(f"    slot {i}: draft={_fmt_bytes(draft_byte[0])!r} "
-                          f"real={_fmt_bytes(real_byte[0])!r} -> {tag}")
-                if agree:
-                    n_accepted += 1
-                all_bytes = torch.cat([all_bytes, accepted_byte], dim=1)
-                logits_all = step(accepted_byte, all_bytes.shape[1] - 1)
-                next_logits = logits_all[:, -1, :]
-                if not agree:
-                    break   # reject: discard the rest of this round's draft, start a fresh one
-
-        if was_training:
-            self.train()
-        stats = {"accept_rate": n_accepted / max(1, n_checked), "n_draft_checks": n_checked,
-                  "n_rounds": n_rounds, "n_draft_passes": n_draft_passes}
-        if verbose:
-            print(f"[wavefront-mtp summary] rounds={n_rounds} draft_passes={n_draft_passes} "
-                  f"verify_checks={n_checked} accepted={n_accepted} accept_rate={stats['accept_rate']:.3f}")
-        if return_stats:
-            return all_bytes[0], stats
-        return all_bytes[0]
-
-    @torch.no_grad()
     def _make_incremental_stepper(self, Bsz: int, device_t: torch.device):
-        """Factory for the real incremental-KV-cache stepper: returns a `step(byte_chunk,
-        start_pos) -> logits_full` closure carrying its own mutable state (byte-level self-attn
-        cache, each fuse stage's refinement cache, code histories, backlogs). Shared by
-        generate_kv_cache (drives it byte-by-byte) and generate_speculative (drives it with
-        whatever byte value needs verifying, drafted or corrected -- same exact machinery either
-        way, so verification is always ground truth, never an approximation of it)."""
+        """Factory for the incremental-KV-cache stepper, shared by generate_kv_cache/generate_speculative."""
         cfg = self.cfg
         D = cfg.d_model
         hd = D // cfg.n_heads
@@ -1580,12 +860,8 @@ class QCuteZero(nn.Module):
         refine_caches = [[None] * cfg.n_layers for _ in range(self.n_fuse)]
         h_hist = None                        # (Bsz, cur_L, D): raw byte hidden states so far
         stage_h_hist = [torch.zeros(Bsz, 0, D, device=device_t) for _ in range(self.n_fuse)]
-        # per-stage backlog: while a stage is still fully inactive (n_blocks_now==0, matching
-        # forward()'s own "if n_blocks<1: break" -- the WHOLE stage is skipped, not just some
-        # positions), its input is accumulated here so the first activation can catch up on
-        # everything it missed in ONE priming call, exactly matching a full recompute at that
-        # point (an earlier version skipped this catch-up entirely -- confirmed via direct
-        # generate_no_cache vs generate_kv_cache mismatch on short prompts, chat 2026-08-22).
+        # per-stage backlog: while a stage is fully inactive, its input accumulates here so the
+        # first activation can catch up in ONE priming call, matching a full recompute exactly.
         x_in_backlog = [None] * self.n_fuse
         cum_Ks = []
         cum = 1
@@ -1623,14 +899,8 @@ class QCuteZero(nn.Module):
                 n_blocks_now = h_code.shape[1]
 
                 if n_blocks_now < 1:
-                    # stage still fully inactive -- a hard BREAK, matching forward()'s own
-                    # "if n_blocks<1: break" exactly: a deeper stage can never be active while
-                    # this one isn't (its codes are derived FROM this stage's own h_code), so
-                    # there is nothing further to accumulate downstream this step either (an
-                    # earlier version used `continue` here, letting a later stage's backlog
-                    # prematurely accumulate this stage's not-yet-final input -- double-counted
-                    # once this stage later caught up, confirmed via direct logit comparison
-                    # against _generate_cascade, chat 2026-08-22).
+                    # stage still fully inactive -- hard BREAK, matching forward()'s "if
+                    # n_blocks<1: break" (a deeper stage can never be active while this one isn't).
                     x_in_backlog[s] = x_in if x_in_backlog[s] is None else torch.cat([x_in_backlog[s], x_in], dim=1)
                     break
 
@@ -1665,14 +935,8 @@ class QCuteZero(nn.Module):
 
     @torch.no_grad()
     def generate_kv_cache(self, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> torch.Tensor:
-        """Real incremental KV cache: the byte-level self.blocks self-attention and each fuse
-        stage's post-cross-attn refinement self.blocks pass are cached across steps (O(1) new
-        attention work per new byte, vs generate_no_cache's full O(L) recompute). The short
-        code-sequence self-attention (kvlm) pass and the fuse cross-attention itself are still
-        recomputed fresh whenever a new code appears (every Ks[s] bytes) -- cheap, since those
-        sequences are short (~L/prod(Ks[:s+1])), not worth incrementally caching. Produces the
-        exact same argmax choices as generate_no_cache, just asymptotically cheaper for long
-        generations (see check_kv_cache_consistency for the direct comparison)."""
+        """O(1) new attention work per new byte (vs generate_no_cache's full O(L) recompute),
+        exact same argmax trajectory -- see check_kv_cache_consistency."""
         was_training = self.training
         self.eval()
         prompt_bytes = prompt_bytes.to(device)
@@ -1696,9 +960,7 @@ class QCuteZero(nn.Module):
     @torch.no_grad()
     def generate_speculative(self, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str,
                               return_stats: bool = False, verbose: bool = False):
-        """MTP-style speculative decoding: draft mtp_heads bytes from one forward pass, verify
-        each against the exact incremental stepper (accept/reject-to-first-divergence). Requires
-        mtp_heads>1 and a checkpoint trained with it. Batch size 1 only."""
+        """MTP-drafted speculative decode, verified vs the exact incremental stepper. Batch size 1 only."""
         cfg = self.cfg
         assert cfg.mtp_heads > 1, "generate_speculative requires cfg.mtp_heads > 1"
         device_t = torch.device(device)
@@ -1723,10 +985,7 @@ class QCuteZero(nn.Module):
             draft_len = min(cfg.mtp_heads, target_len - m)
             n_rounds += 1
 
-            # --- draft: extra_heads, ONE forward pass over the committed prefix, no per-slot
-            # attention-stack cost -- head i (0-indexed) predicts offset i+2, so the immediate
-            # next byte (offset+1, drafted position 0) comes from the SAME final hidden state
-            # via the ordinary head0/cond readout already computed by _generate_cascade.
+            # draft: extra_heads, ONE forward pass, no per-slot attention-stack cost.
             cond_logits_full, _, final_h = self._generate_cascade(all_bytes)
             n_draft_passes += 1
             draft_bytes = [cond_logits_full[:, -1, :].argmax(-1, keepdim=True)]
@@ -1775,13 +1034,8 @@ class QCuteZero(nn.Module):
     @torch.no_grad()
     def check_kv_cache_consistency(self, val_data: torch.Tensor, device: str,
                                     n_checks: int = 3, prompt_len: int = 8, n_new_bytes: int = 24) -> dict:
-        """Diagnostic: generate_no_cache vs generate_kv_cache MUST produce bit-exact identical
-        greedy trajectories -- generate_kv_cache is a pure efficiency reformulation of the same
-        computation, not an approximation. Checks n_checks random prompts sampled from val_data at
-        varying lengths (short prompts specifically exercise the "stage not yet active" backlog
-        path -- this is exactly where a real bug was caught and fixed, chat 2026-08-22). Returns
-        {"match_rate": float, "n_checks": int} -- match_rate should always be 1.0; anything less
-        means the two paths have desynced and needs debugging before trusting generate_kv_cache."""
+        """generate_no_cache vs generate_kv_cache MUST match bit-exact. Returns
+        {"match_rate": float, "n_checks": int} -- should always be 1.0."""
         was_training = self.training
         self.eval()
         n_match = 0
@@ -1798,9 +1052,7 @@ class QCuteZero(nn.Module):
         return {"match_rate": n_match / n_checks, "n_checks": n_checks}
 
 
-# ----------------------------------------------------------------------------
 # training loop
-# ----------------------------------------------------------------------------
 
 def eval_model(model, data: torch.Tensor, batch_size: int, n_batches: int, device: str) -> dict:
     model.eval()
@@ -1843,13 +1095,7 @@ def train(model, train_data, val_data, args, log, run_name: str, device: str) ->
                 step=step, **{f"val_{k}": v for k, v in val.items()}, best_val_loss=checkpointer.best_metric)
 
             if args.eval_decode_mtp_verify and model.cfg.mtp_heads > 1:
-                # MTP-drafted speculative decode, verified byte-by-byte against the exact NTP
-                # stepper (generate_speculative already does this -- see its own docstring) --
-                # show both NTP (generate_no_cache, the ground-truth reference) and the MTP-
-                # verified decode side by side, plus the accept_rate, so MTP draft quality is
-                # visible during training, not just at a separate manual generation step. The two
-                # texts should be IDENTICAL (verification guarantees this) -- shown together as a
-                # direct check of that guarantee, not just trusted from the accept_rate number.
+                # show NTP vs MTP-verified decode side by side -- should always be IDENTICAL.
                 prompt = val_data[:args.eval_decode_prompt_len]
                 n_new = model.cfg.mtp_heads   # one full draft round's worth -- MTP's own max
                 out_ntp = model.generate_no_cache(prompt, n_new, device)
@@ -1892,14 +1138,6 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--mtp_weight", type=float, default=1.0)
     p.add_argument("--weight_tie", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--global_tie", type=lambda x: x.lower() != "false", default=False)
-    p.add_argument("--seed_query_p", type=float, default=0.0)
-    p.add_argument("--seed_query_weight", type=float, default=1.0)
-    p.add_argument("--wavefront_weight", type=float, default=0.0)
-    p.add_argument("--wavefront_K", type=int, default=8)
-    p.add_argument("--wavefront_n_waves", type=int, default=2)
-    p.add_argument("--blocklocal_seed_weight", type=float, default=0.0)
-    p.add_argument("--blocklocal_dual_mode", type=bool, default=True)
-    p.add_argument("--blocklocal_glat_p", type=float, default=0.0)
     p.add_argument("--quant_type", type=str, default="simplex")
     p.add_argument("--vocab", type=int, default=256)
     p.add_argument("--pq_chunks", type=int, default=1)
@@ -1928,6 +1166,7 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--logs_dir", type=Path, default=Path("logs"))
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--device", type=str, default=None)
+    p.add_argument("--seed", type=int, default=1234)
 
     if pre_args.config:
         p.set_defaults(**{k: v for k, v in load_config_module(pre_args.config).items() if k in {a.dest for a in p._actions}})
@@ -1948,12 +1187,6 @@ def config_from_args(args) -> Config:
         code_ntp_weight=args.code_ntp_weight, cond_weight=args.cond_weight,
         mtp_heads=args.mtp_heads, mtp_weight=args.mtp_weight, weight_tie=args.weight_tie,
         global_tie=args.global_tie,
-        seed_query_p=args.seed_query_p, seed_query_weight=args.seed_query_weight,
-        wavefront_weight=args.wavefront_weight, wavefront_K=args.wavefront_K,
-        wavefront_n_waves=args.wavefront_n_waves,
-        blocklocal_seed_weight=args.blocklocal_seed_weight,
-        blocklocal_dual_mode=args.blocklocal_dual_mode,
-        blocklocal_glat_p=args.blocklocal_glat_p,
         quant_type=args.quant_type, vocab=args.vocab, pq_chunks=args.pq_chunks,
         share_lm=args.share_lm,
         mtp_heads_code=args.mtp_heads_code, mtp_weight_code=args.mtp_weight_code,
@@ -1964,6 +1197,7 @@ def config_from_args(args) -> Config:
 
 def main() -> None:
     args, pre_args = build_argparser("qcute_zero: single-LM periodic-fusion architecture")
+    torch.manual_seed(args.seed)
     device = args.device or ("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     cfg = config_from_args(args)
     model = QCuteZero(cfg).to(device)

@@ -7,7 +7,10 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "huggingface-hub[cli]>=1.28.0",
     "matplotlib>=3.11.1",
+    "numpy>=2.5.1",
+    "pyarrow>=25.0.1",
     "sentencepiece>=0.2.2",
     "torch>=2.13.0",
     "tqdm>=4.70.0",
