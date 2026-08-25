@@ -460,6 +460,7 @@ class Config:
     global_tie: bool = False                 # requires weight_tie=True; extends the tie to every
                                               # level's Quantizer (exact only if vocab==unit_vocab, pq_chunks==1)
     share_lm: bool = False                   # True ties every level to the same Block stack
+    share_fuse: bool = False                 # True ties every fuse stage to fuse_stages[0]
     head_word_bits: int | None = None        # None = same as input_preset; see WordHead
 
 
@@ -596,8 +597,12 @@ class QCuteZero(nn.Module):
             nn.init.normal_(self.head.weight, std=0.02)
 
         fuse_layers = cfg.fuse_n_layers if cfg.fuse_n_layers is not None else cfg.n_layers
-        self.fuse_stages = nn.ModuleList(
-            [FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers) for _ in range(self.n_fuse)])
+        if cfg.share_fuse:
+            first_fs = FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers)
+            self.fuse_stages = nn.ModuleList([first_fs] * self.n_fuse)
+        else:
+            self.fuse_stages = nn.ModuleList(
+                [FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers) for _ in range(self.n_fuse)])
         self.fuse_windows = resolve_fuse_window(cfg.fuse_window, self.n_fuse)
 
         self.extra_heads = nn.ModuleList(
@@ -1142,6 +1147,7 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--vocab", type=int, default=256)
     p.add_argument("--pq_chunks", type=int, default=1)
     p.add_argument("--share_lm", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--share_fuse", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--mtp_heads_code", type=int, default=1)
     p.add_argument("--mtp_weight_code", type=float, default=1.0)
     p.add_argument("--mtp_heads_uncond", type=int, default=1)
@@ -1188,7 +1194,7 @@ def config_from_args(args) -> Config:
         mtp_heads=args.mtp_heads, mtp_weight=args.mtp_weight, weight_tie=args.weight_tie,
         global_tie=args.global_tie,
         quant_type=args.quant_type, vocab=args.vocab, pq_chunks=args.pq_chunks,
-        share_lm=args.share_lm,
+        share_lm=args.share_lm, share_fuse=args.share_fuse,
         mtp_heads_code=args.mtp_heads_code, mtp_weight_code=args.mtp_weight_code,
         mtp_heads_uncond=args.mtp_heads_uncond, mtp_weight_uncond=args.mtp_weight_uncond,
         head_word_bits=args.head_word_bits,

@@ -334,6 +334,31 @@ nightly. Use `TPU_VISIBLE_CHIPS`-based independent single-chip processes (see be
 multi-chip utilization whenever flash-attention (or the nightly build for any other reason) is
 needed — not investigated further: no strace/gdb dive into the PJRT client, no upstream bug filed.
 
+**Not a staleness issue**: the wheel used above (`torch-2.10.0.dev-cp312-cp312-linux_x86_64.whl`,
+no date suffix) turned out to be frozen at 2025-11-19 (checked via `gsutil ls -L` on the GCS
+bucket — that's the actual upload date of both the "rolling latest" and the last dated `cp312`
+snapshot; no `cp312`/`cp313` dated snapshots exist after that, only `cp310`/`cp311` kept getting
+new daily builds). Retested with the actual latest available anywhere in the bucket at the time
+(`cp311`, dated 2026-02-08, ~3 months newer) in a fresh `.venv-nightly-cp311` (`uv venv --python
+3.11`, same install steps otherwise) — **identical hang**, CPU time frozen at the exact same
+`00:00:18`/`00:00:19` values across two snapshots ~85s apart. So this isn't a bug that's since been
+fixed upstream and just needs a newer nightly; it reproduces on the newest build available.
+
+**Also not fixed by going the other direction** (an early `2.10.0.dev` build, close to the `2.9.0`
+stable cut, on the theory that a later nightly regressed something that worked right after
+release): `torch_xla-2.10.0.dev20251008` is the *earliest* dated snapshot the GCS bucket still has
+for `cp311`/`cp312` (nothing older archived) — installed in a fresh `.venv-nightly-early`, same
+`libtpu`/`jax` install steps. Two findings: (1) no ABI break pairing this ~6-week-older wheel
+against today's `libtpu==0.0.46` (device init and a plain smoke test both worked, unlike the
+stable-pin-vs-newer-libtpu break described earlier in this doc), and (2) **the multichip hang
+still reproduces identically** — CPU time frozen at the same values across a ~22s gap. So the bug
+has been present since at least the earliest nightly build available after `2.9.0` shipped — not a
+later regression introduced partway through the `2.10.0.dev` line. Conclusion: **no nightly build
+tried (earliest available through newest available, both `cp311` and `cp312`) avoids this hang**;
+it looks structural to the `2.9.0`→`2.10.0.dev` transition itself (a real behavior difference in
+the branch, not a bisectable commit within what's archived), not something a different nightly
+pick can route around.
+
 Static code review (2026-08-22) found nothing wrong in this project's own collective usage (every
 rank reaches `optimizer_step`'s all-reduce in lockstep every step, no other collective appears
 anywhere in the file) — consistent with the bug living in the nightly PJRT client's multi-process

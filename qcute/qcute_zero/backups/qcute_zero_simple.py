@@ -430,6 +430,10 @@ class Config:
                                               # 1 = disabled (only the existing head0 next-byte
                                               # prediction). >1 heads predict t+2..t+mtp_heads.
     mtp_weight: float = 1.0                  # weight for the extra heads' mean loss
+    mtp_heads_code: int = 1                  # extra code-ahead heads off h_code, per stage (1=disabled)
+    mtp_weight_code: float = 1.0
+    mtp_heads_uncond: int = 1                # extra byte-ahead heads off pre-fusion h (1=disabled)
+    mtp_weight_uncond: float = 1.0
     weight_tie: bool = False                 # True: head.weight literally refs embed.weight
     share_lm: bool = False                   # True ties every level's LM stack to lms[0]
     share_fuse: bool = False                 # True ties every fuse stage to fuse_stages[0]
@@ -487,6 +491,16 @@ class QCuteZero(nn.Module):
 
         self.extra_heads = nn.ModuleList(
             [nn.Linear(D, V, bias=False) for _ in range(max(0, cfg.mtp_heads - 1))])
+        self.extra_heads_uncond = nn.ModuleList(
+            [nn.Linear(D, V, bias=False) for _ in range(max(0, cfg.mtp_heads_uncond - 1))])
+        if cfg.share_lm:
+            first_ehc = nn.ModuleList(
+                [nn.Linear(D, V, bias=False) for _ in range(max(0, cfg.mtp_heads_code - 1))])
+            self.extra_heads_code_per_stage = nn.ModuleList([first_ehc] * max(1, self.n_fuse))
+        else:
+            self.extra_heads_code_per_stage = nn.ModuleList([nn.ModuleList(
+                [nn.Linear(D, V, bias=False) for _ in range(max(0, cfg.mtp_heads_code - 1))])
+                for _ in range(max(1, self.n_fuse))])
 
     def _run_blocks(self, level: int, x: torch.Tensor, cos, sin, attn_mask) -> torch.Tensor:
         for block in self.lms[level]:
@@ -512,12 +526,24 @@ class QCuteZero(nn.Module):
         uncond_loss = F.cross_entropy(uncond_logits.reshape(-1, V), byte_ids[:, 1:].reshape(-1))
         uncond_acc = (uncond_logits.argmax(-1) == byte_ids[:, 1:]).float().mean()
 
+        # cheap/coarse extra byte-ahead heads off the pre-fusion hidden state h.
+        uncond_mtp_losses, uncond_mtp_accs = [], []
+        for i, head_u in enumerate(self.extra_heads_uncond):
+            k = i + 2
+            if L <= k:
+                continue
+            logits_u = F.linear(h[:, :-k, :], head_u.weight)
+            targets_u = byte_ids[:, k:]
+            uncond_mtp_losses.append(F.cross_entropy(logits_u.reshape(-1, V), targets_u.reshape(-1)))
+            uncond_mtp_accs.append((logits_u.argmax(-1) == targets_u).float().mean())
+
         # --- cascade through fuse stages ---
         cur_h = h                # source hidden states to extract this stage's codes from
         x_cross = h              # running byte-level query stream, refined by each fuse stage
         cum_K = 1
         fuse_ntp_losses, fuse_ntp_accs = [], []
         cond_losses, cond_accs = [], []
+        code_mtp_losses, code_mtp_accs = {}, {}   # keyed by (stage, k)
         code_kv_cache = []       # (h_code_s, code_pos_abs, window) per stage
 
         for s in range(self.n_fuse):
@@ -548,6 +574,16 @@ class QCuteZero(nn.Module):
                 code_ntp_acc = (code_ntp_logits.argmax(-1) == code_ids[:, 1:]).float().mean()
                 fuse_ntp_losses += [code_ntp_loss]
                 fuse_ntp_accs += [code_ntp_acc]
+
+            # extra code-ahead heads off h_code, this stage's own set.
+            for i, head_c in enumerate(self.extra_heads_code_per_stage[s]):
+                k = i + 2
+                if n_blocks <= k:
+                    continue
+                logits_c = F.linear(h_code[:, :-k, :], head_c.weight)
+                target_c = code_ids[:, k:]
+                code_mtp_losses[(s, k)] = F.cross_entropy(logits_c.reshape(-1, V), target_c.reshape(-1))
+                code_mtp_accs[(s, k)] = (logits_c.argmax(-1) == target_c).float().mean()
 
             # cross-attn: byte-level query stream attends into h_code, causal on CUMULATIVE
             # (absolute-byte) boundary, never this stage's local code-sequence index (chat
@@ -599,6 +635,10 @@ class QCuteZero(nn.Module):
             total_loss = total_loss + cfg.code_ntp_weight * torch.stack(fuse_ntp_losses).sum()
         if mtp_losses:
             total_loss = total_loss + cfg.mtp_weight * torch.stack(mtp_losses).mean()
+        if code_mtp_losses:
+            total_loss = total_loss + cfg.mtp_weight_code * torch.stack(list(code_mtp_losses.values())).mean()
+        if uncond_mtp_losses:
+            total_loss = total_loss + cfg.mtp_weight_uncond * torch.stack(uncond_mtp_losses).mean()
 
         metrics = {
             "loss": total_loss, "final_loss": final_loss, "byte_acc": final_acc,
@@ -609,6 +649,10 @@ class QCuteZero(nn.Module):
             **{f"fuse{s}_ntp_acc": a for s, a in enumerate(fuse_ntp_accs)},
             **{f"mtp{i+2}_loss": l for i, l in enumerate(mtp_losses)},
             **{f"mtp{i+2}_acc": a for i, a in enumerate(mtp_accs)},
+            **{f"mtp{k}_code{s}_loss": l for (s, k), l in code_mtp_losses.items()},
+            **{f"mtp{k}_code{s}_acc": a for (s, k), a in code_mtp_accs.items()},
+            **{f"mtp{i+2}_uncond_loss": l for i, l in enumerate(uncond_mtp_losses)},
+            **{f"mtp{i+2}_uncond_acc": a for i, a in enumerate(uncond_mtp_accs)},
         }
         return total_loss, metrics
 
@@ -1078,6 +1122,10 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--cond_weight", type=float, default=1.0)
     p.add_argument("--mtp_heads", type=int, default=1)
     p.add_argument("--mtp_weight", type=float, default=1.0)
+    p.add_argument("--mtp_heads_code", type=int, default=1)
+    p.add_argument("--mtp_weight_code", type=float, default=1.0)
+    p.add_argument("--mtp_heads_uncond", type=int, default=1)
+    p.add_argument("--mtp_weight_uncond", type=float, default=1.0)
     p.add_argument("--weight_tie", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--share_lm", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--share_fuse", type=lambda x: x.lower() != "false", default=False)
@@ -1118,6 +1166,8 @@ def config_from_args(args) -> Config:
         gumbel_tau=args.gumbel_tau, code_hard=args.code_hard, code_sample=args.code_sample,
         code_ntp_weight=args.code_ntp_weight, cond_weight=args.cond_weight,
         mtp_heads=args.mtp_heads, mtp_weight=args.mtp_weight,
+        mtp_heads_code=args.mtp_heads_code, mtp_weight_code=args.mtp_weight_code,
+        mtp_heads_uncond=args.mtp_heads_uncond, mtp_weight_uncond=args.mtp_weight_uncond,
         weight_tie=args.weight_tie, share_lm=args.share_lm, share_fuse=args.share_fuse,
     )
 
