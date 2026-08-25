@@ -1,0 +1,35 @@
+"""summ_transformer/ks221_1M: full-scale (full enwik8_1M, n_bytes=None) run of the 3-level
+hierarchical-summarization case, following the overfit10k sanity check in ks421_overfit10k.py
+(same idea, Ks=(2,2,1) here vs (4,2,1) there). Same architecture/hyperparameter convention as
+qcute_zero's own full-scale configs (configs/qcute_zero/ks221_1M.py): d_model=256/n_layers=4/
+context_len=256, attn_window=None (unbounded -- no -1 sentinel exists in this codebase).
+
+uv run python -m qcute.summ_transformer.summ_transformer --config configs/summ_transformer/ks221_1M.py
+
+# plot after training:
+uv run python scripts/plot_run.py logs/summ_transformer_ks221_1M
+"""
+from pathlib import Path
+
+run_name = "summ_transformer_ks221_1M"
+Ks = (2, 2, 1)
+d_model = 256
+n_layers = 4
+n_heads = 4
+context_len = 256
+attn_window = None
+fuse_window = None
+input_preset = 8
+mtp_heads = 4
+
+data = Path("datasets/enwik8_1M.gz")
+n_bytes = None
+val_frac = 0.1
+
+steps = 8000
+batch_size = 16
+lr_peak = 6e-4
+warmup_steps = 500
+log_every = 200
+eval_every = 500
+eval_batches = 20

@@ -9,8 +9,9 @@ boundaries). Pass --use_separator to insert --separator between documents instea
 scripts/count_separator_byte.py).
 
 Reads shards via pyarrow (streaming per row-group, never materializing a whole shard's decoded
-text as one Python list), writes two pre-allocated np.memmap uint8 files so training can mmap
-random windows straight off disk instead of loading the whole ~27GB corpus into RAM:
+text as one Python list), writes two flat uint8 binaries (plain chunked file.write(), not
+np.memmap -- see _WRITE_CHUNK below) so training can mmap random windows straight off disk
+instead of loading the whole ~46GB corpus into RAM:
 
   datasets/fineweb_edu_10BT/train.bin
   datasets/fineweb_edu_10BT/val.bin   (held out: the last shard)
@@ -22,9 +23,10 @@ import codecs
 from multiprocessing import Pool
 from pathlib import Path
 
-import numpy as np
 import pyarrow.parquet as pq
 from tqdm import tqdm
+
+_WRITE_CHUNK = 64 * 1024 * 1024  # bounded write() size -- see the write loop below for why
 
 
 def shard_paths(src_dir: Path, limit_shards: int | None) -> list[Path]:
@@ -58,6 +60,7 @@ def main() -> None:
     p.add_argument("--separator", type=str, default="\\x00", help="Python-escape-decoded separator string, e.g. \\x00 or \\n\\n (only used with --use_separator)")
     p.add_argument("--n_workers", type=int, default=4)
     p.add_argument("--force", action="store_true")
+    p.add_argument("--val_only", action="store_true", help="only (re)process the val split -- e.g. to retry after train.bin already wrote successfully")
     args = p.parse_args()
 
     train_path = args.dest_dir / "train.bin"
@@ -73,7 +76,8 @@ def main() -> None:
           f"use_separator={args.use_separator} separator={separator!r}")
 
     args.dest_dir.mkdir(parents=True, exist_ok=True)
-    for split_name, split_paths, out_path in [("train", train_paths, train_path), ("val", val_paths, val_path)]:
+    splits = [("val", val_paths, val_path)] if args.val_only else [("train", train_paths, train_path), ("val", val_paths, val_path)]
+    for split_name, split_paths, out_path in splits:
         jobs = [(sp, args.use_separator, separator) for sp in split_paths]
         blobs: dict[Path, bytes] = {}
         if jobs:
@@ -81,13 +85,16 @@ def main() -> None:
                 for path, blob in tqdm(pool.imap(encode_shard, jobs), total=len(jobs), desc=f"encoding {split_name}"):
                     blobs[path] = blob
         total_len = sum(len(b) for b in blobs.values())
-        mm = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=(total_len,))
-        offset = 0
-        for sp in split_paths:  # write back in original shard order
-            blob = blobs[sp]
-            mm[offset : offset + len(blob)] = np.frombuffer(blob, dtype=np.uint8)
-            offset += len(blob)
-        mm.flush()
+        # Plain buffered file.write() in bounded chunks -- not np.memmap. A single whole-file
+        # mm.flush()/msync() on a ~45GB memmap was observed to enter an uninterruptible D-state
+        # disk wait on tpu7 (2026-08-25, GCP persistent-disk throughput throttling reacting badly
+        # to one giant flush) that not even SIGKILL could clear. Bounded 64MB writes keep any
+        # single I/O request small and let the kernel's normal writeback pace itself instead.
+        with open(out_path, "wb") as f:
+            for sp in split_paths:  # write back in original shard order
+                blob = blobs[sp]
+                for i in range(0, len(blob), _WRITE_CHUNK):
+                    f.write(blob[i : i + _WRITE_CHUNK])
         print(f"wrote {total_len} bytes -> {out_path}")
 
 

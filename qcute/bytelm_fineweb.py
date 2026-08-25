@@ -315,6 +315,7 @@ PRESETS: dict[str, LMConfig] = {
     "d2048x8_mlp2": LMConfig(d_model=2048, n_layers=8, n_heads=16, mlp_mult=2, context=8192, mtp_heads=1),  # ~335.5M — wide, shallow
     "d1024x32_mlp2": LMConfig(d_model=1024, n_layers=32, n_heads=16, mlp_mult=2, context=8192, mtp_heads=1),  # ~335.5M — narrow, deep (matched params vs d2048x8_mlp2). CONFIRMED UNUSABLE 2026-08-24 on tpu4/v4-8+flash: bs=1/2 stall at ~66s/it (a real, disproportionate per-step slowdown, not explained by FLOPs -- d1024x24_mlp4 at 24 layers/2x the MLP width ran ~1.1-1.3s/it on the same node), bs=4 genuinely OOMs (50.87G required vs 31.75G HBM). Don't use for real training; kept only as a documented negative result.
     "d1024x24_mlp2": LMConfig(d_model=1024, n_layers=24, n_heads=16, mlp_mult=2, context=8192, mtp_heads=1),  # ~251.7M — less extreme deep alternative to d1024x32_mlp2 above
+    "d512x8_mlp4": LMConfig(d_model=512, n_layers=8, n_heads=8, mlp_mult=4, context=2048, mtp_heads=4),  # ~33.6M — small FineWeb-Edu starter model
 }
 
 

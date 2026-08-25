@@ -182,11 +182,15 @@ Launch inside `tmux` (see above) so the user can attach and watch it live:
 
 ```bash
 gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> --command="
-  tmux new-session -d -s bytelm 'cd ~/qcute && source \$HOME/.local/bin/env && source .venv/bin/activate && \
+  tmux new-session -d -s bytelm 'cd ~/qcute && source \$HOME/.local/bin/env && source .venv-nightly/bin/activate && \
     export LD_LIBRARY_PATH=/home/muaz/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib:\$LD_LIBRARY_PATH && \
-    python3 -m qcute.bytelm_tpu --config configs/bytelm_tpu/bytelm_tpu_overfit10k.py --device xla; exec bash'
+    python3 -m qcute.bytelm_tpu --config configs/bytelm_tpu/bytelm_tpu_overfit10k.py --device xla --use_flash_attention --no_zero_kv_sink; exec bash'
 "
 ```
+
+(`.venv-nightly` and `--use_flash_attention --no_zero_kv_sink` are the default here — see step
+3.5 above. Only fall back to `.venv`/no flash-attention if the nightly build genuinely isn't
+usable on this node.)
 
 Give the user the attach command:
 
@@ -223,7 +227,12 @@ watch `~/qcute/logs/bytelm_tpu_sd_full_enwik8/run.log` directly (structured, rea
 elapsed-time/it-rate early** rather than trusting the config docstring's step estimate; retune
 `--steps` (or edit the config and relaunch) once real throughput is known.
 
-## Optional: nightly build, for `--use_flash_attention`
+## 3.5. Nightly build (`.venv-nightly`) — default setup, required for `--use_flash_attention`
+
+**Do this on every fresh node, not just when flash-attention is explicitly requested** —
+`--use_flash_attention` + `--no_zero_kv_sink` is now the default way `qcute.bytelm_tpu` is run in
+this project (see CLAUDE.md), so skipping this step means falling back to a slower default that
+doesn't match how runs are actually launched.
 
 The stable pin above (torch/torch_xla 2.9.0) can't use `qcute.bytelm_tpu`'s
 `--use_flash_attention` flag — that kernel needs `libtpu>=0.0.44`, and 2.9.0 locks `libtpu==0.0.21`
@@ -231,14 +240,24 @@ as its own dependency. Bumping libtpu alone on top of the stable pin is a confir
 (`RuntimeError: Unexpected PJRT_ExecuteOptions size: expected 112, got 80` — plugin/framework PJRT
 API versions disagree). What works instead, confirmed directly on a `v4-8` node (Ubuntu 22.04):
 
+**Install into a separate `.venv-nightly`, not `.venv`** — step 2 above already created `.venv`
+with the stable pin; reusing that same name here would silently clobber it. Keeping both lets you
+run flash-attention (`.venv-nightly`) and non-flash-attention (`.venv`) processes side by side on
+the same node (this is what a real multi-chip sweep needs in practice — e.g. tpu6 ran both):
+
 ```bash
-uv venv --python 3.12 && source .venv/bin/activate
+uv venv --python 3.12 .venv-nightly && source .venv-nightly/bin/activate
 UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install \
   https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch-2.10.0.dev-cp312-cp312-linux_x86_64.whl \
   https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-2.10.0.dev-cp312-cp312-linux_x86_64.whl
 uv pip install libtpu jax   # left unpinned — resolves to libtpu 0.0.46 + matching jax/jaxlib
 sudo apt-get update -qq && sudo apt-get install -y -qq libopenblas0   # nightly torch's wheel needs this; stable doesn't
 ```
+
+Every subsequent command on this node needs the matching venv active for what it's doing —
+`source .venv-nightly/bin/activate` before any `--use_flash_attention` launch, `source
+.venv/bin/activate` (the stable one) otherwise. Don't assume whichever venv happens to be active
+in your current shell; check `which python3` if unsure.
 
 (`UV_SKIP_WHEEL_FILENAME_CHECK=1` is needed because uv strictly checks wheel-filename-vs-metadata
 version agreement, and this particular nightly wheel's internal metadata says `2.10.0+git...`
@@ -263,6 +282,15 @@ print('max abs diff:', (y_flash - y_ref).abs().max().item())  # ~0.01 is normal 
 Nightly builds are less stable than the pinned release — re-verify this whole chain (including
 the generation-consistency check, `qcute.bytelm_tpu.validate_generation`) after any nightly
 version bump, don't assume it still works.
+
+**`--use_flash_attention` MUST always be paired with `--no_zero_kv_sink`** — `zero_kv_sink`
+defaults on and the two don't mix well (correctness fix exists but costs ~25x steady-state
+throughput; see this doc's "zero_kv_sink + flash-attention: investigation" section below for the
+full story). There is no known-good reason to launch `--use_flash_attention` without
+`--no_zero_kv_sink` in this project. Forgetting this flag is the most common way to launch a
+"working" flash-attention run that's actually 25x slower than it should be, with no error to flag
+it — every launch command/config in this doc that uses `--use_flash_attention` includes
+`--no_zero_kv_sink` right alongside it; do the same in any new launch.
 
 ## Optional: multiple TPU chips on one host
 
@@ -487,6 +515,80 @@ scp -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute
 
 (`mkdir -p logs/<run_name>` first if this is the first pull for that run.) Re-running the same
 command later just overwrites the local copy with the latest one — safe to repeat every check-in.
+
+## FineWeb-Edu byte-level training (`qcute.bytelm_fineweb`)
+
+Standalone fork of `qcute.bytelm_tpu` for training on FineWeb-Edu's `sample-10BT` subset instead
+of enwik8 -- see `qcute/bytelm_fineweb.py`'s own module docstring for what's different (mmap'd
+flat-binary data loading instead of an in-RAM tensor, loss as the primary metric with bpb
+secondary, no tokenizer/BPE -- pure byte-level). Node setup is otherwise identical to the rest of
+this doc: do steps 0/0.5/1/2/3 above first (stable `.venv`), and step 3.5 (`.venv-nightly`) if
+you'll use `--use_flash_attention` (recommended -- see batch-size findings below).
+
+### 1. Download the corpus
+
+```bash
+uv run python scripts/download_fineweb_edu.py --dest_dir datasets/fineweb_edu_10BT
+```
+
+Reads `HF_TOKEN` from the repo's `.env`. Downloads `sample/10BT/` (14 parquet shards, ~28.5GB) via
+`huggingface_hub.snapshot_download`. Run this on the TPU node itself (not locally then scp'd --
+28.5GB is large enough that downloading directly on-node is much faster).
+
+### 2. Byte-encode into flat mmap-able binaries
+
+```bash
+uv run python scripts/prep_fineweb_edu_bytes.py --dest_dir datasets/fineweb_edu_10BT
+```
+
+Reads the 14 parquet shards (pyarrow, streaming per row-group), UTF-8-encodes each document's
+`text` column straight to bytes -- no tokenizer -- and writes `train.bin` (13 shards,
+45,109,723,621 bytes) / `val.bin` (1 held-out shard, 874,306,351 bytes). Default: plain
+concatenation, no document separator (matches `qcute.bytelm_tpu`'s own enwik8 loader). Pass
+`--use_separator` to insert one `0x00` byte between documents instead -- confirmed via
+`scripts/count_separator_byte.py` that `0x00` occurs **zero** times naturally anywhere in this
+corpus (9,672,101 docs, 45,974,357,885 bytes scanned), so it's an unambiguous boundary marker
+whenever that flag is used.
+
+**Known gotcha (2026-08-25, tpu7): don't use `np.memmap` for the final write.** The first version
+of this script wrote via one `np.memmap(..., mode="w+")` + a single whole-file `mm.flush()`, which
+entered an **uninterruptible D-state disk-I/O wait that not even `SIGKILL` could clear** on this
+node's disk (GCP persistent-disk throughput throttling reacting badly to one giant flush/msync
+call over a ~45GB file -- `/proc/<pid>/wchan` showed `wb_wait_for_completion` then `rq_qos_wait`,
+stuck for 10+ minutes with zero CPU/disk-usage progress). Fixed by switching to plain buffered
+`file.write()` in bounded 64MB chunks instead (`_WRITE_CHUNK` in the script) -- no more mmap, no
+more single giant flush, and the hang has not recurred. If you ever see a `python` process for
+this script stuck in `D` state with a frozen CPU time in `ps aux`, this is almost certainly it --
+check `cat /proc/<pid>/io`'s `write_bytes` across a couple of real (not `ScheduleWakeup`-timed --
+those have been observed to drift from real elapsed time) `sleep`d checks; if it's genuinely flat,
+kill `-9` won't work, you have to wait it out or investigate further.
+
+### 3. Launch training
+
+```bash
+uv run python -m qcute.bytelm_fineweb --config configs/bytelm_fineweb/small_d512x8_mlp4_1epoch_ctx1024_flash.py --device xla --use_flash_attention
+```
+
+(needs `.venv-nightly` active -- this config uses `--use_flash_attention`.)
+
+**Batch-size/context sweep confirmed on tpu7 (v4-8, 31.75GB usable HBM per chip), `d512x8_mlp4`
+preset (~34.2M params)**:
+
+| context | batch_size | flash | result |
+|---|---|---|---|
+| 2048 | 128 | no | OOM (8G needed, only 5.77G free after torch.compile's transient overhead) |
+| 2048 | 64  | no | OOM (45.4G needed) |
+| 2048 | 32  | no | fits |
+| 2048 | 128 | yes | OOM (49.04G needed) |
+| 2048 | 64  | yes | fits, ~1.4-1.5 it/s |
+| 1024 | 256 | yes | OOM (49.04G needed -- same batch*seq_len product as the 2048/128 row above) |
+| 1024 | 128 | yes | fits, ~1.13 it/s (**best util found -- used by the config above**) |
+
+`--no_torch_compile` throughout this sweep (not yet verified in combination with
+`--use_flash_attention` on this node -- try enabling it for a possible further speedup, but
+re-verify memory headroom first, torch.compile's tracing overhead was what caused the very first
+OOM in this table). `--multichip` is NOT compatible with `--use_flash_attention` (confirmed
+hanging, see "Optional: multiple TPU chips on one host" above) -- pick one or the other, not both.
 
 ## Common failure modes recap
 

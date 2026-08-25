@@ -340,6 +340,7 @@ class Config:
     mtp_weight: float = 1.0
     weight_tie: bool = False                 # True: head.weight literally refs embed.weight
     share_lm: bool = False                   # True ties every level to the same Block stack
+    share_fuse: bool = False                 # True ties every fuse stage to the same FuseStage
 
 
 class SummTransformer(nn.Module):
@@ -378,8 +379,12 @@ class SummTransformer(nn.Module):
             nn.init.normal_(self.head.weight, std=0.02)
 
         fuse_layers = cfg.fuse_n_layers if cfg.fuse_n_layers is not None else cfg.n_layers
-        self.fuse_stages = nn.ModuleList(
-            [FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers) for _ in range(self.n_fuse)])
+        if cfg.share_fuse:
+            first_fs = FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers)
+            self.fuse_stages = nn.ModuleList([first_fs] * self.n_fuse)
+        else:
+            self.fuse_stages = nn.ModuleList(
+                [FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers) for _ in range(self.n_fuse)])
         self.fuse_windows = resolve_fuse_window(cfg.fuse_window, self.n_fuse)
 
         self.extra_heads = nn.ModuleList(
@@ -467,7 +472,7 @@ class SummTransformer(nn.Module):
             total_loss = total_loss + cfg.mtp_weight * torch.stack(mtp_losses).mean()
 
         metrics = {
-            "loss": total_loss, "final_loss": loss, "byte_acc": acc,
+            "loss": total_loss, "final_loss": loss, "bpb": loss / math.log(2), "byte_acc": acc,
             **{f"mtp{i+2}_loss": l for i, l in enumerate(mtp_losses)},
             **{f"mtp{i+2}_acc": a for i, a in enumerate(mtp_accs)},
         }
@@ -692,6 +697,7 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--mtp_weight", type=float, default=1.0)
     p.add_argument("--weight_tie", type=lambda x: x.lower() != "false", default=False)
     p.add_argument("--share_lm", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--share_fuse", type=lambda x: x.lower() != "false", default=False)
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -728,7 +734,7 @@ def config_from_args(args) -> Config:
         n_heads=args.n_heads, mlp_mult=args.mlp_mult, rope_base=args.rope_base, context_len=args.context_len,
         attn_window=args.attn_window, fuse_window=args.fuse_window, input_preset=args.input_preset,
         mtp_heads=args.mtp_heads, mtp_weight=args.mtp_weight, weight_tie=args.weight_tie,
-        share_lm=args.share_lm,
+        share_lm=args.share_lm, share_fuse=args.share_fuse,
     )
 
 

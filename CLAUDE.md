@@ -31,6 +31,12 @@ uv run python -m qcute.v5_old.qcute_v5 --decoder_type stack --config configs/v5_
                                                  # still the leaderboard's source of truth for everything
                                                  # already run (docs/status.md), frozen, not receiving further
                                                  # architecture work. `--decoder_type concat` also still works.
+uv run python -m qcute.bytelm_fineweb --config configs/bytelm_fineweb/small_d512x8_mlp4_1epoch_ctx1024_flash.py --device xla --use_flash_attention
+                                                 # byte-level LM on FineWeb-Edu sample-10BT (fork of
+                                                 # qcute.bytelm_tpu -- mmap'd data, loss-primary/bpb-secondary
+                                                 # metrics, no tokenizer). Data prep + full setup/gotchas/
+                                                 # batch-size findings: docs/bytelm_tpu_setup.md's "FineWeb-Edu
+                                                 # byte-level training" section.
 ```
 
 `qcute.bytelm`, `qcute.bpelm`, `qcute.qcute_v1.qcute_v1`, and
@@ -131,10 +137,17 @@ keep the surrounding text to a one-line note on whether any run is approaching/c
 plus anything notable (new best, a run finished, a crash). Only fall back to fuller prose when
 something needs explaining (e.g. the overfitting-response policy actually triggering).
 
-**`qcute.bytelm_tpu`'s `--use_flash_attention` needs a nightly torch/torch_xla build** (the
-stable pin's `libtpu==0.0.21` is too old for the Pallas kernel) — full install steps, confirmed
-working on a `v4-8` node: [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md)'s "Optional:
-nightly build" section. **`--multichip` (collective data-parallel across chips) WORKS on the
+**`--use_flash_attention` + `--no_zero_kv_sink` is now the default way `qcute.bytelm_tpu` is run**
+(not an optional add-on) — set up the nightly torch/torch_xla build on every fresh node as a
+standard setup step, not only when flash-attention is explicitly requested (the stable pin's
+`libtpu==0.0.21` is too old for the Pallas kernel that `--use_flash_attention` needs). Full install
+steps, confirmed working on a `v4-8` node: [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md)'s
+"3.5. Nightly build" section. **Install it into `.venv-nightly`, not `.venv`** (the doc's own
+snippet uses this name) — `.venv` stays the stable pin from the main setup steps, so both coexist
+on the same node and you `source` whichever one a given launch needs (`--use_flash_attention` ⇒
+`.venv-nightly`, otherwise ⇒ `.venv`). **`--use_flash_attention` MUST always be paired with
+`--no_zero_kv_sink`** — there is no known-good reason to launch one without the other in this
+project; see that doc's "zero_kv_sink + flash-attention" section below for why. **`--multichip` (collective data-parallel across chips) WORKS on the
 stable `torch==2.9.0`/`torch_xla==2.9.0` pin** (confirmed 2026-08-23 on a fresh `v4-8` node: 4
 real worker processes, steadily climbing CPU time, a full run completed cleanly with
 `world_size=4 global_batch=64` correctly reported after fixing a real bug — `world_size` must
@@ -196,9 +209,19 @@ queued-resources describe <name> --project raden-tpu --zone us-central2-b` if a 
   before restarting anything there.
 - **tpu6** — `configs/bytelm_tpu/d1024x16_mlp2_reg_smoothing_sweep/` (4 configs, all 170M, varying
   dropout/layer_drop/label_smoothing mix). Tmux sessions `train_reg_full_smooth`,
-  `train_resid_light_smooth`, `train_layerdrop_heavy_nosmooth`, `train_resid_heavy_smooth`.
-  Healthy; `layerdrop_heavy_nosmooth` is the best run across all 3 nodes as of last check
-  (val_bpb ~1.23, still improving).
+  `train_resid_light_smooth`, `train_layerdrop_heavy_nosmooth`, `train_resid_heavy_smooth`. Uses
+  `--use_flash_attention` + `--no_zero_kv_sink`, so its processes run from `.venv-nightly` (see
+  "TPU access" above), not the stable `.venv` tpu4/tpu5 use. Healthy; `layerdrop_heavy_nosmooth` is
+  the best run across all 3 nodes as of last check (val_bpb ~1.23, still improving).
+- **tpu7** (v4-8, `us-central2-b`) — separate lineage: `qcute.bytelm_fineweb` (FineWeb-Edu
+  `sample-10BT`, byte-level, not enwik8). Has both `.venv` (stable) and `.venv-nightly` (for
+  `--use_flash_attention`). Data already prepped: `datasets/fineweb_edu_10BT/{train,val}.bin`
+  (45,109,723,621 / 874,306,351 bytes, plain concatenation, no separator). Full setup/gotchas/
+  batch-size-sweep table: docs/bytelm_tpu_setup.md's "FineWeb-Edu byte-level training" section.
+  Config in use: `configs/bytelm_fineweb/small_d512x8_mlp4_1epoch_ctx1024_flash.py` (`d512x8_mlp4`
+  preset, ~34.2M params, context=1024, batch_size=128, `--use_flash_attention --no_zero_kv_sink`,
+  ~1.13 it/s, 1 epoch = 342,821 steps ≈ 3.5 days) — launch status: not yet started as of writing,
+  ask the user before launching the real multi-day run.
 
 Standing monitoring routine established this session (see hourly hand-off pattern in transcript,
 not yet a persistent cron across session restarts): pull each active run's `run.jsonl` via `scp`
