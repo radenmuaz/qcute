@@ -760,6 +760,7 @@ def main():
     p.add_argument("--qual_source", choices=["train", "val", "user"], default="val")
     p.add_argument("--qual_prompt_bytes", type=int, default=64, help="prompt length when --qual_source is train/val")
     p.add_argument("--qual_user_text", type=str, default=None, help="prompt text when --qual_source user (utf-8 encoded)")
+    p.add_argument("--seed", type=int, default=1234)
 
     if pre_args.config:
         config_vars = load_config_module(pre_args.config)
@@ -772,6 +773,7 @@ def main():
         p.error("--qual_source user requires --qual_user_text")
 
     device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(args.seed)
 
     if args.checkpoint_path is not None:
         ckpt = torch.load(args.checkpoint_path, map_location=device)

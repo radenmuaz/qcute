@@ -157,11 +157,15 @@ an already-spawned worker) — the earlier "confirmed broken" hang was specific 
 wiring, exactly as the 2026-08-22 static-code-review hypothesis predicted. `--multichip` +
 `--use_flash_attention` together **is now confirmed to hang** (2026-08-23, fresh `v4-8` node,
 nightly build) — CPU time flat across all 4 workers on a 5-step smoke test, the same signature as
-the plain nightly-build hang below; standalone flash-attention works fine on the same node/build,
-so it's specifically the combination that's broken. Not usable together on any build tried so far
-(stable pin can't do flash-attention at all; nightly can do either alone, not both at once). See
-docs/bytelm_tpu_setup.md's "Optional: multiple TPU chips on one host" section for the full
-writeup. For single-chip-per-process (embarrassingly-parallel, e.g. a hparam sweep) instead of
+the plain nightly-build hang below. **UPDATE (2026-08-25, tpu5): `--multichip` ALONE, no flash,
+also hangs on the nightly build** — the "nightly can do either alone" claim below was never
+actually tested (all prior multichip testing was on the stable pin); isolated test showed the
+identical frozen-CPU-time signature. So the real fault line is nightly-vs-stable, not
+flash-vs-no-flash: `--multichip` only works on stable (which can't do flash at all), and nothing
+tried so far gets multi-chip data-parallelism and flash-attention working together, or even
+`--multichip` alone on nightly. Full writeup + summary matrix (build × multichip × flash):
+docs/bytelm_tpu_setup.md's "Optional: multiple TPU chips on one host" section. For
+single-chip-per-process (embarrassingly-parallel, e.g. a hparam sweep) instead of
 collective multichip, launch independent processes one per chip via `TPU_VISIBLE_CHIPS=<i>`
 (also verified working) — see that same doc section for the exact pattern. Check real addressable device
 count first (`torch_xla.runtime.addressable_runtime_device_count()` / `ls /dev/accel*` /
@@ -206,7 +210,9 @@ queued-resources describe <name> --project raden-tpu --zone us-central2-b` if a 
   changed at once (seed added, mtp_heads 1->8, regularization added) to isolate seed as the cause;
   the failure *pattern* (clean training for hours then simultaneous divergence) doesn't look
   seed-like. **tpu5 is currently idle, no decision yet on how to relaunch it** — ask the user
-  before restarting anything there.
+  before restarting anything there. (2026-08-25: `.venv-nightly` was set up on tpu5 for a
+  multichip-hang isolation test, see docs/bytelm_tpu_setup.md — harmless leftover, available if a
+  nightly build is needed there again.)
 - **tpu6** — `configs/bytelm_tpu/d1024x16_mlp2_reg_smoothing_sweep/` (4 configs, all 170M, varying
   dropout/layer_drop/label_smoothing mix). Tmux sessions `train_reg_full_smooth`,
   `train_resid_light_smooth`, `train_layerdrop_heavy_nosmooth`, `train_resid_heavy_smooth`. Uses

@@ -430,6 +430,9 @@ class Config:
                                               # 1 = disabled (only the existing head0 next-byte
                                               # prediction). >1 heads predict t+2..t+mtp_heads.
     mtp_weight: float = 1.0                  # weight for the extra heads' mean loss
+    weight_tie: bool = False                 # True: head.weight literally refs embed.weight
+    share_lm: bool = False                   # True ties every level's LM stack to lms[0]
+    share_fuse: bool = False                 # True ties every fuse stage to fuse_stages[0]
 
 
 def resolve_fuse_window(w, n_fuse: int) -> tuple:
@@ -451,21 +454,44 @@ class QCuteZero(nn.Module):
 
         self.embed = nn.Embedding(V, D)
         nn.init.normal_(self.embed.weight, std=0.02)
-        self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
-        self.ln_f = RMSNorm(D)
+
+        # level 0 = byte pass + refinement; level s+1 = fuse stage s's own code-sequence NTP pass.
+        n_lms = self.n_fuse + 1
+        if cfg.share_lm:
+            first = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
+            self.lms = nn.ModuleList([first] * n_lms)
+        else:
+            self.lms = nn.ModuleList(
+                [nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
+                 for _ in range(n_lms)])
+        if cfg.share_lm:
+            first_ln = RMSNorm(D)
+            self.ln_fs = nn.ModuleList([first_ln] * n_lms)
+        else:
+            self.ln_fs = nn.ModuleList([RMSNorm(D) for _ in range(n_lms)])
+
+        self.head = nn.Linear(D, V, bias=False)
+        if cfg.weight_tie:
+            self.head.weight = self.embed.weight
+        else:
+            nn.init.normal_(self.head.weight, std=0.02)
 
         fuse_layers = cfg.fuse_n_layers if cfg.fuse_n_layers is not None else cfg.n_layers
-        self.fuse_stages = nn.ModuleList(
-            [FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers) for _ in range(self.n_fuse)])
+        if cfg.share_fuse:
+            first_fs = FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers)
+            self.fuse_stages = nn.ModuleList([first_fs] * self.n_fuse)
+        else:
+            self.fuse_stages = nn.ModuleList(
+                [FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers) for _ in range(self.n_fuse)])
         self.fuse_windows = resolve_fuse_window(cfg.fuse_window, self.n_fuse)
 
         self.extra_heads = nn.ModuleList(
             [nn.Linear(D, V, bias=False) for _ in range(max(0, cfg.mtp_heads - 1))])
 
-    def _run_blocks(self, x: torch.Tensor, cos, sin, attn_mask) -> torch.Tensor:
-        for block in self.blocks:
+    def _run_blocks(self, level: int, x: torch.Tensor, cos, sin, attn_mask) -> torch.Tensor:
+        for block in self.lms[level]:
             x = block(x, cos, sin, attn_mask)
-        return self.ln_f(x)
+        return self.ln_fs[level](x)
 
     def forward(self, byte_ids: torch.Tensor) -> tuple:
         cfg = self.cfg
@@ -480,9 +506,9 @@ class QCuteZero(nn.Module):
         cos_b, sin_b = rope_cos_sin_for_positions(byte_pos, hd, cfg.rope_base, device)
         byte_mask = causal_mask(byte_pos, byte_pos, cfg.attn_window)
         x0 = self.embed(byte_ids)
-        h = self._run_blocks(x0, cos_b, sin_b, byte_mask)
+        h = self._run_blocks(0, x0, cos_b, sin_b, byte_mask)
 
-        uncond_logits = F.linear(h[:, :-1, :], self.embed.weight)
+        uncond_logits = F.linear(h[:, :-1, :], self.head.weight)
         uncond_loss = F.cross_entropy(uncond_logits.reshape(-1, V), byte_ids[:, 1:].reshape(-1))
         uncond_acc = (uncond_logits.argmax(-1) == byte_ids[:, 1:]).float().mean()
 
@@ -504,20 +530,20 @@ class QCuteZero(nn.Module):
 
             # code extraction: same tied embed/output head bytes use, STE hard sample
             code_h = cur_h[:, K_s - 1::K_s, :][:, :n_blocks, :]
-            code_logits = F.linear(code_h, self.embed.weight)
+            code_logits = F.linear(code_h, self.head.weight)
             onehot = gumbel_quantize(code_logits, cfg.gumbel_tau, cfg.code_hard, cfg.code_sample)
             code_embeds = onehot @ self.embed.weight
             code_ids = onehot.argmax(-1)
 
-            # this stage's own code-sequence NTP pass -- SAME shared blocks, causal, unbounded
-            # (short sequence: n_blocks = cur_len // K_s)
+            # this stage's own code-sequence NTP pass -- level s+1's own LM stack, causal,
+            # unbounded (short sequence: n_blocks = cur_len // K_s)
             code_local_pos = torch.arange(n_blocks, device=device)
             cos_c, sin_c = rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base, device)
             code_mask = causal_mask(code_local_pos, code_local_pos, None)
-            h_code = self._run_blocks(code_embeds, cos_c, sin_c, code_mask)
+            h_code = self._run_blocks(s + 1, code_embeds, cos_c, sin_c, code_mask)
 
             if n_blocks >= 2:
-                code_ntp_logits = F.linear(h_code[:, :-1, :], self.embed.weight)
+                code_ntp_logits = F.linear(h_code[:, :-1, :], self.head.weight)
                 code_ntp_loss = F.cross_entropy(code_ntp_logits.reshape(-1, V), code_ids[:, 1:].reshape(-1))
                 code_ntp_acc = (code_ntp_logits.argmax(-1) == code_ids[:, 1:]).float().mean()
                 fuse_ntp_losses += [code_ntp_loss]
@@ -532,11 +558,11 @@ class QCuteZero(nn.Module):
             cos_q, sin_q = cos_b, sin_b
             cos_k, sin_k = rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base, device)
             x_cross = self.fuse_stages[s](x_cross, h_code, cos_q, sin_q, cos_k, sin_k, fuse_mask)
-            # another pass through the SAME shared self-attn+MLP LM blocks before this stage's
-            # own cond readout (and before the next stage's cross-attn query input) -- i.e. fuse
-            # cross-attn+own-mlp -> shared self-attn/mlp -> this stage's own cond NTP head.
-            x_cross = self._run_blocks(x_cross, cos_b, sin_b, byte_mask)
-            cond_logits_full = self.fuse_stages[s].readout(x_cross, self.embed.weight)
+            # another pass through level 0's own self-attn+MLP LM blocks before this stage's own
+            # cond readout (and before the next stage's cross-attn query input) -- i.e. fuse
+            # cross-attn+own-mlp -> level0 self-attn/mlp -> this stage's own cond NTP head.
+            x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, byte_mask)
+            cond_logits_full = self.fuse_stages[s].readout(x_cross, self.head.weight)
 
             cond_logits = cond_logits_full[:, :-1, :]
             cond_loss = F.cross_entropy(cond_logits.reshape(-1, V), byte_ids[:, 1:].reshape(-1))
@@ -606,12 +632,12 @@ class QCuteZero(nn.Module):
         cos_b, sin_b = rope_cos_sin_for_positions(byte_pos, hd, cfg.rope_base, device)
         byte_mask = causal_mask(byte_pos, byte_pos, cfg.attn_window)
         x0 = self.embed(byte_ids)
-        h = self._run_blocks(x0, cos_b, sin_b, byte_mask)
+        h = self._run_blocks(0, x0, cos_b, sin_b, byte_mask)
 
         cur_h = h
         x_cross = h
         cum_K = 1
-        cond_logits_full = F.linear(self.ln_f(h), self.embed.weight)  # uncond fallback if n_fuse==0
+        cond_logits_full = self.head(h)  # uncond fallback if n_fuse==0 -- h already normed by _run_blocks
         code_kv_cache = []
         for s in range(self.n_fuse):
             K_s = cfg.Ks[s]
@@ -621,22 +647,22 @@ class QCuteZero(nn.Module):
             if n_blocks < 1:
                 break
             code_h = cur_h[:, K_s - 1::K_s, :][:, :n_blocks, :]
-            code_logits = F.linear(code_h, self.embed.weight)
+            code_logits = F.linear(code_h, self.head.weight)
             onehot = gumbel_quantize(code_logits, cfg.gumbel_tau, hard=True, sample=False)
             code_embeds = onehot @ self.embed.weight
 
             code_local_pos = torch.arange(n_blocks, device=device)
             cos_c, sin_c = rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base, device)
             code_mask = causal_mask(code_local_pos, code_local_pos, None)
-            h_code = self._run_blocks(code_embeds, cos_c, sin_c, code_mask)
+            h_code = self._run_blocks(s + 1, code_embeds, cos_c, sin_c, code_mask)
 
             code_pos_abs = (torch.arange(n_blocks, device=device) + 1) * cum_K - 1
             window_s = self.fuse_windows[s]
             fuse_mask = causal_mask(byte_pos, code_pos_abs, window_s)
             cos_k, sin_k = rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base, device)
             x_cross = self.fuse_stages[s](x_cross, h_code, cos_b, sin_b, cos_k, sin_k, fuse_mask)
-            x_cross = self._run_blocks(x_cross, cos_b, sin_b, byte_mask)
-            cond_logits_full = self.fuse_stages[s].readout(x_cross, self.embed.weight)
+            x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, byte_mask)
+            cond_logits_full = self.fuse_stages[s].readout(x_cross, self.head.weight)
             code_kv_cache += [(h_code, code_pos_abs, window_s)]
             cur_h = h_code
 
@@ -705,14 +731,14 @@ class QCuteZero(nn.Module):
             L0 = all_bytes.shape[1]
             pos0 = torch.arange(L0, device=device_t)
             cos0, sin0 = rope_cos_sin_for_positions(pos0, hd, cfg.rope_base, device_t)
-            h0 = self._run_blocks(self.embed(all_bytes), cos0, sin0, causal_mask(pos0, pos0, cfg.attn_window))
+            h0 = self._run_blocks(0, self.embed(all_bytes), cos0, sin0, causal_mask(pos0, pos0, cfg.attn_window))
             code_h = h0[:, K - 1::K, :][:, :n_blocks_prev, :]
-            onehot = gumbel_quantize(F.linear(code_h, self.embed.weight), cfg.gumbel_tau, hard=True, sample=False)
+            onehot = gumbel_quantize(F.linear(code_h, self.head.weight), cfg.gumbel_tau, hard=True, sample=False)
             code_embeds_past = onehot @ self.embed.weight
             cpos = torch.arange(n_blocks_prev, device=device_t)
             ccos, csin = rope_cos_sin_for_positions(cpos, hd, cfg.rope_base, device_t)
-            h_code = self._run_blocks(code_embeds_past, ccos, csin, causal_mask(cpos, cpos, None))
-            next_onehot = gumbel_quantize(F.linear(h_code[:, -1:, :], self.embed.weight),
+            h_code = self._run_blocks(1, code_embeds_past, ccos, csin, causal_mask(cpos, cpos, None))
+            next_onehot = gumbel_quantize(F.linear(h_code[:, -1:, :], self.head.weight),
                                            cfg.gumbel_tau, hard=True, sample=False)
             next_code_embed = next_onehot @ self.embed.weight  # (B, 1, D) -- sampled, not extracted
 
@@ -724,14 +750,14 @@ class QCuteZero(nn.Module):
                 pos = torch.arange(L, device=device_t)
                 cos_b, sin_b = rope_cos_sin_for_positions(pos, hd, cfg.rope_base, device_t)
                 byte_mask = causal_mask(pos, pos, cfg.attn_window)
-                x = self._run_blocks(self.embed(buf), cos_b, sin_b, byte_mask)
+                x = self._run_blocks(0, self.embed(buf), cos_b, sin_b, byte_mask)
 
                 fuse_mask = (pos >= chunk_start).view(1, 1, L, 1)
                 code_pos = torch.tensor([chunk_start], device=device_t)
                 cos_k, sin_k = rope_cos_sin_for_positions(code_pos, hd, cfg.rope_base, device_t)
                 x_cross = self.fuse_stages[0](x, next_code_embed, cos_b, sin_b, cos_k, sin_k, fuse_mask)
-                x_cross = self._run_blocks(x_cross, cos_b, sin_b, byte_mask)
-                logits = self.fuse_stages[0].readout(x_cross, self.embed.weight)
+                x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, byte_mask)
+                logits = self.fuse_stages[0].readout(x_cross, self.head.weight)
                 # predict-next convention (matches forward()/generate_no_cache: position p's
                 # logits predict byte p+1) -- position chunk_start+t is buf's own not-yet-decided
                 # placeholder (still zero) at this point, so predicting FROM it (as an earlier
@@ -784,14 +810,14 @@ class QCuteZero(nn.Module):
             pos = torch.arange(start_pos, start_pos + Tn, device=device_t)
             cos_b, sin_b = rope_cos_sin_for_positions(pos, hd, cfg.rope_base, device_t)
             h_new = self.embed(byte_chunk)
-            for l, block in enumerate(self.blocks):
+            for l, block in enumerate(self.lms[0]):
                 h_new, byte_caches[l] = block.forward_incremental(h_new, cos_b, sin_b, byte_caches[l], cfg.attn_window)
-            h_new = self.ln_f(h_new)
+            h_new = self.ln_fs[0](h_new)
             h_hist = h_new if h_hist is None else torch.cat([h_hist, h_new], dim=1)
 
             x_in = h_new
             cur_h_hist = h_hist
-            logits_full = F.linear(x_in, self.embed.weight)  # uncond fallback if n_fuse==0
+            logits_full = self.head(x_in)  # uncond fallback if n_fuse==0
             for s in range(self.n_fuse):
                 K_s = cfg.Ks[s]
                 n_blocks = cur_h_hist.shape[1] // K_s
@@ -799,13 +825,13 @@ class QCuteZero(nn.Module):
                     # a new code boundary was crossed -- recompute this stage's short code
                     # sequence fresh (cheap: length n_blocks, not the full byte length)
                     code_h = cur_h_hist[:, K_s - 1::K_s, :][:, :n_blocks, :]
-                    code_logits = F.linear(code_h, self.embed.weight)
+                    code_logits = F.linear(code_h, self.head.weight)
                     onehot = gumbel_quantize(code_logits, cfg.gumbel_tau, hard=True, sample=False)
                     code_embeds = onehot @ self.embed.weight
                     code_local_pos = torch.arange(n_blocks, device=device_t)
                     cos_c, sin_c = rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base, device_t)
                     code_mask = causal_mask(code_local_pos, code_local_pos, None)
-                    stage_h_hist[s] = self._run_blocks(code_embeds, cos_c, sin_c, code_mask)
+                    stage_h_hist[s] = self._run_blocks(s + 1, code_embeds, cos_c, sin_c, code_mask)
                 h_code = stage_h_hist[s]
                 n_blocks_now = h_code.shape[1]
 
@@ -839,11 +865,11 @@ class QCuteZero(nn.Module):
                 fuse_mask = causal_mask(q_pos, code_pos_abs, window_s)
 
                 x_cross = self.fuse_stages[s](x_q, h_code, cos_q, sin_q, cos_k, sin_k, fuse_mask)
-                for l, block in enumerate(self.blocks):
+                for l, block in enumerate(self.lms[0]):
                     x_cross, refine_caches[s][l] = block.forward_incremental(
                         x_cross, cos_q, sin_q, refine_caches[s][l], cfg.attn_window)
-                x_cross = self.ln_f(x_cross)
-                logits_full = self.fuse_stages[s].readout(x_cross, self.embed.weight)
+                x_cross = self.ln_fs[0](x_cross)
+                logits_full = self.fuse_stages[s].readout(x_cross, self.head.weight)
                 x_in = x_cross
                 cur_h_hist = h_code
             return logits_full
@@ -1052,6 +1078,9 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--cond_weight", type=float, default=1.0)
     p.add_argument("--mtp_heads", type=int, default=1)
     p.add_argument("--mtp_weight", type=float, default=1.0)
+    p.add_argument("--weight_tie", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--share_lm", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--share_fuse", type=lambda x: x.lower() != "false", default=False)
 
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None)
@@ -1069,6 +1098,7 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--logs_dir", type=Path, default=Path("logs"))
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--device", type=str, default=None)
+    p.add_argument("--seed", type=int, default=1234)
 
     if pre_args.config:
         p.set_defaults(**{k: v for k, v in load_config_module(pre_args.config).items() if k in {a.dest for a in p._actions}})
@@ -1088,12 +1118,14 @@ def config_from_args(args) -> Config:
         gumbel_tau=args.gumbel_tau, code_hard=args.code_hard, code_sample=args.code_sample,
         code_ntp_weight=args.code_ntp_weight, cond_weight=args.cond_weight,
         mtp_heads=args.mtp_heads, mtp_weight=args.mtp_weight,
+        weight_tie=args.weight_tie, share_lm=args.share_lm, share_fuse=args.share_fuse,
     )
 
 
 def main() -> None:
     args, pre_args = build_argparser("qcute_zero: single-LM periodic-fusion architecture")
     device = args.device or ("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
+    torch.manual_seed(args.seed)
     cfg = config_from_args(args)
     model = QCuteZero(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())

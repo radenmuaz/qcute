@@ -312,23 +312,48 @@ project's multichip wiring**, exactly as the static-review hypothesis from 2026-
 v4-8 node, nightly build).** A `--steps 5` smoke test showed all 4 worker processes' cumulative
 CPU *time* (via `ps -o time`, not the noisier `%cpu` column) flat across repeated snapshots ~20s
 apart (`00:00:18`/`00:00:19`, unchanged) — the exact "spin up then go idle, no further progress"
-signature described below for the plain nightly-build hang. Standalone `flash_attention()` calls
-work fine on this same node/build (verified via the smoke-test snippet above, max abs diff
-~0.011, normal variance) — the hang is specific to combining the two mechanisms, not a broken
-install. Conclusion: `--multichip` and `--use_flash_attention` are not usable together on any
-build tried so far (stable pin can't do flash-attention at all; nightly can do flash-attention
-alone or multichip alone, but not both at once). Use `TPU_VISIBLE_CHIPS`-based independent
-single-chip processes (see below) if both flash-attention and multi-chip utilization are wanted
-simultaneously.
+signature described below. Standalone `flash_attention()` calls work fine on this same node/build
+(verified via the smoke-test snippet above, max abs diff ~0.011, normal variance).
 
-**Nightly-build-specific hang** (`torch_xla==2.10.0.dev0`, needed only for
-`--use_flash_attention`, see above) — kept for reference in case the nightly build is used again:
-all worker processes spin up then go idle (CPU time stops climbing) with no further progress,
-consistent with a stuck PJRT multi-process rendezvous specific to that build. Static code review
-(2026-08-22) found nothing wrong in this project's own collective usage (every rank reaches
-`optimizer_step`'s all-reduce in lockstep every step, no other collective appears anywhere in the
-file) — consistent with the now-confirmed conclusion that the bug lives in the nightly PJRT
-client bootstrap itself, not in `qcute.bytelm_tpu`.
+**UPDATE (2026-08-25, tpu5): `--multichip` ALONE (no `--use_flash_attention`) also hangs on the
+nightly build** — this corrects the "nightly can do multichip alone" claim in the previous
+paragraph, which turned out to have never actually been tested (all prior multichip testing was on
+the *stable* pin; all prior nightly testing was flash-only, single-chip). Isolation test: fresh
+`.venv-nightly` on tpu5 (mirroring tpu7's setup), `qcute.bytelm_tpu --preset tiny --multichip
+--no_torch_compile --steps 20` (no flash), all 4 chips. Result: 4 `multiprocessing.spawn_main`
+workers spawned, but `ps -o pid,time,%cpu` showed CPU *time* frozen at the exact same value
+(`00:00:13` workers / `00:00:24` main) across 3 snapshots spanning over a minute, despite nonzero
+`%cpu` (busy-waiting, not real progress) — identical signature to the flash+multichip hang above,
+and no new stdout past the initial `PJRT_Api` startup lines. **Conclusion: the hang is in the
+nightly build's own multi-process PJRT bootstrap in general, not something specific to
+flash-attention's kernel init** — flash-attention was never the actual variable; nightly-vs-stable
+was. `--multichip` only works on the stable pin (confirmed above); the stable pin can't do
+flash-attention at all. There is currently no build/config combination that gets both
+`--multichip` and `--use_flash_attention` working together, nor even `--multichip` alone on
+nightly. Use `TPU_VISIBLE_CHIPS`-based independent single-chip processes (see below) for real
+multi-chip utilization whenever flash-attention (or the nightly build for any other reason) is
+needed — not investigated further: no strace/gdb dive into the PJRT client, no upstream bug filed.
+
+Static code review (2026-08-22) found nothing wrong in this project's own collective usage (every
+rank reaches `optimizer_step`'s all-reduce in lockstep every step, no other collective appears
+anywhere in the file) — consistent with the bug living in the nightly PJRT client's multi-process
+bootstrap itself, not in `qcute.bytelm_tpu`/`qcute.bytelm_fineweb`'s own code.
+
+**Summary matrix (all confirmed directly, `v4-8`)**:
+
+| build | `--multichip` | `--use_flash_attention` | result |
+|---|---|---|---|
+| stable (`torch==2.9.0`) | yes | no | ✅ works (real collective data-parallel) |
+| stable | yes | — | flash unavailable at all (`libtpu==0.0.21` too old for the kernel) |
+| nightly (`torch==2.10.0.dev0`) | no | yes | ✅ works (single-chip; what tpu7's real fineweb run uses) |
+| nightly | yes | no | ❌ hangs |
+| nightly | yes | yes | ❌ hangs |
+
+Only `stable + --multichip + no flash` gets real multi-chip data-parallelism today. Trading away
+flash-attention's memory savings for genuine `world_size>1` (bigger effective batch, one shared
+set of weights) is the one working way to use more than one chip collectively — otherwise use
+`TPU_VISIBLE_CHIPS`-pinned independent single-chip processes (below) for embarrassingly-parallel
+multi-chip utilization instead (own weights/logs per process, not a shared bigger batch).
 
 **What else works**: independent single-chip processes via `TPU_VISIBLE_CHIPS`, confirmed directly
 — two concurrent single-device processes with `TPU_VISIBLE_CHIPS=0` and `TPU_VISIBLE_CHIPS=1` both
