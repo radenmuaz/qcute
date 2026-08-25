@@ -76,9 +76,10 @@ def main() -> None:
     for split_name, split_paths, out_path in [("train", train_paths, train_path), ("val", val_paths, val_path)]:
         jobs = [(sp, args.use_separator, separator) for sp in split_paths]
         blobs: dict[Path, bytes] = {}
-        with Pool(min(args.n_workers, len(jobs))) as pool:
-            for path, blob in tqdm(pool.imap(encode_shard, jobs), total=len(jobs), desc=f"encoding {split_name}"):
-                blobs[path] = blob
+        if jobs:
+            with Pool(min(args.n_workers, len(jobs))) as pool:
+                for path, blob in tqdm(pool.imap(encode_shard, jobs), total=len(jobs), desc=f"encoding {split_name}"):
+                    blobs[path] = blob
         total_len = sum(len(b) for b in blobs.values())
         mm = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=(total_len,))
         offset = 0
