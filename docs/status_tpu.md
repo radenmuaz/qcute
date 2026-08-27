@@ -198,16 +198,15 @@ more headroom needed for the scanned path than the grad_accum=1 case ever needed
 `train_summformer.py`'s logging — leftover name from the original byte-vocab version, misleading
 now that these ablation runs use BPE vocab (it was actually token accuracy, not byte accuracy).
 
-**Current live status, all 4 nodes** (paper-faithful `total_batch_size=524288` throughout, checked
-2026-08-27 ~08:23 UTC — steps/loss will be stale by the time this is read, tok/s is the stable
-number):
+**Current live status** (paper-faithful `total_batch_size=524288` throughout, checked 2026-08-27
+~20:50 local — steps/loss will be stale by the time this is read, tok/s is the stable number):
 
 | Node | Run | Step | Loss | tok/s | Notes |
 |---|---|---|---|---|---|
-| tpu4 | `medium_paper_match_b8` | 281 | 5.66 | ~102.6K | gpt2-medium baseline, batch_size=8/grad_accum=16 |
-| tpu5 | `summformer_medium_ablation` | 336 | 5.6-5.7 | ~250.2K | ablation vs. tpu4 |
-| tpu6 | `small_paper_match` | 362 | 5.2-5.5 | ~257.8K | gpt2-small baseline, batch_size=32/grad_accum=4 (needed a fresh `gpt2_jax` code sync — its `model_gpt.py` was stale/pre-bf16, caused one crash-and-relaunch) |
-| tpu7 | `summformer_small_ablation` | 885 | 4.4-4.7 | ~599K | ablation vs. tpu6 |
+| tpu4 | `medium_paper_match_b8` | 6922 | ~3.09 | ~102.6K | gpt2-medium baseline, batch_size=8/grad_accum=16 |
+| tpu5 | `summformer_medium_ablation` | 17838 | ~2.9-3.0 | ~293K | ablation vs. tpu4, nearing 1-epoch target |
+| tpu6 | `small_paper_match` | 16949 | ~3.0-3.1 | ~258K | gpt2-small baseline, batch_size=32/grad_accum=4 |
+| tpu7 | `summformer_small_ablation` | **finished** (19072/19073, 1 epoch) | val 3.20 / bpb 4.62 | ~689K peak | checkpoint `model_19072` = 448M on disk; node idle since, now used for dataset-prep smoke tests (see below); 55G free on its 97G disk |
 
 Ablation runs are faster in raw tok/s than their baselines (smaller `n_layers` more than offsets
 the fuse-stage FLOPs overhead at these sizes) — not itself meaningful, the actual comparison is
@@ -215,9 +214,54 @@ loss/bpb at matched token counts once both sides have logged enough steps. It's 
 the ablation to lose to its baseline if it finishes — the point is an honest comparison at
 roughly matched compute, not tuning to win (explicit instruction).
 
-ETAs at these steady-state speeds (19,073 steps total, 1 epoch): tpu4 ~27hr, tpu5 ~11hr, tpu6
-~11hr, tpu7 ~5hr — all multi-hour, so don't stream every step; check in periodically instead (see
-below).
+Loss curves are plotted automatically: `scripts/pull_and_plot.sh` scp's each node's `log.jsonl`
+into local `logs/<run_name>/` and regenerates `loss_curve.png` there via `scripts/plot_jax_run.py`;
+an hourly `Monitor` loop runs this and reports each run's current step. Direct-ssh connections to
+all 4 nodes have dropped and been recovered multiple times mid-session (stale `ControlMaster`
+socket, not preemption) — recovery procedure now in `CLAUDE.md`.
+
+### `Ks` tuple semantics fixed (2026-08-27, `summformer_jax` + `qcute_zero`)
+
+Both lineages defined `n_fuse = len(Ks) - 1`, so `Ks`'s *last* entry was read nowhere in either
+model — dead by construction, kept only as a conventionally-`1` placeholder for the top level
+(which needs no block-factor since nothing sits above it to fuse into). Fixed in both to the
+cleaner convention `n_fuse = len(Ks)` (no trailing dummy entry) — verified via direct model
+construction that `n_fuse`/`n_lms`/param shapes are unchanged for the equivalent shortened `Ks`, so
+existing checkpoints (`qcute_zero`'s overfit10k runs, `summformer_jax`'s live ablations) stay
+loadable. All `configs/summformer_jax/*.py` and `configs/qcute_zero/*.py` updated to drop the
+trailing entry (`Ks=(2,2,2,2)`→`(2,2,2)`, `Ks=(2,1)`→`(2,)`, `Ks=(1,)`→`()`, etc.). `qcute_lagcodec`
+audited and left unchanged — it genuinely reads `Ks[-1]` (e.g. a divisibility assert in
+`qcute_lagcodec.py`), so its last entry was never dead; the `qcute_zero` docstring claiming "same
+semantics as qcute_lagcodec" was the source of the divergence and has been removed.
+
+### New dataset-prep work (2026-08-27, in progress)
+
+Goal: bring 2 more datasets into the `gpt2_jax`-compatible token-shard pipeline (Long Range Arena
+dropped per explicit instruction — its `lra_release.gz` is 403 Access Denied via both the
+documented `gs://long-range-arena/lra_release` bucket and its HTTP fallback, from both anonymous
+curl and `gsutil` with the node's ambient GCP credentials; no working mirror found).
+
+- **Pathfinder (32 and 256 resolution)**: `scripts/generate_pathfinder.py` — procedurally
+  *generates* (not downloads) Pathfinder-style examples: a random-walk "snake" contour + distractor
+  snakes, two marker dots, binary connected/disconnected label. **Not a port of the original
+  LRA/drewlinsley renderer** (`github.com/drewlinsley/pathfinder`'s `snakes2.py` — unpublished as a
+  package, MATLAB-derived) — an independent reimplementation of the same task definition,
+  parameterized with the per-resolution constants LRA's TFDS builder docstrings document
+  (`contour_length`, `marker_radius`, `paddle_thickness`, `num_distractor_snakes`), so pixel
+  statistics won't match the original released dataset. Output format: each example is
+  `[flattened grayscale pixels (0-255)] + [1 label token (256=connected, 257=not)]`, concatenated
+  into one flat stream per split and written as uint16 `.npy` shards — the exact convention
+  `gpt2_jax/data_loader.py`'s `DataLoaderLite` already reads (filename contains `train`/`val`, flat
+  1D array). Verified end-to-end at small scale (32/16 examples, both resolutions): generates
+  cleanly, `DataLoaderLite` loads the shards with zero code changes, values fall in the expected
+  0-257 range. Not yet scaled up to a real training-size dataset.
+- **ImageNet64**: smoke-testing HF mirrors (`benjamin-paine/imagenet-1k-64x64`,
+  `ChocolateDave/imagenet-64`) via `datasets` streaming (no full download yet) — in progress on
+  tpu7 as of this update, not yet confirmed.
+
+ETAs at steady-state speeds for the still-running baselines (19,073 steps total, 1 epoch): tpu4
+~27hr total (was ~19hr in at last check), tpu6 ~11hr total. Multi-hour, so don't stream every
+step; check in periodically instead (see below).
 
 **Checking in on a run yourself** (safe, read-only — none of these mutate the run):
 

@@ -55,12 +55,17 @@ cross-attn `FuseStage` and the post-cross-attn refinement pass both run at full 
 not the short pooled length) on top of the initial `n_layers` byte pass. So:
 
 ```
-effective_depth ≈ n_layers * (1 + 2 * n_fuse)          # n_fuse = len(Ks) - 1
+effective_depth ≈ n_layers * (1 + 2 * n_fuse)          # n_fuse = len(Ks) -- no trailing dummy entry
 params ≈ effective_depth * 12 * d_model^2 + 2 * vocab_size * d_model   # untied head
 ```
 
+(As of 2026-08-27, `Ks`'s length equals `n_fuse` exactly -- no top-level placeholder entry. Older
+notes/configs referencing `Ks=(2,2,2,2)` predate this fix; the equivalent config today is
+`Ks=(2,2,2)`, same `n_fuse=3`, same architecture -- see status_tpu.md's "Ks tuple semantics fixed"
+note.)
+
 To land near a GPT2 baseline's own `(n_layer, d_model)` at a given `Ks`, solve for `n_layers`
-given `effective_depth ≈ baseline_n_layer`. Current hparams (both use `Ks=(2,2,2,2)`, `n_fuse=3`,
+given `effective_depth ≈ baseline_n_layer`. Current hparams (both use `Ks=(2,2,2)`, `n_fuse=3`,
 chosen after comparing several `Ks`-length/n_layers tradeoffs -- see status_tpu.md for the
 derivation and the numbers for other `Ks` lengths that were considered and rejected):
 

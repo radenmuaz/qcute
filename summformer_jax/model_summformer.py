@@ -1,7 +1,7 @@
 """JAX/Flax NNX port of qcute/summformer/summformer.py, made GPT2-like (LayerNorm, plain GELU
 MLP, plain MHA -- no RMSNorm/SwiGLU/GQA/QK-norm) and extended to 3 pos_methods matching
 gpt2_jax/model_gpt.py's convention: "rope", "learnable" (GPT2-style absolute position embedding,
-added once at the byte-embedding step), "base" (NoPE, no positional signal anywhere).
+added once at the token-embedding step), "base" (NoPE, no positional signal anywhere).
 
 Kept unchanged from the original (architecture-level): the Ks-tuple hierarchical-summarization
 cascade, the zero-KV-sink attention primitive, FuseStage cross-attention + shared-weight
@@ -9,9 +9,9 @@ refinement pass, mtp_heads, the causality argument (see the original's own docst
 real incremental-KV-cache generation path (ported from qcute_zero's stepper via summformer.py).
 
 For "learnable"/"base" pos_method, RoPE application inside every Attn call becomes a no-op;
-"learnable" instead adds a GPT2-style position embedding once when the byte stream is formed
-(x0 = embed(byte_ids) + wpe(byte_pos)) -- pooled/code streams and cross-attn carry positional
-information implicitly through that already-embedded byte-level h, not via a second lookup.
+"learnable" instead adds a GPT2-style position embedding once when the token stream is formed
+(x0 = embed(token_ids) + wpe(seq_pos)) -- pooled/code streams and cross-attn carry positional
+information implicitly through that already-embedded token-level h, not via a second lookup.
 """
 from __future__ import annotations
 
@@ -44,6 +44,9 @@ def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
 
 def apply_rope(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
     # x: [B, H, T, hd]. cos/sin: [T, hd] (shared positions) or [B, T, hd] (per-batch positions).
+    # computed fp32 (frequency precision matters); cast down to x's dtype here so this doesn't
+    # silently upcast bf16 q/k back to fp32, matching gpt2_jax/model_gpt.py's own fix.
+    cos, sin = cos.astype(x.dtype), sin.astype(x.dtype)
     if cos.ndim == 2:
         cos, sin = cos[None, None], sin[None, None]
     else:
@@ -84,18 +87,21 @@ def resolve_fuse_window(w, n_fuse: int) -> tuple:
 
 
 class Attn(nnx.Module):
-    """Plain multi-head attention (no GQA, no QK-norm) -- GPT2-style."""
+    """Plain multi-head attention (no GQA, no QK-norm) -- GPT2-style, incl. bias=True on all
+    projections and NANOGPT_SCALE_INIT residual scaling on the output projection (both matching
+    gpt2_jax/model_gpt.py's CausalSelfAttention exactly)."""
 
-    def __init__(self, d_model: int, n_heads: int, *, rngs: nnx.Rngs):
+    def __init__(self, d_model: int, n_heads: int, scale_layers: int, dtype, param_dtype, *, rngs: nnx.Rngs):
         self.n_heads = n_heads
         self.d_model = d_model
         self.head_dim = d_model // n_heads
         self.attn_dim = n_heads * self.head_dim
         init = nnx.initializers.normal(stddev=0.02)
-        self.wq = nnx.Linear(d_model, self.attn_dim, use_bias=False, kernel_init=init, rngs=rngs)
-        self.wk = nnx.Linear(d_model, self.attn_dim, use_bias=False, kernel_init=init, rngs=rngs)
-        self.wv = nnx.Linear(d_model, self.attn_dim, use_bias=False, kernel_init=init, rngs=rngs)
-        self.out = nnx.Linear(self.attn_dim, d_model, use_bias=False, kernel_init=init, rngs=rngs)
+        out_init = nnx.initializers.normal(stddev=0.02 * (2 * scale_layers) ** -0.5)
+        self.wq = nnx.Linear(d_model, self.attn_dim, use_bias=True, kernel_init=init, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.wk = nnx.Linear(d_model, self.attn_dim, use_bias=True, kernel_init=init, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.wv = nnx.Linear(d_model, self.attn_dim, use_bias=True, kernel_init=init, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.out = nnx.Linear(self.attn_dim, d_model, use_bias=True, kernel_init=out_init, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
     def _qkv(self, x, B, T):
         H, hd = self.n_heads, self.head_dim
@@ -148,13 +154,15 @@ class Attn(nnx.Module):
 
 
 class MLP(nnx.Module):
-    """Plain GPT2-style MLP: fc (d -> mlp_mult*d) + GELU + proj (mlp_mult*d -> d)."""
+    """Plain GPT2-style MLP: fc (d -> mlp_mult*d) + GELU + proj (mlp_mult*d -> d), incl.
+    NANOGPT_SCALE_INIT residual scaling on proj (matching gpt2_jax/model_gpt.py's MLP exactly)."""
 
-    def __init__(self, d_model: int, mlp_mult: int, *, rngs: nnx.Rngs):
+    def __init__(self, d_model: int, mlp_mult: int, scale_layers: int, dtype, param_dtype, *, rngs: nnx.Rngs):
         hidden = mlp_mult * d_model
         init = nnx.initializers.normal(stddev=0.02)
-        self.fc = nnx.Linear(d_model, hidden, use_bias=True, kernel_init=init, rngs=rngs)
-        self.proj = nnx.Linear(hidden, d_model, use_bias=True, kernel_init=init, rngs=rngs)
+        proj_init = nnx.initializers.normal(stddev=0.02 * (2 * scale_layers) ** -0.5)
+        self.fc = nnx.Linear(d_model, hidden, use_bias=True, kernel_init=init, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.proj = nnx.Linear(hidden, d_model, use_bias=True, kernel_init=proj_init, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         return self.proj(jax.nn.gelu(self.fc(x), approximate=True))
@@ -162,13 +170,14 @@ class MLP(nnx.Module):
 
 class Block(nnx.Module):
     """Self-attention + MLP, pre-LayerNorm (GPT2-style). Shared (same weights) across the
-    byte-level pass and the post-cross-attn refinement pass, same as the original."""
+    token-level pass and the post-cross-attn refinement pass, same as the original."""
 
-    def __init__(self, d_model: int, n_heads: int, mlp_mult: int, *, rngs: nnx.Rngs):
-        self.ln1 = nnx.LayerNorm(d_model, rngs=rngs)
-        self.attn = Attn(d_model, n_heads, rngs=rngs)
-        self.ln2 = nnx.LayerNorm(d_model, rngs=rngs)
-        self.mlp = MLP(d_model, mlp_mult, rngs=rngs)
+    def __init__(self, d_model: int, n_heads: int, mlp_mult: int, scale_layers: int, dtype, param_dtype, *, rngs: nnx.Rngs):
+        # LayerNorm stays fp32 compute (reduction precision matters), regardless of dtype.
+        self.ln1 = nnx.LayerNorm(d_model, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
+        self.attn = Attn(d_model, n_heads, scale_layers, dtype, param_dtype, rngs=rngs)
+        self.ln2 = nnx.LayerNorm(d_model, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
+        self.mlp = MLP(d_model, mlp_mult, scale_layers, dtype, param_dtype, rngs=rngs)
 
     def __call__(self, x, cos, sin, attn_mask, pos_method: str) -> jnp.ndarray:
         x = x + self.attn.forward(self.ln1(x), cos, sin, attn_mask, pos_method)
@@ -185,12 +194,12 @@ class Block(nnx.Module):
 class FuseStage(nnx.Module):
     """Cross-attention + MLP, one instance per periodic-fusion stage, own weights throughout."""
 
-    def __init__(self, d_model: int, n_heads: int, mlp_mult: int, n_layers: int, *, rngs: nnx.Rngs):
-        self.ln1 = nnx.List([nnx.LayerNorm(d_model, rngs=rngs) for _ in range(n_layers)])
-        self.attn = nnx.List([Attn(d_model, n_heads, rngs=rngs) for _ in range(n_layers)])
-        self.ln2 = nnx.List([nnx.LayerNorm(d_model, rngs=rngs) for _ in range(n_layers)])
-        self.mlp = nnx.List([MLP(d_model, mlp_mult, rngs=rngs) for _ in range(n_layers)])
-        self.ln_out = nnx.LayerNorm(d_model, rngs=rngs)
+    def __init__(self, d_model: int, n_heads: int, mlp_mult: int, n_layers: int, scale_layers: int, dtype, param_dtype, *, rngs: nnx.Rngs):
+        self.ln1 = nnx.List([nnx.LayerNorm(d_model, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs) for _ in range(n_layers)])
+        self.attn = nnx.List([Attn(d_model, n_heads, scale_layers, dtype, param_dtype, rngs=rngs) for _ in range(n_layers)])
+        self.ln2 = nnx.List([nnx.LayerNorm(d_model, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs) for _ in range(n_layers)])
+        self.mlp = nnx.List([MLP(d_model, mlp_mult, scale_layers, dtype, param_dtype, rngs=rngs) for _ in range(n_layers)])
+        self.ln_out = nnx.LayerNorm(d_model, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
 
     def __call__(self, x, code_kv, cos_q, sin_q, cos_k, sin_k, attn_mask, pos_method: str) -> jnp.ndarray:
         for l in range(len(self.attn)):
@@ -210,7 +219,7 @@ class FuseStage(nnx.Module):
 
 @dataclass
 class Config:
-    Ks: tuple = (32, 32, 1)          # cumulative periods; last entry unused (kept for tuple-length convention)
+    Ks: tuple = (32, 32)              # per-fuse-stage block size; len(Ks) == n_fuse (no top-level entry)
     d_model: int = 1024
     n_layers: int = 2                 # shared "block regular", reused for every level
     fuse_n_layers: int | None = None  # defaults to n_layers if unset
@@ -225,11 +234,16 @@ class Config:
     input_preset: int = 8             # byte alphabet bits -- vocab = 2**input_preset, used only if vocab_size is unset
     vocab_size: int | None = 50304    # GPT2-BPE vocab (50257, padded to 50304), matching gpt2_jax's own Model exactly;
                                        # None falls back to the byte alphabet (2**input_preset)
-    mtp_heads: int = 1                # extra byte-ahead heads (1 = disabled)
+    mtp_heads: int = 1                # extra token-ahead heads (1 = disabled)
     mtp_weight: float = 1.0
     weight_tie: bool = False
     share_lm: bool = False
     share_fuse: bool = False
+    # mixed precision, matching gpt2_jax/model_gpt.py's ModelConfig exactly: Linear/Embed compute
+    # in compute_dtype (bf16), params stored in param_dtype (fp32, master copy); LayerNorm/final
+    # logits/loss/RoPE table stay fp32 for stability.
+    compute_dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.float32
 
 
 class SummTransformer(nnx.Module):
@@ -242,39 +256,52 @@ class SummTransformer(nnx.Module):
         self.head_dim = D // cfg.n_heads
         V = cfg.vocab_size if cfg.vocab_size is not None else 2 ** cfg.input_preset
         self.vocab = V
-        self.n_fuse = len(cfg.Ks) - 1
+        self.n_fuse = len(cfg.Ks)
         assert D % cfg.n_heads == 0
+        # NANOGPT_SCALE_INIT residual scaling uses the model's effective depth -- the actual
+        # number of residual-stream-additive blocks the primary (x_cross) stream passes through
+        # (initial token pass + each fuse stage's cross-attn + refinement pass), matching
+        # gpt2_jax/model_gpt.py's own convention of scaling by the model's total layer count.
+        scale_layers = cfg.n_layers * (1 + 2 * self.n_fuse)
+        dtype, param_dtype = cfg.compute_dtype, cfg.param_dtype
 
         init = nnx.initializers.normal(stddev=0.02)
-        self.embed = nnx.Embed(V, D, embedding_init=init, rngs=rngs)
-        self.wpe = nnx.Embed(cfg.context_len, D, embedding_init=init, rngs=rngs) if cfg.pos_method == "learnable" else None
+        self.embed = nnx.Embed(V, D, embedding_init=init, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.wpe = (
+            nnx.Embed(cfg.context_len, D, embedding_init=init, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+            if cfg.pos_method == "learnable" else None
+        )
 
         n_lms = self.n_fuse + 1
         if cfg.share_lm:
-            first = nnx.List([Block(D, cfg.n_heads, cfg.mlp_mult, rngs=rngs) for _ in range(cfg.n_layers)])
+            first = nnx.List([Block(D, cfg.n_heads, cfg.mlp_mult, scale_layers, dtype, param_dtype, rngs=rngs) for _ in range(cfg.n_layers)])
             self.lms = nnx.List([first for _ in range(n_lms)])
-            first_ln = nnx.LayerNorm(D, rngs=rngs)
+            first_ln = nnx.LayerNorm(D, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
             self.ln_fs = nnx.List([first_ln for _ in range(n_lms)])
         else:
             self.lms = nnx.List(
-                [nnx.List([Block(D, cfg.n_heads, cfg.mlp_mult, rngs=rngs) for _ in range(cfg.n_layers)])
+                [nnx.List([Block(D, cfg.n_heads, cfg.mlp_mult, scale_layers, dtype, param_dtype, rngs=rngs) for _ in range(cfg.n_layers)])
                  for _ in range(n_lms)])
-            self.ln_fs = nnx.List([nnx.LayerNorm(D, rngs=rngs) for _ in range(n_lms)])
+            self.ln_fs = nnx.List([nnx.LayerNorm(D, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs) for _ in range(n_lms)])
 
-        self.head = nnx.Linear(D, V, use_bias=False, kernel_init=init, rngs=rngs)
+        # fp32 for the final tied/untied-head logits -- numerically sensitive, cheap relative to
+        # the rest of the model (one matmul), matches gpt2_jax's own policy. Input is already fp32
+        # here since _run_blocks always ends with the fp32 ln_fs LayerNorm.
+        self.head = nnx.Linear(D, V, use_bias=False, kernel_init=init, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
         self.weight_tie = cfg.weight_tie
 
         fuse_layers = cfg.fuse_n_layers if cfg.fuse_n_layers is not None else cfg.n_layers
         if cfg.share_fuse:
-            first_fs = FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers, rngs=rngs)
+            first_fs = FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers, scale_layers, dtype, param_dtype, rngs=rngs)
             self.fuse_stages = nnx.List([first_fs for _ in range(self.n_fuse)])
         else:
             self.fuse_stages = nnx.List(
-                [FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers, rngs=rngs) for _ in range(self.n_fuse)])
+                [FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers, scale_layers, dtype, param_dtype, rngs=rngs) for _ in range(self.n_fuse)])
         self.fuse_windows = resolve_fuse_window(cfg.fuse_window, self.n_fuse)
 
         self.extra_heads = nnx.List(
-            [nnx.Linear(D, V, use_bias=False, kernel_init=init, rngs=rngs) for _ in range(max(0, cfg.mtp_heads - 1))])
+            [nnx.Linear(D, V, use_bias=False, kernel_init=init, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
+             for _ in range(max(0, cfg.mtp_heads - 1))])
 
     def _head_weight(self) -> jnp.ndarray:
         return self.embed.embedding.value if self.weight_tie else self.head.kernel.value.T
@@ -288,21 +315,21 @@ class SummTransformer(nnx.Module):
             x = block(x, cos, sin, attn_mask, self.cfg.pos_method)
         return self.ln_fs[level](x)
 
-    def _cascade(self, byte_ids: jnp.ndarray) -> jnp.ndarray:
-        """Full recompute. Returns the final byte-level query stream x_cross (B, L, D), post
+    def _cascade(self, token_ids: jnp.ndarray) -> jnp.ndarray:
+        """Full recompute. Returns the final token-level query stream x_cross (B, L, D), post
         every active fuse stage's cross-attention + refinement pass."""
         cfg = self.cfg
-        B, L = byte_ids.shape
+        B, L = token_ids.shape
         hd = self.head_dim
         pm = cfg.pos_method
 
-        byte_pos = jnp.arange(L)
-        cos_b, sin_b = (rope_cos_sin_for_positions(byte_pos, hd, cfg.rope_base) if pm == "rope" else (None, None))
-        byte_mask = causal_mask(byte_pos, byte_pos, cfg.attn_window)
-        x0 = self.embed(byte_ids)
+        seq_pos = jnp.arange(L)
+        cos_b, sin_b = (rope_cos_sin_for_positions(seq_pos, hd, cfg.rope_base) if pm == "rope" else (None, None))
+        seq_mask = causal_mask(seq_pos, seq_pos, cfg.attn_window)
+        x0 = self.embed(token_ids)
         if pm == "learnable":
-            x0 = x0 + self.wpe(byte_pos)[None]
-        h = self._run_blocks(0, x0, cos_b, sin_b, byte_mask)
+            x0 = x0 + self.wpe(seq_pos)[None]
+        h = self._run_blocks(0, x0, cos_b, sin_b, seq_mask)
 
         cur_h = h
         x_cross = h
@@ -324,23 +351,23 @@ class SummTransformer(nnx.Module):
 
             code_pos_abs = (jnp.arange(n_blocks) + 1) * cum_K - 1
             window_s = self.fuse_windows[s]
-            fuse_mask = causal_mask(byte_pos, code_pos_abs, window_s)
+            fuse_mask = causal_mask(seq_pos, code_pos_abs, window_s)
             cos_k, sin_k = (rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base) if pm == "rope" else (None, None))
 
             x_cross = self.fuse_stages[s](x_cross, h_code, cos_b, sin_b, cos_k, sin_k, fuse_mask, pm)
-            x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, byte_mask)
+            x_cross = self._run_blocks(0, x_cross, cos_b, sin_b, seq_mask)
             cur_h = h_code
 
         return x_cross
 
-    def __call__(self, byte_ids: jnp.ndarray) -> tuple:
+    def __call__(self, token_ids: jnp.ndarray) -> tuple:
         cfg = self.cfg
         V = self.vocab
-        L = byte_ids.shape[1]
-        x_cross = self._cascade(byte_ids)
+        L = token_ids.shape[1]
+        x_cross = self._cascade(token_ids)
 
         logits = self._readout(x_cross[:, :-1, :])
-        targets = byte_ids[:, 1:]
+        targets = token_ids[:, 1:]
         loss = cross_entropy(logits, targets)
 
         mtp_losses, mtp_accs = [], []
@@ -349,7 +376,7 @@ class SummTransformer(nnx.Module):
             if L <= k:
                 continue
             logits_i = head_i(x_cross[:, :-k, :])
-            targets_i = byte_ids[:, k:]
+            targets_i = token_ids[:, k:]
             mtp_losses.append(cross_entropy(logits_i, targets_i))
             mtp_accs.append((jnp.argmax(logits_i, axis=-1) == targets_i).astype(jnp.float32).mean())
 
@@ -364,50 +391,50 @@ class SummTransformer(nnx.Module):
         }
         return total_loss, metrics
 
-    def _forward_next_byte_logits(self, byte_ids: jnp.ndarray) -> jnp.ndarray:
-        """Full recompute over the whole sequence so far, returns logits for the NEXT byte."""
-        x_cross = self._cascade(byte_ids)
+    def _forward_next_token_logits(self, token_ids: jnp.ndarray) -> jnp.ndarray:
+        """Full recompute over the whole sequence so far, returns logits for the NEXT token."""
+        x_cross = self._cascade(token_ids)
         return self._readout(x_cross[:, -1, :])
 
-    def generate_no_cache(self, prompt_bytes: jnp.ndarray, n_new_bytes: int) -> jnp.ndarray:
-        """Byte-by-byte, full recompute each step -- correctness reference for generate_kv_cache."""
-        if prompt_bytes.ndim == 1:
-            prompt_bytes = prompt_bytes[None]
-        all_bytes = prompt_bytes
-        for _ in range(n_new_bytes):
-            logits = self._forward_next_byte_logits(all_bytes)
-            next_byte = jnp.argmax(logits, axis=-1, keepdims=True)
-            all_bytes = jnp.concatenate([all_bytes, next_byte], axis=1)
-        return all_bytes[0]
+    def generate_no_cache(self, prompt_tokens: jnp.ndarray, n_new_tokens: int) -> jnp.ndarray:
+        """Token-by-token, full recompute each step -- correctness reference for generate_kv_cache."""
+        if prompt_tokens.ndim == 1:
+            prompt_tokens = prompt_tokens[None]
+        all_tokens = prompt_tokens
+        for _ in range(n_new_tokens):
+            logits = self._forward_next_token_logits(all_tokens)
+            next_token = jnp.argmax(logits, axis=-1, keepdims=True)
+            all_tokens = jnp.concatenate([all_tokens, next_token], axis=1)
+        return all_tokens[0]
 
     def _make_incremental_stepper(self, Bsz: int):
         """Factory for the real incremental-KV-cache stepper -- O(1) new attention work per new
-        byte, vs generate_no_cache's full O(L) recompute."""
+        token, vs generate_no_cache's full O(L) recompute."""
         cfg = self.cfg
         D = cfg.d_model
         hd = self.head_dim
         pm = cfg.pos_method
 
-        byte_caches = [None] * cfg.n_layers
+        seq_caches = [None] * cfg.n_layers
         refine_caches = [[None] * cfg.n_layers for _ in range(self.n_fuse)]
         state = {"h_hist": None}
         stage_h_hist = [jnp.zeros((Bsz, 0, D)) for _ in range(self.n_fuse)]
         x_in_backlog = [None] * self.n_fuse
         cum_Ks = []
         cum = 1
-        for K_s in cfg.Ks[: self.n_fuse]:
+        for K_s in cfg.Ks:
             cum *= K_s
             cum_Ks.append(cum)
 
-        def step(byte_chunk: jnp.ndarray, start_pos: int) -> jnp.ndarray:
-            Tn = byte_chunk.shape[1]
+        def step(token_chunk: jnp.ndarray, start_pos: int) -> jnp.ndarray:
+            Tn = token_chunk.shape[1]
             pos = jnp.arange(start_pos, start_pos + Tn)
             cos_b, sin_b = (rope_cos_sin_for_positions(pos, hd, cfg.rope_base) if pm == "rope" else (None, None))
-            h_new = self.embed(byte_chunk)
+            h_new = self.embed(token_chunk)
             if pm == "learnable":
                 h_new = h_new + self.wpe(pos)[None]
             for l, block in enumerate(self.lms[0]):
-                h_new, byte_caches[l] = block.forward_incremental(h_new, cos_b, sin_b, byte_caches[l], cfg.attn_window, pm)
+                h_new, seq_caches[l] = block.forward_incremental(h_new, cos_b, sin_b, seq_caches[l], cfg.attn_window, pm)
             h_new = self.ln_fs[0](h_new)
             state["h_hist"] = h_new if state["h_hist"] is None else jnp.concatenate([state["h_hist"], h_new], axis=1)
 
@@ -457,36 +484,36 @@ class SummTransformer(nnx.Module):
 
         return step
 
-    def generate_kv_cache(self, prompt_bytes: jnp.ndarray, n_new_bytes: int) -> jnp.ndarray:
+    def generate_kv_cache(self, prompt_tokens: jnp.ndarray, n_new_tokens: int) -> jnp.ndarray:
         """Real incremental KV cache. Produces the exact same argmax trajectory as
         generate_no_cache (see check_kv_cache_consistency)."""
-        if prompt_bytes.ndim == 1:
-            prompt_bytes = prompt_bytes[None]
-        step = self._make_incremental_stepper(prompt_bytes.shape[0])
+        if prompt_tokens.ndim == 1:
+            prompt_tokens = prompt_tokens[None]
+        step = self._make_incremental_stepper(prompt_tokens.shape[0])
 
-        all_bytes = prompt_bytes
-        logits_all = step(all_bytes, 0)  # prime the caches with the whole prompt
+        all_tokens = prompt_tokens
+        logits_all = step(all_tokens, 0)  # prime the caches with the whole prompt
         next_logits = logits_all[:, -1, :]
-        for _ in range(n_new_bytes):
-            next_byte = jnp.argmax(next_logits, axis=-1, keepdims=True)
-            all_bytes = jnp.concatenate([all_bytes, next_byte], axis=1)
-            logits_all = step(next_byte, all_bytes.shape[1] - 1)
+        for _ in range(n_new_tokens):
+            next_token = jnp.argmax(next_logits, axis=-1, keepdims=True)
+            all_tokens = jnp.concatenate([all_tokens, next_token], axis=1)
+            logits_all = step(next_token, all_tokens.shape[1] - 1)
             next_logits = logits_all[:, -1, :]
 
-        return all_bytes[0]
+        return all_tokens[0]
 
     def check_kv_cache_consistency(self, val_data: jnp.ndarray, key: jax.random.PRNGKey,
-                                    n_checks: int = 3, prompt_len: int = 8, n_new_bytes: int = 24) -> dict:
+                                    n_checks: int = 3, prompt_len: int = 8, n_new_tokens: int = 24) -> dict:
         """Diagnostic: generate_no_cache vs generate_kv_cache MUST produce bit-exact identical
         greedy trajectories. Should always return match_rate == 1.0."""
         n_match = 0
         for i in range(n_checks):
             pl = max(1, prompt_len - i * (prompt_len // max(1, n_checks)))
             key, subkey = jax.random.split(key)
-            start = int(jax.random.randint(subkey, (), 0, max(1, val_data.shape[0] - pl - n_new_bytes)))
+            start = int(jax.random.randint(subkey, (), 0, max(1, val_data.shape[0] - pl - n_new_tokens)))
             prompt = val_data[start:start + pl]
-            out_full = self.generate_no_cache(prompt, n_new_bytes)
-            out_cache = self.generate_kv_cache(prompt, n_new_bytes)
+            out_full = self.generate_no_cache(prompt, n_new_tokens)
+            out_cache = self.generate_kv_cache(prompt, n_new_tokens)
             if jnp.array_equal(out_full, out_cache):
                 n_match += 1
         return {"match_rate": n_match / n_checks, "n_checks": n_checks}

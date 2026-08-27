@@ -80,6 +80,16 @@ nominal ~30-minute budget taking 2.5-3.5 hours instead) — watch actual
 elapsed time/step rate early on rather than assuming a run will finish on
 schedule.
 
+**On a TPU node specifically, since the run always launches inside `tmux` (see TPU access below),
+pipe through `tee` instead of a plain `>` redirect**: `python3 ... 2>&1 | tee ~/<run_name>.log`,
+not `python3 ... > ~/<run_name>.log 2>&1`. Confirmed directly (2026-08-27) that GNU `tee` does NOT
+have `tr`'s block-buffering problem — a `\r`-updating loop piped through `tee` showed up in the
+file within ~2s, same as a direct redirect. The payoff: `tmux capture-pane` on that session then
+shows real live output (matching what `tail -f` on the file shows), instead of an empty pane by
+design the way a plain redirect leaves it. This is TPU/tmux-specific — the local MPS training
+guidance above (background `&`, no tmux pane to view) is unaffected, plain redirect stays fine
+there.
+
 ## TPU access
 
 **Starting a fresh session asked to do a TPU run: read [docs/tpu_setup.md](docs/tpu_setup.md)
@@ -104,6 +114,27 @@ working suddenly can't be reached (hang, `Connection refused`, `No route to host
 `queued-resources describe ... state.state` for `PREEMPTED` *before* assuming a flaky connection,
 retrying, or standing up a replacement node (don't — see above). Full setup and copy-pasteable
 commands: [docs/tpu_direct_ssh.md](docs/tpu_direct_ssh.md).
+
+**Recovering a dropped direct-ssh connection (confirmed 2026-08-27: 3 of 4 nodes' ControlMaster
+sockets died simultaneously mid-session, `Permission denied (publickey)`/`Broken pipe` on direct
+connect)** — not a preemption, just a stale multiplexed connection/expired host key. Fix, per
+node: (1) `gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone>
+--command="echo ok"` to re-propagate the SSH key (this alone re-validates and heals most cases);
+(2) re-run the direct `ssh -o ControlMaster=auto -o ControlPersist=yes -o
+ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@<external_ip>
+'echo connected'` to rebuild the multiplexed socket; (3) if that fails with `Host key verification
+failed` (the external IP was reassigned to a different node), `ssh-keygen -R <external_ip>` first,
+then retry step 2 with `-o StrictHostKeyChecking=accept-new`. Check `queued-resources describe`
+for `PREEMPTED` first regardless — this recovery path is for a healthy-but-unreachable node, not a
+lost one.
+
+**When launching or restarting any run on a TPU node, always give the user in chat (not only in a
+doc) the exact `tmux attach -t <run_name>` and `tmux capture-pane -t <run_name> -p -S -N` commands
+for that specific run** — same standing rule as above, applies to every lineage (`gpt2_jax`,
+`summformer_jax`, not just the older torch ones). Note: if the launch script redirects stdout to a
+log file (`> ~/<run_name>.log 2>&1`, the convention used by both JAX lineages), the tmux pane
+itself stays blank by design — `tail -f ~/<run_name>.log` is the real live view in that case, still
+worth giving alongside the tmux commands for peeking at the raw session.
 **Never create/start a TPU yourself** — only use nodes already listed in TPU.md/already running.
 **Never edit TPU.md itself** — it's the user's own list of queued-resource create commands, not a
 session log; per-node details discovered while connecting (external IP, actual node name behind

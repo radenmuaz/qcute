@@ -9,7 +9,7 @@ GPT2 block stack vs. this file's n_layers=2 + Ks=(2,)*6 hierarchical cascade at 
 d_model=1024/n_heads=16.
 
     uv run python summformer_jax/train_summformer.py --pos-method rope \
-      --dataset-dir data/fineweb-edu-10B --Ks 2,2,2,2,2,2 --d-model 1024 --n-heads 16 \
+      --dataset-dir data/fineweb-edu-10B --Ks 2,2,2,2,2 --d-model 1024 --n-heads 16 \
       --n-layers 2
 """
 from __future__ import annotations
@@ -70,7 +70,7 @@ def main():
     pre_args, _ = pre.parse_known_args()
 
     p = argparse.ArgumentParser(description="summformer_jax training", parents=[pre])
-    p.add_argument("--Ks", type=str, default="2,2,2,2")
+    p.add_argument("--Ks", type=str, default="2,2,2")
     p.add_argument("--d-model", type=int, default=1024)
     p.add_argument("--n-layers", type=int, default=2)
     p.add_argument("--fuse-n-layers", type=int, default=None)
@@ -190,7 +190,7 @@ def main():
     def loss_fn(params, batch):
         m = nnx.merge(graphdef, params)
         x, y = batch
-        # SummTransformer.__call__ takes byte_ids (not x/y separately) -- targets are y=x shifted
+        # SummTransformer.__call__ takes token_ids (not x/y separately) -- targets are y=x shifted
         # by 1, already encoded in _cascade's internal slicing, so feed x (the B*T window) and
         # let the model's own shift-by-1 produce the same (x[:-1]->x[1:]) pairing as batch's y.
         del y

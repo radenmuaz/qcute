@@ -14,7 +14,7 @@ uv run python scripts/plot_run.py logs/qcute_zero_ks221_1M
 from pathlib import Path
 
 run_name = "qcute_zero_ks221_1M"
-Ks = (2, 2, 1)
+Ks = (2, 2)
 d_model = 256
 n_layers = 4
 n_heads = 4

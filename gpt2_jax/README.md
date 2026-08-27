@@ -98,10 +98,10 @@ dataloader audit) `DataLoaderLite`/dataset. Status as of the last check:
 
 | Node | Run | Config | Status |
 |---|---|---|---|
-| tpu4 | `medium_paper_match_b8` | gpt2-medium baseline, `batch_size=8`, paper `total_batch_size=524288` | running, ~102.6K tok/s |
-| tpu5 | `summformer_medium_ablation` | summformer ablation vs. medium (`Ks=(2,2,2,2)`, `n_layers=2`, `d_model=1024`) | running, ~250.2K tok/s |
-| tpu6 | `small_paper_match` | gpt2-small baseline, `batch_size=32`, paper `total_batch_size=524288` | running, ~257.8K tok/s |
-| tpu7 | `summformer_small_ablation` | summformer ablation vs. small (`Ks=(2,2,2,2)`, `n_layers=1`, `d_model=768`) | running, ~599K tok/s |
+| tpu4 | `medium_paper_match_b8` | gpt2-medium baseline, `batch_size=8`, paper `total_batch_size=524288` | running, step 6922, ~102.6K tok/s |
+| tpu5 | `summformer_medium_ablation` | summformer ablation vs. medium (`Ks=(2,2,2)`, `n_layers=2`, `d_model=1024`) | running, step 17838, ~293K tok/s |
+| tpu6 | `small_paper_match` | gpt2-small baseline, `batch_size=32`, paper `total_batch_size=524288` | running, step 16949, ~258K tok/s |
+| tpu7 | `summformer_small_ablation` | summformer ablation vs. small (`Ks=(2,2,2)`, `n_layers=1`, `d_model=768`) | **finished** (19072/19073), val loss 3.20 / bpb 4.62, checkpoint 448M — node now idle, used for dataset-prep smoke tests |
 
 Param counts: medium baseline 353.8M vs. ablation 279.3M (-21%); small baseline ~123.6M vs.
 ablation ~126.8M (+2.6%). It's expected/fine for the ablation to lose to its baseline if it

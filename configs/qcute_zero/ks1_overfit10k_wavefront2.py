@@ -11,7 +11,7 @@ uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks1_ove
 from pathlib import Path
 
 run_name = "qcute_zero_ks1_overfit10k_wavefront2"
-Ks = (1,)
+Ks = ()
 d_model = 256
 n_layers = 2
 n_heads = 4

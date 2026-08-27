@@ -17,7 +17,7 @@ uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks221_o
 from pathlib import Path
 
 run_name = "qcute_zero_ks221_overfit10k_mtp8"
-Ks = (2, 2, 1)
+Ks = (2, 2)
 d_model = 256
 n_layers = 2
 n_heads = 4

@@ -6,7 +6,7 @@ B=4, total_batch_size=524288, seq_len=1024, n_devices=4 -> grad_accum_steps=5242
 is heavier per forward pass -- chosen conservatively to avoid OOM, not yet tuned upward; see
 docs/status_tpu.md).
 
-d_model=1024/n_heads=16 match GPT2-medium exactly; n_layers=2 + Ks=(2,2,2,2) (n_fuse=3) chosen so
+d_model=1024/n_heads=16 match GPT2-medium exactly; n_layers=2 + Ks=(2,2,2) (n_fuse=3) chosen so
 this architecture's effective GPT2-equivalent depth (~n_layers*(1+2*n_fuse)=14) and param count
 (~279M) land close to GPT2-medium's 24 layers / 353.8M params -- see the chat history around
 2026-08-27 for the full FLOPs/param derivation and the -1-vs-2-Ks-length tradeoff analysis.
@@ -15,7 +15,7 @@ this architecture's effective GPT2-equivalent depth (~n_layers*(1+2*n_fuse)=14) 
 """
 pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"
-Ks = "2,2,2,2"
+Ks = "2,2,2"
 d_model = 1024
 n_heads = 16
 n_layers = 2

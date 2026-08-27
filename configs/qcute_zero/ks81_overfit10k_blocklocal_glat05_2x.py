@@ -11,7 +11,7 @@ uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks81_ov
 from pathlib import Path
 
 run_name = "qcute_zero_ks81_overfit10k_blocklocal_glat05_2x"
-Ks = (8, 1)
+Ks = (8,)
 d_model = 256
 n_layers = 2
 n_heads = 4

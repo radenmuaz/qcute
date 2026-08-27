@@ -1,3 +1,29 @@
+"""summformer: a fork of qcute_zero, simplified to a plain hierarchical-summarization
+transformer (chat 2026-08-25). Removed relative to qcute_zero: (1) the per-level Quantizer
+entirely -- no discrete/STE code bottleneck anywhere, a level's "code" is just the raw continuous
+hidden state pooled every K positions; (2) each fuse stage's own code-sequence NTP auxiliary loss
+(falls out naturally once codes are continuous -- no categorical target left to run cross-entropy
+against); (3) the per-stage cond_loss/uncond_loss split -- exactly ONE loss, the final byte NTP
+loss computed after every cross-attention fuse stage has run.
+
+What's kept, unchanged from qcute_zero: the `Ks`-tuple hierarchy (every K positions at level s
+pool, via last-of-block hidden state, into level s+1's input sequence), the fuse cross-attention
+mechanism (each level's pooled/summarized sequence cross-attends back into the byte stream,
+followed by a refinement pass through the SAME shared byte-level blocks), the zero-KV-sink
+attention primitive, RoPE, and `mtp_heads` (orthogonal, cheap, reads the final post-cascade hidden
+state). Causality is if anything simpler than qcute_zero's: a level's summary is a deterministic,
+non-sampled function of strictly-real, already-computed hidden states (no STE/gumbel subtlety),
+so there is no possible circularity to reason about -- see qcute_zero.py's own causality note for
+the general argument, which still applies here without the discrete-code caveat.
+
+Real incremental KV cache (`generate_kv_cache`) ported directly from qcute_zero's
+`_make_incremental_stepper`, with the quantizer's `extract_greedy` step simply removed (the pooled
+hidden state IS the code, no extraction needed). `check_kv_cache_consistency` verifies it produces
+the exact same argmax trajectory as `generate_no_cache` (full recompute reference).
+
+uv run python -m qcute.summformer.summformer --config configs/summformer/ks21_overfit10k.py
+uv run python -m qcute.summformer.summformer --config configs/summformer/ks421_overfit10k.py
+"""
 import argparse
 import gzip
 import json
@@ -334,12 +360,7 @@ def resolve_fuse_window(w, n_fuse: int) -> tuple:
 
 @dataclass
 class Config:
-    Ks: tuple[int, ...] = (32, 32)          # per-stage pooling factor; len(Ks) = number of fuse
-                                              # stages (no trailing placeholder -- every element
-                                              # is a real stage). cum(Ks[:s+1]) must stay well
-                                              # under the training sequence length for every s, or
-                                              # that stage never fires and its query backlog in
-                                              # _make_incremental_stepper grows unboundedly.
+    Ks: tuple[int, ...] = (32, 32, 1)       # same semantics as qcute_zero: cumulative periods
     d_model: int = 256
     n_layers: int = 4                        # shared "block regular", reused for every level
     fuse_n_layers: int | None = None         # defaults to n_layers if unset
@@ -373,7 +394,7 @@ class SummTransformer(nn.Module):
         self.head_dim = cfg.head_dim if cfg.head_dim is not None else D // cfg.n_heads
         V = 2 ** cfg.input_preset
         self.vocab = V
-        self.n_fuse = len(cfg.Ks)
+        self.n_fuse = len(cfg.Ks) - 1
         assert D % cfg.n_heads == 0
 
         self.embed = nn.Embedding(V, D)
@@ -537,15 +558,10 @@ class SummTransformer(nn.Module):
         refine_caches = [[None] * cfg.n_layers for _ in range(self.n_fuse)]
         h_hist = None
         stage_h_hist = [torch.zeros(Bsz, 0, D, device=device_t) for _ in range(self.n_fuse)]
-        # KV caches for each stage's OWN self-attention over its pooled code sequence, and a
-        # monotonic (never-reset) block counter per stage for RoPE position -- see the note
-        # below on why this makes the stage recompute incremental instead of cubic.
-        stage_caches = [[None] * cfg.n_layers for _ in range(self.n_fuse)]
-        stage_local_pos = [0] * self.n_fuse
         x_in_backlog = [None] * self.n_fuse
         cum_Ks = []
         cum = 1
-        for K_s in cfg.Ks:
+        for K_s in cfg.Ks[:self.n_fuse]:
             cum *= K_s
             cum_Ks.append(cum)
 
@@ -563,35 +579,15 @@ class SummTransformer(nn.Module):
             x_in = h_new
             cur_h_hist = h_hist
             logits_full = self.head(x_in)   # fallback if n_fuse==0 or no stage active yet
-            x_hidden = x_in
             for s in range(self.n_fuse):
                 K_s = cfg.Ks[s]
                 n_blocks = cur_h_hist.shape[1] // K_s
-                n_prev = stage_h_hist[s].shape[1]
-                if n_blocks > n_prev:
-                    # NOTE: incremental, NOT a from-scratch recompute over all n_blocks. The old
-                    # code re-ran _run_blocks(s+1, ...) -- full (non-cached) self-attention -- over
-                    # the ENTIRE pooled history every time one new block completed, i.e. O(n_blocks^2)
-                    # work paid roughly n_blocks times per file = O(n_blocks^3) cumulative over one
-                    # epoch. Real causal self-attention computed via KV-caching is mathematically
-                    # identical to full recompute (the same equivalence that makes KV-caching valid
-                    # for autoregressive generation at all), so processing only the NEW block(s)
-                    # through a persistent cache (like byte_caches above) gives the exact same
-                    # stage_h_hist values for O(n_blocks) work per call / O(n_blocks^2) cumulative --
-                    # cubic to quadratic, for free, no output change.
-                    new_code = cur_h_hist[:, K_s - 1::K_s, :][:, n_prev:n_blocks, :]
-                    n_new = new_code.shape[1]
-                    new_local_pos = torch.arange(
-                        stage_local_pos[s], stage_local_pos[s] + n_new, device=device_t)
-                    cos_c, sin_c = rope_cos_sin_for_positions(new_local_pos, hd, cfg.rope_base, device_t)
-                    h_new_code = new_code
-                    for l, blk in enumerate(self.lms[s + 1]):
-                        h_new_code, stage_caches[s][l] = blk.forward_incremental(
-                            h_new_code, cos_c, sin_c, stage_caches[s][l], None)
-                    h_new_code = self.ln_fs[s + 1](h_new_code)
-                    stage_local_pos[s] += n_new
-                    stage_h_hist[s] = (h_new_code if n_prev == 0
-                                       else torch.cat([stage_h_hist[s], h_new_code], dim=1))
+                if n_blocks > stage_h_hist[s].shape[1]:
+                    code_h = cur_h_hist[:, K_s - 1::K_s, :][:, :n_blocks, :]
+                    code_local_pos = torch.arange(n_blocks, device=device_t)
+                    cos_c, sin_c = rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base, device_t)
+                    code_mask = causal_mask(code_local_pos, code_local_pos, None)
+                    stage_h_hist[s] = self._run_blocks(s + 1, code_h, cos_c, sin_c, code_mask)
                 h_code = stage_h_hist[s]
                 n_blocks_now = h_code.shape[1]
 
@@ -619,40 +615,12 @@ class SummTransformer(nn.Module):
                     x_cross, refine_caches[s][l] = block.forward_incremental(
                         x_cross, cos_q, sin_q, refine_caches[s][l], cfg.attn_window)
                 x_cross = self.ln_fs[0](x_cross)
-                # NOTE: intentionally self.head(x_cross), NOT fuse_stages[s].readout(...) --
-                # readout() applies an extra ln_out RMSNorm that forward()/_cascade() never
-                # applies (ln_fs[0] above is the only normalization on the training path), so
-                # readout's ln_out sees no gradient during training and stays at its untrained
-                # init. Using self.head here keeps this incremental path numerically identical
-                # to the training-time cascade at every position, fired stage or not.
-                logits_full = self.head(x_cross)
+                logits_full = self.fuse_stages[s].readout(x_cross, self.head.weight)
                 x_in = x_cross
                 cur_h_hist = h_code
-                x_hidden = x_in
-            return logits_full, x_hidden
+            return logits_full
 
-        def detach_state() -> None:
-            """TBPTT boundary: detach all persistent state from the autograd graph in place,
-            so the next step()'s backward doesn't walk back through previous chunks. Purely a
-            graph-truncation op -- values are unchanged, only .requires_grad-tracking history
-            is cut, exactly like _detach_states() in randcompress/train.py's curriculum trainer."""
-            nonlocal h_hist
-            if h_hist is not None:
-                h_hist = h_hist.detach()
-            for l in range(cfg.n_layers):
-                if byte_caches[l] is not None:
-                    byte_caches[l] = tuple(t.detach() for t in byte_caches[l])
-            for s in range(self.n_fuse):
-                stage_h_hist[s] = stage_h_hist[s].detach()
-                if x_in_backlog[s] is not None:
-                    x_in_backlog[s] = x_in_backlog[s].detach()
-                for l in range(cfg.n_layers):
-                    if refine_caches[s][l] is not None:
-                        refine_caches[s][l] = tuple(t.detach() for t in refine_caches[s][l])
-                    if stage_caches[s][l] is not None:
-                        stage_caches[s][l] = tuple(t.detach() for t in stage_caches[s][l])
-
-        return step, detach_state
+        return step
 
     @torch.no_grad()
     def generate_kv_cache(self, prompt_bytes: torch.Tensor, n_new_bytes: int, device: str) -> torch.Tensor:
@@ -664,15 +632,15 @@ class SummTransformer(nn.Module):
         prompt_bytes = prompt_bytes.to(device)
         if prompt_bytes.dim() == 1:
             prompt_bytes = prompt_bytes.unsqueeze(0)
-        step, _ = self._make_incremental_stepper(prompt_bytes.shape[0], torch.device(device))
+        step = self._make_incremental_stepper(prompt_bytes.shape[0], torch.device(device))
 
         all_bytes = prompt_bytes
-        logits_all, _ = step(all_bytes, 0)          # prime the caches with the whole prompt
+        logits_all = step(all_bytes, 0)          # prime the caches with the whole prompt
         next_logits = logits_all[:, -1, :]
         for _ in range(n_new_bytes):
             next_byte = next_logits.argmax(-1, keepdim=True)
             all_bytes = torch.cat([all_bytes, next_byte], dim=1)
-            logits_all, _ = step(next_byte, all_bytes.shape[1] - 1)
+            logits_all = step(next_byte, all_bytes.shape[1] - 1)
             next_logits = logits_all[:, -1, :]
 
         if was_training:
@@ -758,7 +726,7 @@ def build_argparser(description: str) -> tuple:
     pre_args, _ = pre.parse_known_args()
 
     p = argparse.ArgumentParser(description=description, parents=[pre])
-    p.add_argument("--Ks", default=(32, 32))
+    p.add_argument("--Ks", default=(32, 32, 1))
     p.add_argument("--d_model", type=int, default=256)
     p.add_argument("--n_layers", type=int, default=4)
     p.add_argument("--fuse_n_layers", type=int, default=None)

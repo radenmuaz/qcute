@@ -462,8 +462,7 @@ class Quantizer(nn.Module):
 
 @dataclass
 class Config:
-    Ks: tuple[int, ...] = (32, 32, 1)       # same semantics as qcute_lagcodec: cumulative periods, last
-                                              # entry conventionally 1 (no further fuse stage after it)
+    Ks: tuple[int, ...] = (32, 32)          # per-fuse-stage block size; len(Ks) == n_fuse (no top-level entry)
     d_model: int = 256
     n_layers: int = 4                        # scalar -- shared "block regular", reused for every
                                               # fuse stage's own code-sequence NTP pass too
@@ -608,7 +607,7 @@ class QCuteZero(nn.Module):
         self.head_dim = cfg.head_dim if cfg.head_dim is not None else D // cfg.n_heads
         V = 2 ** cfg.input_preset
         self.vocab = V
-        self.n_fuse = len(cfg.Ks) - 1
+        self.n_fuse = len(cfg.Ks)
         assert D % cfg.n_heads == 0
 
         self.embed = nn.Embedding(V, D)
@@ -915,7 +914,7 @@ class QCuteZero(nn.Module):
         x_in_backlog = [None] * self.n_fuse
         cum_Ks = []
         cum = 1
-        for K_s in cfg.Ks[:self.n_fuse]:
+        for K_s in cfg.Ks:
             cum *= K_s
             cum_Ks.append(cum)
 
