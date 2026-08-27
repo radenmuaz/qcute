@@ -113,8 +113,19 @@ def main():
     optimizer, schedule = build_optimizer(max_steps)
     opt_state = optimizer.init(params)
 
-    params = jax.device_put_replicated(params, jax.local_devices())
-    opt_state = jax.device_put_replicated(opt_state, jax.local_devices())
+    # jax.device_put_replicated was removed -- replicate manually: stack n_devices copies along
+    # a new leading axis, then shard that axis one-per-device via a Mesh/NamedSharding. Produces
+    # the same per-device-leading-axis layout pmap expects.
+    devices = jax.local_devices()
+    mesh = jax.sharding.Mesh(devices, ("d",))
+    replicate_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("d"))
+
+    def replicate(pytree):
+        stacked = jax.tree.map(lambda x: jnp.stack([x] * len(devices)), pytree)
+        return jax.tree.map(lambda x: jax.device_put(x, replicate_sharding), stacked)
+
+    params = replicate(params)
+    opt_state = replicate(opt_state)
 
     def loss_fn(params, batch):
         model = nnx.merge(graphdef, params)
