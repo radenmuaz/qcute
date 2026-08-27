@@ -1,15 +1,15 @@
-"""summ_transformer/ks221_1M_shareall: same as ks221_1M.py but with every weight-sharing flag on --
+"""summformer/ks221_1M_shareall: same as ks221_1M.py but with every weight-sharing flag on --
 share_lm (lms[s] all alias lms[0]), share_fuse (fuse_stages[s] all alias fuse_stages[0]), and
 weight_tie (head.weight refs embed.weight). Companion to ks21_1M_shareall.py for the 3-level case.
 
-uv run python -m qcute.summ_transformer.summ_transformer --config configs/summ_transformer/ks221_1M_shareall.py
+uv run python -m qcute.summformer.summformer --config configs/summformer/ks221_1M_shareall.py
 
 # plot after training:
-uv run python scripts/plot_run.py logs/summ_transformer_ks221_1M_shareall
+uv run python scripts/plot_run.py logs/summformer_ks221_1M_shareall
 """
 from pathlib import Path
 
-run_name = "summ_transformer_ks221_1M_shareall"
+run_name = "summformer_ks221_1M_shareall"
 Ks = (2, 2, 1)
 d_model = 256
 n_layers = 4

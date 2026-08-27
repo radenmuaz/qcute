@@ -1,13 +1,13 @@
-"""summ_transformer/ks21_overfit10k: Ks=(2,1), the simplest 2-level hierarchical-summarization
+"""summformer/ks21_overfit10k: Ks=(2,1), the simplest 2-level hierarchical-summarization
 config (2026-08-25) -- sanity/fast-iteration testbed matching this project's own
 overfit10k convention (see CLAUDE.md's "Standing methodology"). Also exercises
 check_kv_cache_consistency (run automatically at the end of training, see --check_kv_cache).
 
-uv run python -m qcute.summ_transformer.summ_transformer --config configs/summ_transformer/ks21_overfit10k.py
+uv run python -m qcute.summformer.summformer --config configs/summformer/ks21_overfit10k.py
 """
 from pathlib import Path
 
-run_name = "summ_transformer_ks21_overfit10k"
+run_name = "summformer_ks21_overfit10k"
 Ks = (2, 1)
 d_model = 256
 n_layers = 2

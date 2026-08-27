@@ -31,13 +31,17 @@ uv run python -m qcute.v5_old.qcute_v5 --decoder_type stack --config configs/v5_
                                                  # still the leaderboard's source of truth for everything
                                                  # already run (docs/status.md), frozen, not receiving further
                                                  # architecture work. `--decoder_type concat` also still works.
-uv run python -m qcute.bytelm_fineweb --config configs/bytelm_fineweb/small_d512x8_mlp4_1epoch_ctx1024_flash.py --device xla --use_flash_attention
-                                                 # byte-level LM on FineWeb-Edu sample-10BT (fork of
-                                                 # qcute.bytelm_tpu -- mmap'd data, loss-primary/bpb-secondary
-                                                 # metrics, no tokenizer). Data prep + full setup/gotchas/
-                                                 # batch-size findings: docs/bytelm_tpu_setup.md's "FineWeb-Edu
-                                                 # byte-level training" section.
+uv run python gpt2_jax/train_gpt.py --model tiny --pos-method rope --dataset-dir data/fineweb-edu-10B
+                                                 # ACTIVE TPU lineage as of 2026-08-27: JAX/Flax port of the
+                                                 # Cable paper's nanoGPT (Cable/src/model_gpt.py), restricted to
+                                                 # 3 pos_methods (rope/learnable/base-NoPE), FineWeb-Edu 10B via
+                                                 # Cable's own dataset_preparation.py used as-is. See
+                                                 # docs/status_tpu.md for current run state.
 ```
+
+The earlier torch_xla-based `qcute.bytelm_fineweb`/`qcute.bpelm_fineweb` (FineWeb-Edu byte/BPE
+baselines) are archived at `archive_fineweb_1/`, not part of active work — superseded by the
+`gpt2_jax/` JAX line above.
 
 `qcute.bytelm`, `qcute.bpelm`, `qcute.qcute_v1.qcute_v1`, and
 `qcute.v5_old.qcute_v5` all read `--help` for their full flag
@@ -137,104 +141,22 @@ keep the surrounding text to a one-line note on whether any run is approaching/c
 plus anything notable (new best, a run finished, a crash). Only fall back to fuller prose when
 something needs explaining (e.g. the overfitting-response policy actually triggering).
 
-**`--use_flash_attention` + `--no_zero_kv_sink` is now the default way `qcute.bytelm_tpu` is run**
-(not an optional add-on) — set up the nightly torch/torch_xla build on every fresh node as a
-standard setup step, not only when flash-attention is explicitly requested (the stable pin's
-`libtpu==0.0.21` is too old for the Pallas kernel that `--use_flash_attention` needs). Full install
-steps, confirmed working on a `v4-8` node: [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md)'s
-"3.5. Nightly build" section. **Install it into `.venv-nightly`, not `.venv`** (the doc's own
-snippet uses this name) — `.venv` stays the stable pin from the main setup steps, so both coexist
-on the same node and you `source` whichever one a given launch needs (`--use_flash_attention` ⇒
-`.venv-nightly`, otherwise ⇒ `.venv`). **`--use_flash_attention` MUST always be paired with
-`--no_zero_kv_sink`** — there is no known-good reason to launch one without the other in this
-project; see that doc's "zero_kv_sink + flash-attention" section below for why. **`--multichip` (collective data-parallel across chips) WORKS on the
-stable `torch==2.9.0`/`torch_xla==2.9.0` pin** (confirmed 2026-08-23 on a fresh `v4-8` node: 4
-real worker processes, steadily climbing CPU time, a full run completed cleanly with
-`world_size=4 global_batch=64` correctly reported after fixing a real bug — `world_size` must
-come from `xr.world_size()`, not `xr.addressable_runtime_device_count()`, which returns 1 inside
-an already-spawned worker) — the earlier "confirmed broken" hang was specific to the **nightly**
-`torch_xla==2.10.0.dev0` build (only needed for `--use_flash_attention`), not this project's own
-wiring, exactly as the 2026-08-22 static-code-review hypothesis predicted. `--multichip` +
-`--use_flash_attention` together **is now confirmed to hang** (2026-08-23, fresh `v4-8` node,
-nightly build) — CPU time flat across all 4 workers on a 5-step smoke test, the same signature as
-the plain nightly-build hang below. **UPDATE (2026-08-25, tpu5): `--multichip` ALONE, no flash,
-also hangs on the nightly build** — the "nightly can do either alone" claim below was never
-actually tested (all prior multichip testing was on the stable pin); isolated test showed the
-identical frozen-CPU-time signature. So the real fault line is nightly-vs-stable, not
-flash-vs-no-flash: `--multichip` only works on stable (which can't do flash at all), and nothing
-tried so far gets multi-chip data-parallelism and flash-attention working together, or even
-`--multichip` alone on nightly. Full writeup + summary matrix (build × multichip × flash):
-docs/bytelm_tpu_setup.md's "Optional: multiple TPU chips on one host" section. For
-single-chip-per-process (embarrassingly-parallel, e.g. a hparam sweep) instead of
-collective multichip, launch independent processes one per chip via `TPU_VISIBLE_CHIPS=<i>`
-(also verified working) — see that same doc section for the exact pattern. Check real addressable device
-count first (`torch_xla.runtime.addressable_runtime_device_count()` / `ls /dev/accel*` /
-`tpu-info`) — a slice's "-N" suffix (e.g. `v4-8`) counts TensorCores, not addressable devices.
-**Multi-chip runs get one named `tmux` session per chip**, not backgrounded `&` jobs in a single
-shell (those all die if that one shell's session ends) — `tmux ls` lists every session on the
-node, `tmux capture-pane -t <session> -p -S -N` peeks at any one without attaching (swap
-`<session>` per run), `-t muaz@<ip> "tmux attach -t <session>"` (note the `-t` before the ssh
-target, for a real pty) attaches interactively.
+**torch_xla-specific findings (flash-attention/nightly-build setup, the `--multichip` +
+nightly-build hang investigation, `zero_kv_sink`+flash-attention's throughput cost) apply only to
+the archived `qcute.bytelm_tpu` lineage** — full detail preserved in
+[docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md), not repeated here. The active TPU lineage
+(`gpt2_jax/`, see Commands above) uses JAX, not torch_xla, and doesn't inherit that hang (JAX
+`pmap` across all local chips is expected to just work).
 
-**`qcute.bytelm_tpu`'s `zero_kv_sink` (default on) and `--use_flash_attention` don't mix well**:
-a correctness fix exists (pad Q by one dummy row + pick `context=1024*k-1`) but even the correct
-version costs ~25x steady-state throughput (10s/it vs. 0.4s/it) — confirmed not a `torch.compile`
-or tensor-allocation artifact, and a from-scratch JAX reimplementation
-(`qcute/bytelm_jax.py`) didn't rescue it either (a properly controlled sink-on/off test in JAX
-showed the sink made no measurable difference there, ~0.33-0.35 it/s regardless — JAX's own
-floor has an unidentified separate cause). Use `--no_zero_kv_sink` whenever
-`--use_flash_attention` is on. Full investigation: docs/bytelm_tpu_setup.md's "zero_kv_sink +
-flash-attention: investigation" section.
+**Current TPU run status**: [docs/status_tpu.md](docs/status_tpu.md) — a living doc, check there
+for what's running on tpu4/5/6/7 right now rather than assuming anything below is current. Update
+that file in place (don't append) whenever a run starts/stops/changes.
 
-**Current TPU run status (as of 2026-08-25, this is a living status block — update it, don't append
-to it, as runs finish/change)**: 3 nodes in play, `tpu4`/`tpu5`/`tpu6` (all v4-8, `us-central2-b`),
-each running up to 4 independent single-chip `qcute.bytelm_tpu` sweeps via
-`TPU_VISIBLE_CHIPS=<0-3>`, one tmux session per chip. Last known external IPs: tpu4
-`35.186.15.67`, tpu5 `35.186.33.7`, tpu6 `35.186.110.50` — re-verify via `gcloud compute tpus
-queued-resources describe <name> --project raden-tpu --zone us-central2-b` if a connection fails
-(spot instances, can be preempted; see above). All runs use `qcute.bytelm_tpu`'s `--seed 1234`
-(added this session), `mtp_heads=8`.
-
-- **tpu4** — `configs/bytelm_tpu/power2_heavyreg_sweep/` (4 configs, power-of-2 sizes 68M-340M,
-  heavy regularization). Tmux sessions `train_d512_heavyreg`, `train_d1024x16mlp4_heavyreg`,
-  `train_d2048x8_wideshallow`, `train_d1024x24_deep`. Healthy and improving as of last check
-  (best val_bpb ~1.31-1.46 across the 4, still trending down).
-- **tpu5** — `configs/bytelm_tpu/modelsize_48h_lrsweep/` (4 configs, 115M-405M, varied
-  lr_peak/grad_clip). **STOPPED 2026-08-25**: all 4 runs' val_bpb turned flat-or-increasing
-  simultaneously around step ~28-32k/~10h elapsed (e.g. `d768x12_mlp4_48h` went 1.51 best -> 3.67;
-  full trajectories in session transcript), no NaN/traceback in any log, processes killed cleanly.
-  The simultaneity across differently-sized models/LRs suggests something node-level (bad data
-  batch, host issue) rather than 4 independent per-config instabilities — not confirmed. Open
-  question raised: is this seed-sensitivity (this sweep is a revival of an earlier unseeded/
-  mtp_heads=1/lighter-reg run that reportedly reached ~1.1 bpb) — inconclusive, too many confounds
-  changed at once (seed added, mtp_heads 1->8, regularization added) to isolate seed as the cause;
-  the failure *pattern* (clean training for hours then simultaneous divergence) doesn't look
-  seed-like. **tpu5 is currently idle, no decision yet on how to relaunch it** — ask the user
-  before restarting anything there. (2026-08-25: `.venv-nightly` was set up on tpu5 for a
-  multichip-hang isolation test, see docs/bytelm_tpu_setup.md — harmless leftover, available if a
-  nightly build is needed there again.)
-- **tpu6** — `configs/bytelm_tpu/d1024x16_mlp2_reg_smoothing_sweep/` (4 configs, all 170M, varying
-  dropout/layer_drop/label_smoothing mix). Tmux sessions `train_reg_full_smooth`,
-  `train_resid_light_smooth`, `train_layerdrop_heavy_nosmooth`, `train_resid_heavy_smooth`. Uses
-  `--use_flash_attention` + `--no_zero_kv_sink`, so its processes run from `.venv-nightly` (see
-  "TPU access" above), not the stable `.venv` tpu4/tpu5 use. Healthy; `layerdrop_heavy_nosmooth` is
-  the best run across all 3 nodes as of last check (val_bpb ~1.23, still improving).
-- **tpu7** (v4-8, `us-central2-b`) — separate lineage: `qcute.bytelm_fineweb` (FineWeb-Edu
-  `sample-10BT`, byte-level, not enwik8). Has both `.venv` (stable) and `.venv-nightly` (for
-  `--use_flash_attention`). Data already prepped: `datasets/fineweb_edu_10BT/{train,val}.bin`
-  (45,109,723,621 / 874,306,351 bytes, plain concatenation, no separator). Full setup/gotchas/
-  batch-size-sweep table: docs/bytelm_tpu_setup.md's "FineWeb-Edu byte-level training" section.
-  Config in use: `configs/bytelm_fineweb/small_d512x8_mlp4_1epoch_ctx1024_flash.py` (`d512x8_mlp4`
-  preset, ~34.2M params, context=1024, batch_size=128, `--use_flash_attention --no_zero_kv_sink`,
-  ~1.13 it/s, 1 epoch = 342,821 steps ≈ 3.5 days) — launch status: not yet started as of writing,
-  ask the user before launching the real multi-day run.
-
-Standing monitoring routine established this session (see hourly hand-off pattern in transcript,
-not yet a persistent cron across session restarts): pull each active run's `run.jsonl` via `scp`
-into local `logs/<run_name>/`, print one combined table (node, params, run, step, elapsed,
-train_bpb, val_bpb, test_bpb), and silently check each node's runs for flat-or-increasing val_bpb
-over their last 4-5 evals — only surface/act on it if it actually triggers (stop that node, report
-the sequence, ask before redesigning/relaunching — don't do it unilaterally).
+**Standing monitoring routine**: pull each active run's `run.jsonl` via `scp` into local
+`logs/<run_name>/` periodically (roughly hourly for a multi-hour run), print one combined table
+(node, run, step, elapsed, primary metric), and silently check each node's runs for a stalled/
+diverging metric over their last 4-5 evals — only surface/act on it if it actually triggers (stop
+that node, report the sequence, ask before redesigning/relaunching — don't do it unilaterally).
 
 ## Architecture
 

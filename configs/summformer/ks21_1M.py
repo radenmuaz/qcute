@@ -1,18 +1,18 @@
-"""summ_transformer/ks21_1M: full-scale (full enwik8_1M, n_bytes=None) run of the simplest
+"""summformer/ks21_1M: full-scale (full enwik8_1M, n_bytes=None) run of the simplest
 2-level hierarchical-summarization case, following the overfit10k sanity check in
 ks21_overfit10k.py. Same architecture/hyperparameter convention as qcute_zero's own full-scale
 configs (configs/qcute_zero/ks221_1M.py): d_model=256/n_layers=4/context_len=256, attn_window=None
 (unbounded -- no -1 sentinel exists in this codebase's causal_mask, which treats window as a
 literal `< window` comparison, so "unbounded" means None, not -1).
 
-uv run python -m qcute.summ_transformer.summ_transformer --config configs/summ_transformer/ks21_1M.py
+uv run python -m qcute.summformer.summformer --config configs/summformer/ks21_1M.py
 
 # plot after training:
-uv run python scripts/plot_run.py logs/summ_transformer_ks21_1M
+uv run python scripts/plot_run.py logs/summformer_ks21_1M
 """
 from pathlib import Path
 
-run_name = "summ_transformer_ks21_1M"
+run_name = "summformer_ks21_1M"
 Ks = (2, 1)
 d_model = 256
 n_layers = 4

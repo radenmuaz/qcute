@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from qcute.qcute_v1.qcute_v1_common import Config, WORD_PRESET_BITS, make_dict, resolve_per_level, run_main
+from qcute.qcute_v1.qcute_v1_common import Config, ROPE_PRESETS, WORD_PRESET_BITS, make_dict, resolve_per_level, run_main
 from qcute.qcute_v1.qcute_v1_decoder import make_decoder
 from qcute.qcute_v1.qcute_v1_encoder import Encoder
 
@@ -10,6 +10,8 @@ from qcute.qcute_v1.qcute_v1_encoder import Encoder
 class QCuteLM(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
+        if cfg.rope_preset is not None:
+            cfg.rope_base = ROPE_PRESETS[cfg.rope_preset]
         self.cfg = cfg
         self.n_levels = len(cfg.Ks)
         self.d_models = resolve_per_level(cfg.d_model, self.n_levels)

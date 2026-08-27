@@ -96,9 +96,12 @@ class Config:
     n_layers: int | tuple = 2
     context_len: int = 1024
     n_heads: int = 4
+    n_kv_heads: int | None = None            # None = max(1, n_heads//4) (Llama3/Qwen3-style GQA-by-default); set == n_heads for plain MHA
+    qk_norm: bool = True                    # Qwen3-style per-head RMSNorm on Q/K before RoPE
     mlp_mult: int = 4
     attn_window: int | tuple = 32
     rope_base: float = 10000.0
+    rope_preset: str | None = "qwen3"           # "llama2"/"llama3"/"qwen3" overrides rope_base (see ROPE_PRESETS)
     byte_ntp_weight: float = 1.0
     code_ntp_weight: float = 1.0
     decode_ntp_weight: float | tuple = 1.0
@@ -826,6 +829,10 @@ def make_quant(cfg: Config) -> QuantScheme:
     return quant
 
 
+ROPE_PRESETS = {"llama2": 10000.0, "llama3": 500000.0, "qwen3": 1000000.0}  # theta only, no
+                                                                              # Llama3.1 NTK-by-parts scaling
+
+
 def rope_cos_sin(seq_len: int, head_dim: int, base: float, device: torch.device):
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     t = torch.arange(seq_len, device=device).float()
@@ -894,21 +901,86 @@ def chunked_windowed_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     return y.view(B, n_chunks, H, w, hd).permute(0, 2, 1, 3, 4).reshape(B, H, T, hd)
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * self.weight
+
+
+class SwiGLU(nn.Module):
+    """gate/up/down, no bias: down(silu(gate(x)) * up(x)) -- Llama3-style MLP."""
+    def __init__(self, d_model: int, mlp_mult: int):
+        super().__init__()
+        hidden = mlp_mult * d_model
+        self.gate = nn.Linear(d_model, hidden, bias=False)
+        self.up = nn.Linear(d_model, hidden, bias=False)
+        self.down = nn.Linear(hidden, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int):
+    """GQA (n_kv_heads < n_heads repeats each KV head across n_heads//n_kv_heads query heads) +
+    optional Qwen3-style QK-norm (per-head RMSNorm on Q/K before RoPE). qcute_v1_decoder.py's own
+    ~13 manual incremental/windowed decode call sites use `_project_qkv`/`_repeat_kv` directly
+    (ported 2026-08-27) so GQA and QK-norm apply consistently there too, not just forward()/
+    forward_cross() -- see that file's own call sites for the exact pattern each one follows.
+    TODO(head_dim decoupling): summformer/qcute_zero/qcute_zero_simple all support an optional
+    head_dim independent of d_model//n_heads (Qwen3-style, e.g. some of its smaller variants use
+    head_dim=128 regardless of hidden_size/n_heads) -- NOT ported here. Would need self.head_dim
+    (already a plain d_model//n_heads derivation) decoupled via a new head_dim param/Config field,
+    self.out resized to (n_heads*head_dim, d_model), every reshape target in this class's own
+    forward()/forward_incremental()/forward_cross() changed from D to n_heads*head_dim, AND every
+    `hd = D // cfg.n_heads`-style local var in qcute_v1_decoder.py's own ~13 manual call sites
+    (and qcute_v1_common.py's LM/rope call sites) updated to read a resolved head_dim instead --
+    same shape of change as the GQA port, but touching attention OUTPUT width too, not just K/V."""
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int | None = None, qk_norm: bool = True):
         super().__init__()
         self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads if n_kv_heads is not None else max(1, n_heads // 4)
+        assert n_heads % self.n_kv_heads == 0, "n_heads must be a multiple of n_kv_heads"
+        self.n_rep = n_heads // self.n_kv_heads
         self.d_model = d_model
         self.head_dim = d_model // n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        # kept as one combined Linear (not split wq/wk/wv) so qcute_v1_decoder.py's raw
+        # `.qkv.weight[:D]/[D:2D]/[2D:3D]` slicing keeps working when n_kv_heads==n_heads (the
+        # only supported case for those call sites, see class docstring).
+        self.qkv = nn.Linear(d_model, d_model + 2 * self.n_kv_heads * self.head_dim, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+
+    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
+        if self.n_rep == 1:
+            return x
+        B, Hkv, T, hd = x.shape
+        return x[:, :, None].expand(B, Hkv, self.n_rep, T, hd).reshape(B, Hkv * self.n_rep, T, hd)
+
+    def _project_qkv(self, x_q: torch.Tensor, x_kv: torch.Tensor):
+        B, T, D = x_q.shape
+        S = x_kv.shape[1]
+        H, Hkv, hd = self.n_heads, self.n_kv_heads, self.head_dim
+        Wq, Wk, Wv = self.qkv.weight[:D], self.qkv.weight[D:D + Hkv * hd], self.qkv.weight[D + Hkv * hd:]
+        q = F.linear(x_q, Wq).view(B, T, H, hd).transpose(1, 2)
+        k = F.linear(x_kv, Wk).view(B, S, Hkv, hd).transpose(1, 2)
+        v = F.linear(x_kv, Wv).view(B, S, Hkv, hd).transpose(1, 2)
+        return q, k, v
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, window: int | None):
         B, T, D = x.shape
-        H, hd = self.n_heads, self.head_dim
-        qkv = self.qkv(x).reshape(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = self._project_qkv(x, x)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        k, v = self._repeat_kv(k), self._repeat_kv(v)
         if window is not None:
             y = chunked_windowed_attention(q, k, v, window)
         else:
@@ -918,29 +990,23 @@ class CausalSelfAttention(nn.Module):
     def forward_cross(self, x_q: torch.Tensor, x_kv: torch.Tensor, cos_q: torch.Tensor, sin_q: torch.Tensor,
                        cos_k: torch.Tensor, sin_k: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         B, T, D = x_q.shape
-        _, S, _ = x_kv.shape
-        H, hd = self.n_heads, self.head_dim
-        Wq, Wk, Wv = self.qkv.weight[:D], self.qkv.weight[D:2 * D], self.qkv.weight[2 * D:3 * D]
-        q = F.linear(x_q, Wq).view(B, T, H, hd).transpose(1, 2)
-        k = F.linear(x_kv, Wk).view(B, S, H, hd).transpose(1, 2)
-        v = F.linear(x_kv, Wv).view(B, S, H, hd).transpose(1, 2)
+        q, k, v = self._project_qkv(x_q, x_kv)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
         q = apply_rope(q, cos_q, sin_q)
         k = apply_rope(k, cos_k, sin_k)
+        k, v = self._repeat_kv(k), self._repeat_kv(v)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         return self.out(y.transpose(1, 2).reshape(B, T, D))
 
 
 class Block(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, mlp_mult: int):
+    def __init__(self, d_model: int, n_heads: int, mlp_mult: int, n_kv_heads: int | None = None, qk_norm: bool = True):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, mlp_mult * d_model),
-            nn.GELU(),
-            nn.Linear(mlp_mult * d_model, d_model),
-        )
+        self.ln1 = RMSNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_heads, n_kv_heads, qk_norm)
+        self.ln2 = RMSNorm(d_model)
+        self.mlp = SwiGLU(d_model, mlp_mult)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, window: int | None):
         a = self.attn(self.ln1(x), cos, sin, window)
@@ -1000,8 +1066,8 @@ class LM(nn.Module):
         # inheriting state from the previous block, since decode no longer fuses any code into
         # self-attention at all (own-level code is cross-attended instead).
         self.self_code_const = nn.Parameter(torch.zeros(D))
-        self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(n_layers)])
-        self.ln_f = nn.LayerNorm(D)
+        self.blocks = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult, cfg.n_kv_heads, cfg.qk_norm) for _ in range(n_layers)])
+        self.ln_f = RMSNorm(D)
         # code_head/code_predict always produce/consume cfg.vocab-wide codes (the categorical code
         # convention shared by every level going UP the hierarchy) -- independent of `vocab` above,
         # which only sizes this backbone's own INPUT embedding table (word alphabet, level0 only
@@ -1496,9 +1562,12 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--n_layers", type=parse_scalar_or_tuple, default=2)
     p.add_argument("--context_len", type=int, default=1024)
     p.add_argument("--n_heads", type=int, default=4)
+    p.add_argument("--n_kv_heads", type=int, default=None)
+    p.add_argument("--qk_norm", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--mlp_mult", type=int, default=4)
     p.add_argument("--attn_window", default=32)
     p.add_argument("--rope_base", type=float, default=10000.0)
+    p.add_argument("--rope_preset", type=str, default="qwen3", choices=list(ROPE_PRESETS))
     p.add_argument("--byte_ntp_weight", type=float, default=1.0)
     p.add_argument("--code_ntp_weight", type=float, default=1.0)
     p.add_argument("--decode_ntp_weight", type=float, default=1.0)
@@ -1741,8 +1810,9 @@ def build_argparser(description: str) -> tuple:
 def config_from_args(args) -> Config:
     return Config(
         decoder_type=args.decoder_type, Ks=args.Ks, d_model=args.d_model, n_layers=args.n_layers,
-        context_len=args.context_len, n_heads=args.n_heads, mlp_mult=args.mlp_mult, attn_window=args.attn_window,
-        rope_base=args.rope_base, byte_ntp_weight=args.byte_ntp_weight, code_ntp_weight=args.code_ntp_weight,
+        context_len=args.context_len, n_heads=args.n_heads, n_kv_heads=args.n_kv_heads, qk_norm=args.qk_norm,
+        mlp_mult=args.mlp_mult, attn_window=args.attn_window,
+        rope_base=args.rope_base, rope_preset=args.rope_preset, byte_ntp_weight=args.byte_ntp_weight, code_ntp_weight=args.code_ntp_weight,
         decode_ntp_weight=args.decode_ntp_weight, gumbel_tau=args.gumbel_tau,
         code_extract_mode=args.code_extract_mode, code_head_tied=args.code_head_tied,
         vocab=args.vocab, quant_type=args.quant_type, binary_bits=args.binary_bits, binary_lfq=args.binary_lfq,

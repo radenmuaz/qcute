@@ -143,9 +143,11 @@ def merged_decode_forward(bb: LM, x0: torch.Tensor, tracks: list, extra_query: b
         xe = combined
         for block in bb.blocks:
             xn = block.ln1(xe)
-            qkv = block.attn.qkv(xn).reshape(B, Le, 3, H, hd).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
+            q, k, v = block.attn._project_qkv(xn, xn)
+            if block.attn.qk_norm:
+                q, k = block.attn.q_norm(q), block.attn.k_norm(k)
             q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+            k, v = block.attn._repeat_kv(k), block.attn._repeat_kv(v)
             y = (F.scaled_dot_product_attention(q, k, v, is_causal=True) if fully_causal
                  else F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask))
             a = block.attn.out(y.transpose(1, 2).reshape(B, Le, D))
@@ -164,9 +166,11 @@ def merged_decode_forward(bb: LM, x0: torch.Tensor, tracks: list, extra_query: b
         cos, sin = rope_cos_sin_for_positions(true_pos_p.clamp(min=0), hd, cfg.rope_base, device)
         for block in bb.blocks:
             xn = block.ln1(xe)
-            qkv = block.attn.qkv(xn).reshape(B, Lp, 3, H, hd).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
+            q, k, v = block.attn._project_qkv(xn, xn)
+            if block.attn.qk_norm:
+                q, k = block.attn.q_norm(q), block.attn.k_norm(k)
             q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+            k, v = block.attn._repeat_kv(k), block.attn._repeat_kv(v)
 
             qb = q.view(B, H, n_chunks, sc, hd).permute(0, 2, 1, 3, 4).reshape(B * n_chunks, H, sc, hd)
             kb_flat = k.view(B, H, n_chunks, sc, hd)
@@ -259,15 +263,19 @@ def cross_attn_stage(bb: LM, x_in: torch.Tensor, code_kv: torch.Tensor, seq_repr
             coden = block.ln1(code_kv)
             if coden_pad_len > 0:
                 coden = F.pad(coden, (0, 0, 0, coden_pad_len))
+            Hkv = block.attn.n_kv_heads
             Wq = block.attn.qkv.weight[:D]
-            Wk = block.attn.qkv.weight[D:2 * D]
-            Wv = block.attn.qkv.weight[2 * D:3 * D]
+            Wk = block.attn.qkv.weight[D:D + Hkv * hd]
+            Wv = block.attn.qkv.weight[D + Hkv * hd:]
 
             q = F.linear(xn, Wq).view(B, Lp, H, hd).transpose(1, 2)
-            k = F.linear(coden, Wk).view(B, n_code_slots, H, hd).transpose(1, 2)
-            v = F.linear(coden, Wv).view(B, n_code_slots, H, hd).transpose(1, 2)
+            k = F.linear(coden, Wk).view(B, n_code_slots, Hkv, hd).transpose(1, 2)
+            v = F.linear(coden, Wv).view(B, n_code_slots, Hkv, hd).transpose(1, 2)
+            if block.attn.qk_norm:
+                q, k = block.attn.q_norm(q), block.attn.k_norm(k)
             q = apply_rope(q, cos_q, sin_q)
             k = apply_rope(k, cos_k, sin_k)
+            k, v = block.attn._repeat_kv(k), block.attn._repeat_kv(v)
 
             k_b = k.view(B, H, n_chunks, codes_per_chunk, hd)
             v_b = v.view(B, H, n_chunks, codes_per_chunk, hd)
@@ -341,9 +349,11 @@ def bos_interleaved_self_attn(bb: LM, x0: torch.Tensor, K: int, window: int | No
     cos, sin = rope_cos_sin_for_positions(pos, hd, cfg.rope_base, device)
     for block in bb.blocks:
         xn = block.ln1(xe)
-        qkv = block.attn.qkv(xn).reshape(B, Le, 3, H, hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = block.attn._project_qkv(xn, xn)
+        if block.attn.qk_norm:
+            q, k = block.attn.q_norm(q), block.attn.k_norm(k)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        k, v = block.attn._repeat_kv(k), block.attn._repeat_kv(v)
         if window is None:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
@@ -458,9 +468,11 @@ def encode_like_self_attn_decode(bb: LM, x0: torch.Tensor, code_kv: torch.Tensor
     saved_k, saved_v = [], []
     for block in bb.blocks:
         xn = block.ln1(x)
-        qkv = block.attn.qkv(xn).reshape(B, L, 3, H, hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = block.attn._project_qkv(xn, xn)
+        if block.attn.qk_norm:
+            q, k = block.attn.q_norm(q), block.attn.k_norm(k)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        k, v = block.attn._repeat_kv(k), block.attn._repeat_kv(v)
         y = (chunked_windowed_attention(q, k, v, self_window) if self_window is not None
              else F.scaled_dot_product_attention(q, k, v, is_causal=True))
         a = block.attn.out(y.transpose(1, 2).reshape(B, L, D))
@@ -511,7 +523,10 @@ def seed_query_decode(bb: LM, saved_k: list, saved_v: list, code_kv: torch.Tenso
     for i, block in enumerate(bb.blocks):
         xn = block.ln1(x)
         Wq = block.attn.qkv.weight[:D]
-        q = apply_rope(F.linear(xn, Wq).view(B, n_blocks, H, hd).transpose(1, 2), cos_q, sin_q)
+        q = F.linear(xn, Wq).view(B, n_blocks, H, hd).transpose(1, 2)
+        if block.attn.qk_norm:
+            q = block.attn.q_norm(q)
+        q = apply_rope(q, cos_q, sin_q)
         k, v = saved_k[i], saved_v[i]
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=self_mask)
         a = block.attn.out(y.transpose(1, 2).reshape(B, n_blocks, D))
@@ -543,9 +558,11 @@ def encode_like_step(bb: LM, x_embed: torch.Tensor, cache_k: list, cache_v: list
     x = x_embed
     for li, block in enumerate(bb.blocks):
         xn = block.ln1(x)
-        qkv = block.attn.qkv(xn).reshape(B, 1, 3, H, hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = block.attn._project_qkv(xn, xn)
+        if block.attn.qk_norm:
+            q, k = block.attn.q_norm(q), block.attn.k_norm(k)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        k, v = block.attn._repeat_kv(k), block.attn._repeat_kv(v)
         cache_k[li] = k if cache_k[li] is None else torch.cat([cache_k[li], k], dim=2)
         cache_v[li] = v if cache_v[li] is None else torch.cat([cache_v[li], v], dim=2)
         y = F.scaled_dot_product_attention(q, cache_k[li], cache_v[li])
@@ -580,7 +597,10 @@ def seed_step(bb: LM, cache_k: list, cache_v: list, seed_pos: int, code_kv_b: to
         else:
             xn = block.ln1(x)
             Wq = block.attn.qkv.weight[:D]
-            q = apply_rope(F.linear(xn, Wq).view(B, 1, H, hd).transpose(1, 2), cos_q, sin_q)
+            q = F.linear(xn, Wq).view(B, 1, H, hd).transpose(1, 2)
+            if block.attn.qk_norm:
+                q = block.attn.q_norm(q)
+            q = apply_rope(q, cos_q, sin_q)
             y = F.scaled_dot_product_attention(q, cache_k[li], cache_v[li])
             a = block.attn.out(y.transpose(1, 2).reshape(B, 1, D))
         x = x + a
@@ -2010,9 +2030,11 @@ def block_local_track0_decode(bb: LM, x_list_i: torch.Tensor, code_embeds0: torc
     x = xb
     for block in bb.blocks:
         xn = block.ln1(x)
-        qkv = block.attn.qkv(xn).reshape(B * n_blocks, K, 3, H, hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = block.attn._project_qkv(xn, xn)
+        if block.attn.qk_norm:
+            q, k = block.attn.q_norm(q), block.attn.k_norm(k)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        k, v = block.attn._repeat_kv(k), block.attn._repeat_kv(v)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         a = block.attn.out(y.transpose(1, 2).reshape(B * n_blocks, K, D))
         x = x + a

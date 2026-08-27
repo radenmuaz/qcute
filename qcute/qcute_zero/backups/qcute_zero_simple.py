@@ -201,6 +201,10 @@ def load_config_module(path: Path) -> dict:
 # RoPE + attention primitives
 # ----------------------------------------------------------------------------
 
+ROPE_PRESETS = {"llama2": 10000.0, "llama3": 500000.0, "qwen3": 1000000.0}  # theta only, no
+                                                                              # Llama3.1 NTK-by-parts scaling
+
+
 def rope_cos_sin_for_positions(position_ids: torch.Tensor, head_dim: int, base: float, device: torch.device):
     """position_ids: (T,) shared across the whole batch (the common case), or (Bv, T) -- one
     absolute-position row per batch element (block-folded parallel-decode training, where
@@ -266,37 +270,66 @@ class RMSNorm(nn.Module):
 class Attn(nn.Module):
     """Self- and cross-attention share this: same QKV/out projections, sdpa_with_sink mandatory
     either way. forward() = self-attention (Q,K,V all from x); forward_cross() = cross-attention
-    (Q from x, K/V from a separate kv sequence)."""
-    def __init__(self, d_model: int, n_heads: int):
+    (Q from x, K/V from a separate kv sequence). GQA (n_kv_heads < n_heads repeats each KV head
+    across n_heads//n_kv_heads query heads) + optional Qwen3-style QK-norm (per-head RMSNorm on
+    Q/K before RoPE) + optional decoupled head_dim (Qwen3-style: some of its smaller variants set
+    head_dim independently of d_model//n_heads -- None here is a no-op, deriving head_dim the old
+    way)."""
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int | None = None, qk_norm: bool = True,
+                 head_dim: int | None = None):
         super().__init__()
         self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads if n_kv_heads is not None else max(1, n_heads // 4)
+        assert n_heads % self.n_kv_heads == 0, "n_heads must be a multiple of n_kv_heads"
+        self.n_rep = n_heads // self.n_kv_heads
         self.d_model = d_model
-        self.head_dim = d_model // n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out = nn.Linear(d_model, d_model, bias=False)
+        self.head_dim = head_dim if head_dim is not None else d_model // n_heads
+        self.attn_dim = n_heads * self.head_dim
+        self.wq = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.out = nn.Linear(self.attn_dim, d_model, bias=False)
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+
+    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
+        if self.n_rep == 1:
+            return x
+        B, Hkv, T, hd = x.shape
+        return x[:, :, None].expand(B, Hkv, self.n_rep, T, hd).reshape(B, Hkv * self.n_rep, T, hd)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
-        H, hd = self.n_heads, self.head_dim
-        qkv = self.qkv(x).reshape(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        H, Hkv, hd = self.n_heads, self.n_kv_heads, self.head_dim
+        q = self.wq(x).view(B, T, H, hd).transpose(1, 2)
+        k = self.wk(x).view(B, T, Hkv, hd).transpose(1, 2)
+        v = self.wv(x).view(B, T, Hkv, hd).transpose(1, 2)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        k, v = self._repeat_kv(k), self._repeat_kv(v)
         y = sdpa_with_sink(q, k, v, attn_mask)
-        return self.out(y.transpose(1, 2).reshape(B, T, D))
+        return self.out(y.transpose(1, 2).reshape(B, T, self.attn_dim))
 
     def forward_incremental(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
                              cache, window: int | None):
         """Incremental self-attention: x_new is only the NEW position(s) (Tn=1 per generation
         step, or the whole prompt on the priming call); cache is None (nothing yet) or (k_prev,
-        v_prev) from earlier calls. Returns (out, new_cache) -- new_cache is trimmed to the last
-        `window` entries when windowed, so a subsequent call only ever pays for what's visible.
-        Mask uses LOCAL (call-relative) positions -- only relative order matters for causality,
-        and cos/sin (computed from true absolute positions by the caller) is what actually encodes
-        real distance, so this stays exactly consistent with the full-recompute path."""
+        v_prev) from earlier calls, stored PRE-repeat (n_kv_heads heads). Returns (out, new_cache)
+        -- new_cache is trimmed to the last `window` entries when windowed, so a subsequent call
+        only ever pays for what's visible. Mask uses LOCAL (call-relative) positions -- only
+        relative order matters for causality, and cos/sin (computed from true absolute positions
+        by the caller) is what actually encodes real distance, so this stays exactly consistent
+        with the full-recompute path."""
         B, Tn, D = x_new.shape
-        H, hd = self.n_heads, self.head_dim
-        qkv = self.qkv(x_new).reshape(B, Tn, 3, H, hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        H, Hkv, hd = self.n_heads, self.n_kv_heads, self.head_dim
+        q = self.wq(x_new).view(B, Tn, H, hd).transpose(1, 2)
+        k = self.wk(x_new).view(B, Tn, Hkv, hd).transpose(1, 2)
+        v = self.wv(x_new).view(B, Tn, Hkv, hd).transpose(1, 2)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
         q, k = apply_rope(q, cos_new, sin_new), apply_rope(k, cos_new, sin_new)
         if cache is None:
             k_all, v_all, S_prev = k, v, 0
@@ -308,8 +341,8 @@ class Attn(nn.Module):
         new_pos = torch.arange(S_prev, S_prev + Tn, device=x_new.device)
         key_pos = torch.arange(S, device=x_new.device)
         mask = causal_mask(new_pos, key_pos, window)
-        y = sdpa_with_sink(q, k_all, v_all, mask)
-        out = self.out(y.transpose(1, 2).reshape(B, Tn, D))
+        y = sdpa_with_sink(q, self._repeat_kv(k_all), self._repeat_kv(v_all), mask)
+        out = self.out(y.transpose(1, 2).reshape(B, Tn, self.attn_dim))
         if window is not None and S > window:
             k_all, v_all = k_all[:, :, -window:], v_all[:, :, -window:]
         return out, (k_all, v_all)
@@ -318,31 +351,44 @@ class Attn(nn.Module):
                        cos_k: torch.Tensor, sin_k: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         B, T, D = x_q.shape
         _, S, _ = x_kv.shape
-        H, hd = self.n_heads, self.head_dim
-        Wq, Wk, Wv = self.qkv.weight[:D], self.qkv.weight[D:2 * D], self.qkv.weight[2 * D:3 * D]
-        q = F.linear(x_q, Wq).view(B, T, H, hd).transpose(1, 2)
-        k = F.linear(x_kv, Wk).view(B, S, H, hd).transpose(1, 2)
-        v = F.linear(x_kv, Wv).view(B, S, H, hd).transpose(1, 2)
+        H, Hkv, hd = self.n_heads, self.n_kv_heads, self.head_dim
+        q = self.wq(x_q).view(B, T, H, hd).transpose(1, 2)
+        k = self.wk(x_kv).view(B, S, Hkv, hd).transpose(1, 2)
+        v = self.wv(x_kv).view(B, S, Hkv, hd).transpose(1, 2)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
         q = apply_rope(q, cos_q, sin_q)
         k = apply_rope(k, cos_k, sin_k)
+        k, v = self._repeat_kv(k), self._repeat_kv(v)
         y = sdpa_with_sink(q, k, v, attn_mask)
-        return self.out(y.transpose(1, 2).reshape(B, T, D))
+        return self.out(y.transpose(1, 2).reshape(B, T, self.attn_dim))
+
+
+class SwiGLU(nn.Module):
+    """gate/up/down, no bias: down(silu(gate(x)) * up(x)) -- Llama3-style MLP, replaces the plain
+    Linear-GELU-Linear MLP everywhere in this file (Block and FuseStage both)."""
+    def __init__(self, d_model: int, mlp_mult: int):
+        super().__init__()
+        hidden = mlp_mult * d_model
+        self.gate = nn.Linear(d_model, hidden, bias=False)
+        self.up = nn.Linear(d_model, hidden, bias=False)
+        self.down = nn.Linear(hidden, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 class Block(nn.Module):
     """"block regular": self-attention + MLP. Shared (same weights) across the byte-level pass and
     every fuse stage's own code-sequence NTP pass -- this IS the "single LM" the whole design
     hinges on."""
-    def __init__(self, d_model: int, n_heads: int, mlp_mult: int):
+    def __init__(self, d_model: int, n_heads: int, mlp_mult: int, n_kv_heads: int | None = None, qk_norm: bool = True,
+                 head_dim: int | None = None):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
-        self.attn = Attn(d_model, n_heads)
+        self.attn = Attn(d_model, n_heads, n_kv_heads, qk_norm, head_dim)
         self.ln2 = RMSNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, mlp_mult * d_model, bias=False),
-            nn.GELU(),
-            nn.Linear(mlp_mult * d_model, d_model, bias=False),
-        )
+        self.mlp = SwiGLU(d_model, mlp_mult)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln1(x), cos, sin, attn_mask)
@@ -362,15 +408,13 @@ class FuseStage(nn.Module):
     throughout (no cross-stage sharing) -- including this stage's own final LayerNorm feeding its
     own cond NTP readout (logits via the shared tied embed weight, passed in). Cheap: called with
     the code sequence's length (L/cum_K), not the byte sequence's."""
-    def __init__(self, d_model: int, n_heads: int, mlp_mult: int, n_layers: int):
+    def __init__(self, d_model: int, n_heads: int, mlp_mult: int, n_layers: int,
+                 n_kv_heads: int | None = None, qk_norm: bool = True, head_dim: int | None = None):
         super().__init__()
         self.ln1 = nn.ModuleList([RMSNorm(d_model) for _ in range(n_layers)])
-        self.attn = nn.ModuleList([Attn(d_model, n_heads) for _ in range(n_layers)])
+        self.attn = nn.ModuleList([Attn(d_model, n_heads, n_kv_heads, qk_norm, head_dim) for _ in range(n_layers)])
         self.ln2 = nn.ModuleList([RMSNorm(d_model) for _ in range(n_layers)])
-        self.mlp = nn.ModuleList([nn.Sequential(
-            nn.Linear(d_model, mlp_mult * d_model, bias=False), nn.GELU(),
-            nn.Linear(mlp_mult * d_model, d_model, bias=False))
-            for _ in range(n_layers)])
+        self.mlp = nn.ModuleList([SwiGLU(d_model, mlp_mult) for _ in range(n_layers)])
         self.ln_out = RMSNorm(d_model)
 
     def forward(self, x: torch.Tensor, code_kv: torch.Tensor, cos_q, sin_q, cos_k, sin_k,
@@ -413,8 +457,13 @@ class Config:
                                               # fuse stage's own code-sequence NTP pass too
     fuse_n_layers: int | None = None         # defaults to n_layers if unset
     n_heads: int = 4
+    n_kv_heads: int | None = None            # None = max(1, n_heads//4) (Llama3/Qwen3-style GQA-by-default); set == n_heads for plain MHA
+    head_dim: int | None = None              # None = d_model // n_heads (no-op, Llama3/big-Qwen3 style); set to
+                                              # decouple from d_model/n_heads (small-Qwen3 style, e.g. head_dim=128)
+    qk_norm: bool = True                    # Qwen3-style per-head RMSNorm on Q/K before RoPE
     mlp_mult: int = 4
     rope_base: float = 10000.0
+    rope_preset: str | None = "qwen3"           # "llama2"/"llama3"/"qwen3" overrides rope_base (see ROPE_PRESETS)
     context_len: int = 256
     attn_window: int | None = None           # main byte self-attention window (None = unbounded)
     fuse_window: int | tuple | None = None   # per-fuse-stage cross-attn window, in BYTES; None/scalar/tuple
@@ -448,9 +497,12 @@ def resolve_fuse_window(w, n_fuse: int) -> tuple:
 
 class QCuteZero(nn.Module):
     def __init__(self, cfg: Config):
+        if cfg.rope_preset is not None:
+            cfg.rope_base = ROPE_PRESETS[cfg.rope_preset]
         super().__init__()
         self.cfg = cfg
         D = cfg.d_model
+        self.head_dim = cfg.head_dim if cfg.head_dim is not None else D // cfg.n_heads
         V = 2 ** cfg.input_preset
         self.vocab = V
         self.n_fuse = len(cfg.Ks) - 1
@@ -462,11 +514,11 @@ class QCuteZero(nn.Module):
         # level 0 = byte pass + refinement; level s+1 = fuse stage s's own code-sequence NTP pass.
         n_lms = self.n_fuse + 1
         if cfg.share_lm:
-            first = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
+            first = nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult, cfg.n_kv_heads, cfg.qk_norm, cfg.head_dim) for _ in range(cfg.n_layers)])
             self.lms = nn.ModuleList([first] * n_lms)
         else:
             self.lms = nn.ModuleList(
-                [nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult) for _ in range(cfg.n_layers)])
+                [nn.ModuleList([Block(D, cfg.n_heads, cfg.mlp_mult, cfg.n_kv_heads, cfg.qk_norm, cfg.head_dim) for _ in range(cfg.n_layers)])
                  for _ in range(n_lms)])
         if cfg.share_lm:
             first_ln = RMSNorm(D)
@@ -482,11 +534,11 @@ class QCuteZero(nn.Module):
 
         fuse_layers = cfg.fuse_n_layers if cfg.fuse_n_layers is not None else cfg.n_layers
         if cfg.share_fuse:
-            first_fs = FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers)
+            first_fs = FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers, cfg.n_kv_heads, cfg.qk_norm, cfg.head_dim)
             self.fuse_stages = nn.ModuleList([first_fs] * self.n_fuse)
         else:
             self.fuse_stages = nn.ModuleList(
-                [FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers) for _ in range(self.n_fuse)])
+                [FuseStage(D, cfg.n_heads, cfg.mlp_mult, fuse_layers, cfg.n_kv_heads, cfg.qk_norm, cfg.head_dim) for _ in range(self.n_fuse)])
         self.fuse_windows = resolve_fuse_window(cfg.fuse_window, self.n_fuse)
 
         self.extra_heads = nn.ModuleList(
@@ -511,7 +563,7 @@ class QCuteZero(nn.Module):
         cfg = self.cfg
         B, L = byte_ids.shape
         D = cfg.d_model
-        hd = D // cfg.n_heads
+        hd = self.head_dim
         device = byte_ids.device
         V = self.vocab
 
@@ -670,7 +722,7 @@ class QCuteZero(nn.Module):
         cfg = self.cfg
         B, L = byte_ids.shape
         D = cfg.d_model
-        hd = D // cfg.n_heads
+        hd = self.head_dim
         device = byte_ids.device
         byte_pos = torch.arange(L, device=device)
         cos_b, sin_b = rope_cos_sin_for_positions(byte_pos, hd, cfg.rope_base, device)
@@ -754,7 +806,7 @@ class QCuteZero(nn.Module):
         chunk 0, not added here (see docs/maths.md's mid-sentence-init discussion)."""
         assert self.n_fuse == 1, "generate_free_rollout PoC only supports a single fuse stage (n_fuse==1)"
         cfg = self.cfg
-        hd = cfg.d_model // cfg.n_heads
+        hd = self.head_dim
         device_t = torch.device(device)
         was_training = self.training
         self.eval()
@@ -829,7 +881,7 @@ class QCuteZero(nn.Module):
         way, so verification is always ground truth, never an approximation of it)."""
         cfg = self.cfg
         D = cfg.d_model
-        hd = D // cfg.n_heads
+        hd = self.head_dim
 
         byte_caches = [None] * cfg.n_layers
         refine_caches = [[None] * cfg.n_layers for _ in range(self.n_fuse)]
@@ -1109,8 +1161,12 @@ def build_argparser(description: str) -> tuple:
     p.add_argument("--n_layers", type=int, default=4)
     p.add_argument("--fuse_n_layers", type=int, default=None)
     p.add_argument("--n_heads", type=int, default=4)
+    p.add_argument("--n_kv_heads", type=int, default=None)
+    p.add_argument("--head_dim", type=int, default=None)
+    p.add_argument("--qk_norm", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--mlp_mult", type=int, default=4)
     p.add_argument("--rope_base", type=float, default=10000.0)
+    p.add_argument("--rope_preset", type=str, default="qwen3", choices=list(ROPE_PRESETS))
     p.add_argument("--context_len", type=int, default=256)
     p.add_argument("--attn_window", default=None)
     p.add_argument("--fuse_window", default=None)
@@ -1161,7 +1217,8 @@ def build_argparser(description: str) -> tuple:
 def config_from_args(args) -> Config:
     return Config(
         Ks=args.Ks, d_model=args.d_model, n_layers=args.n_layers, fuse_n_layers=args.fuse_n_layers,
-        n_heads=args.n_heads, mlp_mult=args.mlp_mult, rope_base=args.rope_base, context_len=args.context_len,
+        n_heads=args.n_heads, n_kv_heads=args.n_kv_heads, qk_norm=args.qk_norm, head_dim=args.head_dim,
+        mlp_mult=args.mlp_mult, rope_base=args.rope_base, rope_preset=args.rope_preset, context_len=args.context_len,
         attn_window=args.attn_window, fuse_window=args.fuse_window, input_preset=args.input_preset,
         gumbel_tau=args.gumbel_tau, code_hard=args.code_hard, code_sample=args.code_sample,
         code_ntp_weight=args.code_ntp_weight, cond_weight=args.cond_weight,
