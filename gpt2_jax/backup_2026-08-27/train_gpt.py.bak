@@ -13,8 +13,6 @@ import argparse
 import json
 import math
 import os
-import queue
-import threading
 import time
 from pathlib import Path
 
@@ -191,79 +189,36 @@ def main():
         logits = model(x)
         return cross_entropy_loss(logits, y)
 
-    # Fused grad-accum: the whole microbatch loop runs as one jax.lax.scan inside a single
-    # pmapped call (instead of a Python loop of separate pmap calls each read back to host via
-    # float()) -- avoids grad_accum_steps blocking host<->device syncs per training step, letting
-    # XLA see/optimize the whole step as one graph and keeping dispatch async.
-    def grad_accum_step(params, batch):
-        x_all, y_all = batch  # per-device: [grad_accum_steps, B, T]
+    def grad_step(params, batch):
+        loss, grads = jax.value_and_grad(loss_fn)(params, batch)
+        loss = jax.lax.pmean(loss, "batch")
+        grads = jax.lax.pmean(grads, "batch")
+        return loss, grads
 
-        def scan_fn(carry, xy):
-            loss_sum, grads_sum = carry
-            x, y = xy
-            loss, grads = jax.value_and_grad(loss_fn)(params, (x, y))
-            loss_sum = loss_sum + loss
-            grads_sum = jax.tree.map(jnp.add, grads_sum, grads)
-            return (loss_sum, grads_sum), None
-
-        zero_grads = jax.tree.map(jnp.zeros_like, params)
-        zero_loss = jnp.zeros((), dtype=jnp.float32)
-        (loss_sum, grads_sum), _ = jax.lax.scan(scan_fn, (zero_loss, zero_grads), (x_all, y_all))
-        loss_mean = loss_sum / grad_accum_steps
-        grads_mean = jax.tree.map(lambda g: g / grad_accum_steps, grads_sum)
-        loss_mean = jax.lax.pmean(loss_mean, "batch")
-        grads_mean = jax.lax.pmean(grads_mean, "batch")
-        return loss_mean, grads_mean
-
-    p_grad_accum_step = jax.pmap(grad_accum_step, axis_name="batch")
+    p_grad_step = jax.pmap(grad_step, axis_name="batch")
 
     def apply_step(params, opt_state, grads):
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state
 
-    # donate params/opt_state buffers: after this call the old copies are dead (superseded by
-    # the returned new params/opt_state), so XLA can reuse their device memory in place instead
-    # of allocating fresh buffers every step.
-    p_apply_step = jax.pmap(apply_step, axis_name="batch", donate_argnums=(0, 1))
+    p_apply_step = jax.pmap(apply_step, axis_name="batch")
 
-    def eval_accum_step(params, batch):
-        x_all, y_all = batch  # per-device: [eval_steps, B, T]
+    def eval_step(params, batch):
+        loss = loss_fn(params, batch)
+        return jax.lax.pmean(loss, "batch")
 
-        def scan_fn(loss_sum, xy):
-            x, y = xy
-            return loss_sum + loss_fn(params, (x, y)), None
+    p_eval_step = jax.pmap(eval_step, axis_name="batch")
 
-        loss_sum, _ = jax.lax.scan(scan_fn, jnp.zeros((), dtype=jnp.float32), (x_all, y_all))
-        loss_mean = loss_sum / x_all.shape[0]
-        return jax.lax.pmean(loss_mean, "batch")
-
-    p_eval_accum_step = jax.pmap(eval_accum_step, axis_name="batch")
-
-    def fetch_pmap_batch(loader: DataLoaderLite, steps: int):
-        # Builds one combined [n_devices, steps, B, T] batch (steps = grad_accum_steps or
-        # eval_steps) so the whole accumulation loop above can run as a single scan/pmap call --
-        # each of the n_devices gets its own independently-advanced slice of the SAME loader
-        # (sequential-not-random), consistent across the `steps` dimension.
-        xs = np.empty((n_devices, steps, B, T), dtype=np.int32)
-        ys = np.empty((n_devices, steps, B, T), dtype=np.int32)
-        for s in range(steps):
-            for d in range(n_devices):
-                x, y = loader.next_batch()
-                xs[d, s] = np.asarray(x)
-                ys[d, s] = np.asarray(y)
-        return jnp.asarray(xs), jnp.asarray(ys)
-
-    # Background prefetch: build next step's training batch (host-side numpy/memmap work) on a
-    # separate thread while the device is still executing the current step's pmap call, instead
-    # of blocking the main loop on fetch_pmap_batch between every step.
-    _prefetch_q: queue.Queue = queue.Queue(maxsize=2)
-
-    def _prefetch_worker():
-        while True:
-            _prefetch_q.put(fetch_pmap_batch(train_loader, grad_accum_steps))
-
-    threading.Thread(target=_prefetch_worker, daemon=True).start()
+    def fetch_pmap_batch(loader: DataLoaderLite):
+        # Each of the n_devices gets its own independently-advanced slice of the SAME loader --
+        # sequential-not-random, so this just pulls n_devices consecutive B*T windows.
+        xs, ys = [], []
+        for _ in range(n_devices):
+            x, y = loader.next_batch()
+            xs.append(np.asarray(x))
+            ys.append(np.asarray(y))
+        return jnp.stack(xs), jnp.stack(ys)
 
     for step in range(max_steps):
         t0 = time.time()
@@ -271,14 +226,21 @@ def main():
 
         if step % args.eval_every == 0 or last_step:
             val_loader.reset()
-            val_batch = fetch_pmap_batch(val_loader, args.eval_steps)
-            val_loss = float(p_eval_accum_step(params, val_batch)[0])
+            val_loss = 0.0
+            for _ in range(args.eval_steps):
+                batch = fetch_pmap_batch(val_loader)
+                val_loss += float(p_eval_step(params, batch)[0]) / args.eval_steps
             log(step=step, split="val", loss=val_loss, ppl=math.exp(min(val_loss, 20)))
 
-        batch = _prefetch_q.get()
-        loss, grads = p_grad_accum_step(params, batch)
-        params, opt_state = p_apply_step(params, opt_state, grads)
-        loss_accum = float(loss[0])
+        loss_accum = 0.0
+        grads_accum = None
+        for _ in range(grad_accum_steps):
+            batch = fetch_pmap_batch(train_loader)
+            loss, grads = p_grad_step(params, batch)
+            loss_accum += float(loss[0]) / grad_accum_steps
+            scaled = jax.tree.map(lambda g: g / grad_accum_steps, grads)
+            grads_accum = scaled if grads_accum is None else jax.tree.map(jnp.add, grads_accum, scaled)
+        params, opt_state = p_apply_step(params, opt_state, grads_accum)
 
         dt = time.time() - t0
         tok_per_sec = (B * T * grad_accum_steps * n_devices) / dt

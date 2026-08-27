@@ -106,6 +106,43 @@ single compiled `jax.lax.scan` step instead of a Python-level loop of separate p
 so that run's own compile time wasn't captured this way — its step 0 dt_ms in the JSONL log,
 84.5s, is the equivalent number).
 
+**Dispatch-overhead fix (2026-08-27, `medium_opt_v1`)**: the grad-accum microbatch loop and the
+eval loop each called `float(...)` on a device array every iteration -- a blocking host sync that
+serialized what should've been async-dispatched device work (root-caused after MFU stayed ~13-16%
+despite bf16). Fixed in `gpt2_jax/train_gpt.py` by fusing each loop into a single `jax.lax.scan`
+inside one `pmap` call (`grad_accum_step`/`eval_accum_step`, replacing the old
+`p_grad_step`/`p_eval_step` + Python-loop-with-`float()` pattern), adding a background prefetch
+thread for the next training batch, and `donate_argnums=(0,1)` on the params/opt_state apply step.
+Smoke-tested locally (CPU, grad_accum=1 and 2) before pushing. Also tried
+`LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=98304"` (confirmed valid on this libtpu build,
+via `XLA_FLAGS=--help`'s flag dump) -- three other guessed `XLA_FLAGS` collective-fusion flag
+names were rejected as unknown by this build, dropped rather than guessed further.
+
+**Result: ~94.6K tokens/s steady-state (692.5ms/step)** at batch=16/grad_accum=1/bf16/flash-attn
+on tpu4 (`medium_opt_v1`) -- up from ~70-71K pre-fix, the single biggest throughput jump of the
+day. MFU ≈2.42e9 FLOPs/token x 94.6K tok/s / 1100 TFLOPS peak bf16 (4x v4 chips) ≈ **~21%** (up
+from ~13-14% pre-bf16, ~16% bf16-only). Updated ETA: 152,588 steps (10B tokens / 65536
+total_batch_size) x 692.5ms ≈ **~29.4 hours (~1.2 days)** for 1 epoch. Confirms the blocking-sync
+removal mattered more than the XLA flag (which is still in the launch but unvalidated for actual
+impact in isolation -- not yet ablated separately per the "try all, ablate by removing" plan).
+Original `train_gpt.py`/`model_gpt.py` (pre-bf16, pre-fusion) backed up to
+`gpt2_jax/backup_2026-08-27/`.
+
+Progression on tpu4 today (superseding the earlier list): `medium_flash_c0` (no bf16, batch=12) ->
+`medium_flash_b8ga2` (no bf16, batch=8/ga=2, ~64K tok/s) -> `medium_bf16_b16ga1` (bf16, batch=16,
+~70-71K tok/s) -> **`medium_opt_v1`** (bf16 + fused-scan/prefetch/donate + vmem flag, batch=16,
+~94.6K tok/s) -- current live run, tmux `medium_opt_v1` on tpu4, log `~/medium_opt_v1.log`
+(`logs/medium_opt_v1/` for structured JSONL).
+
+Remaining levers not yet tried: ablate the vmem `LIBTPU_INIT_ARGS` flag alone to isolate its
+actual contribution; re-measure duty cycle/HBM via `tpu-info` at this throughput (not yet done
+post-fix); profile any still-remaining host/XLA dispatch gap with `jax.profiler`.
+
+`gpt2_jax/README.md` (new, 2026-08-27): step-by-step for a fresh session on this lineage (env
+setup, data prep, launch, `tpu-info` monitoring, and the checkpoint-egress-warning / periodic
+`log.jsonl`+`resolved_config.py` pull-back policy -- same policy as CLAUDE.md/tpu_setup.md's
+existing rule for the other TPU lineages, not a new one).
+
 `pyproject.toml`/`uv.lock` fix (2026-08-27): `jax-ai-stack` was hard-pinning `jax==0.8.0`/
 `flax==0.12.0`, silently downgrading the manually-upgraded working versions (jax 0.11.1/flax
 0.12.9) on every plain `uv sync` — confirmed happening on all 4 nodes. Root cause: nothing in the
