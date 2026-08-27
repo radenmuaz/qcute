@@ -51,28 +51,61 @@ Run this inside `tmux` too — it's long enough to be worth detaching from.
 ## 3. Run
 
 Always launch inside a `tmux` session (never a bare blocking `ssh --command`) so it survives a
-dropped connection and so you/the user can attach and watch it live.
+dropped connection and so you/the user can attach and watch it live. Prefer a `--config` file
+(qcute-style, CLI flags override it) over hand-written flags — `configs/gpt2_jax/medium_rope_default.py`
+and `small_rope_default.py` are the paper-faithful configs (see the formula below):
 
 ```bash
 tmux new-session -d -s <run_name> "\
   export LD_LIBRARY_PATH=/home/muaz/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib:\$LD_LIBRARY_PATH && \
   cd ~/qcute && source .venv/bin/activate && \
-  python3 gpt2_jax/train_gpt.py --model medium --pos-method rope \
-    --dataset-dir data/fineweb-edu-10B --use-flash-attention \
-    --batch-size 16 --total-batch-size 65536 --run-name <run_name> \
+  python3 gpt2_jax/train_gpt.py --config configs/gpt2_jax/medium_rope_default.py --run-name <run_name> \
     > ~/<run_name>.log 2>&1; echo TRAIN_EXIT=\$? >> ~/<run_name>.log"
 ```
 
-- `--config configs/gpt2_jax/*.py` also works in place of individual flags (qcute-style config
-  file, CLI flags override it) — see that dir for existing configs.
-- Per-device `--batch-size`/`--total-batch-size` are hardware-dependent, not universal — a v4-8's
-  30.75GB/chip needs `--use-flash-attention` plus bf16 (on by default in `model_gpt.py`'s
-  `ModelConfig`) to fit Cable's own batch_size=16 default; see status_tpu.md for the OOM history
-  if retuning these for a different node/model size.
 - Watch it live: `tail -f ~/<run_name>.log` (raw stdout/stderr) and/or
   `tail -f logs/<run_name>/log.jsonl` (structured, same data) on the node; `tmux attach -t
   <run_name>` or `tmux capture-pane -t <run_name> -p -S -N` (peek without attaching) from another
   session.
+
+### Formula to match Cable's paper baseline (any model size, any device count)
+
+Cable trained on 8x H100; this port runs on 4-chip TPU v4-8 nodes. To stay faithful to the paper
+despite the different device count, keep the paper's own per-device `batch_size` (`MICRO_BATCH_SIZES`
+in `train_gpt.py`: 64/32/16 for tiny/small/medium) AND its own `total_batch_size=524288` fixed --
+let `grad_accum_steps` absorb the device-count difference, exactly per the paper's own formula:
+
+```
+grad_accum_steps = total_batch_size // (batch_size * sequence_length * n_devices)
+```
+
+This is what `configs/gpt2_jax/{small,medium}_rope_default.py` set explicitly (not left to CLI
+defaults, so the recipe is self-documenting). **Caveat found 2026-08-27**: `medium`'s own
+batch_size=16 at this total_batch_size (grad_accum=8, which forces `train_gpt.py`'s fused
+`jax.lax.scan` grad-accum path) OOMs by a small margin (~340MB) even with flash-attention+bf16 --
+more headroom is needed for the scanned path than the grad_accum=1 case ever needed. Fix: pass
+`--batch-size 8` (grad_accum=16) for medium at this total_batch_size; small's own batch_size=32
+(grad_accum=4) fits without adjustment. Both still yield the SAME per-step token count the paper's
+own grad_accum=4(small)/2(medium) on 8 GPUs would (only more microbatches per step, not a
+different sequence of gradient updates).
+
+### Baselines vs. `summformer_jax`'s ablation runs (2026-08-27)
+
+`summformer_jax/` (see [../summformer_jax/README.md](../summformer_jax/README.md)) ablates the
+Ks-hierarchical-summarization + fuse-cross-attn method against these exact baselines, at matched
+`total_batch_size`, matched d_model/n_heads, and the confirmed-identical (see status_tpu.md's
+dataloader audit) `DataLoaderLite`/dataset. Status as of the last check:
+
+| Node | Run | Config | Status |
+|---|---|---|---|
+| tpu4 | `medium_paper_match_b8` | gpt2-medium baseline, `batch_size=8`, paper `total_batch_size=524288` | running, ~102.6K tok/s |
+| tpu5 | `summformer_medium_ablation` | summformer ablation vs. medium (`Ks=(2,2,2,2)`, `n_layers=2`, `d_model=1024`) | running, ~250.2K tok/s |
+| tpu6 | `small_paper_match` | gpt2-small baseline, `batch_size=32`, paper `total_batch_size=524288` | running, ~257.8K tok/s |
+| tpu7 | `summformer_small_ablation` | summformer ablation vs. small (`Ks=(2,2,2,2)`, `n_layers=1`, `d_model=768`) | running, ~599K tok/s |
+
+Param counts: medium baseline 353.8M vs. ablation 279.3M (-21%); small baseline ~123.6M vs.
+ablation ~126.8M (+2.6%). It's expected/fine for the ablation to lose to its baseline if it
+finishes -- the point is an honest comparison at roughly matched compute, not tuning to win.
 
 ## 4. Monitor tpu-info
 

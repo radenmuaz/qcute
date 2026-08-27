@@ -222,7 +222,9 @@ class Config:
     context_len: int = 1024
     attn_window: int | None = None    # None = max (unbounded)
     fuse_window: int | tuple | None = None
-    input_preset: int = 8             # byte alphabet bits -- vocab = 2**input_preset
+    input_preset: int = 8             # byte alphabet bits -- vocab = 2**input_preset, used only if vocab_size is unset
+    vocab_size: int | None = 50304    # GPT2-BPE vocab (50257, padded to 50304), matching gpt2_jax's own Model exactly;
+                                       # None falls back to the byte alphabet (2**input_preset)
     mtp_heads: int = 1                # extra byte-ahead heads (1 = disabled)
     mtp_weight: float = 1.0
     weight_tie: bool = False
@@ -238,7 +240,7 @@ class SummTransformer(nnx.Module):
         self.cfg = cfg
         D = cfg.d_model
         self.head_dim = D // cfg.n_heads
-        V = 2 ** cfg.input_preset
+        V = cfg.vocab_size if cfg.vocab_size is not None else 2 ** cfg.input_preset
         self.vocab = V
         self.n_fuse = len(cfg.Ks) - 1
         assert D % cfg.n_heads == 0
@@ -340,7 +342,6 @@ class SummTransformer(nnx.Module):
         logits = self._readout(x_cross[:, :-1, :])
         targets = byte_ids[:, 1:]
         loss = cross_entropy(logits, targets)
-        acc = (jnp.argmax(logits, axis=-1) == targets).astype(jnp.float32).mean()
 
         mtp_losses, mtp_accs = [], []
         for i, head_i in enumerate(self.extra_heads):
@@ -357,7 +358,7 @@ class SummTransformer(nnx.Module):
             total_loss = total_loss + cfg.mtp_weight * jnp.mean(jnp.stack(mtp_losses))
 
         metrics = {
-            "loss": total_loss, "final_loss": loss, "bpb": loss / math.log(2), "byte_acc": acc,
+            "loss": total_loss, "final_loss": loss, "bpb": loss / math.log(2),
             **{f"mtp{i+2}_loss": l for i, l in enumerate(mtp_losses)},
             **{f"mtp{i+2}_acc": a for i, a in enumerate(mtp_accs)},
         }
