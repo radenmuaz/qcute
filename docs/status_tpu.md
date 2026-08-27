@@ -13,9 +13,9 @@ All prior torch/torch_xla sweeps on tpu4/5/6/7 (`qcute.bytelm_tpu`, the FineWeb-
 `qcute.bytelm_fineweb`/`qcute.bpelm_fineweb` byte/BPE lines) are stopped and archived —
 `run.jsonl` pulled back to local `logs/` for every run that had one, then each node's
 `checkpoints/`, `logs/`, old `.venv`/`.venv-nightly*`, and FineWeb-Edu datasets were deleted for a
-clean slate (76-80GB free on each node afterward). The fineweb-specific scripts/models/configs
-themselves are archived locally at `archive_fineweb_1/` (not deleted, just moved out of the active
-tree) — that byte/BPE-on-FineWeb-Edu line is not being continued.
+clean slate (76-80GB free on each node afterward). The fineweb-specific scripts/models/configs were moved to `archive_fineweb_1/` and later deleted
+outright (2026-08-27) — that byte/BPE-on-FineWeb-Edu line is not being continued; recover them
+from git history (`git log --all -- '*bytelm_fineweb*'`) if ever needed again.
 
 **New direction**: port [Cable](https://github.com/axiomlab/Cable) (the CABLE paper's PyTorch
 nanoGPT, `Cable/src/model_gpt.py`) to JAX, restricted to 3 of its `pos_method` options — `rope`,
