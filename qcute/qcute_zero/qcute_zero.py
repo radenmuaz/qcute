@@ -1,4 +1,4 @@
-"""qcute_zero: a monolithic, single-LM alternative to qcute_v1's multi-encoder StackDecoder
+"""qcute_zero: a monolithic, single-LM alternative to qcute_lagcodec's multi-encoder StackDecoder
 lineage. One transformer LM (level0, byte space); every K bytes it summarizes its own hidden state
 into a discrete code (STE hard sample via the tied embed/head), runs that code sequence through
 the SAME shared blocks for a genuine code-NTP loss + contextualized K/V, then cross-attends that
@@ -11,7 +11,7 @@ speculative decoding, verified exact against `generate_kv_cache`'s incremental s
 2026-08-25: every parallel-decode-strategy experiment (wavefront, blocklocal/GLAT, free rollout,
 early exit, seed_query) pruned -- see backups/qcute_zero_parallel_attempt1.py for that lineage,
 docs/status.md for the full history. Single file by design, primitives adapted from
-qcute_v1_common.py rather than imported.
+qcute_lagcodec_common.py rather than imported.
 
 uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks21_overfit10k.py
 uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks221_overfit10k.py
@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
-# small shared utilities (copied/trimmed from qcute_v1_common.py)
+# small shared utilities (copied/trimmed from qcute_lagcodec_common.py)
 
 def make_dict(**kwargs) -> dict:
     return kwargs
@@ -462,7 +462,7 @@ class Quantizer(nn.Module):
 
 @dataclass
 class Config:
-    Ks: tuple[int, ...] = (32, 32, 1)       # same semantics as qcute_v1: cumulative periods, last
+    Ks: tuple[int, ...] = (32, 32, 1)       # same semantics as qcute_lagcodec: cumulative periods, last
                                               # entry conventionally 1 (no further fuse stage after it)
     d_model: int = 256
     n_layers: int = 4                        # scalar -- shared "block regular", reused for every

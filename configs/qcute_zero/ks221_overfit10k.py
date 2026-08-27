@@ -1,5 +1,5 @@
 """qcute_zero/ks221_overfit10k: Ks=(2,2,1), two fuse stages (periods 2 and 4 bytes) cascading
-through the SAME shared LM. No curriculum -- this is the hard case qcute_v1's StackDecoder needed
+through the SAME shared LM. No curriculum -- this is the hard case qcute_lagcodec's StackDecoder needed
 curriculum_max_srcs/curriculum_step to get working (see docs/status.md's 2026-08-21/22 entry);
 qcute_zero's design expects to not need that (see qcute_zero.py's module docstring). Same
 scale/methodology as ks21_overfit10k.py for direct comparison.

@@ -170,7 +170,7 @@ argument instead of Part 2's exact chain rule.
 
 ## 6. `qcute_zero`: genuinely causal code-conditioning $\Rightarrow$ exact AR chain rule, not just a bound
 
-`qcute_zero` (`qcute/qcute_zero/`) is architecturally different from `qcute_v1`'s `StackDecoder`/
+`qcute_zero` (`qcute/qcute_zero/`) is architecturally different from `qcute_lagcodec`'s `StackDecoder`/
 `StackDecoderLocal` in exactly the one respect that matters for Parts 3 and 5: there is a single
 shared LM doing the byte pass, and each `Ks`-stage periodically *fuses* its own code sequence back
 into the byte stream via cross-attention -- but (verified position-by-position by direct code
@@ -180,7 +180,7 @@ it -- no exception.** Every admissible code $c_j$ at byte position $t$ is $c_j =
 for some chunk with $b_j < t$, i.e. computed purely from bytes strictly earlier than the one being
 predicted.
 
-This is the crucial difference from `qcute_v1`: there, block $i$'s code $c_i = f(x_{B_i})$ is
+This is the crucial difference from `qcute_lagcodec`: there, block $i$'s code $c_i = f(x_{B_i})$ is
 computed from block $i$'s *own* bytes -- so for a byte $x_{i,r}$ being predicted, $c_i$ depends on
 other bytes of the *same* block ($x_{i,r+1},\dots,x_{i,K}$) that haven't been generated yet at
 inference time. Formally, $c_i \notin \sigma(x_{<t})$ for $t$ inside block $i$ -- the code carries
@@ -214,8 +214,8 @@ $$
 $$
 
 with the gap coming *only* from model fit, exactly like a plain byte-level AR LM (`qcute.bytelm`)
--- **not** an ELBO-style bound like `qcute_v1`'s `stack`/`stack_local` (Parts 3, 5). This also
-explains why `qcute_zero` doesn't inherit `qcute_v1`'s "bpb only counts `decode_losses[0]`,
+-- **not** an ELBO-style bound like `qcute_lagcodec`'s `stack`/`stack_local` (Parts 3, 5). This also
+explains why `qcute_zero` doesn't inherit `qcute_lagcodec`'s "bpb only counts `decode_losses[0]`,
 missing `encode_losses[1:]`" gap (Part 4): there is no separate code-transmission cost to add in
 the first place, because the fuse codes carry no information beyond what $x_{<t}$ already
 contains -- nothing is being "sent" that isn't already paid for by the ordinary byte NTP loss.
@@ -235,7 +235,7 @@ lossy encode/decode split.
 | $q(x\mid c)$'s expressiveness | n/a | block-diagonal only (no cross-block visibility) | cross-block self-attention (richer, tighter potential bound) | n/a (no encode/decode split at all) |
 | Validity class vs. plain AR LM | -- | bound only (ELBO) | bound only (ELBO), same as `stack_local` | **identical to plain AR LM** |
 
-## 8. Would retargeting `qcute_v1`'s decode from own-block reconstruction to next-block prediction make it exact, like an AR LM?
+## 8. Would retargeting `qcute_lagcodec`'s decode from own-block reconstruction to next-block prediction make it exact, like an AR LM?
 
 Question (chat, 2026-08-23): instead of decoding block $i$'s bytes from block $i$'s *own* code
 $c_i = f(x_{B_i})$ (the autoencoder-style target Parts 3/5 identify as the source of the
@@ -243,7 +243,7 @@ ELBO-only bound), retarget decode to predict block $i$'s byte *content* from the
 code at block $i-1$** -- i.e. $c_{i-1}$, produced by the upper-level encoder's own causal,
 unconditional NTP pass over blocks $1,\dots,i-1$ only (exactly `Encoder.forward`'s own mechanism,
 already documented as non-circular -- see its docstring's "path (b): upper-level LM predicts the
-next code directly"). Does this make `qcute_v1`'s bpb an exact chain-rule identity rather than
+next code directly"). Does this make `qcute_lagcodec`'s bpb an exact chain-rule identity rather than
 just a bound?
 
 **Yes.** The entire reason Parts 3 and 5 needed the Jensen/ELBO step was that $c_i = f(x_{B_i})$
@@ -291,11 +291,11 @@ So the real, remaining cost is purely statistical, not architectural:
   content from *prior* blocks -- genuinely predictive, but only as good as adjacent-block
   correlation actually is (the same "is the upper LM earning its keep over just re-encoding"
   question CLAUDE.md's "Non-recurrent upper-level plan" already raises, 2026-08-21).
-- With `min_lag=1`, `qcute_v1`'s decode becomes a special case of exactly what `qcute_zero` already
+- With `min_lag=1`, `qcute_lagcodec`'s decode becomes a special case of exactly what `qcute_zero` already
   does (Part 6): a byte's cross-attention target is always strictly past-derived. Run that way, the
   two lineages no longer differ in the property this whole document is about -- only in incidental
   details (shared vs. per-stage weights, curriculum, etc.) -- but nothing stops running the *same*
-  `qcute_v1` codebase in either mode, config to config.
+  `qcute_lagcodec` codebase in either mode, config to config.
 
 So: provably closes the bpb-validity gap, cheap to turn on (one flag), but a genuine statistical
 tradeoff remains (own-block reconstruction signal for AR-LM-valid bpb) -- not a strictly-better
@@ -355,7 +355,7 @@ Parts 3/5/6/8 all reduce to one structural choice: where is a code $c$ allowed t
 information from, relative to the content it conditions? That choice splits every code-augmented
 byte model in this codebase into exactly two paradigms:
 
-- **LM with autoencoder** (`qcute_v1`'s `stack`/`stack_local`): $c_i = f(x_{B_i})$, drawn from the
+- **LM with autoencoder** (`qcute_lagcodec`'s `stack`/`stack_local`): $c_i = f(x_{B_i})$, drawn from the
   *same* content it later helps decode -- code and content are entangled by construction, a real
   encoder/decoder codec sitting inside the generative model.
 - **LM with context compression** (`qcute_zero`): $c_j = g(x_{a_j:b_j})$ with $b_j < t$ always --
@@ -375,7 +375,7 @@ identity, same validity class as a plain AR LM, with nothing extra to count.
 
 ### 9.2 Free rollout ("plan the block, then render it") -- and what this amortizes, precisely
 
-**Correction (2026-08-23, after directly checking every `qcute_v1` generation path -- all 8
+**Correction (2026-08-23, after directly checking every `qcute_lagcodec` generation path -- all 8
 occurrences of `for t in range(K)` across `_stack_generate_blockwise` and its `StackDecoderLocal`
 override): "render an entire block in one shot, no per-byte stepper" overstated what actually
 runs.** Every generation path, `stack_local` included, still generates a block's $K$ bytes one at a
@@ -416,10 +416,10 @@ block-level free rollout -- it drafts individual next tokens from a hidden state
 from an upstream code, and it always verifies against the model's own true output rather than
 committing to a draft unconditionally. It requires nothing more than a well-defined,
 causal-enough per-position hidden state to draft from and verify against -- a requirement both
-paradigms satisfy equally: `qcute_zero`'s shared-LM hidden state, or `qcute_v1`'s track0 hidden
+paradigms satisfy equally: `qcute_zero`'s shared-LM hidden state, or `qcute_lagcodec`'s track0 hidden
 state within a block (itself conditioned on that block's own code, whatever its bpb-validity
 status). `qcute_zero` already implements this exactly (`generate_speculative`, `mtp_heads` drafting
-verified against `generate_kv_cache`'s `_make_incremental_stepper`, `qcute_zero.py`). `qcute_v1`
+verified against `generate_kv_cache`'s `_make_incremental_stepper`, `qcute_zero.py`). `qcute_lagcodec`
 has no equivalent implemented, but nothing about the circularity/free-rollout distinction blocks
 adding one -- the same MTP-head-draft-then-verify scheme could equally sit on top of track0's
 per-byte generation within a block, since verification is always against the model's own real
@@ -429,17 +429,17 @@ output regardless of whether that output's own bpb happens to be exact or only a
 the two paradigms -- a code either can or cannot stand in for content that doesn't exist yet, and
 that single fact determines both properties together. Speculative decoding (9.3) is not on that
 axis at all: it is equally available (implemented, for `qcute_zero`; straightforward to add, for
-`qcute_v1`) to either paradigm, because it only needs a causal hidden state to draft and verify
+`qcute_lagcodec`) to either paradigm, because it only needs a causal hidden state to draft and verify
 from -- not any particular relationship between a code and the content it summarizes.
 
 ## 10. Which paradigm fits which domain (text / audio / image / video)
 
-Corollary of Part 9 (chat, 2026-08-23): is `qcute_v1`'s autoencoder paradigm mainly suited to
+Corollary of Part 9 (chat, 2026-08-23): is `qcute_lagcodec`'s autoencoder paradigm mainly suited to
 non-text domains, and `qcute_zero`'s context-compression paradigm right for text but too slow
 there unless paired with speculative decoding? **Broadly yes**, and Part 9's two structural
 properties (9.1, 9.2) are exactly why:
 
-- **Autoencoder (`qcute_v1`) fits domains with high local redundancy** -- image patches, audio
+- **Autoencoder (`qcute_lagcodec`) fits domains with high local redundancy** -- image patches, audio
   frames, short video clips -- where a block's raw samples are largely determined by a much
   lower-dimensional underlying signal, so one learned code genuinely *can* be close to sufficient
   for reconstructing that block (9.2's premise holds well). This is exactly the standard toolkit
@@ -454,7 +454,7 @@ properties (9.1, 9.2) are exactly why:
   redundancy -- committing early to a block-level code tends to be a much weaker prior for text
   than for pixels.
 - **The cost, precisely per 9.2**: `qcute_zero` has no block-amortization shortcut, so text
-  generation is necessarily byte-by-byte causal -- a genuine throughput cost `qcute_v1`-style
+  generation is necessarily byte-by-byte causal -- a genuine throughput cost `qcute_lagcodec`-style
   domains don't pay (their code-then-render step amortizes a whole block, roughly a $K\times$
   speedup, in one cheap upstream sample). Ordinary MTP-style speculative decoding (9.3) is the
   realistic mitigation, but it only buys a *constant-factor* speedup bounded by how often the
@@ -462,7 +462,7 @@ properties (9.1, 9.2) are exactly why:
   ($K\times$) speedup block amortization gives when it works. For text this constant factor is
   often decent (next-token distributions are frequently locally confident), which is exactly why
   "too slow unless speculative decoding" is the right characterization rather than "unusably slow."
-- **Caveat -- not a strict either/or.** `qcute_v1` runs on text today (this whole codebase's
+- **Caveat -- not a strict either/or.** `qcute_lagcodec` runs on text today (this whole codebase's
   `enwik8` testbed), it just can't claim an exact bpb without the missing `p(c)` term (Part 4).
   Symmetrically, `qcute_zero`'s context-compression codes could in principle be built for
   image/audio/video too -- but forfeiting within-patch/within-frame block amortization is a much
@@ -474,15 +474,15 @@ properties (9.1, 9.2) are exactly why:
 ### 10.1 For/against, restated in objective terms: codec training vs. predictive-LM training
 
 Two follow-on questions (chat, 2026-08-23), moved here from `docs/status.md`'s 2026-08-23 entry of
-the same title: given Part 8 shows `qcute_v1`'s own-block reconstruction only yields an ELBO
+the same title: given Part 8 shows `qcute_lagcodec`'s own-block reconstruction only yields an ELBO
 bound while `qcute_zero`'s predictive fuse gives an exact bpb, why ever train as a codec at all?
 And can predictive codes still support "plan then fill" generation?
 
-**Why ever prefer `qcute_v1`'s own-block reconstruction, given it only yields an ELBO bound, not
+**Why ever prefer `qcute_lagcodec`'s own-block reconstruction, given it only yields an ELBO bound, not
 an exact bpb?** Because the two designs are training the code for genuinely different purposes,
 and bpb-exactness isn't the only thing worth optimizing for:
 
-- `qcute_v1`'s $c_i = f(x_{B_i})$ is trained so that $q(x\mid c_i)$ can reconstruct that *specific*
+- `qcute_lagcodec`'s $c_i = f(x_{B_i})$ is trained so that $q(x\mid c_i)$ can reconstruct that *specific*
   block -- a real rate-distortion/codec objective. The code is guaranteed (by the training
   objective itself) to be a faithful, self-contained, standalone representation of its own block:
   decode it in isolation and you get that block's content back. This is exactly the property the
@@ -497,13 +497,13 @@ and bpb-exactness isn't the only thing worth optimizing for:
   interpretable than "faithfully represents this block."
 - So the choice is precisely the Part 8 tradeoff restated in objective terms: exact-bpb-validity
   and pure forecasting utility (`qcute_zero`) vs. a genuine, inspectable, reconstructible codec
-  (`qcute_v1`), at the cost of the bpb number only being a valid bound (Parts 3/5), not an exact
+  (`qcute_lagcodec`), at the cost of the bpb number only being a valid bound (Parts 3/5), not an exact
   quantity, unless the missing $p(c)$ term (Part 4) is added in.
 
 **Can predictive (`qcute_zero`-style) codes still support "roll out the upper code LM, then
-reconstruct/decode a whole block from the sampled code," the way `qcute_v1`'s
+reconstruct/decode a whole block from the sampled code," the way `qcute_lagcodec`'s
 `generate_level_codes` + `decode_level` does?** No -- genuinely different, not just an
-implementation gap, for the same reason as the bpb question. `qcute_v1`'s decode can do this
+implementation gap, for the same reason as the bpb question. `qcute_lagcodec`'s decode can do this
 because $c_i$ was trained specifically to be *sufficient* to reconstruct block $i$'s real content
 (it was computed from that content) -- so even a *sampled* (not ground-truth) code, once decode
 treats it as if it were real, still gets turned into a fully-committed, specific byte sequence via
@@ -519,11 +519,11 @@ This is the same tension underlying Part 8's tradeoff, restated for generation: 
 simultaneously (a) depend only on the past, which is what exact bpb validity and genuine
 forecasting require, and (b) be sufficient to determine/reconstruct content that is strictly in
 its own future, which is what a "plan the block, then fill it in" generation scheme requires.
-`qcute_v1` chose (b); `qcute_zero` chose (a); no single code can have both properties at once.
+`qcute_lagcodec` chose (b); `qcute_zero` chose (a); no single code can have both properties at once.
 
-## 11. How to actually interpret `qcute_v1`'s reported train/val bpb
+## 11. How to actually interpret `qcute_lagcodec`'s reported train/val bpb
 
-Question (chat, 2026-08-23): given `qcute_v1`'s reported train and val bpb numbers, how should
+Question (chat, 2026-08-23): given `qcute_lagcodec`'s reported train and val bpb numbers, how should
 they be read against a model with a genuinely exact bpb (a plain AR LM, `qcute.bytelm`)?
 
 **They are not the same quantity, and are not directly comparable as reported.** Per Part 4, the
@@ -543,7 +543,7 @@ $\mathrm{bpb}_{\text{total}} = (\text{decode\_losses[0]} + \sum_{i\ge 1}\text{en
 $\mathrm{bpb}_{\text{total}} \ge H(p)/L$, a genuine upper bound, directly comparable in the same
 units and same *direction* of inequality as `qcute.bytelm`'s own reported bpb (which is Part 2's
 plain cross-entropy bound, tight up to model fit only). But note the two bounds are not equally
-tight in general: `qcute_v1`'s bound carries an *extra*, structural gap beyond ordinary model-fit
+tight in general: `qcute_lagcodec`'s bound carries an *extra*, structural gap beyond ordinary model-fit
 looseness -- forcing a **hard/deterministic** encoder ($c=f(x)$, a point mass, `code_hard=True`)
 is itself a specific, generally suboptimal choice of the importance-sampling distribution $q(c\mid
 x)$ in Part 3's derivation; the true posterior $p(c\mid x) \propto p(c)\,q(x\mid c)$ implied by the
@@ -552,9 +552,9 @@ softer encoder could have kept. This is the same "amortization/approximation gap
 discrete-VAE literature -- it doesn't vanish with more training, only with a better choice of
 encoder distribution. So even a fully-counted $\mathrm{bpb}_{\text{total}}$ should be *expected*
 to sit somewhat above a well-trained AR LM's bpb on the same data, not merely equal to it; a
-`qcute_v1` number that comes in *lower* than `qcute.bytelm`'s on the same slice is a red flag that
+`qcute_lagcodec` number that comes in *lower* than `qcute.bytelm`'s on the same slice is a red flag that
 the comparison still isn't fair (almost certainly the missing-encode-term undercount, Part 4),
-not evidence `qcute_v1` is winning.
+not evidence `qcute_lagcodec` is winning.
 
 **Train vs. val, read separately:**
 
@@ -573,14 +573,14 @@ not evidence `qcute_v1` is winning.
   decode-only bpb, however low, simply doesn't measure the thing free-rollout generation quality
   depends on.
 
-**Practical rule of thumb**: use `qcute_v1`'s reported train/val bpb only for *relative*
-comparisons among `qcute_v1` variants (e.g. this session's sharing-ablation grid, comparing codec
+**Practical rule of thumb**: use `qcute_lagcodec`'s reported train/val bpb only for *relative*
+comparisons among `qcute_lagcodec` variants (e.g. this session's sharing-ablation grid, comparing codec
 quality config-to-config), never read as an absolute cross-entropy number, and never compared
-directly against `qcute.bytelm`'s bpb unless the encode-loss term is added in on `qcute_v1`'s side
+directly against `qcute.bytelm`'s bpb unless the encode-loss term is added in on `qcute_lagcodec`'s side
 first. For anything resembling "does this generate well," check free-rollout qual-gen samples
 directly -- bpb/byte_acc alone, at any value, is not sufficient evidence either way.
 
-## 12. Could `qcute_zero` get `qcute_v1`-style free rollout / `stack_local`, and would it stay valid?
+## 12. Could `qcute_zero` get `qcute_lagcodec`-style free rollout / `stack_local`, and would it stay valid?
 
 Three related questions (chat, 2026-08-23): what structurally blocks `qcute_zero` from getting
 Part 9.2's free-rollout feature; is a `stack_local`-style block-local parallel decoder feasible
@@ -621,9 +621,9 @@ just masked off: in *both* `forward` (training) and `generate_no_cache`/`generat
 chunk's own last byte position -- so it always requires that chunk's real bytes to already exist,
 at training time *and* generation time alike. The code-sequence NTP pass (`h_code =
 self._run_blocks(code_embeds, ...)`) is already a genuinely causal model over the code stream
-(same mechanism as `qcute_v1`'s `Encoder.forward`), but nothing currently *samples* a code from it
+(same mechanism as `qcute_lagcodec`'s `Encoder.forward`), but nothing currently *samples* a code from it
 ahead of its own chunk's bytes existing -- that sampling routine (read `h_code[:, -1, :]`, sample
-the next code, exactly `qcute_v1`'s `sample_next` pattern) plus a generation-time wiring to feed it
+the next code, exactly `qcute_lagcodec`'s `sample_next` pattern) plus a generation-time wiring to feed it
 into the loosened-mask `FuseStage` before that chunk's bytes are generated, is new code, not a
 flag. So: moderate, scoped, and buildable from existing load-bearing pieces (`FuseStage`, the code
 NTP, `causal_mask`) -- but not the one-line change `own_code_min_lag` turned out to be.
@@ -638,8 +638,8 @@ one reduces to something that already exists in this codebase rather than a new 
   -- note per Part 9.2's correction this is fidelity of a still-sequential-within-block decode, not
   a literal one-shot render, which nothing in this codebase currently does). This reintroduces
   exactly Part 3's circularity ($c_i \notin \sigma(x_{<t})$) --
-  the resulting bpb is only an ELBO bound, not exact, for the identical reason `qcute_v1`'s
-  `stack_local` is a bound. This is just re-deriving `qcute_v1`'s `StackDecoderLocal` inside
+  the resulting bpb is only an ELBO bound, not exact, for the identical reason `qcute_lagcodec`'s
+  `stack_local` is a bound. This is just re-deriving `qcute_lagcodec`'s `StackDecoderLocal` inside
   `qcute_zero`'s shell -- no advantage over using `StackDecoderLocal` directly.
 - **(B) Use only strictly-past-derived codes**, to preserve exactness. Bpb stays exact (Part 6's
   argument still applies), but you lose real one-shot fidelity: jointly predicting several
@@ -650,15 +650,15 @@ one reduces to something that already exists in this codebase rather than a new 
   decode" capability.
 
 **So**: it can be built, but whichever branch is taken lands back on a mechanism that already
-exists (`qcute_v1`'s `stack_local`, bound-only; or `qcute_zero`'s own `generate_speculative`,
+exists (`qcute_lagcodec`'s `stack_local`, bound-only; or `qcute_zero`'s own `generate_speculative`,
 exact) rather than a genuinely new combination of exact bpb *and* `stack_local`-quality one-shot
 block rendering. This is Part 9's "a code can't have both properties at once" restated once more,
 now specifically against this proposed feature -- consistent with every other angle this document
 has checked it from.
 
-## 13. Stepping back: yes, `qcute_v1`'s own cascade already contains a way to do both -- constructively
+## 13. Stepping back: yes, `qcute_lagcodec`'s own cascade already contains a way to do both -- constructively
 
-Question (chat, 2026-08-23): `qcute_v1`'s cascade already has each level's encoder modeling the
+Question (chat, 2026-08-23): `qcute_lagcodec`'s cascade already has each level's encoder modeling the
 level below's code stream with a genuinely exact, causal NTP (`Encoder.forward`, confirmed by
 direct inspection: pure self-attention over its own input stream, no cross-level attention at
 all -- level $j{+}1$'s NTP never reads anything from level $j{+}2$ or above). Given that, is there
@@ -699,18 +699,18 @@ more forecasting-based conditioning stacks up, exactly Part 8's fidelity cost, n
 across the whole hierarchy rather than incurred once. Nothing about the encoder cascade needs to
 change to get here (it already does its part correctly) -- the entire fix is confined to decode's
 choice of *which* code to condition on, applied consistently at every level rather than left at
-`qcute_v1`'s current own-block default.
+`qcute_lagcodec`'s current own-block default.
 
-## 14. `qcute_v1` (maximally shared) vs. `qcute_zero`: feature parity or not?
+## 14. `qcute_lagcodec` (maximally shared) vs. `qcute_zero`: feature parity or not?
 
-Question (chat, 2026-08-23): given `qcute_v1` can now share weights heavily
+Question (chat, 2026-08-23): given `qcute_lagcodec` can now share weights heavily
 (`kv_lm_mode`/`decoder_own_stage_mode="shared"`), achieve exact bpb (`own_code_min_lag=1`, Part 8)
 and report it correctly (`bpb_valid`, Part 4's fix), and given `qcute_zero` just gained free
 rollout (Part 12's missing piece, now built), is either now a strict subset/superset of the
 other? **No** -- both lineages converge on the same *mathematical* point from either side (Part
 8/9), but three structural differences remain, none of them a missing flag:
 
-| Dimension | `qcute_v1` | `qcute_zero` |
+| Dimension | `qcute_lagcodec` | `qcute_zero` |
 |---|---|---|
 | Default bpb validity | ELBO bound only (`own_code_min_lag=0` default, Parts 3/5) | Exact by construction (Part 6) |
 | Can reach exact bpb | Yes -- `own_code_min_lag=1` (Part 8) | Yes -- native, always |
@@ -721,7 +721,7 @@ other? **No** -- both lineages converge on the same *mathematical* point from ei
 | Code vocabulary | Own PQ-structured combinatorial space (`vocab`, `pq_chunks`), independent of the byte alphabet | Code space *is* the byte alphabet -- one tied embed/output table, flat softmax, no PQ |
 | Incremental KV-cache generation | Yes -- `generate_kv_cache`, verified bit-exact against full recompute | Yes -- `generate_kv_cache`/`_make_incremental_stepper`, verified bit-exact across 315 configs |
 | Speculative decoding | Not implemented (Part 9.3: nothing blocks adding it) | Implemented and verified (`generate_speculative`, MTP heads) |
-| Block-local/parallel same-level decode | Yes -- `StackDecoderLocal` | Not implemented (Part 12's options A/B: buildable, but would cost exact bpb the same way `qcute_v1`'s does if own-block-code) |
+| Block-local/parallel same-level decode | Yes -- `StackDecoderLocal` | Not implemented (Part 12's options A/B: buildable, but would cost exact bpb the same way `qcute_lagcodec`'s does if own-block-code) |
 
 **Reading the table**: rows 1-4 are the ones this whole document is actually about (bpb validity,
 free rollout) -- both sides can now reach the same point, so neither dominates there anymore.
@@ -729,5 +729,5 @@ Rows 5-7 are foundational *design choices*, not gaps: how much to unify weights 
 what a "code" even is (an independent combinatorial alphabet vs. the byte alphabet itself) --
 closing either would mean one lineage becoming a rewrite of the other, not a config change. Rows
 8-9 are genuine, currently one-sided capabilities (speculative decoding only in `qcute_zero`,
-block-local decode only in `qcute_v1`) that plausibly *could* be ported either direction with
+block-local decode only in `qcute_lagcodec`) that plausibly *could* be ported either direction with
 moderate effort (like `generate_free_rollout` just was) -- but haven't been.

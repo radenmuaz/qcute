@@ -4,7 +4,7 @@ Pruned 2026-08-27 — the prior narrative (GLAT-dose experiments/repetition-coll
 investigation, the `qcute_zero.py` parallel-decode-strategy pruning pass, and the full
 `qcute_zero_simple`/`summ_transformer` fork story through 2026-08-25) is now archival, once this
 file passed 700 lines with `summ_transformer` established as a third active lineage alongside
-`qcute_v1`/`qcute_zero`. Full prior history: [docs/archive6/status.md](archive6/status.md) (the
+`qcute_lagcodec`/`qcute_zero`. Full prior history: [docs/archive6/status.md](archive6/status.md) (the
 log this prune supersedes, verbatim), older still [docs/archive5/status.md](archive5/status.md),
 [docs/archive4/status.md](archive4/status.md), [docs/archive3/status.md](archive3/status.md),
 [docs/archive2/status.md](archive2/status.md). For current architecture (not results), see
@@ -71,5 +71,5 @@ back-ported to the active `qcute_zero.py` for parity (it previously only had `sh
 the 2026-08-25 parallel-decode-strategy cleanup, see archive6).
 
 `qcute.bytelm` gained `--seed` (default 1234) + `torch.manual_seed`, matching `qcute_zero`/
-`qcute_v1`/`summ_transformer` — previously the only one of the four training modules with no seed
+`qcute_lagcodec`/`summ_transformer` — previously the only one of the four training modules with no seed
 control at all.

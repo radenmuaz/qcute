@@ -1,5 +1,5 @@
-"""qcute_zero: a monolithic, single-LM alternative to qcute_v1's multi-encoder StackDecoder
-lineage (see CLAUDE.md's Architecture section for qcute_v1; this is a separate lineage, not a
+"""qcute_zero: a monolithic, single-LM alternative to qcute_lagcodec's multi-encoder StackDecoder
+lineage (see CLAUDE.md's Architecture section for qcute_lagcodec; this is a separate lineage, not a
 fork of it). Design, restated (chat 2026-08-22):
 
 There is exactly ONE transformer LM (level0, byte space). Every K bytes it summarizes its own
@@ -12,7 +12,7 @@ previous codes, using the identical loss machinery as byte NTP -- "free" via wei
 separate per-level encoder needed) and (b) contextualized representations that become the K/V for
 a cross-attention stage feeding back into the byte-level query stream. Repeat for every entry in
 `Ks` (len(Ks)-1 "fuse" stages total, one per cumulative period Ks[0], Ks[0]*Ks[1], ... -- same Ks
-semantics as qcute_v1) -- each stage's codes are built FROM the previous stage's own contextualized
+semantics as qcute_lagcodec) -- each stage's codes are built FROM the previous stage's own contextualized
 hidden state, a genuine cascade, not independent re-samples of the raw byte hidden state.
 
 Causality: every code's causal boundary is its CUMULATIVE byte-span (`cum_K*(block_idx+1)-1`, in
@@ -33,16 +33,16 @@ provably clean no-op contribution, not an arbitrary bias, and immune to NaN. Bec
 value is exactly zero, whether it's "rotated" by RoPE is moot (a zero vector rotates to itself);
 it's simplest to just prepend it after RoPE has been applied to the real keys.
 
-No curriculum needed by design (unlike qcute_v1's max_srcs/curriculum_max_srcs hack): every fuse
+No curriculum needed by design (unlike qcute_lagcodec's max_srcs/curriculum_max_srcs hack): every fuse
 stage's code source is the SAME shared, already-training backbone from step 1 (nothing is a fresh,
-untouched, randomly-initialized module the way each qcute_v1 encoder level was), and the zero-sink
+untouched, randomly-initialized module the way each qcute_lagcodec encoder level was), and the zero-sink
 lets a stage's own freshly-initialized cross-attention weights learn to suppress themselves early
 (put softmax weight on the sink) and gradually rely on real codes as those weights improve -- an
 emergent, learned on-ramp instead of a hand-scheduled one. Expected, not yet proven -- the whole
 point of the ks21/ks221-no-curriculum runs this file's plan calls for.
 
 Query for "what predicts a new position" is the ordinary previous-token hidden state (no seed/BOS
-token at all, unlike qcute_v1) -- pure standard AR continuation, causal by construction.
+token at all, unlike qcute_lagcodec) -- pure standard AR continuation, causal by construction.
 
 Real incremental KV caching (`generate_kv_cache`): byte-level self.blocks self-attention and each
 fuse stage's post-cross-attn refinement self.blocks pass are cached across generation steps
@@ -63,7 +63,7 @@ simpler `qcute.bytelm` trunk: `qcute/bytelm_queryvec/bytelm_queryvec.py` (`qcute
 the original fork of this file holding that mechanism, is now redundant/archived).
 
 Single file by design for now (explicitly asked: "make thing single file first refactor later") --
-copies/adapts primitives from qcute_v1_common.py (Block/RoPE/Logger/data-loading/train-loop shapes)
+copies/adapts primitives from qcute_lagcodec_common.py (Block/RoPE/Logger/data-loading/train-loop shapes)
 rather than importing them, since this is meant to stay a separate, prunable lineage.
 
 uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks21_overfit10k.py
@@ -84,7 +84,7 @@ from tqdm import tqdm
 
 
 # ----------------------------------------------------------------------------
-# small shared utilities (copied/trimmed from qcute_v1_common.py)
+# small shared utilities (copied/trimmed from qcute_lagcodec_common.py)
 # ----------------------------------------------------------------------------
 
 def make_dict(**kwargs) -> dict:
@@ -450,7 +450,7 @@ def gumbel_quantize(logits: torch.Tensor, tau: float, hard: bool = True, sample:
 
 @dataclass
 class Config:
-    Ks: tuple[int, ...] = (32, 32, 1)       # same semantics as qcute_v1: cumulative periods, last
+    Ks: tuple[int, ...] = (32, 32, 1)       # same semantics as qcute_lagcodec: cumulative periods, last
                                               # entry conventionally 1 (no further fuse stage after it)
     d_model: int = 256
     n_layers: int = 4                        # scalar -- shared "block regular", reused for every
@@ -716,7 +716,7 @@ class QCuteZero(nn.Module):
         (uncond fallback if n_fuse==0), code_kv_cache is the per-stage (h_code, code_pos_abs,
         window) list, final_h is the raw final hidden state (pre-readout) generate_speculative's
         MTP-head drafting reads from. Used by _forward_next_byte_logits so there is exactly one
-        generation-time code path, not two drifting copies -- unlike qcute_v1's
+        generation-time code path, not two drifting copies -- unlike qcute_lagcodec's
         generate_no_cache/_stack_generate_blockwise split (see docs/status.md's 2026-08-21/22
         generation-bug entry for why that split is risky)."""
         cfg = self.cfg
@@ -794,7 +794,7 @@ class QCuteZero(nn.Module):
         """2026-08-23 PoC (docs/maths.md Part 12's missing piece, now built): every other
         generate_* method always extracts a fuse stage's code from the REAL trunk hidden state at
         that chunk's own last byte -- requiring that chunk's bytes to already exist, so free
-        rollout (qcute_v1's own-chunk-code-before-its-bytes trick, Part 8) was never possible here.
+        rollout (qcute_lagcodec's own-chunk-code-before-its-bytes trick, Part 8) was never possible here.
         This instead samples stage 0's NEXT code from its own already-trained causal NTP
         (h_code[:, -1, :], same gumbel_quantize head used everywhere else) using only chunks that
         are already real, THEN decodes the new chunk's own K bytes one at a time cross-attending

@@ -12,10 +12,10 @@ uv run python -m qcute.bytelm --preset sd       # byte-level baseline LM (Phase 
 uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_1M_8192.model   # BPE baseline
 uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_ctx1024.py   # named, reproducible byte-level run
 uv run python scripts/plot_run.py logs/<run_name>   # train/val bpb PNG from a run's run.jsonl
-uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks21_v256_pq1_overfit10k.py
-                                                 # ACTIVE lineage: qcute_v1 (qcute/qcute_v1/) — the
+uv run python -m qcute.qcute_lagcodec.qcute_lagcodec --decoder_type stack --config configs/lagcodec/lagcodec_stack_simplex/ks21_v256_pq1_overfit10k.py
+                                                 # ACTIVE lineage: qcute_lagcodec (qcute/qcute_lagcodec/) — the
                                                  # latent-AR / parallel-block-local-decode rewrite.
-                                                 # Full design doc: docs/qcute_v1_plan.md.
+                                                 # Full design doc: docs/qcute_lagcodec_plan.md.
 uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks21_overfit10k.py
                                                  # ACTIVE lineage: qcute_zero (qcute/qcute_zero/) — monolithic
                                                  # single-shared-LM design, see Architecture below.
@@ -30,7 +30,7 @@ uv run python gpt2_jax/train_gpt.py --model tiny --pos-method rope --dataset-dir
                                                  # docs/status_tpu.md for current run state.
 ```
 
-`qcute.bytelm`, `qcute.bpelm`, `qcute.qcute_v1.qcute_v1`, `qcute.qcute_zero.qcute_zero`, and
+`qcute.bytelm`, `qcute.bpelm`, `qcute.qcute_lagcodec.qcute_lagcodec`, `qcute.qcute_zero.qcute_zero`, and
 `qcute.summformer.summformer` all read `--help` for their full flag
 list; all support `--config path.py` (see `configs/` — every config file
 has its own module docstring explaining what it's testing and its exact
@@ -163,17 +163,17 @@ for all three lives in [docs/status.md](docs/status.md), not here — this secti
 fresh session to where each lineage's code and design docs are, and gives durable (non-dated)
 reference material.
 
-- **`qcute_v1`** (`qcute/qcute_v1/`) — latent-AR / parallel-block-local-decode rewrite of
+- **`qcute_lagcodec`** (`qcute/qcute_lagcodec/`) — latent-AR / parallel-block-local-decode rewrite of
   `qcute_v5` (now frozen/archived at `qcute/v5_old/`): only the top level is a genuine NTP/AR
   decoder, every level below decodes via a per-block seed token (interleaved self-attention +
   cross-attention to that block's own code). Design narrative, worked examples, staged plan:
-  [docs/qcute_v1_plan.md](docs/qcute_v1_plan.md). `--decoder_type`: `stack` (current default,
+  [docs/qcute_lagcodec_plan.md](docs/qcute_lagcodec_plan.md). `--decoder_type`: `stack` (current default,
   non-interleaved, less memory), `stack_v1` (legacy interleaved-seed-token mechanism), `stack_local`
   (block-diagonal same-level conditioning), `stack_sync` (design-note stub, unimplemented) — see
-  `qcute_v1_decoder.py` docstrings for the difference between them.
+  `qcute_lagcodec_decoder.py` docstrings for the difference between them.
 - **`qcute_zero`** (`qcute/qcute_zero/`) — monolithic single-shared-LM design: one LM does both the
   byte pass and every fuse-stage's own code-sequence pass, periodic cross-attention back into the
-  byte stream, no curriculum by design. Why this avoids `qcute_v1`'s free-rollout collapse, its
+  byte stream, no curriculum by design. Why this avoids `qcute_lagcodec`'s free-rollout collapse, its
   incremental KV cache, and full history: [docs/archive5/status.md](docs/archive5/status.md).
   Formal bpb-validity/paradigm-comparison writeup: [docs/maths.md](docs/maths.md). **Checkpoint
   caveat**: use `last.pt`, not `best.pt` — `Checkpointer`'s val_loss-based selection is a bad proxy

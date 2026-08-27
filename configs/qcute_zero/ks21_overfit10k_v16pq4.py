@@ -2,7 +2,7 @@
 input_preset=8) but with the pluggable Quantizer (2026-08-24) set to vocab=16, pq_chunks=4
 instead of the default vocab=256, pq_chunks=1 -- product-quantized categorical code, combinatorial
 capacity 16**4=65536 (vs the default's flat 256), same "v16pq4" naming convention as this
-session's qcute_v1 sharing-ablation grid. Tests whether the richer/PQ-structured code
+session's qcute_lagcodec sharing-ablation grid. Tests whether the richer/PQ-structured code
 representation trains/overfits comparably to the default flat-256 code at the same overfit10k
 scale (n_bytes=10000, context_len=256). mtp_heads=4 added (2026-08-24) so
 --eval_decode_mtp_verify can show MTP-drafted speculative decode (verified against NTP) during

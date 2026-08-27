@@ -176,7 +176,7 @@ Downloads/writes `datasets/enwik8.gz` (full 100,000,000-byte corpus) and
 
 ## 6. Smoke test: `--device xla` actually needed
 
-`qcute.bytelm_tpu` (unlike plain `qcute.bytelm`/`qcute.qcute_v1.qcute_v1`) auto-detects and uses
+`qcute.bytelm_tpu` (unlike plain `qcute.bytelm`/`qcute.qcute_lagcodec.qcute_lagcodec`) auto-detects and uses
 the TPU by default — but always check the run's own startup log line for `device=xla(...)`, not
 just that the process didn't crash; a silent CPU fallback (e.g. torch_xla import failing) is easy
 to miss otherwise.

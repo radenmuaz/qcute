@@ -3,7 +3,7 @@ Single shared LM (byte pass + this stage's own code-sequence NTP pass reuse the 
 blocks/embed), zero-KV sink mandatory on every attention call, NO curriculum (see
 qcute_zero.py's module docstring for why none should be needed by design -- every fuse stage's
 code source is the same already-training backbone from step 1, and the sink lets under-trained
-fuse-attention weights self-suppress early on). Matches qcute_v1's ks21_v256_pq1_overfit10k.py in
+fuse-attention weights self-suppress early on). Matches qcute_lagcodec's ks21_v256_pq1_overfit10k.py in
 scale/methodology (n_bytes=10000, context_len=256) for direct comparison.
 
 uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks21_overfit10k.py

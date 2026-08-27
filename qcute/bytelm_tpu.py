@@ -46,7 +46,7 @@ Differences from qcute.bytelm:
     XLA graph doesn't grow unbounded across a no-grad loop. All hot-path tensor shapes (batch,
     context, mtp_heads) are fixed for the whole run, so this should not recompile per step.
   - Checkpointer.is_better guards against a non-finite or non-positive metric (copied from
-    qcute_v1_common.py's version — bf16 TPU training can occasionally spike to nan/inf; a bad
+    qcute_lagcodec_common.py's version — bf16 TPU training can occasionally spike to nan/inf; a bad
     checkpoint from that is worse than skipping a save).
   - CausalSelfAttention.zero_kv_sink option (default ON): prepends one all-zero key/value
     ("sink") token before every real token, visible to every query unconditionally, before SDPA.
@@ -211,7 +211,7 @@ class Logger:
 class Checkpointer:
     """checkpoints/<run_name>/{best,last}.pt. is_better rejects a non-finite or non-positive
     metric (bf16 TPU training can spike to nan/inf; a checkpoint saved on that spike is worse
-    than just skipping the save) — copied from qcute_v1_common.py's Checkpointer."""
+    than just skipping the save) — copied from qcute_lagcodec_common.py's Checkpointer."""
 
     def __init__(self, run_dir: Path, save_every_n_evals: int = 1, minimize: bool = True):
         run_dir.mkdir(parents=True, exist_ok=True)

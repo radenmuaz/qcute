@@ -20,11 +20,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from qcute.qcute_v1.qcute_v1_common import Config
-from qcute.qcute_v1.qcute_v1_decoder import (
+from qcute.qcute_lagcodec.qcute_lagcodec_common import Config
+from qcute.qcute_lagcodec.qcute_lagcodec_decoder import (
     encode_like_self_attn_decode, seed_query_decode, upper_track_step, sample_next_byte,
 )
-from qcute.qcute_v1.qcute_v1 import QCuteLM
+from qcute.qcute_lagcodec.qcute_lagcodec import QCuteLM
 
 CKPT = "logs/v1_stack_simplex_ks221_v256_pq1_overfit10k_window16_relaxed/last.pt"
 DATA = "datasets/enwik8_1M.gz"
