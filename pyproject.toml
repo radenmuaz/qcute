@@ -8,15 +8,20 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "datasets>=5.0.1",
+    "flax>=0.12.9",
     "huggingface-hub[cli]>=1.28.0",
-    "jax-ai-stack>=2025.10.28",
+    "jax[tpu]>=0.11.1; sys_platform == 'linux'",
+    "jax>=0.11.1; sys_platform != 'linux'",
     "matplotlib>=3.11.1",
     "numpy>=2.5.1",
+    "optax>=0.2.8",
+    "orbax-checkpoint>=0.12.4",
     "pyarrow>=25.0.1",
     "sentencepiece>=0.2.2",
     "tiktoken>=0.14.0",
     "torch>=2.13.0",
     "tqdm>=4.70.0",
+    "tpu-info>=0.14.2",
 ]
 
 [tool.uv]

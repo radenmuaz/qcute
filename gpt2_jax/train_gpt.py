@@ -94,9 +94,7 @@ def main():
     p.add_argument("--max-steps", type=int, default=None, help="override computed max_steps (for smoke tests)")
     p.add_argument("--lr", type=float, default=None, help="override MAX_LR (peak learning rate); MIN_LR stays 0.1x this")
     p.add_argument("--run-name", type=str, default=None, help="override the auto-derived run_name (else derived from --config/model/pos-method)")
-    p.add_argument("--use-flash-attention", action="store_true",
-                    help="use JAX's Pallas TPU flash-attention kernel in place of plain materialized attention "
-                         "(this port's own addition, not in Cable's original -- see model_gpt.py's ModelConfig docstring)")
+    p.add_argument("--use-flash-attention", action="store_true")
 
     if pre_args.config:
         config_vars = load_config_module(pre_args.config)
@@ -248,6 +246,8 @@ def main():
         tok_per_sec = (B * T * grad_accum_steps * n_devices) / dt
         lr = float(schedule(step))
         log(step=step, split="train", loss=loss_accum, lr=lr, dt_ms=dt * 1000, tok_per_sec=tok_per_sec)
+        if step == 0:
+            print(f"[compile] step 0 wall time (includes first-call XLA compile): {dt:.2f}s", flush=True)
 
         if last_step:
             single = jax.tree.map(lambda x: x[0], params)

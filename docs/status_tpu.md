@@ -73,11 +73,47 @@ Cable's own 524288 since grad_accum=1 was prioritized over matching that exact t
 instruction). At that throughput, 1 epoch (10B tokens // 49152 = 203,450 steps) is
 **~45 hours (~1.9 days)**.
 
-**Real launch (2026-08-27, tpu4, tmux `medium_flash_c0`)**: `python3 gpt2_jax/train_gpt.py --model
-medium --pos-method rope --dataset-dir data/fineweb-edu-10B --use-flash-attention --batch-size 12
---total-batch-size 49152 --run-name medium_rope_flash_b12`, log `~/medium_flash_c0.log` on the
-node (`logs/medium_rope_flash_b12/` for the structured JSONL) — target: `gpt2_jax/
-CABLE_PAPER_NOTES.md`'s RoPE/medium perplexity ≈16.9 at context=1024.
+**Superseded (2026-08-27) by bf16 mixed precision** — `gpt2_jax/model_gpt.py`'s `ModelConfig` now
+has `compute_dtype`/`param_dtype` (default bf16 compute / fp32 param master), wired through every
+`nnx.Linear`/`nnx.Embed` (matmul-heavy layers), matching Cable's own `torch.autocast(bfloat16)`.
+`LayerNorm` and the final tied-head logits/loss stay fp32 (numerically sensitive, matches
+autocast's own policy), as does RoPE's cos/sin table before being cast down to q/k's dtype.
+Verified locally: forward/backward run correctly, params/grads stay fp32 (master copy), only the
+Linear/Embed matmuls actually execute in bf16.
+
+**With bf16, Cable's own original batch_size=16/grad_accum=1 now fits** (previously OOM'd even
+with flash-attention, ~160MB short) — confirms the earlier flash-attention OOM was genuinely
+non-attention memory pressure, and bf16 (halved activation/param-compute footprint) was the fix,
+not more flash-attention tuning. Steady-state ~920-930ms/step, **~70-71K tokens/s** (up from
+~61.7K at batch=12/no bf16, ~64K at batch=8,grad_accum=2/no bf16 — the best throughput yet), HBM
+27-28.6GiB/30.75GiB per chip (close to ceiling but stable), duty cycle ~73%. `total_batch_size`
+still 65536 (not Cable's 524288) since grad_accum=1 is still prioritized per earlier instruction.
+
+Progression on tpu4 today: `medium_flash_c0` (no bf16, batch=12, flash-attn) → stopped → 
+`medium_flash_b8ga2` (no bf16, batch=8/grad_accum=2, flash-attn, ~64K tok/s) → stopped →
+**`medium_bf16_b16ga1`** (bf16 + flash-attn, batch=16/grad_accum=1, ~70-71K tok/s) — current live
+run, tmux `medium_bf16_b16ga1` on tpu4, log `~/medium_bf16_b16ga1.log`
+(`logs/medium_bf16_b16ga1/` for structured JSONL). Target: `gpt2_jax/CABLE_PAPER_NOTES.md`'s
+RoPE/medium perplexity ≈16.9 at context=1024.
+
+MFU at batch=12/no-bf16 was measured ~13-14% (duty cycle ~85-87%); not yet re-measured for the
+bf16 run. Known remaining levers to close the gap (not yet done): profile step-to-step host/XLA
+dispatch overhead (duty cycle sub-100% suggests some), fuse the grad-accum microbatch loop into a
+single compiled `jax.lax.scan` step instead of a Python-level loop of separate pmap calls.
+
+`gpt2_jax/train_gpt.py` now prints `[compile] step 0 wall time (includes first-call XLA compile):
+{dt}s` after step 0, for future launches (added after `medium_bf16_b16ga1` was already compiling,
+so that run's own compile time wasn't captured this way — its step 0 dt_ms in the JSONL log,
+84.5s, is the equivalent number).
+
+`pyproject.toml`/`uv.lock` fix (2026-08-27): `jax-ai-stack` was hard-pinning `jax==0.8.0`/
+`flax==0.12.0`, silently downgrading the manually-upgraded working versions (jax 0.11.1/flax
+0.12.9) on every plain `uv sync` — confirmed happening on all 4 nodes. Root cause: nothing in the
+repo actually imports jax-ai-stack's other sub-packages (chex/grain/orbax-export/tensorflow), so
+it was dropped entirely in favor of depending on `jax[tpu]` (Linux-only via `sys_platform`
+marker)/`flax`/`optax`/`orbax-checkpoint` directly at the versions actually in use. `tpu-info` also
+added as a tracked dependency (was previously an ad-hoc `uv pip install` per node). `uv sync` now
+converges to the correct versions/extras on its own, verified on all 4 nodes.
 
 - **tpu6** (`35.186.110.50`) — env fully set up (`.venv` + `jax[tpu]` + `flax`, 4 chips confirmed),
   otherwise idle, ready for a run.

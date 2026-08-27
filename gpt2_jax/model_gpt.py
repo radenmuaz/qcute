@@ -1,14 +1,4 @@
-"""JAX/Flax NNX port of Cable/src/model_gpt.py (https://github.com/axiomlab/Cable), exact
-architecture port restricted to 3 of that repo's `pos_method` options (the rest — cable/kcable/
-alibi/fire/kerple/t5bias/rotali/sinusoidal — are not ported):
-
-  - "rope"      -- pos_methods/rope.py: rotary embeddings applied to q/k in attention, no
-                   positional signal added to the input embedding.
-  - "learnable" -- GPT-2's own original absolute position embedding (a `wpe` table added to
-                   the token embedding), plain (BASE_ATTENTION) attention otherwise.
-  - "base"      -- NoPE: BASE_ATTENTION with no wpe and no rotary -- no positional signal
-                   anywhere in the model.
-
+"""
 Same LayerNorm+GELU nanoGPT block structure, weight-tied lm_head/wte, and NANOGPT_SCALE_INIT
 residual-projection init scaling (std *= (2*n_layer)**-0.5) as the PyTorch original -- see that
 file's own docstring-equivalent comments for design rationale, not repeated here.
@@ -38,15 +28,12 @@ class ModelConfig:
     n_layer: int = 6
     n_head: int = 8
     n_embd: int = 512
-    use_flash_attention: bool = False  # not in Cable's own model -- a memory/speed opt-in
-    # (this port's own addition, not present in Cable's PyTorch original) using JAX's Pallas TPU
-    # flash-attention kernel in place of the plain jnp.einsum+softmax path below. Mathematically
-    # equivalent (same causal-softmax-attention), verified against the plain path on 4 TPU
-    # chips via pmap: max abs diff 0.031, mean 0.0013 (bf16-level variance) -- see gpt2_jax's own
-    # status notes. Needed because plain attention's O(B*H*T^2) materialized score matrix hits
-    # this hardware's HBM ceiling well before Cable's own paper defaults (tuned for 8x H100 80GB,
-    # not a v4 TPU's 30.75GB/chip) -- e.g. the "medium" model OOMs at batch_size=16 (Cable's own
-    # default) without this.
+    use_flash_attention: bool = False
+    # mixed precision: matmuls (Linear/Embed) compute in this dtype, params stored in
+    # param_dtype (fp32) as the master copy; LayerNorm/softmax/loss stay fp32 for stability,
+    # matching torch.autocast's own policy in Cable's original.
+    compute_dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.float32
 
 
 def _linear_init(std: float):
@@ -55,10 +42,14 @@ def _linear_init(std: float):
 
 class MLP(nnx.Module):
     def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
-        self.c_fc = nnx.Linear(config.n_embd, 4 * config.n_embd, kernel_init=_linear_init(0.02), rngs=rngs)
+        self.c_fc = nnx.Linear(
+            config.n_embd, 4 * config.n_embd, kernel_init=_linear_init(0.02),
+            dtype=config.compute_dtype, param_dtype=config.param_dtype, rngs=rngs,
+        )
         self.c_proj = nnx.Linear(
             4 * config.n_embd, config.n_embd,
-            kernel_init=_linear_init(0.02 * (2 * config.n_layer) ** -0.5), rngs=rngs,
+            kernel_init=_linear_init(0.02 * (2 * config.n_layer) ** -0.5),
+            dtype=config.compute_dtype, param_dtype=config.param_dtype, rngs=rngs,
         )
 
     def __call__(self, x):
@@ -83,7 +74,9 @@ def _rotate_half(x):
 
 
 def _apply_rope(x, cos, sin):
-    # x: [B, H, T, rotary_dim]
+    # x: [B, H, T, rotary_dim]. cos/sin computed fp32 (frequency precision matters); cast
+    # down to x's dtype so this doesn't silently upcast bf16 q/k back to fp32.
+    cos, sin = cos.astype(x.dtype), sin.astype(x.dtype)
     return x * cos[None, None] + _rotate_half(x) * sin[None, None]
 
 
@@ -101,10 +94,14 @@ class CausalSelfAttention(nnx.Module):
         self.head_dim = config.n_embd // config.n_head
         self.rotary_dim = min(64, self.head_dim)  # matches Cable's RotaryEmbedding(dim=64)
         self.use_flash_attention = config.use_flash_attention and _HAS_FLASH_ATTENTION
-        self.c_attn = nnx.Linear(config.n_embd, 3 * config.n_embd, kernel_init=_linear_init(0.02), rngs=rngs)
+        self.c_attn = nnx.Linear(
+            config.n_embd, 3 * config.n_embd, kernel_init=_linear_init(0.02),
+            dtype=config.compute_dtype, param_dtype=config.param_dtype, rngs=rngs,
+        )
         self.c_proj = nnx.Linear(
             config.n_embd, config.n_embd,
-            kernel_init=_linear_init(0.02 * (2 * config.n_layer) ** -0.5), rngs=rngs,
+            kernel_init=_linear_init(0.02 * (2 * config.n_layer) ** -0.5),
+            dtype=config.compute_dtype, param_dtype=config.param_dtype, rngs=rngs,
         )
 
     def __call__(self, x):
@@ -130,10 +127,12 @@ class CausalSelfAttention(nnx.Module):
                 causal=True, sm_scale=1.0 / math.sqrt(hd),
             ).astype(x.dtype)
         else:
+            # softmax in fp32 for stability, matching autocast's own policy; matmuls stay
+            # in q/k/v's compute dtype (bf16).
             scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) / math.sqrt(hd)
             causal_mask = jnp.tril(jnp.ones((T, T), dtype=bool))
-            scores = jnp.where(causal_mask[None, None], scores, -jnp.inf)
-            attn = jax.nn.softmax(scores, axis=-1)
+            scores = jnp.where(causal_mask[None, None], scores.astype(jnp.float32), -jnp.inf)
+            attn = jax.nn.softmax(scores, axis=-1).astype(v.dtype)
             y = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, C)
         return self.c_proj(y)
@@ -141,9 +140,10 @@ class CausalSelfAttention(nnx.Module):
 
 class Block(nnx.Module):
     def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
-        self.ln_1 = nnx.LayerNorm(config.n_embd, rngs=rngs)
+        # LayerNorm stays fp32 compute (reduction precision matters), regardless of compute_dtype.
+        self.ln_1 = nnx.LayerNorm(config.n_embd, dtype=jnp.float32, param_dtype=config.param_dtype, rngs=rngs)
         self.attn = CausalSelfAttention(config, rngs=rngs)
-        self.ln_2 = nnx.LayerNorm(config.n_embd, rngs=rngs)
+        self.ln_2 = nnx.LayerNorm(config.n_embd, dtype=jnp.float32, param_dtype=config.param_dtype, rngs=rngs)
         self.mlp = MLP(config, rngs=rngs)
 
     def __call__(self, x):
@@ -155,13 +155,21 @@ class Block(nnx.Module):
 class Model(nnx.Module):
     def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
         self.config = config
-        self.wte = nnx.Embed(config.vocab_size, config.n_embd, embedding_init=_linear_init(0.02), rngs=rngs)
+        self.wte = nnx.Embed(
+            config.vocab_size, config.n_embd, embedding_init=_linear_init(0.02),
+            dtype=config.compute_dtype, param_dtype=config.param_dtype, rngs=rngs,
+        )
         self.wpe = (
-            nnx.Embed(config.block_size, config.n_embd, embedding_init=_linear_init(0.02), rngs=rngs)
+            nnx.Embed(
+                config.block_size, config.n_embd, embedding_init=_linear_init(0.02),
+                dtype=config.compute_dtype, param_dtype=config.param_dtype, rngs=rngs,
+            )
             if config.pos_method == "learnable" else None
         )
         self.h = nnx.List([Block(config, rngs=rngs) for _ in range(config.n_layer)])
-        self.ln_f = nnx.LayerNorm(config.n_embd, rngs=rngs)
+        # fp32 for the final norm + tied-head logits/loss -- numerically sensitive, cheap
+        # relative to the rest of the model (one matmul), matches autocast's own policy.
+        self.ln_f = nnx.LayerNorm(config.n_embd, dtype=jnp.float32, param_dtype=config.param_dtype, rngs=rngs)
         # weight-tied lm_head: reuse wte's embedding matrix as the output projection kernel
         # directly in __call__ (no separate nnx.Linear/param -- see forward below), matching
         # `self.transformer.wte.weight = self.lm_head.weight` in the PyTorch original.
