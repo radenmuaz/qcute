@@ -6,7 +6,7 @@ flash-attention -- see below), no_zero_kv_sink.
 use_flash_attention=False here: tpu4 runs the STABLE torch_xla==2.9.0 pin
 (libtpu==0.0.21), which per this repo's own findings does not support the Pallas
 flash-attention kernel at all (needs a nightly build, libtpu>=0.0.44 -- see
-docs/bytelm_tpu_setup.md's "Optional: nightly build" section). A first attempt at
+docs/tpu_setup.md's "Optional: nightly build" section). A first attempt at
 --use_flash_attention here (2026-08-23) additionally installed jax[tpu] to satisfy the
 kernel's internal jax dependency, which silently upgraded libtpu to 0.0.46 as a side
 effect and broke --multichip's grpc-based multi-process TPU coordination entirely

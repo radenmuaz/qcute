@@ -9,19 +9,28 @@ uv sync                                         # install/update env from pyproj
 uv run python scripts/prepare_data.py           # download/cut datasets/enwik8{,_1M}.gz
 uv run python scripts/train_bpe.py --data datasets/enwik8_1M.gz   # BPE tokenizer for qcute.bpelm
 uv run python -m qcute.bytelm --preset sd       # byte-level baseline LM (Phase 0), reports BPB
+uv run python -m qcute.archive.qcutelm          # end-to-end tokenizer + latent LM (FSQ/BSQ) — ARCHIVED,
+                                                 # superseded by qcute_refine (see Architecture below); still
+                                                 # importable/runnable via its archive path for historical reference
 uv run python -m qcute.bpelm --sp_model datasets/bpe_enwik8_1M_8192.model   # BPE baseline
-uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_ctx1024.py   # named, reproducible byte-level run
+uv run python -m qcute.bytelm --config configs/bytelm_xs_mtp4_ctx1024.py   # named, reproducible run — the
+                                                 # standard byte-level baseline as of this session (context=1024,
+                                                 # matching qcute_refine's own context_len); the older
+                                                 # configs/bytelm_xs_mtp4.py (context=256) is superseded, kept only
+                                                 # for historical reproducibility, not a comparison target anymore
 uv run python scripts/plot_run.py logs/<run_name>   # train/val bpb PNG from a run's run.jsonl
 uv run python -m qcute.qcute_v1.qcute_v1 --decoder_type stack --config configs/v1_stack_simplex/ks21_v256_pq1_overfit10k.py
-                                                 # ACTIVE lineage: qcute_v1 (qcute/qcute_v1/) — the
-                                                 # latent-AR / parallel-block-local-decode rewrite.
+                                                 # ACTIVE lineage: qcute_v1 (qcute/qcute_v1/) is where the
+                                                 # latent-AR / parallel-block-local-decode rewrite (see below)
+                                                 # is actually implemented -- forked from a verbatim copy of
+                                                 # qcute_v5, diverging as of the BOS-interleaved-decode rewrite.
                                                  # Full design doc: docs/qcute_v1_plan.md.
-uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks21_overfit10k.py
-                                                 # ACTIVE lineage: qcute_zero (qcute/qcute_zero/) — monolithic
-                                                 # single-shared-LM design, see Architecture below.
-uv run python -m qcute.summformer.summformer --config configs/summformer/ks21_overfit10k.py
-                                                 # ACTIVE lineage: summformer (qcute/summformer/) — summary-token
-                                                 # fusion transformer, see Architecture below.
+uv run python -m qcute.v5_old.qcute_v5 --decoder_type stack --config configs/v5_stack_fsq/ks1_16x8.py
+                                                 # ARCHIVED: qcute_v5 (formerly qcute/qcute_v5*.py, moved to
+                                                 # qcute/v5_old/ once qcute_v1 became the active lineage) --
+                                                 # still the leaderboard's source of truth for everything
+                                                 # already run (docs/status.md), frozen, not receiving further
+                                                 # architecture work. `--decoder_type concat` also still works.
 uv run python gpt2_jax/train_gpt.py --model tiny --pos-method rope --dataset-dir data/fineweb-edu-10B
                                                  # ACTIVE TPU lineage as of 2026-08-27: JAX/Flax port of the
                                                  # Cable paper's nanoGPT (Cable/src/model_gpt.py), restricted to
@@ -30,8 +39,12 @@ uv run python gpt2_jax/train_gpt.py --model tiny --pos-method rope --dataset-dir
                                                  # docs/status_tpu.md for current run state.
 ```
 
-`qcute.bytelm`, `qcute.bpelm`, `qcute.qcute_v1.qcute_v1`, `qcute.qcute_zero.qcute_zero`, and
-`qcute.summformer.summformer` all read `--help` for their full flag
+The earlier torch_xla-based `qcute.bytelm_fineweb`/`qcute.bpelm_fineweb` (FineWeb-Edu byte/BPE
+baselines) are archived at `archive_fineweb_1/`, not part of active work — superseded by the
+`gpt2_jax/` JAX line above.
+
+`qcute.bytelm`, `qcute.bpelm`, `qcute.qcute_v1.qcute_v1`, and
+`qcute.v5_old.qcute_v5` all read `--help` for their full flag
 list; all support `--config path.py` (see `configs/` — every config file
 has its own module docstring explaining what it's testing and its exact
 `uv run` invocation, copy-pasteable directly from the file), `--run_name`
@@ -41,6 +54,11 @@ it: `logs/<run_name>/`, `checkpoints/<run_name>/`), and `--eval_only
 `--qual_gen_bytes` for qualitative generation. Tiny-corpus-scale defaults
 (`xs` preset) target ~4 bytes/timestep — see `qcute/bytelm.py`'s
 `PRESETS` comment for why. No test suite, linter, or CI config exists yet.
+Existing `configs/v5_stack_*/`, `configs/v5_word/`, etc. docstrings still say
+`qcute.qcute_v5`/`qcute.qcute_v5_wordlm` (pre-move path) in their copy-pasteable
+`uv run` line — substitute `qcute.v5_old.qcute_v5`/`qcute.v5_old.qcute_v5_wordlm`
+when actually running them; left as-is rather than bulk-edited, matching how
+other archived lineages' configs keep their original invocation text.
 
 **Only ever run one training job at a time.** All four modules train on
 MPS; two concurrent training processes contend for the same GPU and both
@@ -82,7 +100,7 @@ schedule.
 
 ## TPU access
 
-**Starting a fresh session asked to do a TPU run: read [docs/tpu_setup.md](docs/tpu_setup.md)
+**Starting a fresh session asked to do a TPU run: read [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md)
 and [docs/tpu_direct_ssh.md](docs/tpu_direct_ssh.md) first, in full** — the first walks
 scp → install → run → common failure modes (including two bugs already hit and fixed: the
 torch/torch_xla version-pin ABI mismatch, and `xm.optimizer_step`'s `barrier=False` default
@@ -110,7 +128,7 @@ session log; per-node details discovered while connecting (external IP, actual n
 a queued-resource name, accelerator type) go in a session's own working notes/commands, not
 written back into TPU.md.
 Full scp-to-running-training walkthrough (uv/torch_xla install, common failure modes, `qcute.
-bytelm_tpu` smoke test): [docs/tpu_setup.md](docs/tpu_setup.md). **Any long-running
+bytelm_tpu` smoke test): [docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md). **Any long-running
 or user-monitorable remote command (installs, training) goes inside a `tmux` session on the TPU
 VM**, not a bare blocking `gcloud ... ssh --command`, and the user gets the exact `tmux attach`
 command back so they can watch it live themselves — see that doc's own tmux section for the
@@ -123,26 +141,10 @@ keep the surrounding text to a one-line note on whether any run is approaching/c
 plus anything notable (new best, a run finished, a crash). Only fall back to fuller prose when
 something needs explaining (e.g. the overfitting-response policy actually triggering).
 
-**Default any TPU-node data prep/dataloader cache to RAM (`/dev/shm`, tmpfs), not persistent
-disk.** Confirmed twice independently (2026-08-27, tpu4 and tpu5, `gpt2_jax/dataset_preparation.py`
-via HF `datasets`): a large buffered write to the node's persistent disk — HF `datasets`' own
-raw-parquet + re-encoded-Arrow cache, ~55-60GB, but the same shape of bug as the earlier
-`prep_fineweb_edu_bytes.py`/`np.memmap` incident — reliably drops the writing process into an
-uninterruptible `D` (disk-sleep) state with `/proc/<pid>/io`'s `write_bytes` frozen, once free
-disk space drops under ~20GB. `kill -9` does **not** clear a `D`-state process; it can take 30-40+
-minutes to clear on its own, there is no faster recovery. These nodes have ~400GB RAM with ~390GB
-typically free (`free -h`), far more than the disk's 97GB — so point any data-prep cache dir at
-tmpfs by default (`HF_HOME`/`HF_DATASETS_CACHE=/dev/shm/...` for HF `datasets`, or the equivalent
-for whatever's being used) rather than waiting to hit this failure mode again. `gpt2_jax/
-dataset_preparation.py` already does this (`os.environ.setdefault(...)` at import time, before
-`datasets` is imported) — follow that pattern for any new TPU dataloader/prep script. tmpfs
-content doesn't survive a node reboot/preemption, which is an acceptable tradeoff here (a
-preempted node needs everything relaunched anyway).
-
 **torch_xla-specific findings (flash-attention/nightly-build setup, the `--multichip` +
 nightly-build hang investigation, `zero_kv_sink`+flash-attention's throughput cost) apply only to
 the archived `qcute.bytelm_tpu` lineage** — full detail preserved in
-[docs/tpu_setup.md](docs/tpu_setup.md), not repeated here. The active TPU lineage
+[docs/bytelm_tpu_setup.md](docs/bytelm_tpu_setup.md), not repeated here. The active TPU lineage
 (`gpt2_jax/`, see Commands above) uses JAX, not torch_xla, and doesn't inherit that hang (JAX
 `pmap` across all local chips is expected to just work).
 

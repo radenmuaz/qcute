@@ -5,7 +5,7 @@ see PRESETS["d512x16"]), context=8192, torch.compile (openxla backend) ON.
 Sizing, from live probes on this node (2026-08-23), carried over from the original
 bytelm_tpu_v6e1_d512_16L_saturate.py:
   - zero_kv_sink DISABLED here (context=8192, no_zero_kv_sink=True) -- see
-    docs/bytelm_tpu_setup.md's "zero_kv_sink + flash-attention: investigation" section for the
+    docs/tpu_setup.md's "zero_kv_sink + flash-attention: investigation" section for the
     full story. Short version: a "square" fix (pad Q by one dummy row so q_len==kv_len, verified
     numerically correct) makes the sink combine with flash-attention without OOMing, but costs
     ~25x steady-state throughput (10s/it vs 0.4s/it) on torch_xla -- confirmed not a

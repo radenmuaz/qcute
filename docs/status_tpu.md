@@ -3,7 +3,7 @@
 Living status doc for anything that trains on a TPU node (`tpu4`/`tpu5`/`tpu6`/`tpu7`, all v4-8,
 `us-central2-b` — see [TPU.md](../TPU.md)). Update this in place as runs start/finish/change,
 don't append a new dated block each time. Setup/how-to lives in
-[bytelm_tpu_setup.md](bytelm_tpu_setup.md) (torch/torch_xla install, flash-attention,
+[tpu_setup.md](tpu_setup.md) (torch/torch_xla install, flash-attention,
 multichip-hang investigation, FineWeb-Edu byte-level prep) and
 [tpu_direct_ssh.md](tpu_direct_ssh.md) (connection setup) — this doc is state, not how-to.
 
@@ -25,7 +25,7 @@ anywhere) — training on FineWeb-Edu 10B via Cable's own `dataset_preparation.p
 plus a copy of `dataset_preparation.py`) — see that module's own docstrings for the port's exact
 scope and what's deliberately not ported (ALiBi/CABLE/FIRE/KERPLE/T5Bias/etc.). Multi-device
 training uses `jax.pmap` across all locally-addressable TPU chips (JAX doesn't share torch_xla's
-confirmed multichip+nightly hang — see bytelm_tpu_setup.md — so this is expected to actually use
+confirmed multichip+nightly hang — see tpu_setup.md — so this is expected to actually use
 all 4 chips, unlike the torch_xla line ever managed to).
 
 Env: plain `.venv` via `uv sync` + `uv pip install -U "jax[tpu]"` on top (jax-ai-stack's own pin
@@ -37,7 +37,7 @@ for this lineage, unlike the torch_xla one.
   Arrow-build phase, ~54GB written between raw-parquet `hub/` cache + re-encoded `datasets/`
   cache) — process sat in uninterruptible `D` state with `/proc/<pid>/io`'s `write_bytes` frozen
   across multiple checks, same signature as the earlier `prep_fineweb_edu_bytes.py` disk-hang
-  incident (see bytelm_tpu_setup.md). `kill -9` did not clear it immediately; it eventually cleared
+  incident (see tpu_setup.md). `kill -9` did not clear it immediately; it eventually cleared
   on its own after ~40+ minutes. `~/.cache/huggingface` wiped afterward, node otherwise idle/clean
   (71GB free) — available as a second node once tpu5 confirms a working approach.
 - **tpu5** (`35.186.33.7`) — **active**: fresh `.venv` + `jax[tpu]` set up, 4 chips confirmed.

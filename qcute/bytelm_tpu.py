@@ -6,7 +6,7 @@ TPU VM without dragging in the rest of the repo's device-selection assumptions.
 **Optional flash-attention kernel (`--use_flash_attention`), default off.**
 `torch_xla.experimental.custom_kernel.flash_attention` (a JAX Pallas TPU kernel under
 torch_xla's hood) needs `jax` installed *and* `libtpu>=0.0.44` — the pinned stable
-`torch_xla==2.9.0` install (see docs/bytelm_tpu_setup.md) locks `libtpu==0.0.21`, and bumping
+`torch_xla==2.9.0` install (see docs/tpu_setup.md) locks `libtpu==0.0.21`, and bumping
 libtpu alone against that pin is a confirmed hard break (`RuntimeError: Unexpected
 PJRT_ExecuteOptions size: expected 112, got 80` — the plugin/framework PJRT API versions
 disagree). What does work, confirmed directly on a v4-8 node: `torch==2.10.0.dev0` +
@@ -985,7 +985,7 @@ def _run(index: int, args: argparse.Namespace, pre_args: argparse.Namespace) -> 
     # (1, inside an already-spawned multichip worker) -- xr.world_size() is the real replica
     # count across all processes. Confirmed bug (logged world_size=1 despite 4 workers actually
     # running) on 2026-08-23 while verifying --multichip works on the stable torch_xla==2.9.0
-    # pin (see docs/bytelm_tpu_setup.md).
+    # pin (see docs/tpu_setup.md).
     world_size = xr.world_size() if (args.multichip and _HAS_XLA) else 1
     log(
         f"{preset_label}  params={count_params(model)/1e6:.1f}M  device={device}  xla={_HAS_XLA}"

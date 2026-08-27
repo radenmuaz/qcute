@@ -1,4 +1,14 @@
 import os
+
+# Default HF's raw-download + re-encoded-Arrow cache to tmpfs, not persistent disk -- the
+# persistent-disk-backed cache (2x the dataset size: parquet + Arrow) was observed to stall
+# `datasets`' Arrow-build step in an uninterruptible D-state (write_bytes frozen in
+# /proc/<pid>/io) around 55-60GB written with <20GB free, reproduced on two separate TPU nodes
+# (2026-08-27). Set before importing `datasets`, which reads these at import time. Only a
+# default (os.environ.setdefault) -- an already-exported HF_HOME/HF_DATASETS_CACHE still wins.
+os.environ.setdefault("HF_HOME", "/dev/shm/hf_cache")
+os.environ.setdefault("HF_DATASETS_CACHE", "/dev/shm/hf_cache/datasets")
+
 import multiprocessing as mp
 import numpy as np
 import tiktoken

@@ -2,7 +2,7 @@
 constant after warmup — the baseline learning rate already used by
 bytelm_tpu_sm_full_enwik8.py). One of 4 variants (see _lr3e4/_lr1e3/_cosine siblings) meant to
 run concurrently, one per TPU chip, via `TPU_VISIBLE_CHIPS` — see
-docs/bytelm_tpu_setup.md's "Optional: multiple TPU chips on one host" section. Goal: find which
+docs/tpu_setup.md's "Optional: multiple TPU chips on one host" section. Goal: find which
 of these actually converges fastest toward 1.0 bpb, not just which trains fastest per-step.
 
 sm preset (d_model=256, n_layers=8, n_heads=4, mlp_mult=2, ~4.3M params), context=4096,
@@ -47,7 +47,7 @@ val_frac = 0.05
 test_frac = 0.05
 context = 4096
 mtp_heads = 1                       # MTP disabled — plain next-byte prediction only
-use_flash_attention = True          # nightly-only, see docs/bytelm_tpu_setup.md
+use_flash_attention = True          # nightly-only, see docs/tpu_setup.md
 steps = 167616                      # ~24h at measured throughput, see docstring
 batch_size = 32
 lr_peak = 6e-4

@@ -6,7 +6,7 @@ build (torch==2.10.0.dev0, libtpu==0.0.46) since flash-attention needs libtpu>=0
 
 Single-chip, not --multichip: bytelm_tpu_v4-8_d512_16L_multichip_flash.py (same node) confirmed
 --multichip + --use_flash_attention hangs (all 4 workers' CPU time flat across repeated
-snapshots, 5-step smoke test) -- see docs/bytelm_tpu_setup.md's "Optional: multiple TPU chips on
+snapshots, 5-step smoke test) -- see docs/tpu_setup.md's "Optional: multiple TPU chips on
 one host" section for the full writeup. Standalone flash-attention works fine on this node/build;
 it's specifically the multichip+flash combination that's broken on both the stable and nightly
 pins tried so far. This config uses one chip alone instead, to get flash-attention actually

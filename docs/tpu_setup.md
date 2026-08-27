@@ -1,14 +1,17 @@
-# Setting up `qcute.bytelm_tpu` on a TPU VM
+# TPU VM setup
 
 End-to-end steps to get from a bare TPU VM (see [TPU.md](../TPU.md) for available queued
 resources — **never create a new one yourself**, only use nodes already listed there) to a
-running `qcute.bytelm_tpu` training job. Session-tested on a `v6e-1` node
-(`v2-alpha-tpuv6e` runtime, Ubuntu 22.04). **Right after step 0 below (confirming the node is
-READY), set up direct ssh per [docs/tpu_direct_ssh.md](tpu_direct_ssh.md) before doing anything
-else** — every step from 1 onward should go through that persistent connection, not repeated
-`gcloud ... ssh` calls; this doc's own command blocks are still written with plain
-`gcloud ... ssh` for copy-paste clarity, substitute the direct-ssh form once the connection is
-live.
+running training job. Originated with `qcute.bytelm_tpu` (session-tested on a `v6e-1` node,
+`v2-alpha-tpuv6e` runtime, Ubuntu 22.04) — the general steps (ssh, uv/venv setup, tmux/monitoring
+conventions) apply to any lineage trained on these nodes; sections that are specific to one
+lineage (torch/torch_xla install+flash-attention, the FineWeb-Edu byte-level prep) say so in their
+own headings. See [docs/status_tpu.md](status_tpu.md) for which lineage is actually running where
+right now. **Right after step 0 below (confirming the node is READY), set up direct ssh per
+[docs/tpu_direct_ssh.md](tpu_direct_ssh.md) before doing anything else** — every step from 1
+onward should go through that persistent connection, not repeated `gcloud ... ssh` calls; this
+doc's own command blocks are still written with plain `gcloud ... ssh` for copy-paste clarity,
+substitute the direct-ssh form once the connection is live.
 
 ## Run long/interactive work inside `tmux` on the VM, not a bare `gcloud ssh --command`
 

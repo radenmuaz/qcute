@@ -4,11 +4,11 @@ n_heads=8, mlp_mult=4 -- see PRESETS["d512x16"]), context=8192, use_flash_attent
 no_zero_kv_sink.
 
 Runs on tpu5 (v4-8, us-central2-b), set up fresh with the NIGHTLY torch/torch_xla build
-(torch==2.10.0.dev0, libtpu==0.0.46) per docs/bytelm_tpu_setup.md's "Optional: nightly build"
+(torch==2.10.0.dev0, libtpu==0.0.46) per docs/tpu_setup.md's "Optional: nightly build"
 section -- tpu4's bytelm_tpu_v4-8_d512_16L_multichip.py runs the stable pin instead, which
 cannot do flash-attention at all (see that config's own docstring for the full story of why).
 This is the first real test of --multichip + --use_flash_attention together, a combination
-flagged as untested in both CLAUDE.md and docs/bytelm_tpu_setup.md before this run.
+flagged as untested in both CLAUDE.md and docs/tpu_setup.md before this run.
 
 batch_size=4 -- smart-guess per-process batch, NOT bench-verified on this node. Flash-attention's
 O(T) (not O(T^2)) memory means this could likely go higher than the plain-SDPA tpu4 config's
