@@ -22,6 +22,13 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+try:
+    from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention as _tpu_flash_attention
+    _HAS_FLASH_ATTENTION = True
+except ImportError:
+    _tpu_flash_attention = None
+    _HAS_FLASH_ATTENTION = False
+
 
 @dataclass
 class ModelConfig:
@@ -31,6 +38,15 @@ class ModelConfig:
     n_layer: int = 6
     n_head: int = 8
     n_embd: int = 512
+    use_flash_attention: bool = False  # not in Cable's own model -- a memory/speed opt-in
+    # (this port's own addition, not present in Cable's PyTorch original) using JAX's Pallas TPU
+    # flash-attention kernel in place of the plain jnp.einsum+softmax path below. Mathematically
+    # equivalent (same causal-softmax-attention), verified against the plain path on 4 TPU
+    # chips via pmap: max abs diff 0.031, mean 0.0013 (bf16-level variance) -- see gpt2_jax's own
+    # status notes. Needed because plain attention's O(B*H*T^2) materialized score matrix hits
+    # this hardware's HBM ceiling well before Cable's own paper defaults (tuned for 8x H100 80GB,
+    # not a v4 TPU's 30.75GB/chip) -- e.g. the "medium" model OOMs at batch_size=16 (Cable's own
+    # default) without this.
 
 
 def _linear_init(std: float):
@@ -84,6 +100,7 @@ class CausalSelfAttention(nnx.Module):
         self.pos_method = config.pos_method
         self.head_dim = config.n_embd // config.n_head
         self.rotary_dim = min(64, self.head_dim)  # matches Cable's RotaryEmbedding(dim=64)
+        self.use_flash_attention = config.use_flash_attention and _HAS_FLASH_ATTENTION
         self.c_attn = nnx.Linear(config.n_embd, 3 * config.n_embd, kernel_init=_linear_init(0.02), rngs=rngs)
         self.c_proj = nnx.Linear(
             config.n_embd, config.n_embd,
@@ -106,11 +123,18 @@ class CausalSelfAttention(nnx.Module):
             q = jnp.concatenate([_apply_rope(q_rot, cos, sin), q_pass], axis=-1)
             k = jnp.concatenate([_apply_rope(k_rot, cos, sin), k_pass], axis=-1)
 
-        scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) / math.sqrt(hd)
-        causal_mask = jnp.tril(jnp.ones((T, T), dtype=bool))
-        scores = jnp.where(causal_mask[None, None], scores, -jnp.inf)
-        attn = jax.nn.softmax(scores, axis=-1)
-        y = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+        if self.use_flash_attention:
+            # Pallas TPU kernel wants bf16 q/k/v; output comes back in that dtype too.
+            y = _tpu_flash_attention(
+                q.astype(jnp.bfloat16), k.astype(jnp.bfloat16), v.astype(jnp.bfloat16),
+                causal=True, sm_scale=1.0 / math.sqrt(hd),
+            ).astype(x.dtype)
+        else:
+            scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) / math.sqrt(hd)
+            causal_mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+            scores = jnp.where(causal_mask[None, None], scores, -jnp.inf)
+            attn = jax.nn.softmax(scores, axis=-1)
+            y = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, C)
         return self.c_proj(y)
 

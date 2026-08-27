@@ -206,20 +206,23 @@ def load_enwik8(path: Path, n_bytes: int | None = None) -> torch.Tensor:
     return torch.tensor(list(data), dtype=torch.long)
 
 
+ROPE_PRESETS = {"llama2": 10000.0, "llama3": 500000.0, "qwen3": 1000000.0}  # theta only
+
+
 @dataclass
 class LMConfig:
     vocab: int = 256
     d_model: int = 1024
     n_layers: int = 8
     n_heads: int = 16
+    n_kv_heads: int | None = None  # None = max(1, n_heads//4) (Llama3/Qwen3-style GQA-by-default); set == n_heads for plain MHA
+    head_dim: int | None = None    # None = d_model // n_heads (no-op, Llama3/big-Qwen3 style); set to decouple (small-Qwen3 style)
+    qk_norm: bool = True           # Qwen3-style per-head RMSNorm on Q/K before RoPE
     context: int = 2048
     mlp_mult: int = 4
     rope_base: float = 10000.0
+    rope_preset: str | None = "qwen3"  # "llama2"/"llama3"/"qwen3" overrides rope_base (see ROPE_PRESETS)
     mtp_heads: int = 8  # n parallel next-byte heads (bandwidth-matched to qcute.qcutelm's K)
-
-    @property
-    def head_dim(self) -> int:
-        return self.d_model // self.n_heads
 
 
 PRESETS: dict[str, LMConfig] = {
@@ -269,58 +272,99 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return x * cos[None, None] + rotate_half(x) * sin[None, None]
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * self.weight
+
+
 class CausalSelfAttention(nn.Module):
+    """GQA (n_kv_heads < n_heads repeats each KV head across n_heads//n_kv_heads query
+    heads) + optional Qwen3-style QK-norm (per-head RMSNorm on Q/K before RoPE) + optional
+    decoupled head_dim (None = d_model // n_heads, a no-op)."""
     def __init__(self, cfg: LMConfig):
         super().__init__()
-        self.cfg = cfg
-        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
-        self.out = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads if cfg.n_kv_heads is not None else max(1, cfg.n_heads // 4)
+        assert cfg.n_heads % self.n_kv_heads == 0, "n_heads must be a multiple of n_kv_heads"
+        self.n_rep = cfg.n_heads // self.n_kv_heads
+        self.head_dim = cfg.head_dim if cfg.head_dim is not None else cfg.d_model // cfg.n_heads
+        self.attn_dim = cfg.n_heads * self.head_dim
+        self.wq = nn.Linear(cfg.d_model, cfg.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(cfg.d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(cfg.d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.out = nn.Linear(self.attn_dim, cfg.d_model, bias=False)
+        self.qk_norm = cfg.qk_norm
+        if cfg.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+
+    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
+        if self.n_rep == 1:
+            return x
+        B, Hkv, T, hd = x.shape
+        return x[:, :, None].expand(B, Hkv, self.n_rep, T, hd).reshape(B, Hkv * self.n_rep, T, hd)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
-        H, hd = self.cfg.n_heads, self.cfg.head_dim
-        qkv = self.qkv(x).reshape(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)  # [3, B, H, T, hd]
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        H, Hkv, hd = self.n_heads, self.n_kv_heads, self.head_dim
+        q = self.wq(x).view(B, T, H, hd).transpose(1, 2)
+        k = self.wk(x).view(B, T, Hkv, hd).transpose(1, 2)
+        v = self.wv(x).view(B, T, Hkv, hd).transpose(1, 2)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        k, v = self._repeat_kv(k), self._repeat_kv(v)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)       # [B, H, T, hd]
-        y = y.transpose(1, 2).reshape(B, T, D)
+        y = y.transpose(1, 2).reshape(B, T, self.attn_dim)
         return self.out(y)
 
     def forward_step(self, x_new: torch.Tensor, cos_new: torch.Tensor, sin_new: torch.Tensor,
                       cache_k: torch.Tensor | None, cache_v: torch.Tensor | None):
         """Single-new-position forward, growing an explicit K/V cache —
         same pattern as qcute_refine_v4.py's own Block.forward_step.
-        x_new: [B, 1, D]. Returns (y [B, 1, D], new_cache_k, new_cache_v)."""
+        x_new: [B, 1, D]. Cache is stored PRE-repeat (n_kv_heads heads).
+        Returns (y [B, 1, D], new_cache_k, new_cache_v)."""
         B, _, D = x_new.shape
-        H, hd = self.cfg.n_heads, self.cfg.head_dim
-        qkv = self.qkv(x_new).reshape(B, 1, 3, H, hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        H, Hkv, hd = self.n_heads, self.n_kv_heads, self.head_dim
+        q = self.wq(x_new).view(B, 1, H, hd).transpose(1, 2)
+        k = self.wk(x_new).view(B, 1, Hkv, hd).transpose(1, 2)
+        v = self.wv(x_new).view(B, 1, Hkv, hd).transpose(1, 2)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
         q, k = apply_rope(q, cos_new, sin_new), apply_rope(k, cos_new, sin_new)
         new_k = k if cache_k is None else torch.cat([cache_k, k], dim=2)
         new_v = v if cache_v is None else torch.cat([cache_v, v], dim=2)
-        y = F.scaled_dot_product_attention(q, new_k, new_v, is_causal=False)   # single query, full past KV — no mask needed
-        y = y.transpose(1, 2).reshape(B, 1, D)
+        y = F.scaled_dot_product_attention(q, self._repeat_kv(new_k), self._repeat_kv(new_v), is_causal=False)   # single query, full past KV — no mask needed
+        y = y.transpose(1, 2).reshape(B, 1, self.attn_dim)
         return self.out(y), new_k, new_v
 
 
-class MLP(nn.Module):
+class SwiGLU(nn.Module):
+    """gate/up/down, no bias: down(silu(gate(x)) * up(x))."""
     def __init__(self, cfg: LMConfig):
         super().__init__()
         hidden = cfg.mlp_mult * cfg.d_model
+        self.gate = nn.Linear(cfg.d_model, hidden, bias=False)
         self.up = nn.Linear(cfg.d_model, hidden, bias=False)
         self.down = nn.Linear(hidden, cfg.d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(F.silu(self.up(x)))
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 class Block(nn.Module):
     def __init__(self, cfg: LMConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.d_model)
+        self.ln1 = RMSNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
-        self.ln2 = nn.LayerNorm(cfg.d_model)
-        self.mlp = MLP(cfg)
+        self.ln2 = RMSNorm(cfg.d_model)
+        self.mlp = SwiGLU(cfg)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln1(x), cos, sin)
@@ -344,10 +388,13 @@ class ByteLM(nn.Module):
 
     def __init__(self, cfg: LMConfig):
         super().__init__()
+        if cfg.rope_preset is not None:
+            cfg.rope_base = ROPE_PRESETS[cfg.rope_preset]
         self.cfg = cfg
+        self.head_dim = cfg.head_dim if cfg.head_dim is not None else cfg.d_model // cfg.n_heads
         self.tok_emb = nn.Embedding(cfg.vocab, cfg.d_model)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
-        self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.ln_f = RMSNorm(cfg.d_model)
         self.heads = nn.ModuleList(
             [nn.Linear(cfg.d_model, cfg.vocab, bias=False) for _ in range(cfg.mtp_heads)]
         )
@@ -366,7 +413,7 @@ class ByteLM(nn.Module):
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         # tokens: [B, T] long -> logits [n_heads, B, T, vocab]
         B, T = tokens.shape
-        cos, sin = rope_cos_sin(T, self.cfg.head_dim, self.cfg.rope_base, tokens.device)
+        cos, sin = rope_cos_sin(T, self.head_dim, self.cfg.rope_base, tokens.device)
         x = self.tok_emb(tokens)
         for block in self.blocks:
             x = block(x, cos, sin)
@@ -539,7 +586,7 @@ def generate_kv_cache(model: ByteLM, prompt_bytes: torch.Tensor, n_new_bytes: in
 
     def step(byte_id: torch.Tensor, pos: int) -> torch.Tensor:
         x = model.tok_emb(byte_id).unsqueeze(1)
-        cos_new, sin_new = rope_cos_sin_at(pos, cfg.head_dim, cfg.rope_base, device)
+        cos_new, sin_new = rope_cos_sin_at(pos, model.head_dim, cfg.rope_base, device)
         for li, block in enumerate(model.blocks):
             x, cache_k[li], cache_v[li] = block.forward_step(x, cos_new, sin_new, cache_k[li], cache_v[li])
         return model.ln_f(x).squeeze(1)
@@ -722,6 +769,10 @@ def main():
     p.add_argument("--context", type=int, default=None, help="override preset's context length")
     p.add_argument("--mtp_heads", type=int, default=None, help="override preset's MTP head count")
     p.add_argument("--n_layers", type=int, default=None, help="override preset's transformer layer count")
+    p.add_argument("--n_kv_heads", type=int, default=None, help="override preset's GQA kv-head count (None = max(1, n_heads//4))")
+    p.add_argument("--head_dim", type=int, default=None, help="override preset's head_dim (None = d_model // n_heads)")
+    p.add_argument("--qk_norm", type=lambda x: x.lower() != "false", default=True)
+    p.add_argument("--rope_preset", type=str, default="qwen3", choices=list(ROPE_PRESETS))
     p.add_argument("--data", type=Path, default=Path("datasets/enwik8_1M.gz"))
     p.add_argument("--n_bytes", type=int, default=None, help="prefix of the corpus to load (default: all)")
     p.add_argument("--val_frac", type=float, default=0.1)
@@ -789,6 +840,12 @@ def main():
             cfg.mtp_heads = args.mtp_heads
         if args.n_layers is not None:
             cfg.n_layers = args.n_layers
+        if args.n_kv_heads is not None:
+            cfg.n_kv_heads = args.n_kv_heads
+        if args.head_dim is not None:
+            cfg.head_dim = args.head_dim
+        cfg.qk_norm = args.qk_norm
+        cfg.rope_preset = args.rope_preset
         model = ByteLM(cfg).to(device)
         start_step = 0
 

@@ -22,7 +22,7 @@ uv run python -m qcute.qcute_zero.qcute_zero --config configs/qcute_zero/ks21_ov
 uv run python -m qcute.summformer.summformer --config configs/summformer/ks21_overfit10k.py
                                                  # ACTIVE lineage: summformer (qcute/summformer/) — summary-token
                                                  # fusion transformer, see Architecture below.
-uv run python gpt2_jax/train_gpt.py --model tiny --pos-method rope --dataset-dir data/fineweb-edu-10B
+uv run python gpt2_jax/train_gpt.py --config configs/gpt2_jax/medium_rope_default.py
                                                  # ACTIVE TPU lineage as of 2026-08-27: JAX/Flax port of the
                                                  # Cable paper's nanoGPT (Cable/src/model_gpt.py), restricted to
                                                  # 3 pos_methods (rope/learnable/base-NoPE), FineWeb-Edu 10B via
