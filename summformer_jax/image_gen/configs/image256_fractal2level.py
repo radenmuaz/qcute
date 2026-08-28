@@ -19,7 +19,7 @@ at window=12), impractical at this depth; treat this config as the lower-bound a
 the intended final design. Also unverified at any scale -- run an overfit10k-equivalent (small
 image subset) smoke test before trusting the shape choices below.
 
-    uv run python summformer_jax/train_summformer_v2.py --config configs/summformer_jax_v2/image256_fractal2level.py
+    uv run python summformer_jax/lm/train_summformer_v2.py --config configs/summformer_jax_v2/image256_fractal2level.py
 """
 pos_method = "rope"
 dataset_dir = "data/image_bytes_256"  # TODO: not yet prepared, see module docstring

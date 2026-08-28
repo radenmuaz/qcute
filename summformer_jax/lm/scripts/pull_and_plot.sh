@@ -17,7 +17,7 @@ for entry in "${RUNS[@]}"; do
   scp -o ControlPath="$HOME/.ssh/controlmasters/${name}-%r@%h:%p" \
     "muaz@${ip}:~/qcute/${module}/logs/${run}/log.jsonl" "logs/${run}/log.jsonl" 2>/dev/null
   if [ -f "logs/${run}/log.jsonl" ]; then
-    .venv/bin/python3 scripts/plot_jax_run.py "logs/${run}"
+    .venv/bin/python3 summformer_jax/lm/scripts/plot_jax_run.py "logs/${run}"
   else
     echo "WARN: failed to pull logs/${run}/log.jsonl"
   fi

@@ -7,7 +7,7 @@ d_model=768/n_heads=12 match GPT2-small exactly; n_layers=1 + Ks=(2,2,2) (n_fuse
 effective depth (~n_layers*(1+2*n_fuse)=7) and param count (~126.8M) land close to GPT2-small's
 12 layers / ~123.6M params.
 
-    uv run python summformer_jax/train_summformer.py --config configs/summformer_jax/small_rope_ablation.py
+    uv run python summformer_jax/lm/train_summformer.py --config configs/summformer_jax/small_rope_ablation.py
 """
 pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"

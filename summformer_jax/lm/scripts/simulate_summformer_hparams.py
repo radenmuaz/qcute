@@ -1,14 +1,14 @@
 """Sweep summformer_jax `Ks`/`n_layers` combinations and report effective_depth/params/FLOPs/KV
 cache for each, alongside a target gpt2_jax baseline -- lets you pick hparams before committing to
-an actual multi-hour TPU run. Params/FLOPs/KV cache formulas match scripts/compare_summformer_gpt2.py
+an actual multi-hour TPU run. Params/FLOPs/KV cache formulas match compare_summformer_gpt2.py
 (same effective_depth definition, same analytical KV-cache formula); FLOPs are measured for real
 via JAX's compiled cost analysis, not estimated, so this is slower per row than a pure formula sweep
 but trustworthy.
 
-    uv run python scripts/simulate_summformer_hparams.py --target medium
-    uv run python scripts/simulate_summformer_hparams.py --target small --ks-lengths 2,3,4 \
+    uv run python summformer_jax/lm/scripts/simulate_summformer_hparams.py --target medium
+    uv run python summformer_jax/lm/scripts/simulate_summformer_hparams.py --target small --ks-lengths 2,3,4 \
       --ks-values 2,4 --n-layers 1,2,3
-    uv run python scripts/simulate_summformer_hparams.py --target medium --gpt-n-layer 16
+    uv run python summformer_jax/lm/scripts/simulate_summformer_hparams.py --target medium --gpt-n-layer 16
       # hypothetical 16-layer gpt2 reference, d_model/n_heads still from --target's preset
 """
 from __future__ import annotations
@@ -22,8 +22,9 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gpt2_jax"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "summformer_jax"))
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_REPO_ROOT / "gpt2_jax"))
+sys.path.insert(0, str(_REPO_ROOT / "summformer_jax" / "lm"))
 
 from model_gpt import ModelConfig as GPTConfig, Model as GPT  # noqa: E402
 from model_summformer import Config as SummConfig, SummTransformer, cross_entropy  # noqa: E402

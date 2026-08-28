@@ -9,7 +9,7 @@ closest match WITHOUT overshooting -- main_layers=3 gives +2.6%, which does over
 FLOPs (not FLOPs-matched -- see small_rope_v2_flopsmatch.py for that variant, which does not
 param-match in return: matching both simultaneously isn't possible at this fuse-stage count).
 
-    uv run python summformer_jax/train_summformer_v2.py --config configs/summformer_jax_v2/small_rope_v2_parammatch.py
+    uv run python summformer_jax/lm/train_summformer_v2.py --config configs/summformer_jax_v2/small_rope_v2_parammatch.py
 """
 pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"

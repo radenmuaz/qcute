@@ -170,6 +170,23 @@ dataset_preparation.py` already does this (`os.environ.setdefault(...)` at impor
 content doesn't survive a node reboot/preemption, which is an acceptable tradeoff here (a
 preempted node needs everything relaunched anyway).
 
+**Before relying on `/dev/shm` for anything long-lived on a fresh TPU node, run `sudo loginctl
+enable-linger muaz` once.** Confirmed 2026-08-28 (tpu1/2/3): `systemd-logind`'s `RemoveIPC=yes`
+default wipes a user's tmpfs-owned files (including plain files under `/dev/shm`, not just SysV/
+POSIX IPC objects) once their last tracked login session ends — and a `tmux new-session -d ...`
+launched over a plain `ssh ... 'command'` does NOT keep a session alive from logind's point of
+view once that SSH connection closes, even though the detached tmux process (and anything it
+spawned) keeps running. Symptom: a multi-hour prep/training job silently loses its `/dev/shm` data
+out from under it — once mid-training (~1h10-1h20 in, `FileNotFoundError` on a shard file, process
+left hanging on a dead prefetch thread rather than crashing outright) and once immediately after a
+prep script's own successful exit, before the SSH session had even fully wound down. Not a timer,
+not a reboot, not disk pressure — `grep -i removeipc /etc/systemd/logind.conf` shows it's the
+(commented-out, i.e. default) `RemoveIPC=yes`, and `loginctl show-user <user> --property=Linger`
+showed `Linger=no`. Fix is one command, persists across reboots, do it immediately after the
+direct-ssh setup on any node that will use `/dev/shm`: `ssh ... 'sudo loginctl enable-linger
+muaz'`. Persistent-disk-based data (e.g. `gpt2_jax`'s own default output path) is unaffected by
+this — it's specific to tmpfs.
+
 **torch_xla-specific findings (flash-attention/nightly-build setup, the `--multichip` +
 nightly-build hang investigation, `zero_kv_sink`+flash-attention's throughput cost) apply only to
 the archived `qcute.bytelm_tpu` lineage** — full detail preserved in

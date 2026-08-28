@@ -10,7 +10,7 @@ pooling, at matched effective_depth. See docs/status_tpu.md's "ks222 vs ks444" n
 d_model=1024/n_heads=16 match GPT2-medium exactly, same as every other medium ablation variant.
 Launch AFTER medium_rope_ablation_ks444 finishes (same node, tpu5) -- not run concurrently with it.
 
-    uv run python summformer_jax/train_summformer.py --config configs/summformer_jax/medium_rope_ablation_ks222.py
+    uv run python summformer_jax/lm/train_summformer.py --config configs/summformer_jax/medium_rope_ablation_ks222.py
 """
 pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"

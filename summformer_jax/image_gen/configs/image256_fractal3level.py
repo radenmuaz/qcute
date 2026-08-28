@@ -19,7 +19,7 @@ Same source_index=0 point-sampling caveat as the 2-level config applies to BOTH 
 this is still the naive/cheap baseline arm, not the intended final design. Also still unverified
 at any scale -- overfit10k-equivalent smoke test first.
 
-    uv run python summformer_jax/train_summformer_v2.py --config configs/summformer_jax_v2/image256_fractal3level.py
+    uv run python summformer_jax/lm/train_summformer_v2.py --config configs/summformer_jax_v2/image256_fractal3level.py
 """
 pos_method = "rope"
 dataset_dir = "data/image_bytes_256"  # TODO: not yet prepared, see image256_fractal2level.py

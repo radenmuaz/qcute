@@ -9,7 +9,7 @@ docs/status_tpu.md's "second summformer ablation variants" note for the full swe
 d_model=1024/n_heads=16 match GPT2-medium exactly, same as the original medium_rope_ablation.py --
 this is a Ks/n_layers variant of that same comparison, not a different width.
 
-    uv run python summformer_jax/train_summformer.py --config configs/summformer_jax/medium_rope_ablation_ks444.py
+    uv run python summformer_jax/lm/train_summformer.py --config configs/summformer_jax/medium_rope_ablation_ks444.py
 """
 pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"

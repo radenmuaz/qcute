@@ -9,7 +9,7 @@ docs/status_tpu.md's "second summformer ablation variants" note for the full swe
 d_model=768/n_heads=12 match GPT2-small exactly, same as the original small_rope_ablation.py --
 this is a Ks/n_layers variant of that same comparison, not a different width.
 
-    uv run python summformer_jax/train_summformer.py --config configs/summformer_jax/small_rope_ablation_ks44.py
+    uv run python summformer_jax/lm/train_summformer.py --config configs/summformer_jax/small_rope_ablation_ks44.py
 """
 pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"

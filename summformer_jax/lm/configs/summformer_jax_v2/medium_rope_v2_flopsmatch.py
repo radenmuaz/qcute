@@ -9,7 +9,7 @@ WITHOUT overshooting -- main_layers=19 gives 1.012x, which does overshoot), at t
 430,534,656 params (+21.7% -- NOT param-matched, see medium_rope_v2_parammatch.py for that
 variant).
 
-    uv run python summformer_jax/train_summformer_v2.py --config configs/summformer_jax_v2/medium_rope_v2_flopsmatch.py
+    uv run python summformer_jax/lm/train_summformer_v2.py --config configs/summformer_jax_v2/medium_rope_v2_flopsmatch.py
 """
 pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"

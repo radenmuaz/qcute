@@ -25,9 +25,9 @@ a call, and every call after the first hits the same compiled executable (fair "
 state" timing, not per-op dispatch overhead). generation_only cost is then reported as
 (combined mean) - (prefill-alone mean), amortized over --gen-tokens.
 
-    uv run python scripts/bench_generation.py --model summformer --config configs/summformer_jax/medium_rope_ablation.py --device tpu
-    uv run python scripts/bench_generation.py --model gpt2 --config configs/gpt2_jax/medium_rope_default.py --device tpu --context 512 --gen-tokens 32
-    uv run python scripts/bench_generation.py --model summformer --config configs/summformer_jax/small_rope_ablation.py   # --device cpu default
+    uv run python scripts/jax/bench_generation.py --model summformer --config configs/summformer_jax/medium_rope_ablation.py --device tpu
+    uv run python scripts/jax/bench_generation.py --model gpt2 --config configs/gpt2_jax/medium_rope_default.py --device tpu --context 512 --gen-tokens 32
+    uv run python scripts/jax/bench_generation.py --model summformer --config configs/summformer_jax/small_rope_ablation.py   # --device cpu default
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ from flax import nnx
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "gpt2_jax"))
-sys.path.insert(0, str(REPO_ROOT / "summformer_jax"))
+sys.path.insert(0, str(REPO_ROOT / "summformer_jax" / "lm"))
 
 
 def load_config_module(path: Path) -> dict:

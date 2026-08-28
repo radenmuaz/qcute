@@ -10,7 +10,7 @@ docs/status_tpu.md's "ks22 vs ks44" note.
 
 d_model=768/n_heads=12 match GPT2-small exactly, same as every other small ablation variant.
 
-    uv run python summformer_jax/train_summformer.py --config configs/summformer_jax/small_rope_ablation_ks22.py
+    uv run python summformer_jax/lm/train_summformer.py --config configs/summformer_jax/small_rope_ablation_ks22.py
 """
 pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"

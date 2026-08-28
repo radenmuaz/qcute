@@ -8,7 +8,7 @@ WITHOUT overshooting -- main_layers=10 gives 1.038x, which does overshoot), at t
 169,413,888 params (+37.0% -- NOT param-matched; matching both simultaneously isn't possible at
 this fuse-stage count, see small_rope_v2_parammatch.py for the param-matched variant instead).
 
-    uv run python summformer_jax/train_summformer_v2.py --config configs/summformer_jax_v2/small_rope_v2_flopsmatch.py
+    uv run python summformer_jax/lm/train_summformer_v2.py --config configs/summformer_jax_v2/small_rope_v2_flopsmatch.py
 """
 pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"

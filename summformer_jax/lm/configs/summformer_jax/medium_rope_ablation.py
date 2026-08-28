@@ -11,7 +11,7 @@ this architecture's effective GPT2-equivalent depth (~n_layers*(1+2*n_fuse)=14) 
 (~279M) land close to GPT2-medium's 24 layers / 353.8M params -- see the chat history around
 2026-08-27 for the full FLOPs/param derivation and the -1-vs-2-Ks-length tradeoff analysis.
 
-    uv run python summformer_jax/train_summformer.py --config configs/summformer_jax/medium_rope_ablation.py
+    uv run python summformer_jax/lm/train_summformer.py --config configs/summformer_jax/medium_rope_ablation.py
 """
 pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"

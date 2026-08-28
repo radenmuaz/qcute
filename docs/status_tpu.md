@@ -172,7 +172,7 @@ runs a controlled ablation of the Ks-hierarchical-summarization + fuse-cross-att
 
 **Dataloader audit (requested explicitly)**: `gpt2_jax/data_loader.py` vs. Cable's own
 `Cable_ref/src/data_loader.py` — algorithm-identical (window slicing/shard-advance/wraparound
-logic byte-for-byte the same, only cosmetic diffs). `summformer_jax/data_loader.py` vs.
+logic byte-for-byte the same, only cosmetic diffs). `summformer_jax/lm/data_loader.py` vs.
 `gpt2_jax/data_loader.py` — functionally byte-identical (only the module docstring differs,
 confirmed via diff). So both baseline and ablation share the exact same, Cable-faithful data
 pipeline, not just the same dataset files.
@@ -230,7 +230,7 @@ the ablation to lose to its baseline if it finishes — the point is an honest c
 roughly matched compute, not tuning to win (explicit instruction).
 
 Loss curves are plotted automatically: `scripts/jax/pull_and_plot.sh` scp's each node's `log.jsonl`
-into local `logs/<run_name>/` and regenerates `loss_curve.png` there via `scripts/jax/plot_jax_run.py`;
+into local `logs/<run_name>/` and regenerates `loss_curve.png` there via `summformer_jax/lm/scripts/plot_jax_run.py`;
 an hourly `Monitor` loop runs this and reports each run's current step. Direct-ssh connections to
 all 4 nodes have dropped and been recovered multiple times mid-session (stale `ControlMaster`
 socket, not preemption) — recovery procedure now in `CLAUDE.md`.
@@ -310,7 +310,7 @@ gpt2-small's 1024-length forward pass is itself cheap enough (5ms) that recomput
 barely costs more than one incremental step's dispatch/bookkeeping overhead; the KV-cache
 advantage should widen as context/gen_tokens grow (naive cost scales with context, incremental
 doesn't) -- not yet tested at larger context or longer generation. Both prefill numbers (203K/366K
-tok/s) are consistent with the FLOPs findings in `scripts/jax/compare_summformer_gpt2.py`'s own results
+tok/s) are consistent with the FLOPs findings in `summformer_jax/lm/scripts/compare_summformer_gpt2.py`'s own results
 (summformer cheaper per-token at this matched d_model/n_heads).
 
 Raw results: `bench_results/gpt2_small_rope_default_tpu_1787863315.json`,
@@ -401,7 +401,7 @@ zero-KV-sink on for summformer -- matches what's actually trained):
 Consistent pattern at both sizes: summformer's real KV-cache generates ~1.7-1.8x faster per token
 than gpt2's real KV-cache (small: 3673 vs 2053 tok/s; medium: 1369 vs 806 tok/s), and summformer's
 prefill advantage widens with scale (1.09x at small, 1.24x at medium) -- consistent with the FLOPs
-findings in `scripts/jax/compare_summformer_gpt2.py` (summformer cheaper per-token at matched
+findings in `summformer_jax/lm/scripts/compare_summformer_gpt2.py` (summformer cheaper per-token at matched
 d_model/n_heads, the gap growing with model size). This reverses the earlier (naive-generation,
 flash-on) reading that had gpt2 looking faster at generation -- both of those were measurement
 artifacts (naive recompute happened to be cheap at tiny scale/short runs; flash-attention was

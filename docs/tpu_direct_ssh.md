@@ -54,6 +54,21 @@ ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute
 
 `scp` can use the same `-o ControlPath=...` flag to reuse the connection too.
 
+## 4. Enable linger before using `/dev/shm` for anything long-lived
+
+```bash
+ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine \
+  muaz@<external_ip> 'sudo loginctl enable-linger muaz'
+```
+
+Do this on every fresh node right after step 3, before launching any `tmux`-detached job that
+writes to `/dev/shm`. Without it, `systemd-logind`'s default `RemoveIPC=yes` wipes the user's
+tmpfs-owned files once their last tracked SSH session ends — a plain `ssh ... 'tmux new-session -d
+...'` does NOT keep a session alive from logind's perspective once that SSH call returns, even
+though the detached tmux process keeps running. See CLAUDE.md's tmpfs section for the full
+incident (silently lost `/dev/shm` training data on tpu1/2/3, 2026-08-28) — this is a one-time,
+reboot-persistent fix per node, not a per-command workaround.
+
 ## Caveats
 
 - **Every TPU listed in [TPU.md](../TPU.md) is a spot instance** — it can be preempted (reclaimed)

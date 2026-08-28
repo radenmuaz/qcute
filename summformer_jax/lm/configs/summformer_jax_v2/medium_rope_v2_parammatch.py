@@ -7,7 +7,7 @@ Verified via direct construction+FLOPs (2026-08-28, tpu7), swept against gpt2-me
 closest match WITHOUT overshooting -- main_layers=12 gives +0.3%, which does overshoot) at 0.684x
 FLOPs (not FLOPs-matched -- see medium_rope_v2_flopsmatch.py for that variant).
 
-    uv run python summformer_jax/train_summformer_v2.py --config configs/summformer_jax_v2/medium_rope_v2_parammatch.py
+    uv run python summformer_jax/lm/train_summformer_v2.py --config configs/summformer_jax_v2/medium_rope_v2_parammatch.py
 """
 pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"

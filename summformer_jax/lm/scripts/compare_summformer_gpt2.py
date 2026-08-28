@@ -6,7 +6,7 @@ heuristic); params via nnx.split; KV cache via summformer_jax's real incremental
 cache arrays after a full context, not just the analytical formula) vs. gpt2_jax's analytical dense
 KV-cache size (gpt2_jax has no incremental/cache generation code at all -- it's training-only).
 
-    uv run python scripts/compare_summformer_gpt2.py
+    uv run python summformer_jax/lm/scripts/compare_summformer_gpt2.py
 """
 from __future__ import annotations
 
@@ -17,8 +17,9 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gpt2_jax"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "summformer_jax"))
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_REPO_ROOT / "gpt2_jax"))
+sys.path.insert(0, str(_REPO_ROOT / "summformer_jax" / "lm"))
 
 from model_gpt import ModelConfig as GPTConfig, Model as GPT  # noqa: E402
 from model_summformer import Config as SummConfig, SummTransformer, cross_entropy  # noqa: E402
