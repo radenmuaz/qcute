@@ -98,7 +98,7 @@ def main():
     p.add_argument("--sequence-length", type=int, default=1024)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-steps", type=int, default=20)
-    p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--run-name", type=str, default=None)

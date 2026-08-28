@@ -432,3 +432,29 @@ Run names/nodes for the 4 active runs: `medium_paper_match_b8`@tpu4 (`35.186.15.
 New config files: `configs/gpt2_jax/small_rope_default.py` (new, mirrors `medium_rope_default.py`),
 `configs/summformer_jax/{medium,small}_rope_ablation.py` (new dir). `gpt2_jax/README.md` updated
 with the batch/grad_accum-matching formula and this status table; `summformer_jax/README.md` new.
+
+## 2026-08-28 (later): summformer_jax v2 configs launched (tpu1-4), tpu8 running image_gen
+
+**tpu1-4**: the 4 finalized `configs/summformer_jax_v2/*.py` configs (small/medium x param-match/
+flops-match) launched via `summformer_jax/lm/train_summformer_v2.py` (note: `train_summformer_v2.py`
+now lives under `summformer_jax/lm/`, not `summformer_jax/` directly, after a repo reorg this
+session -- `summformer_jax/lm/` holds the byte/BPE-text lineage, `summformer_jax/image_gen/` a new,
+separate image-byte lineage, see below). tpu1/2/3's FineWeb-Edu-10B data lives in `/dev/shm`
+(tmpfs) -- hit and fixed a real data-loss bug here: `systemd-logind`'s `RemoveIPC=yes` default was
+wiping tmpfs-owned files once the launching SSH session ended, even with a detached `tmux` still
+running the job; fixed via `sudo loginctl enable-linger muaz` on every node using `/dev/shm` (see
+CLAUDE.md's tmpfs section and `docs/tpu_direct_ssh.md` step 4 for the full incident + standing
+fix). Run names: `small_rope_v2_parammatch`@tpu1, `small_rope_v2_flopsmatch`@tpu2,
+`medium_rope_v2_flopsmatch`@tpu3, `summformer_medium_v2_parammatch`@tpu4.
+
+**tpu8**: new lineage, `summformer_jax/image_gen/` -- byte-level RGB image generation (not text),
+mixed-dim trunk/code-LM architecture, real incremental KV-cache (trunk + fuse-stage cross-attention
++ code-LM, all bit-exact verified), block-locality/receptive-field probes, and a training loop
+whose per-epoch eval also generates and saves sample PNGs. Full design history, every bug found and
+fixed, and the Fractal-Generative-Models/`qcute_lagcodec`/ARMD comparison discussion behind the
+architecture choices: **`docs/image_gen_design.md`**. Currently training `image64_mixdim_v1`
+(tmux session `image_gen_mixdim`) against tpu8's own in-progress ImageNet64 prep output at
+`/dev/shm/imagenet64` (`scripts/prep_imagenet64.py`, still growing in the background -- the
+training run reads whatever shards exist at startup, not the complete 1.28M-image set yet). Exact
+setup/launch commands and log/sample paths: see `docs/image_gen_design.md`'s "First real TPU
+training run" section.

@@ -1,6 +1,6 @@
 """v2: GPT-style deep backbone with FuseStage cross-attention spliced in at chosen depths, NO
 weight sharing anywhere (contrast with model_summformer.py/model_summformer_v1.py's small
-n_layers + uniform Ks-cascade with a reused block for every refinement pass).
+n_layers + uniform stride-cascade with a reused block for every refinement pass).
 
 Semantics differences from v1:
 - `n_layers` main blocks are SEQUENTIAL and DISTINCT (own weights each), like a plain causal
@@ -9,10 +9,10 @@ Semantics differences from v1:
 - v1's periodic cascade (run all n_fuse stages every forward pass, always reusing the SAME
   n_layers-sized block for both the initial pass and every post-cross-attn refinement) is replaced
   by explicit placement: `Config.fuse_stages` is a tuple of independently-configured insertion
-  points, each a 5-tuple `(insert_after, Ks, window, code_n_layers, source_index)`:
+  points, each a 5-tuple `(insert_after, stride, window, code_n_layers, source_index)`:
     - insert_after: main_blocks index after which this fuse-stage's cross-attention runs (the
       main stack's own NEXT layer serves as the "refinement" step -- no separate reused block).
-    - Ks: pooling factor for this stage's own code/summary sequence (same meaning as v1's Ks[s]).
+    - stride: pooling factor for this stage's own code/summary sequence (same meaning as v1's stride[s]).
     - window: this fuse-stage's cross-attention window (None = unbounded).
     - code_n_layers: depth of this stage's own dedicated "summary LM" (self-attention over the
       pooled sequence) -- own weights, not shared with main_blocks or any other fuse-stage.
@@ -80,7 +80,7 @@ class ConfigV2:
     rope_preset: str | None = None
     context_len: int = 1024
     main_window: int | tuple | None = None   # int (all layers), tuple of len n_layers, or None
-    fuse_stages: tuple = ()           # tuple of (insert_after, Ks, window, code_n_layers, source_index)
+    fuse_stages: tuple = ()           # tuple of (insert_after, stride, window, code_n_layers, source_index)
     input_preset: int = 8
     vocab_size: int | None = 50304
     mtp_heads: int = 1
@@ -173,20 +173,20 @@ class SummTransformerV2(nnx.Module):
     def _pool_and_fuse(self, stage_i: int, x, x0, layer_hist, seq_pos, cos_b, sin_b):
         cfg = self.cfg
         hd = self.head_dim
-        insert_after, K_s, window, code_n_layers, source_index = cfg.fuse_stages[stage_i]
+        insert_after, stride, window, code_n_layers, source_index = cfg.fuse_stages[stage_i]
         source = x0 if source_index == 0 else (x if source_index == -1 else layer_hist[source_index])
 
         L = source.shape[1]
-        n_blocks = L // K_s
+        n_blocks = L // stride
         if n_blocks < 1:
             return x
-        code_h = source[:, K_s - 1::K_s, :][:, :n_blocks, :]
+        code_h = source[:, stride - 1::stride, :][:, :n_blocks, :]
         code_local_pos = jnp.arange(n_blocks)
         cos_c, sin_c = (rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base) if cfg.pos_method == "rope" else (None, None))
         code_mask = causal_mask(code_local_pos, code_local_pos, None)
         h_code_list = self._run_code_lm(stage_i, code_h, cos_c, sin_c, code_mask)
 
-        code_pos_abs = (jnp.arange(n_blocks) + 1) * K_s - 1
+        code_pos_abs = (jnp.arange(n_blocks) + 1) * stride - 1
         cos_k, sin_k = (rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base) if cfg.pos_method == "rope" else (None, None))
         fuse_mask = causal_mask(seq_pos, code_pos_abs, window)
         return self.fuse_stages[stage_i](x, h_code_list, cos_b, sin_b, cos_k, sin_k, fuse_mask, cfg.pos_method)

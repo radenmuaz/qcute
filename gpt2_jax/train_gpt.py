@@ -93,7 +93,7 @@ def main():
     p.add_argument("--sequence-length", type=int, default=1024)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-steps", type=int, default=20)
-    p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--max-steps", type=int, default=None, help="override computed max_steps (for smoke tests)")
     p.add_argument("--lr", type=float, default=None, help="override MAX_LR (peak learning rate); MIN_LR stays 0.1x this")
     p.add_argument("--run-name", type=str, default=None, help="override the auto-derived run_name (else derived from --config/model/pos-method)")
