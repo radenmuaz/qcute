@@ -390,3 +390,34 @@ against FractalAR's reported numbers, using gpt2-tiny and ImageNet64 as referenc
 guesses discussed: small downsampling `Ks`/attention windows (4 or 8, smaller preferred), large
 MTP head counts (32-64). Not yet implemented as of this doc -- restate-to-check was requested and
 interrupted before the restate happened; pick this up as the actual next task.
+
+`fuse_stages` reformatted to grouped nested tuples
+(`((src, dst), (stride, window), (code_n_layers, code_d_model=None, code_n_heads=None))`, parsed
+by `_parse_fuse_stage`) instead of a flat 7-tuple -- `image64_mixdim.py` (built with `mtp_heads=24`,
+per the plan above) and every other config updated to match, re-verified via the full
+`check_kv_cache_consistency_fully_static` battery (9/9 pass, bit-exact vs. dense at fp32).
+
+## JIT fix: `generate_kv_cache_fully_static`'s decode step wasn't actually jitted
+
+`_make_fully_static_incremental_stepper`'s decode closure mutated captured Python state
+(`nonlocal`/list-index reassignment on `code_lm_caches`, `h_code_out_bufs`, etc.) on every call --
+unsafe under `jax.jit`/`nnx.jit` (a jitted closure that mutates captured variables freezes them at
+first-trace tracer values; every later call silently reuses stale state), so the step function was
+never actually wrapped in `jit` at all and re-traced/executed eagerly per call. Measured on tpu8
+(`image64_mixdim.py`, `bench_generation_speed.py`): **6915ms/token**, extrapolating to ~23.6h for
+one full 64x64 image -- would have blocked training's first eval-time sample generation for a day.
+
+Fix: rewrote the whole stepper as pure functions -- `_init_decode_state` (zero-init `DecodeState`
+dict pytree, fixed key structure per config), `_pool_and_fuse_pure`/`_embed_and_hist_pure`
+(read state, return updated fields instead of mutating), `_prime_pure`/`_decode_step_pure` (thread
+state explicitly, return `(logits, new_state)`), with `_decode_step_pure` wrapped in a
+module-level `nnx.jit()` (`_jitted_decode_step_pure`) so one compiled trace is reused across all
+decode steps. `generate_kv_cache_fully_static` now threads `state` through
+`_init_decode_state` -> `_prime_pure` -> a loop over `_jitted_decode_step_pure`. Re-verified
+correctness (9/9 consistency battery, bit-exact at fp32) before syncing to tpu8.
+
+**Result**: 674ms/token (10x faster), but still ~137.9 min (2.3h) per full 12288-token image --
+real but insufficient. `--eval-samples` stays disabled (0) for the next training launch; the
+Python-level `for` loop over 12k decode steps (plus per-fuse-stage-boundary retracing inside
+`lax.cond` branches) is still the bottleneck, not closure-mutation -- an outer `lax.scan`/
+`fori_loop` over the whole generation loop would be the real fix, not attempted yet.
