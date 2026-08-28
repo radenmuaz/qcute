@@ -25,7 +25,7 @@ vocab_size = 256
 d_model = 128
 n_heads = 4
 n_layers = 3
-main_window = 8
+main_window = 24
 context_len = 12288
 fuse_stages = (
     ((-1, 1), (8, None), (2, 256, 4)),

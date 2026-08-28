@@ -24,11 +24,23 @@ post-hoc from the trunk, which is a bigger redesign NOT done here):
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+
+# Persistent (disk-backed) JIT compilation cache -- without this, JAX's compiled-executable cache
+# is purely in-process (an in-memory dict, gone on every restart), so every fresh training/bench
+# process re-pays the full compile cost for every fuse-stage code-LM block-count shape it
+# encounters (confirmed: within one image every shape is new anyway, but ACROSS restarts -- e.g.
+# training's periodic eval-time sample generation over many steps -- shapes repeat constantly, and
+# without this every restart re-compiles all of them from zero). Small artifacts (KB-MB range per
+# compiled program), not the large-write D-state-hang risk documented in CLAUDE.md for GB-scale
+# dataset caches -- safe on persistent disk, doesn't need /dev/shm.
+jax.config.update("jax_compilation_cache_dir", os.path.expanduser("~/.cache/jax_compilation_cache"))
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.5)
 
 # ----------------------------------------------------------------------------
 # RoPE + attention primitives (from model_summformer.py)
@@ -211,7 +223,7 @@ class Attn(nnx.Module):
         growing shapes, so a jax.jit wrapping this (and everything built on it) compiles once and
         is reused for every generation step, not retraced per step."""
         B, Tn, D = x_new.shape
-        assert Tn == 1, "forward_incremental_static is decode-only (Tn=1); use prime_static_cache for the prompt"
+        assert Tn == 1, "forward_incremental_static is decode-only (Tn=1)"
         q, k, v = self._qkv(x_new, B, Tn)
         k_buf, v_buf, pos_buf, write_pos = cache
         new_abs_pos = write_pos  # scalar traced int32, the new token's absolute position
@@ -637,12 +649,39 @@ class SummTransformerV2(nnx.Module):
             elif src != 0:
                 referenced_depths.add(src)
         hist = {j: jnp.zeros((Bsz, 0, D), dtype=cfg.compute_dtype) for j in referenced_depths}
-        stage_code_cache = [None] * n_stages
         stage_n_blocks_done = [0] * n_stages
+
+        # True O(1)-per-new-block code-LM cache: preallocated fixed-size (Bsz, heads, max_nb, hd)
+        # circular-style buffers per code-LM layer (via Attn.forward_incremental_static, the same
+        # primitive the trunk's "fully static" path uses, proven correct there), updated via
+        # dynamic_update_slice_in_dim -- ONE new block's worth of work per boundary, not a
+        # recompute over all blocks-so-far (even a fixed-shape padded recompute, as tried earlier,
+        # is still O(max_n_blocks) attention work every single boundary). h_code_out_bufs stays
+        # fixed-shape (Bsz, max_n_blocks, D) from the first call onward; not-yet-valid slots are
+        # excluded downstream via an explicit `valid` mask (same pattern as the "fully static"
+        # design's _pool_and_fuse_pure, reused here for a plain eager stepper instead).
+        code_lm_layer_caches = [None] * n_stages
+        h_code_out_bufs = [None] * n_stages
+        for stage_i, spec in enumerate(cfg.fuse_stages):
+            _, _, _, _, code_n_layers_i, _, _ = _parse_fuse_stage(spec)
+            max_nb_i = self.max_n_blocks[stage_i]
+            n_code_heads_i = self.code_dims[stage_i] // self.code_head_dims[stage_i]
+            code_hd_i = self.code_head_dims[stage_i]
+
+            def _zero_layer_cache():
+                k0 = jnp.zeros((Bsz, n_code_heads_i, max_nb_i, code_hd_i), dtype=cfg.compute_dtype)
+                v0 = jnp.zeros((Bsz, n_code_heads_i, max_nb_i, code_hd_i), dtype=cfg.compute_dtype)
+                pos0 = jnp.full((max_nb_i,), -10 ** 9, dtype=jnp.int32)
+                return (k0, v0, pos0, jnp.array(0, dtype=jnp.int32))
+
+            code_lm_layer_caches[stage_i] = tuple(_zero_layer_cache() for _ in range(code_n_layers_i))
+            h_code_out_bufs[stage_i] = tuple(
+                jnp.zeros((Bsz, max_nb_i, D), dtype=cfg.compute_dtype) for _ in range(code_n_layers_i))
 
         def pool_and_fuse_incremental(stage_i: int, x_new, new_pos, cos_new, sin_new, current_depth: int):
             source_index, _insert_after, stride, window, _code_n_layers, _, _ = _parse_fuse_stage(cfg.fuse_stages[stage_i])
             code_hd = self.code_head_dims[stage_i]
+            max_nb = self.max_n_blocks[stage_i]
             if source_index == 0:
                 source_hist = hist[0]
             elif source_index == -1:
@@ -651,21 +690,35 @@ class SummTransformerV2(nnx.Module):
                 source_hist = hist[source_index]
 
             n_blocks = source_hist.shape[1] // stride
-            if n_blocks > stage_n_blocks_done[stage_i]:
-                code_h = self.code_in_proj[stage_i](source_hist[:, stride - 1::stride, :][:, :n_blocks, :])
-                code_local_pos = jnp.arange(n_blocks)
+            # A multi-token chunk (Tn>1, e.g. the initial prompt-priming call) can cross MULTIPLE
+            # block boundaries in one call -- loop over every newly-completed block one at a time
+            # (each still O(1) work via the incremental code-LM cache), not just the last one.
+            for old_nb_done in range(stage_n_blocks_done[stage_i], n_blocks):
+                # code_local_pos uses the OLD (pre-increment) count as the new block's 0-indexed
+                # local position -- matches the dense path's arange(n_blocks)'s last entry exactly.
+                sample_pos = (old_nb_done + 1) * stride - 1
+                sample = jax.lax.dynamic_slice_in_dim(source_hist, sample_pos, 1, axis=1)
+                h = self.code_in_proj[stage_i](sample)
+                code_local_pos = jnp.array([old_nb_done], dtype=jnp.int32)
                 cos_c, sin_c = (rope_cos_sin_for_positions(code_local_pos, code_hd, cfg.rope_base) if pm == "rope" else (None, None))
-                code_mask = causal_mask(code_local_pos, code_local_pos, None)
-                stage_code_cache[stage_i] = self._run_code_lm(stage_i, code_h, cos_c, sin_c, code_mask)
-                stage_n_blocks_done[stage_i] = n_blocks
+                new_caches, new_out_bufs = [], []
+                for l, block in enumerate(self.code_lms[stage_i]):
+                    h, new_cache = block.forward_incremental_static(h, cos_c, sin_c, code_lm_layer_caches[stage_i][l], max_nb, pm)
+                    new_caches.append(new_cache)
+                    projected = self.code_out_proj[stage_i](self.code_ln_fs[stage_i](h))
+                    new_out_bufs.append(jax.lax.dynamic_update_slice_in_dim(h_code_out_bufs[stage_i][l], projected, old_nb_done, axis=1))
+                code_lm_layer_caches[stage_i] = tuple(new_caches)
+                h_code_out_bufs[stage_i] = tuple(new_out_bufs)
+                stage_n_blocks_done[stage_i] = old_nb_done + 1
 
-            h_code_list = stage_code_cache[stage_i]
-            if h_code_list is None:
+            n_blocks_now = stage_n_blocks_done[stage_i]
+            if n_blocks_now == 0:
                 return x_new
-            n_blocks_now = h_code_list[0].shape[1]
-            code_pos_abs = (jnp.arange(n_blocks_now) + 1) * stride - 1
+            h_code_list = h_code_out_bufs[stage_i]
+            code_pos_abs = (jnp.arange(max_nb) + 1) * stride - 1
             cos_k, sin_k = (rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base) if pm == "rope" else (None, None))
-            fuse_mask = causal_mask(new_pos, code_pos_abs, window)
+            valid = (jnp.arange(max_nb) < n_blocks_now).reshape(1, 1, 1, max_nb)
+            fuse_mask = causal_mask(new_pos, code_pos_abs, window) & valid
             return self.fuse_stages[stage_i](x_new, h_code_list, cos_new, sin_new, cos_k, sin_k, fuse_mask, pm)
 
         def step(token_chunk: jnp.ndarray, start_pos: int) -> jnp.ndarray:
@@ -716,6 +769,50 @@ class SummTransformerV2(nnx.Module):
 
         return all_tokens[0]
 
+    def _prime_pure_growing(self, prompt_tokens):
+        """Trunk-only pure prefill (no fuse_stages support -- for isolating/benching plain
+        self-attn KV-cache cost against gpt2_jax's identical growing-cache design). Not jitted
+        (prompt length varies call to call). Returns (logits, caches), caches = tuple of (k, v)
+        per trunk layer -- self-truncated to main_window by Attn.forward_incremental already, so
+        shape stabilizes after `window` tokens without any circular-buffer bookkeeping."""
+        cfg = self.cfg
+        hd = self.head_dim
+        pm = cfg.pos_method
+        Tn = prompt_tokens.shape[1]
+        pos = jnp.arange(Tn)
+        cos, sin = (rope_cos_sin_for_positions(pos, hd, cfg.rope_base) if pm == "rope" else (None, None))
+        x = self.embed(prompt_tokens)
+        if pm == "learnable":
+            x = x + self.wpe(pos)[None]
+        caches = []
+        for i, block in enumerate(self.main_blocks):
+            x, cache = block.forward_incremental(x, cos, sin, None, self.main_windows[i], pm)
+            caches.append(cache)
+        x = self.ln_f(x)
+        logits = x @ self._head_weight().T
+        return logits, tuple(caches)
+
+    def _decode_step_pure_growing(self, token, pos_scalar, caches):
+        """PURE single-token decode step, trunk-only: caches passed in/returned explicitly (no
+        closure mutation), safe to wrap in nnx.jit and reuse the compiled trace across calls --
+        S_prev/S come from cache.shape (static under jit), not from pos_scalar, so no
+        ConcretizationTypeError the way a naive jnp.arange(pos_scalar, ...) would hit."""
+        cfg = self.cfg
+        hd = self.head_dim
+        pm = cfg.pos_method
+        pos1 = pos_scalar.reshape(1)
+        cos, sin = (rope_cos_sin_for_positions(pos1, hd, cfg.rope_base) if pm == "rope" else (None, None))
+        x = self.embed(token)
+        if pm == "learnable":
+            x = x + self.wpe(pos1)[None]
+        new_caches = []
+        for i, block in enumerate(self.main_blocks):
+            x, cache = block.forward_incremental(x, cos, sin, caches[i], self.main_windows[i], pm)
+            new_caches.append(cache)
+        x = self.ln_f(x)
+        logits = x @ self._head_weight().T
+        return logits, tuple(new_caches)
+
     def check_kv_cache_consistency(self, seq_len: int, key: jax.random.PRNGKey,
                                     n_checks: int = 3, prompt_len: int = 8, n_new_tokens: int = 24) -> dict:
         """Diagnostic: generate_no_cache vs generate_kv_cache MUST produce bit-exact identical
@@ -727,124 +824,6 @@ class SummTransformerV2(nnx.Module):
             prompt = jax.random.randint(subkey, (pl,), 0, self.vocab)
             out_full = self.generate_no_cache(prompt, n_new_tokens)
             out_cache = self.generate_kv_cache(prompt, n_new_tokens)
-            if jnp.array_equal(out_full, out_cache):
-                n_match += 1
-        return {"match_rate": n_match / n_checks, "n_checks": n_checks}
-
-    def _make_static_incremental_stepper(self, Bsz: int):
-        """Trunk uses a genuinely static (fixed-shape) circular KV cache per layer
-        (prime_static_cache/forward_incremental_static) -- reusable across a jax.jit trace, unlike
-        _make_incremental_stepper's concatenate-based cache which changes shape every call for the
-        first `window` steps. The fuse-stage/code-LM side is deliberately NOT given the same
-        treatment here -- see the module-level note on why (not a small fixed window; its natural
-        bound is context_len//K, and its recompute trigger is a Python-level shape-changing branch,
-        not a `jax.lax.cond`-gated one) -- so a decode_step call still retraces whenever a
-        fuse-stage's code buffer grows, even though the trunk math itself is now fixed-shape."""
-        cfg = self.cfg
-        D = cfg.d_model
-        hd = self.head_dim
-        pm = cfg.pos_method
-        caps = [w if w is not None else cfg.context_len for w in self.main_windows]
-
-        main_caches = [None] * cfg.n_layers
-        referenced_depths = {0}
-        for spec in cfg.fuse_stages:
-            src, dst, _, _, _, _, _ = _parse_fuse_stage(spec)
-            if src == -1:
-                referenced_depths.add(dst)
-            elif src != 0:
-                referenced_depths.add(src)
-        hist = {j: jnp.zeros((Bsz, 0, D), dtype=cfg.compute_dtype) for j in referenced_depths}
-        n_stages = len(cfg.fuse_stages)
-        stage_code_cache = [None] * n_stages
-        stage_n_blocks_done = [0] * n_stages
-
-        def pool_and_fuse_incremental(stage_i, x_new, new_pos, cos_new, sin_new, current_depth):
-            source_index, _insert_after, stride, window, _code_n_layers, _, _ = _parse_fuse_stage(cfg.fuse_stages[stage_i])
-            code_hd = self.code_head_dims[stage_i]
-            source_hist = hist[0] if source_index == 0 else (hist[current_depth] if source_index == -1 else hist[source_index])
-            n_blocks = source_hist.shape[1] // stride
-            if n_blocks > stage_n_blocks_done[stage_i]:
-                code_h = self.code_in_proj[stage_i](source_hist[:, stride - 1::stride, :][:, :n_blocks, :])
-                code_local_pos = jnp.arange(n_blocks)
-                cos_c, sin_c = (rope_cos_sin_for_positions(code_local_pos, code_hd, cfg.rope_base) if pm == "rope" else (None, None))
-                code_mask = causal_mask(code_local_pos, code_local_pos, None)
-                stage_code_cache[stage_i] = self._run_code_lm(stage_i, code_h, cos_c, sin_c, code_mask)
-                stage_n_blocks_done[stage_i] = n_blocks
-            h_code_list = stage_code_cache[stage_i]
-            if h_code_list is None:
-                return x_new
-            n_blocks_now = h_code_list[0].shape[1]
-            code_pos_abs = (jnp.arange(n_blocks_now) + 1) * stride - 1
-            cos_k, sin_k = (rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base) if pm == "rope" else (None, None))
-            fuse_mask = causal_mask(new_pos, code_pos_abs, window)
-            return self.fuse_stages[stage_i](x_new, h_code_list, cos_new, sin_new, cos_k, sin_k, fuse_mask, pm)
-
-        def embed_step(token_chunk, pos):
-            x0 = self.embed(token_chunk)
-            if pm == "learnable":
-                x0 = x0 + self.wpe(pos)[None]
-            if 0 in hist:
-                hist[0] = jnp.concatenate([hist[0], x0], axis=1)
-            return x0
-
-        def prime(prompt_tokens):
-            Tn = prompt_tokens.shape[1]
-            pos = jnp.arange(0, Tn)
-            cos_b, sin_b = (rope_cos_sin_for_positions(pos, hd, cfg.rope_base) if pm == "rope" else (None, None))
-            x = embed_step(prompt_tokens, pos)
-            for stage_i in self.insertions.get(0, []):
-                x = pool_and_fuse_incremental(stage_i, x, pos, cos_b, sin_b, current_depth=0)
-            for i, block in enumerate(self.main_blocks):
-                x, main_caches[i] = block.prime_static_cache(x, cos_b, sin_b, caps[i], self.main_windows[i], pm)
-                depth = i + 1
-                if depth in hist:
-                    hist[depth] = jnp.concatenate([hist[depth], x], axis=1)
-                for stage_i in self.insertions.get(depth, []):
-                    x = pool_and_fuse_incremental(stage_i, x, pos, cos_b, sin_b, current_depth=depth)
-            return self.ln_f(x) @ self._head_weight().T
-
-        def decode_step(token, pos_scalar):
-            pos = jnp.asarray([pos_scalar])
-            cos_b, sin_b = (rope_cos_sin_for_positions(pos, hd, cfg.rope_base) if pm == "rope" else (None, None))
-            x = embed_step(token, pos)
-            for stage_i in self.insertions.get(0, []):
-                x = pool_and_fuse_incremental(stage_i, x, pos, cos_b, sin_b, current_depth=0)
-            for i, block in enumerate(self.main_blocks):
-                x, main_caches[i] = block.forward_incremental_static(x, cos_b, sin_b, main_caches[i], caps[i], pm)
-                depth = i + 1
-                if depth in hist:
-                    hist[depth] = jnp.concatenate([hist[depth], x], axis=1)
-                for stage_i in self.insertions.get(depth, []):
-                    x = pool_and_fuse_incremental(stage_i, x, pos, cos_b, sin_b, current_depth=depth)
-            return self.ln_f(x) @ self._head_weight().T
-
-        return prime, decode_step
-
-    def generate_kv_cache_static(self, prompt_tokens: jnp.ndarray, n_new_tokens: int) -> jnp.ndarray:
-        if prompt_tokens.ndim == 1:
-            prompt_tokens = prompt_tokens[None]
-        prime, decode_step = self._make_static_incremental_stepper(prompt_tokens.shape[0])
-        all_tokens = prompt_tokens
-        logits_all = prime(all_tokens)
-        next_logits = logits_all[:, -1, :]
-        for _ in range(n_new_tokens):
-            next_token = jnp.argmax(next_logits, axis=-1, keepdims=True)
-            all_tokens = jnp.concatenate([all_tokens, next_token], axis=1)
-            logits_all = decode_step(next_token, all_tokens.shape[1] - 1)
-            next_logits = logits_all[:, -1, :]
-        return all_tokens[0]
-
-    def check_kv_cache_consistency_static(self, seq_len: int, key: jax.random.PRNGKey,
-                                           n_checks: int = 3, prompt_len: int = 8, n_new_tokens: int = 24) -> dict:
-        """Same contract as check_kv_cache_consistency, for the static-cache path."""
-        n_match = 0
-        for i in range(n_checks):
-            pl = max(1, prompt_len - i * (prompt_len // max(1, n_checks)))
-            key, subkey = jax.random.split(key)
-            prompt = jax.random.randint(subkey, (pl,), 0, self.vocab)
-            out_full = self.generate_no_cache(prompt, n_new_tokens)
-            out_cache = self.generate_kv_cache_static(prompt, n_new_tokens)
             if jnp.array_equal(out_full, out_cache):
                 n_match += 1
         return {"match_rate": n_match / n_checks, "n_checks": n_checks}
@@ -981,6 +960,12 @@ class SummTransformerV2(nnx.Module):
 
         main_caches = list(state["main_caches"])
         for i, block in enumerate(self.main_blocks):
+            # Standardized on the same fixed-shape/dynamic_update_slice circular-buffer design as
+            # the code-LM cache, not the simpler growing/self-truncating forward_incremental --
+            # deliberate even though the growing version measured faster at main_window=8: cost is
+            # O(1) w.r.t. window size either way, so this doesn't regress as main_window grows
+            # later (the growing version's one-time compile count scales with window; the
+            # circular-buffer version never needs more than one compile regardless of window).
             x, main_caches[i] = block.prime_static_cache(x, cos_b, sin_b, caps[i], self.main_windows[i], pm)
             depth = i + 1
             if depth in hist_buf:
@@ -1095,6 +1080,7 @@ class SummTransformerV2(nnx.Module):
 # VALUES (those are traced inputs, not baked into the trace). This is what actually fixes the
 # ~6.9s/token eager-dispatch cost measured before this existed -- see docs/image_gen_design.md.
 _jitted_decode_step_pure = nnx.jit(SummTransformerV2._decode_step_pure)
+_jitted_decode_step_pure_growing = nnx.jit(SummTransformerV2._decode_step_pure_growing)
 
 
 def check_block_locality(model: SummTransformerV2, rngs: nnx.Rngs, seq_len: int,

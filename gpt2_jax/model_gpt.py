@@ -93,6 +93,7 @@ class CausalSelfAttention(nnx.Module):
         self.pos_method = config.pos_method
         self.head_dim = config.n_embd // config.n_head
         self.rotary_dim = min(64, self.head_dim)  # matches Cable's RotaryEmbedding(dim=64)
+        self.block_size = config.block_size
         self.use_flash_attention = config.use_flash_attention and _HAS_FLASH_ATTENTION
         self.c_attn = nnx.Linear(
             config.n_embd, 3 * config.n_embd, kernel_init=_linear_init(0.02),
@@ -153,8 +154,12 @@ class CausalSelfAttention(nnx.Module):
         v = v.reshape(B, Tn, H, hd).transpose(0, 2, 1, 3)
 
         if self.pos_method == "rope":
-            cos, sin = _rope_cos_sin(start_pos + Tn, self.rotary_dim)
-            cos, sin = cos[start_pos : start_pos + Tn], sin[start_pos : start_pos + Tn]
+            # start_pos may be a traced value under jit (decode step) -- build the full
+            # cos/sin table up to block_size (static) and dynamic_slice into it, rather than
+            # jnp.arange(start_pos + Tn) which needs a concrete Python int.
+            cos_full, sin_full = _rope_cos_sin(self.block_size, self.rotary_dim)
+            cos = jax.lax.dynamic_slice_in_dim(cos_full, start_pos, Tn, axis=0)
+            sin = jax.lax.dynamic_slice_in_dim(sin_full, start_pos, Tn, axis=0)
             q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
             k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
             q = jnp.concatenate([_apply_rope(q_rot, cos, sin), q_pass], axis=-1)
@@ -168,7 +173,9 @@ class CausalSelfAttention(nnx.Module):
         S = k_all.shape[2]
 
         scores = jnp.einsum("bhqd,bhkd->bhqk", q, k_all) / math.sqrt(hd)
-        query_pos = jnp.arange(start_pos, start_pos + Tn).reshape(-1, 1)
+        # start_pos may be a traced value under jit -- add it to a static jnp.arange(Tn)
+        # instead of jnp.arange(start_pos, start_pos + Tn), which needs a concrete start.
+        query_pos = (jnp.arange(Tn) + start_pos).reshape(-1, 1)
         key_pos = jnp.arange(S).reshape(1, -1)
         causal_mask = key_pos <= query_pos  # [Tn, S]
         scores = jnp.where(causal_mask[None, None], scores.astype(jnp.float32), -jnp.inf)
@@ -289,6 +296,53 @@ class Model(nnx.Module):
 
         return all_tokens[0]
 
+    def _prime_pure(self, prompt_tokens):
+        """Pure prefill: not jitted (prompt length varies call to call). Returns
+        (logits, caches) where caches is a tuple of (k, v) per layer -- a plain pytree,
+        no closure mutation (see summformer_jax/image_gen's _prime_pure for the same fix)."""
+        Tn = prompt_tokens.shape[1]
+        x = self.wte(prompt_tokens)
+        if self.config.pos_method == "learnable":
+            x = x + self.wpe(jnp.arange(Tn))[None]
+        caches = []
+        for block in self.h:
+            x, cache = block.forward_incremental(x, None, 0)
+            caches.append(cache)
+        x = self.ln_f(x)
+        logits = x @ self.wte.embedding.value.T
+        return logits, tuple(caches)
+
+    def _decode_step_pure(self, token, pos_scalar, caches):
+        """PURE single-token decode step: caches passed in and returned explicitly, no
+        captured-list mutation -- safe to wrap in nnx.jit and reuse the compiled trace
+        across every call (only cache content changes, not pytree structure/shapes)."""
+        x = self.wte(token)
+        if self.config.pos_method == "learnable":
+            x = x + self.wpe(pos_scalar[None])[None]
+        new_caches = []
+        for l, block in enumerate(self.h):
+            x, cache = block.forward_incremental(x, caches[l], pos_scalar)
+            new_caches.append(cache)
+        x = self.ln_f(x)
+        logits = x @ self.wte.embedding.value.T
+        return logits, tuple(new_caches)
+
+    def generate_kv_cache_jit(self, prompt_tokens, n_new_tokens: int):
+        """Same trajectory as generate_kv_cache, but the decode step is a pure function
+        wrapped in nnx.jit (_jitted_decode_step_pure below) so the compiled trace is
+        reused across all n_new_tokens calls instead of re-tracing/executing eagerly."""
+        if prompt_tokens.ndim == 1:
+            prompt_tokens = prompt_tokens[None]
+        logits, caches = self._prime_pure(prompt_tokens)
+        all_tokens = prompt_tokens
+        next_logits = logits[:, -1, :]
+        for _ in range(n_new_tokens):
+            next_token = jnp.argmax(next_logits, axis=-1, keepdims=True)
+            all_tokens = jnp.concatenate([all_tokens, next_token], axis=1)
+            logits, caches = _jitted_decode_step_pure(self, next_token, all_tokens.shape[1] - 1, caches)
+            next_logits = logits[:, -1, :]
+        return all_tokens[0]
+
     def check_kv_cache_consistency(self, val_data, key, n_checks: int = 3, prompt_len: int = 8,
                                     n_new_tokens: int = 24) -> dict:
         """Diagnostic: generate_no_cache vs generate_kv_cache MUST produce bit-exact identical
@@ -304,6 +358,9 @@ class Model(nnx.Module):
             if jnp.array_equal(out_full, out_cache):
                 n_match += 1
         return {"match_rate": n_match / n_checks, "n_checks": n_checks}
+
+
+_jitted_decode_step_pure = nnx.jit(Model._decode_step_pure)
 
 
 def cross_entropy_loss(logits, targets):
