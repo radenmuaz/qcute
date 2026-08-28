@@ -317,6 +317,31 @@ fuse windows, `code_n_layers>1`, `prompt_len=17` non-coincidental) -- all `match
 the new entry points; `generate_kv_cache_static` (trunk-only) is left as-is, still correct, just
 superseded in scope by this one.
 
+## `image64_mixdim.py` config rationale
+
+**Trunk** (`d_model=128, n_heads=4, n_layers=3, main_window=8`) -- deliberately cheap/shallow
+because it runs once per byte (12,288 times per 64x64 image). `main_window=8` caps its
+self-attention at `O(T*8)` instead of `O(T^2)` via `chunked_windowed_attention`, matching the
+"small like 4 and 8, smaller better" guidance -- even a full image's trunk pass stays cheap.
+
+**Stride-8 fuse-stage** (`(1, 8, None, 2, 0, 256, 4)`, inserted after trunk layer 1): pools every
+8th byte (one pixel's RGB), code length 1536. Stride 8 is the finest granularity worth a dedicated
+code-LM for -- smaller barely compresses anything. `code_d_model=256` (2x trunk width), only 2
+layers, since it fires often (every 8 trunk positions) and needs to stay cheap too.
+
+**Stride-64 fuse-stage** (`(3, 64, None, 4, 0, 512, 8)`, inserted after all 3 trunk layers): pools
+every 64th byte (8x8, roughly a small patch's worth of raster bytes), code length 192. Updates 8x
+less often than the stride-8 stage, so it can afford to be wider/deeper (`code_d_model=512`,
+matching gpt2-tiny's own width exactly -- `gpt2_jax/train_gpt.py`'s `n_embd=512` -- 4 layers)
+without dominating total compute -- the "code-LM wide/deep but updates less frequently" principle
+directly traded against stride.
+
+The two strides (8, 64) form a coarse-to-fine hierarchy analogous to Fractal's multi-level grid,
+via pooling+cross-attention on a flat byte stream rather than literal 2D patchify -- same rationale
+as `image256_fractal2level`/`3level`, re-derived at a size actually fast enough to iterate on now.
+Confirmed via param count: trunk is 3.9% of total params, code-LMs 87.4% -- matches the design
+intent directly, not just by construction (see the mixed-dim implementation section above).
+
 ## First real TPU training run (2026-08-28, tpu8)
 
 Added `log.jsonl` logging to `train.py` (matches `summformer_jax/lm/train_summformer_v2.py`'s own

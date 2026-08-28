@@ -368,9 +368,13 @@ class ConfigV2:
     rope_preset: str | None = None
     context_len: int = 1024
     main_window: int | tuple | None = None
-    # (insert_after, stride, window, code_n_layers, source_index) -- trunk-dim code-LM (backward compat)
-    # (insert_after, stride, window, code_n_layers, source_index, code_d_model, code_n_heads) -- own dim,
-    #   projected to/from trunk dim at the fuse-stage boundary (Attn/FuseStageV2 stay trunk-dim only).
+    # Each stage: ((src, dst), (stride, window), (code_n_layers, code_d_model=None, code_n_heads=None))
+    #   src = source_index (0 = raw embedded x0; -1 = current x at this insertion point; specific
+    #         int j = main_blocks[j-1]'s output). dst = insert_after (main_blocks index this stage's
+    #         cross-attention fires after). code_d_model/code_n_heads omitted -> default to trunk
+    #         dims; given -> the code-LM runs at its own (typically wider) dim, bridged to/from
+    #         trunk dim at the fuse-stage boundary via code_in_proj/code_out_proj (Attn/FuseStageV2
+    #         themselves stay trunk-dim only). See _parse_fuse_stage.
     fuse_stages: tuple = ()
     input_preset: int = 8
     vocab_size: int | None = 256      # byte-level RGB by default here (not GPT2-BPE 50304 like lm/'s)
@@ -380,6 +384,18 @@ class ConfigV2:
     zero_kv_sink: bool = True
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
+
+
+def _parse_fuse_stage(spec):
+    """spec: ((src, dst), (stride, window), (code_n_layers, code_d_model=None, code_n_heads=None)).
+    code_d_model/code_n_heads omitted -> None, caller defaults to trunk dims. code_n_layers is
+    always required (first in its group, not last, so the optional width/head-count pair trails a
+    variable-length tuple instead of sitting in the middle)."""
+    (src, dst), (stride, window), code_part = spec
+    code_n_layers = code_part[0]
+    code_d_model = code_part[1] if len(code_part) > 1 else None
+    code_n_heads = code_part[2] if len(code_part) > 2 else None
+    return src, dst, stride, window, code_n_layers, code_d_model, code_n_heads
 
 
 def _resolve_main_windows(w, n_layers: int) -> tuple:
@@ -402,7 +418,7 @@ class SummTransformerV2(nnx.Module):
         assert D % cfg.n_heads == 0
         dtype, param_dtype = cfg.compute_dtype, cfg.param_dtype
 
-        n_fuse_layers_total = sum(spec[3] * 2 for spec in cfg.fuse_stages)
+        n_fuse_layers_total = sum(_parse_fuse_stage(spec)[4] * 2 for spec in cfg.fuse_stages)
         scale_layers = cfg.n_layers + n_fuse_layers_total
 
         init = nnx.initializers.normal(stddev=0.02)
@@ -418,31 +434,33 @@ class SummTransformerV2(nnx.Module):
         self.main_windows = _resolve_main_windows(cfg.main_window, cfg.n_layers)
         self.ln_f = nnx.LayerNorm(D, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
 
-        # per-stage code-LM dim: defaults to trunk dim D (5-tuple spec, backward compat) or its own
-        # (larger, typically) dim from a 7-tuple spec -- code-LM runs cheaply-infrequently (once per
-        # K trunk positions) so it can afford to be wider/deeper than the trunk without dominating
-        # cost. Attn/FuseStageV2 themselves stay trunk-dim only; code_in_proj/code_out_proj bridge
-        # the boundary so no cross-attention machinery needs to support mixed dims directly.
-        code_dims = [(spec[5] if len(spec) > 5 else D) for spec in cfg.fuse_stages]
-        code_n_heads_list = [(spec[6] if len(spec) > 6 else cfg.n_heads) for spec in cfg.fuse_stages]
+        # per-stage code-LM dim: defaults to trunk dim D when code_d_model/code_n_heads are omitted
+        # from a stage's spec, or its own (larger, typically) dim when given -- code-LM runs
+        # cheaply-infrequently (once per stride trunk positions) so it can afford to be
+        # wider/deeper than the trunk without dominating cost. Attn/FuseStageV2 themselves stay
+        # trunk-dim only; code_in_proj/code_out_proj bridge the boundary so no cross-attention
+        # machinery needs to support mixed dims directly.
+        parsed = [_parse_fuse_stage(spec) for spec in cfg.fuse_stages]
+        code_dims = [(cd if cd is not None else D) for _, _, _, _, _, cd, _ in parsed]
+        code_n_heads_list = [(ch if ch is not None else cfg.n_heads) for _, _, _, _, _, _, ch in parsed]
         for cd, ch in zip(code_dims, code_n_heads_list):
             assert cd % ch == 0, f"code_d_model={cd} must be divisible by code_n_heads={ch}"
         self.code_dims = code_dims
         self.code_head_dims = [cd // ch for cd, ch in zip(code_dims, code_n_heads_list)]
-        # static upper bound on how many codes a stage can ever produce -- context_len//K, known at
-        # construction time (context_len is fixed per config) -- used to size the fully-static
-        # incremental-decode buffers (see _make_fully_static_incremental_stepper).
-        self.max_n_blocks = [cfg.context_len // spec[1] for spec in cfg.fuse_stages]
+        # static upper bound on how many codes a stage can ever produce -- context_len//stride,
+        # known at construction time (context_len is fixed per config) -- used to size the
+        # fully-static incremental-decode buffers (see _make_fully_static_incremental_stepper).
+        self.max_n_blocks = [cfg.context_len // p[2] for p in parsed]
 
         self.fuse_stages = nnx.List([
-            FuseStageV2(D, cfg.n_heads, cfg.mlp_mult, spec[3], scale_layers, dtype, param_dtype,
+            FuseStageV2(D, cfg.n_heads, cfg.mlp_mult, p[4], scale_layers, dtype, param_dtype,
                         rngs=rngs, use_sink=cfg.zero_kv_sink)
-            for spec in cfg.fuse_stages
+            for p in parsed
         ])
         self.code_lms = nnx.List([
             nnx.List([Block(cd, ch, cfg.mlp_mult, scale_layers, dtype, param_dtype,
-                             rngs=rngs, use_sink=cfg.zero_kv_sink) for _ in range(spec[3])])
-            for spec, cd, ch in zip(cfg.fuse_stages, code_dims, code_n_heads_list)
+                             rngs=rngs, use_sink=cfg.zero_kv_sink) for _ in range(p[4])])
+            for p, cd, ch in zip(parsed, code_dims, code_n_heads_list)
         ])
         self.code_ln_fs = nnx.List([
             nnx.LayerNorm(cd, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs) for cd in code_dims
@@ -458,8 +476,8 @@ class SummTransformerV2(nnx.Module):
             for cd in code_dims
         ])
         self.insertions: dict[int, list[int]] = {}
-        for i, spec in enumerate(cfg.fuse_stages):
-            self.insertions.setdefault(spec[0], []).append(i)
+        for i, p in enumerate(parsed):
+            self.insertions.setdefault(p[1], []).append(i)  # p[1] = dst (insert_after)
 
         self.head = (
             nnx.Linear(D, V, use_bias=False, kernel_init=init, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
@@ -488,7 +506,7 @@ class SummTransformerV2(nnx.Module):
         cfg = self.cfg
         hd = self.head_dim
         code_hd = self.code_head_dims[stage_i]
-        insert_after, stride, window, code_n_layers, source_index = cfg.fuse_stages[stage_i][:5]
+        source_index, _insert_after, stride, window, _code_n_layers, _, _ = _parse_fuse_stage(cfg.fuse_stages[stage_i])
         source = x0 if source_index == 0 else (x if source_index == -1 else layer_hist[source_index])
 
         L = source.shape[1]
@@ -613,9 +631,9 @@ class SummTransformerV2(nnx.Module):
         # for every unused depth).
         referenced_depths = {0}
         for spec in cfg.fuse_stages:
-            src = spec[4]
+            src, dst, _, _, _, _, _ = _parse_fuse_stage(spec)
             if src == -1:
-                referenced_depths.add(spec[0])  # -1 means "the depth this stage fires at"
+                referenced_depths.add(dst)  # -1 means "the depth this stage fires at"
             elif src != 0:
                 referenced_depths.add(src)
         hist = {j: jnp.zeros((Bsz, 0, D), dtype=cfg.compute_dtype) for j in referenced_depths}
@@ -623,7 +641,7 @@ class SummTransformerV2(nnx.Module):
         stage_n_blocks_done = [0] * n_stages
 
         def pool_and_fuse_incremental(stage_i: int, x_new, new_pos, cos_new, sin_new, current_depth: int):
-            insert_after, stride, window, code_n_layers, source_index = cfg.fuse_stages[stage_i][:5]
+            source_index, _insert_after, stride, window, _code_n_layers, _, _ = _parse_fuse_stage(cfg.fuse_stages[stage_i])
             code_hd = self.code_head_dims[stage_i]
             if source_index == 0:
                 source_hist = hist[0]
@@ -731,9 +749,9 @@ class SummTransformerV2(nnx.Module):
         main_caches = [None] * cfg.n_layers
         referenced_depths = {0}
         for spec in cfg.fuse_stages:
-            src = spec[4]
+            src, dst, _, _, _, _, _ = _parse_fuse_stage(spec)
             if src == -1:
-                referenced_depths.add(spec[0])
+                referenced_depths.add(dst)
             elif src != 0:
                 referenced_depths.add(src)
         hist = {j: jnp.zeros((Bsz, 0, D), dtype=cfg.compute_dtype) for j in referenced_depths}
@@ -742,7 +760,7 @@ class SummTransformerV2(nnx.Module):
         stage_n_blocks_done = [0] * n_stages
 
         def pool_and_fuse_incremental(stage_i, x_new, new_pos, cos_new, sin_new, current_depth):
-            insert_after, stride, window, code_n_layers, source_index = cfg.fuse_stages[stage_i][:5]
+            source_index, _insert_after, stride, window, _code_n_layers, _, _ = _parse_fuse_stage(cfg.fuse_stages[stage_i])
             code_hd = self.code_head_dims[stage_i]
             source_hist = hist[0] if source_index == 0 else (hist[current_depth] if source_index == -1 else hist[source_index])
             n_blocks = source_hist.shape[1] // stride
@@ -831,149 +849,204 @@ class SummTransformerV2(nnx.Module):
                 n_match += 1
         return {"match_rate": n_match / n_checks, "n_checks": n_checks}
 
-    def _make_fully_static_incremental_stepper(self, Bsz: int):
-        """Extends _make_static_incremental_stepper to the fuse-stage/code-LM side: every buffer
-        (trunk KV, pooling-source history, code-LM's own KV, code-LM output) is now fixed-shape,
-        and the code recompute trigger is a jax.lax.cond (both branches same-shaped), not a
-        Python-level branch -- so a decode call no longer retraces when a fuse-stage's code buffer
-        grows. Sized to context_len (self.max_n_blocks = context_len // K per stage), a static
-        bound known at construction time -- see ConfigV2/SummTransformerV2.max_n_blocks.
-
-        Correctness discipline unchanged from every other stepper here: must match generate_no_cache
-        bit-exactly, verified via check_kv_cache_consistency_fully_static, not assumed from the
-        padding/masking design being "obviously" equivalent."""
+    def _init_decode_state(self, Bsz: int) -> dict:
+        """Zero-initialized DecodeState pytree (plain dict -- valid JAX pytree, fixed keys per
+        cfg so its structure never changes across calls, which is what makes it safe to thread
+        through a jax.jit/nnx.jit-wrapped decode step). See _decode_step_pure's docstring for why
+        this replaced _make_fully_static_incremental_stepper's closure-mutation design."""
         cfg = self.cfg
         D = cfg.d_model
-        hd = self.head_dim
-        pm = cfg.pos_method
-        caps = [w if w is not None else cfg.context_len for w in self.main_windows]
         n_stages = len(cfg.fuse_stages)
 
-        main_caches = [None] * cfg.n_layers
         referenced_depths = {0}
         for spec in cfg.fuse_stages:
-            src = spec[4]
+            src, dst, _, _, _, _, _ = _parse_fuse_stage(spec)
             if src == -1:
-                referenced_depths.add(spec[0])
+                referenced_depths.add(dst)
             elif src != 0:
                 referenced_depths.add(src)
-        # sequential (non-circular) static history buffers -- pooling needs the FULL causal past,
-        # never evicted, so sized to context_len outright (the true max, no wraparound needed).
         hist_buf = {j: jnp.zeros((Bsz, cfg.context_len, D), dtype=cfg.compute_dtype) for j in referenced_depths}
-        total_written = jnp.array(0, dtype=jnp.int32)  # shared: every depth gets exactly 1 new row/call
 
-        # jax.lax.cond needs both branches to return the SAME pytree structure from the start --
-        # None (used by the dynamic stepper's cache) doesn't work here; forward_incremental_static
-        # has no None-handling path, so seed proper zero-initialized (k,v,pos,write_pos) tuples.
         def _zero_code_cache(stage_i):
-            cd, ch = self.code_dims[stage_i], self.code_dims[stage_i] // self.code_head_dims[stage_i]
+            ch = self.code_dims[stage_i] // self.code_head_dims[stage_i]
             hd_c = self.code_head_dims[stage_i]
             max_nb = self.max_n_blocks[stage_i]
-            k0 = jnp.zeros((Bsz, ch, max_nb, hd_c), dtype=self.cfg.compute_dtype)
-            v0 = jnp.zeros((Bsz, ch, max_nb, hd_c), dtype=self.cfg.compute_dtype)
+            k0 = jnp.zeros((Bsz, ch, max_nb, hd_c), dtype=cfg.compute_dtype)
+            v0 = jnp.zeros((Bsz, ch, max_nb, hd_c), dtype=cfg.compute_dtype)
             pos0 = jnp.full((max_nb,), -10 ** 9, dtype=jnp.int32)
             return (k0, v0, pos0, jnp.array(0, dtype=jnp.int32))
 
-        code_lm_caches = [[_zero_code_cache(i) for _ in range(spec[3])] for i, spec in enumerate(cfg.fuse_stages)]
-        h_code_out_bufs = [
-            [jnp.zeros((Bsz, self.max_n_blocks[i], D), dtype=cfg.compute_dtype) for _ in range(cfg.fuse_stages[i][3])]
+        code_lm_caches = tuple(
+            tuple(_zero_code_cache(i) for _ in range(_parse_fuse_stage(spec)[4]))
+            for i, spec in enumerate(cfg.fuse_stages)
+        )
+        h_code_out_bufs = tuple(
+            tuple(jnp.zeros((Bsz, self.max_n_blocks[i], D), dtype=cfg.compute_dtype)
+                  for _ in range(_parse_fuse_stage(cfg.fuse_stages[i])[4]))
             for i in range(n_stages)
-        ]
-        n_blocks_done = [jnp.array(0, dtype=jnp.int32) for _ in range(n_stages)]
+        )
+        n_blocks_done = tuple(jnp.array(0, dtype=jnp.int32) for _ in range(n_stages))
+        main_caches = tuple(None for _ in range(cfg.n_layers))  # filled by _prime_pure
 
-        def pool_and_fuse_static(stage_i, x_new, new_pos, cos_new, sin_new, current_depth,
-                                  total_written_now):
-            insert_after, stride, window, code_n_layers, source_index = cfg.fuse_stages[stage_i][:5]
-            code_hd = self.code_head_dims[stage_i]
-            max_nb = self.max_n_blocks[stage_i]
-            source_buf = hist_buf[0] if source_index == 0 else (hist_buf[current_depth] if source_index == -1 else hist_buf[source_index])
+        return {
+            "main_caches": main_caches, "hist_buf": hist_buf, "code_lm_caches": code_lm_caches,
+            "h_code_out_bufs": h_code_out_bufs, "n_blocks_done": n_blocks_done,
+            "total_written": jnp.array(0, dtype=jnp.int32),
+        }
 
-            def do_update(carry):
-                caches_i, out_bufs_i, nb_done_i = carry
-                sample_pos = (nb_done_i + 1) * stride - 1
-                sample = jax.lax.dynamic_slice_in_dim(source_buf, sample_pos, 1, axis=1)
-                h = self.code_in_proj[stage_i](sample)
-                code_local_pos = nb_done_i[None]
-                cos_c, sin_c = (rope_cos_sin_for_positions(code_local_pos, code_hd, cfg.rope_base) if pm == "rope" else (None, None))
-                new_caches, new_out_bufs = [], []
-                for l, block in enumerate(self.code_lms[stage_i]):
-                    h, new_cache = block.forward_incremental_static(h, cos_c, sin_c, caches_i[l], max_nb, pm)
-                    new_caches.append(new_cache)
-                    projected = self.code_out_proj[stage_i](self.code_ln_fs[stage_i](h))
-                    new_out_bufs.append(jax.lax.dynamic_update_slice_in_dim(out_bufs_i[l], projected, nb_done_i, axis=1))
-                return new_caches, new_out_bufs, nb_done_i + 1
+    def _pool_and_fuse_pure(self, stage_i, x_new, new_pos, cos_new, sin_new, current_depth,
+                             total_written_now, state: dict):
+        """Pure version of pool_and_fuse_static -- reads state, returns (x_out, updated fields)
+        instead of mutating closure lists. Same algorithm/correctness contract as before."""
+        cfg = self.cfg
+        hd = self.head_dim
+        source_index, _insert_after, stride, window, _code_n_layers, _, _ = _parse_fuse_stage(cfg.fuse_stages[stage_i])
+        code_hd = self.code_head_dims[stage_i]
+        max_nb = self.max_n_blocks[stage_i]
+        pm = cfg.pos_method
+        hist_buf = state["hist_buf"]
+        source_buf = hist_buf[0] if source_index == 0 else (hist_buf[current_depth] if source_index == -1 else hist_buf[source_index])
 
-            def no_update(carry):
-                return carry
+        def do_update(carry):
+            caches_i, out_bufs_i, nb_done_i = carry
+            sample_pos = (nb_done_i + 1) * stride - 1
+            sample = jax.lax.dynamic_slice_in_dim(source_buf, sample_pos, 1, axis=1)
+            h = self.code_in_proj[stage_i](sample)
+            code_local_pos = nb_done_i[None]
+            cos_c, sin_c = (rope_cos_sin_for_positions(code_local_pos, code_hd, cfg.rope_base) if pm == "rope" else (None, None))
+            new_caches, new_out_bufs = [], []
+            for l, block in enumerate(self.code_lms[stage_i]):
+                h, new_cache = block.forward_incremental_static(h, cos_c, sin_c, caches_i[l], max_nb, pm)
+                new_caches.append(new_cache)
+                projected = self.code_out_proj[stage_i](self.code_ln_fs[stage_i](h))
+                new_out_bufs.append(jax.lax.dynamic_update_slice_in_dim(out_bufs_i[l], projected, nb_done_i, axis=1))
+            return tuple(new_caches), tuple(new_out_bufs), nb_done_i + 1
 
-            need_update = (total_written_now // stride) > n_blocks_done[stage_i]
-            new_caches, new_out_bufs, new_nb_done = jax.lax.cond(
-                need_update, do_update, no_update,
-                (code_lm_caches[stage_i], h_code_out_bufs[stage_i], n_blocks_done[stage_i]),
-            )
-            code_lm_caches[stage_i] = new_caches
-            h_code_out_bufs[stage_i] = new_out_bufs
-            n_blocks_done[stage_i] = new_nb_done
+        def no_update(carry):
+            return carry
 
-            code_pos_abs = (jnp.arange(max_nb) + 1) * stride - 1
-            cos_k, sin_k = (rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base) if pm == "rope" else (None, None))
-            valid = (jnp.arange(max_nb) < n_blocks_done[stage_i]).reshape(1, 1, 1, max_nb)
-            fuse_mask = causal_mask(new_pos, code_pos_abs, window) & valid
-            # dense _pool_and_fuse SKIPS the fuse-stage entirely (x unchanged) when no codes exist
-            # yet (n_blocks<1) -- relying on the sink alone to avoid NaN under an all-invalid mask
-            # is NOT equivalent: FuseStageV2's residual MLP still applies even when attention output
-            # is "just sink", silently diverging from dense's true no-op. Match dense exactly via
-            # lax.cond (both branches same-shape: (B,Tn,D)).
-            return jax.lax.cond(
-                n_blocks_done[stage_i] > 0,
-                lambda: self.fuse_stages[stage_i](x_new, h_code_out_bufs[stage_i], cos_new, sin_new, cos_k, sin_k, fuse_mask, pm),
-                lambda: x_new,
-            )
+        need_update = (total_written_now // stride) > state["n_blocks_done"][stage_i]
+        new_caches, new_out_bufs, new_nb_done = jax.lax.cond(
+            need_update, do_update, no_update,
+            (state["code_lm_caches"][stage_i], state["h_code_out_bufs"][stage_i], state["n_blocks_done"][stage_i]),
+        )
 
-        def embed_and_hist(token_chunk, pos, write_idx):
-            x0 = self.embed(token_chunk)
-            if pm == "learnable":
-                x0 = x0 + self.wpe(pos)[None]
-            if 0 in hist_buf:
-                hist_buf[0] = jax.lax.dynamic_update_slice_in_dim(hist_buf[0], x0, write_idx, axis=1)
-            return x0
+        code_pos_abs = (jnp.arange(max_nb) + 1) * stride - 1
+        cos_k, sin_k = (rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base) if pm == "rope" else (None, None))
+        valid = (jnp.arange(max_nb) < new_nb_done).reshape(1, 1, 1, max_nb)
+        fuse_mask = causal_mask(new_pos, code_pos_abs, window) & valid
+        # dense _pool_and_fuse SKIPS the fuse-stage entirely (x unchanged) when no codes exist yet
+        # (n_blocks<1) -- the sink alone avoiding NaN under an all-invalid mask is NOT equivalent:
+        # FuseStageV2's residual MLP still applies even when attention output is "just sink",
+        # silently diverging from dense's true no-op. Match dense exactly via lax.cond (both
+        # branches same-shape: (B,Tn,D)).
+        x_out = jax.lax.cond(
+            new_nb_done > 0,
+            lambda: self.fuse_stages[stage_i](x_new, new_out_bufs, cos_new, sin_new, cos_k, sin_k, fuse_mask, pm),
+            lambda: x_new,
+        )
+        return x_out, new_caches, new_out_bufs, new_nb_done
 
-        def prime(prompt_tokens):
-            nonlocal total_written
-            Tn = prompt_tokens.shape[1]
-            pos = jnp.arange(0, Tn)
-            cos_b, sin_b = (rope_cos_sin_for_positions(pos, hd, cfg.rope_base) if pm == "rope" else (None, None))
-            x = embed_and_hist(prompt_tokens, pos, 0)
-            total_written = jnp.array(Tn, dtype=jnp.int32)
-            for stage_i in self.insertions.get(0, []):
-                x = pool_and_fuse_static(stage_i, x, pos, cos_b, sin_b, 0, total_written)
-            for i, block in enumerate(self.main_blocks):
-                x, main_caches[i] = block.prime_static_cache(x, cos_b, sin_b, caps[i], self.main_windows[i], pm)
-                depth = i + 1
-                if depth in hist_buf:
-                    hist_buf[depth] = jax.lax.dynamic_update_slice_in_dim(hist_buf[depth], x, 0, axis=1)
-                for stage_i in self.insertions.get(depth, []):
-                    x = pool_and_fuse_static(stage_i, x, pos, cos_b, sin_b, depth, total_written)
-            return self.ln_f(x) @ self._head_weight().T
+    def _embed_and_hist_pure(self, token_chunk, pos, write_idx, hist_buf: dict):
+        pm = self.cfg.pos_method
+        x0 = self.embed(token_chunk)
+        if pm == "learnable":
+            x0 = x0 + self.wpe(pos)[None]
+        new_hist_buf = dict(hist_buf)
+        if 0 in hist_buf:
+            new_hist_buf[0] = jax.lax.dynamic_update_slice_in_dim(hist_buf[0], x0, write_idx, axis=1)
+        return x0, new_hist_buf
 
-        def decode_step(token, pos_scalar):
-            nonlocal total_written
-            pos = jnp.asarray([pos_scalar])
-            cos_b, sin_b = (rope_cos_sin_for_positions(pos, hd, cfg.rope_base) if pm == "rope" else (None, None))
-            x = embed_and_hist(token, pos, total_written)
-            total_written = total_written + 1
-            for stage_i in self.insertions.get(0, []):
-                x = pool_and_fuse_static(stage_i, x, pos, cos_b, sin_b, 0, total_written)
-            for i, block in enumerate(self.main_blocks):
-                x, main_caches[i] = block.forward_incremental_static(x, cos_b, sin_b, main_caches[i], caps[i], pm)
-                depth = i + 1
-                if depth in hist_buf:
-                    hist_buf[depth] = jax.lax.dynamic_update_slice_in_dim(hist_buf[depth], x, pos_scalar, axis=1)
-                for stage_i in self.insertions.get(depth, []):
-                    x = pool_and_fuse_static(stage_i, x, pos, cos_b, sin_b, depth, total_written)
-            return self.ln_f(x) @ self._head_weight().T
+    def _prime_pure(self, prompt_tokens, state: dict):
+        """Prefill: not jitted (prompt length varies call to call, so there's no repeated-shape
+        benefit to caching a trace for it) -- only _decode_step_pure needs to be fast/cached."""
+        cfg = self.cfg
+        hd = self.head_dim
+        pm = cfg.pos_method
+        caps = [w if w is not None else cfg.context_len for w in self.main_windows]
+        Tn = prompt_tokens.shape[1]
+        pos = jnp.arange(0, Tn)
+        cos_b, sin_b = (rope_cos_sin_for_positions(pos, hd, cfg.rope_base) if pm == "rope" else (None, None))
+        x, hist_buf = self._embed_and_hist_pure(prompt_tokens, pos, 0, state["hist_buf"])
+        total_written = jnp.array(Tn, dtype=jnp.int32)
+        code_lm_caches = list(state["code_lm_caches"])
+        h_code_out_bufs = list(state["h_code_out_bufs"])
+        n_blocks_done = list(state["n_blocks_done"])
+        s = {**state, "hist_buf": hist_buf}
 
-        return prime, decode_step
+        for stage_i in self.insertions.get(0, []):
+            x, code_lm_caches[stage_i], h_code_out_bufs[stage_i], n_blocks_done[stage_i] = self._pool_and_fuse_pure(
+                stage_i, x, pos, cos_b, sin_b, 0, total_written, {**s, "code_lm_caches": tuple(code_lm_caches),
+                "h_code_out_bufs": tuple(h_code_out_bufs), "n_blocks_done": tuple(n_blocks_done)})
+
+        main_caches = list(state["main_caches"])
+        for i, block in enumerate(self.main_blocks):
+            x, main_caches[i] = block.prime_static_cache(x, cos_b, sin_b, caps[i], self.main_windows[i], pm)
+            depth = i + 1
+            if depth in hist_buf:
+                hist_buf = {**hist_buf, depth: jax.lax.dynamic_update_slice_in_dim(hist_buf[depth], x, 0, axis=1)}
+            for stage_i in self.insertions.get(depth, []):
+                s = {"hist_buf": hist_buf, "code_lm_caches": tuple(code_lm_caches),
+                     "h_code_out_bufs": tuple(h_code_out_bufs), "n_blocks_done": tuple(n_blocks_done)}
+                x, code_lm_caches[stage_i], h_code_out_bufs[stage_i], n_blocks_done[stage_i] = self._pool_and_fuse_pure(
+                    stage_i, x, pos, cos_b, sin_b, depth, total_written, s)
+
+        logits = self.ln_f(x) @ self._head_weight().T
+        new_state = {
+            "main_caches": tuple(main_caches), "hist_buf": hist_buf,
+            "code_lm_caches": tuple(code_lm_caches), "h_code_out_bufs": tuple(h_code_out_bufs),
+            "n_blocks_done": tuple(n_blocks_done), "total_written": total_written,
+        }
+        return logits, new_state
+
+    def _decode_step_pure(self, state: dict, token, pos_scalar):
+        """PURE version: takes the full DecodeState explicitly, returns (logits, new_state) --
+        no closure mutation (no `nonlocal`, no list-index reassignment on captured objects). This
+        is what makes it safe to wrap in nnx.jit/jax.jit and call repeatedly: a closure-mutating
+        version traces fine ONCE, but the mutated closure lists end up holding TRACERS from that
+        first trace, not real values -- every call after the first would silently reuse whatever
+        was captured at trace time (exactly the anti-pattern flagged in bench_generation.py's own
+        docstring, now applying to this stepper too). Passing state explicitly avoids that
+        entirely: jax.jit only ever sees state as a normal input/output pytree, no closure at all.
+        """
+        cfg = self.cfg
+        hd = self.head_dim
+        pm = cfg.pos_method
+        caps = [w if w is not None else cfg.context_len for w in self.main_windows]
+
+        pos = jnp.asarray([pos_scalar])
+        cos_b, sin_b = (rope_cos_sin_for_positions(pos, hd, cfg.rope_base) if pm == "rope" else (None, None))
+        x, hist_buf = self._embed_and_hist_pure(token, pos, state["total_written"], state["hist_buf"])
+        total_written = state["total_written"] + 1
+        code_lm_caches = list(state["code_lm_caches"])
+        h_code_out_bufs = list(state["h_code_out_bufs"])
+        n_blocks_done = list(state["n_blocks_done"])
+
+        def cur_state():
+            return {"hist_buf": hist_buf, "code_lm_caches": tuple(code_lm_caches),
+                    "h_code_out_bufs": tuple(h_code_out_bufs), "n_blocks_done": tuple(n_blocks_done)}
+
+        for stage_i in self.insertions.get(0, []):
+            x, code_lm_caches[stage_i], h_code_out_bufs[stage_i], n_blocks_done[stage_i] = self._pool_and_fuse_pure(
+                stage_i, x, pos, cos_b, sin_b, 0, total_written, cur_state())
+
+        main_caches = list(state["main_caches"])
+        for i, block in enumerate(self.main_blocks):
+            x, main_caches[i] = block.forward_incremental_static(x, cos_b, sin_b, main_caches[i], caps[i], pm)
+            depth = i + 1
+            if depth in hist_buf:
+                hist_buf = {**hist_buf, depth: jax.lax.dynamic_update_slice_in_dim(hist_buf[depth], x, pos_scalar, axis=1)}
+            for stage_i in self.insertions.get(depth, []):
+                x, code_lm_caches[stage_i], h_code_out_bufs[stage_i], n_blocks_done[stage_i] = self._pool_and_fuse_pure(
+                    stage_i, x, pos, cos_b, sin_b, depth, total_written, cur_state())
+
+        logits = self.ln_f(x) @ self._head_weight().T
+        new_state = {
+            "main_caches": tuple(main_caches), "hist_buf": hist_buf,
+            "code_lm_caches": tuple(code_lm_caches), "h_code_out_bufs": tuple(h_code_out_bufs),
+            "n_blocks_done": tuple(n_blocks_done), "total_written": total_written,
+        }
+        return logits, new_state
 
     def generate_kv_cache_fully_static(self, prompt_tokens: jnp.ndarray, n_new_tokens: int,
                                         key: jax.random.PRNGKey | None = None, temperature: float = 1.0) -> jnp.ndarray:
@@ -985,10 +1058,11 @@ class SummTransformerV2(nnx.Module):
         (and often repetitive/degenerate, especially early in training) continuation."""
         if prompt_tokens.ndim == 1:
             prompt_tokens = prompt_tokens[None]
-        prime, decode_step = self._make_fully_static_incremental_stepper(prompt_tokens.shape[0])
+        Bsz = prompt_tokens.shape[0]
+        state = self._init_decode_state(Bsz)
         all_tokens = prompt_tokens
-        logits_all = prime(all_tokens)
-        next_logits = logits_all[:, -1, :]
+        logits, state = self._prime_pure(all_tokens, state)
+        next_logits = logits[:, -1, :]
         for _ in range(n_new_tokens):
             if key is None:
                 next_token = jnp.argmax(next_logits, axis=-1, keepdims=True)
@@ -996,8 +1070,8 @@ class SummTransformerV2(nnx.Module):
                 key, subkey = jax.random.split(key)
                 next_token = jax.random.categorical(subkey, next_logits / temperature, axis=-1)[:, None]
             all_tokens = jnp.concatenate([all_tokens, next_token], axis=1)
-            logits_all = decode_step(next_token, all_tokens.shape[1] - 1)
-            next_logits = logits_all[:, -1, :]
+            logits, state = _jitted_decode_step_pure(self, state, next_token, all_tokens.shape[1] - 1)
+            next_logits = logits[:, -1, :]
         return all_tokens[0]
 
     def check_kv_cache_consistency_fully_static(self, seq_len: int, key: jax.random.PRNGKey,
@@ -1012,6 +1086,15 @@ class SummTransformerV2(nnx.Module):
             if jnp.array_equal(out_full, out_cache):
                 n_match += 1
         return {"match_rate": n_match / n_checks, "n_checks": n_checks}
+
+
+# Module-level so it's built ONCE and reused across every generate_kv_cache_fully_static call
+# (not just within one call) -- nnx.jit traces _decode_step_pure the first time it's invoked
+# with a given (model structure, state pytree structure) and reuses that compiled executable for
+# every subsequent call with the same structure, regardless of the changing `pos_scalar`/state
+# VALUES (those are traced inputs, not baked into the trace). This is what actually fixes the
+# ~6.9s/token eager-dispatch cost measured before this existed -- see docs/image_gen_design.md.
+_jitted_decode_step_pure = nnx.jit(SummTransformerV2._decode_step_pure)
 
 
 def check_block_locality(model: SummTransformerV2, rngs: nnx.Rngs, seq_len: int,

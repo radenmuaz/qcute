@@ -29,6 +29,6 @@ n_heads = 8
 n_layers = 8
 main_window = 12
 sequence_length = 196608
-fuse_stages = ((2, 48, None, 1, 0), (6, 768, None, 2, 0))
+fuse_stages = (((0, 2), (48, None), (1,)), ((0, 6), (768, None), (2,)))
 batch_size = 1
 total_batch_size = 196608
