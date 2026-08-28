@@ -178,11 +178,15 @@ class OnlineImageByteLoader:
         return np.stack(rows, axis=0)
 
     def close(self):
+        """Workers spend most of their time blocked deep inside HF's streaming network I/O, not
+        at the stop_evt check between images -- a graceful stop_evt+join can hang well past any
+        reasonable timeout waiting for that check to be reached. Since these are daemon processes
+        (safe to hard-kill, nothing to flush), terminate immediately rather than waiting."""
         self._stop_evt.set()
         for w in self._workers:
+            w.terminate()
+        for w in self._workers:
             w.join(timeout=5)
-            if w.is_alive():
-                w.terminate()
 
     def __del__(self):
         try:
