@@ -287,7 +287,8 @@ def main():
         dt = time.time() - t0
         tok_per_sec = (B * T * grad_accum_steps * n_devices) / dt
         lr = float(schedule(step))
-        log(step=step, split="train", loss=loss_accum, lr=lr, dt_ms=dt * 1000, tok_per_sec=tok_per_sec)
+        log(step=step, split="train", loss=loss_accum, ppl=math.exp(min(loss_accum, 20)), lr=lr,
+            dt_ms=dt * 1000, tok_per_sec=tok_per_sec)
         postfix = {"loss": f"{loss_accum:.6f}", "tok/s": f"{tok_per_sec:.2f}", "lr": f"{lr:.8f}"}
         if val_loss is not None:
             postfix["val_loss"] = f"{val_loss:.6f}"

@@ -221,7 +221,7 @@ design source-of-truth for the `qcutelm` lineage:
 [docs/archive/continuous_tokenizer_handover.md](docs/archive/continuous_tokenizer_handover.md).
 `qcute/bytelm.py` and `qcute/bpelm.py` are the exception — still the active baseline comparison
 points, not archived. Pre-v4 `DecoderLevel` KV-contribution probe diagnostic
-(`scripts/probe_decoder_kv_contribution.py`) and its narrative:
+(`scripts/archive/probe_decoder_kv_contribution.py`) and its narrative:
 [docs/archive2/kv_contribution.md](docs/archive2/kv_contribution.md).
 
 **Standing methodology**: use a small (`n_bytes=10000`) slice with a short step budget as the

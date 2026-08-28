@@ -152,6 +152,13 @@ marker)/`flax`/`optax`/`orbax-checkpoint` directly at the versions actually in u
 added as a tracked dependency (was previously an ad-hoc `uv pip install` per node). `uv sync` now
 converges to the correct versions/extras on its own, verified on all 4 nodes.
 
+## 2026-08-27 (later): 4 new nodes (tpu1/tpu2/tpu3/tpu8) set up, idle
+
+Environment set up and verified on all 4 (direct-ssh live, repo synced, `uv sync` clean,
+`jax.devices()` confirms 4 TPU chips each, same v4-8 shape as tpu4-7). Not running anything yet —
+available for scaling up the Pathfinder dataset-prep work or further ablation sweeps.
+IPs: tpu1=35.186.98.243, tpu2=35.186.39.107, tpu3=107.167.160.20, tpu8=35.186.86.22.
+
 ## 2026-08-27 (later): summformer_jax ablation vs. gpt2_jax baselines, all 4 nodes in use
 
 New lineage `summformer_jax/` (JAX/Flax NNX port of `qcute/summformer/summformer.py`, made
@@ -208,14 +215,22 @@ now that these ablation runs use BPE vocab (it was actually token accuracy, not 
 | tpu6 | `small_paper_match` | 16949 | ~3.0-3.1 | ~258K | gpt2-small baseline, batch_size=32/grad_accum=4 |
 | tpu7 | `summformer_small_ablation` | **finished** (19072/19073, 1 epoch) | val 3.20 / bpb 4.62 | ~689K peak | checkpoint `model_19072` = 448M on disk; node idle since, now used for dataset-prep smoke tests (see below); 55G free on its 97G disk |
 
+`summformer_small_ablation`'s checkpoint pulled to local `checkpoints/summformer_small_ablation/` and
+restored successfully (126,892,800 params, matches the ~126.8M documented above; sane finite loss
+on a smoke-test forward pass) — confirms the checkpoint isn't corrupt and the current model code
+still loads it correctly. All TPU nodes are on GCP's default **Premium Tier** network (no
+`--network-tier=STANDARD` in any `TPU.md` create command) — internet egress $0.12/GB for the first
+1TB/month, with the first 1GiB/month free; a 448M checkpoint pull costs ≈$0.05 or less (likely free,
+under the monthly allowance).
+
 Ablation runs are faster in raw tok/s than their baselines (smaller `n_layers` more than offsets
 the fuse-stage FLOPs overhead at these sizes) — not itself meaningful, the actual comparison is
 loss/bpb at matched token counts once both sides have logged enough steps. It's expected/fine for
 the ablation to lose to its baseline if it finishes — the point is an honest comparison at
 roughly matched compute, not tuning to win (explicit instruction).
 
-Loss curves are plotted automatically: `scripts/pull_and_plot.sh` scp's each node's `log.jsonl`
-into local `logs/<run_name>/` and regenerates `loss_curve.png` there via `scripts/plot_jax_run.py`;
+Loss curves are plotted automatically: `scripts/jax/pull_and_plot.sh` scp's each node's `log.jsonl`
+into local `logs/<run_name>/` and regenerates `loss_curve.png` there via `scripts/jax/plot_jax_run.py`;
 an hourly `Monitor` loop runs this and reports each run's current step. Direct-ssh connections to
 all 4 nodes have dropped and been recovered multiple times mid-session (stale `ControlMaster`
 socket, not preemption) — recovery procedure now in `CLAUDE.md`.
@@ -241,7 +256,7 @@ dropped per explicit instruction — its `lra_release.gz` is 403 Access Denied v
 documented `gs://long-range-arena/lra_release` bucket and its HTTP fallback, from both anonymous
 curl and `gsutil` with the node's ambient GCP credentials; no working mirror found).
 
-- **Pathfinder (32 and 256 resolution)**: `scripts/generate_pathfinder.py` — procedurally
+- **Pathfinder (32 and 256 resolution)**: `scripts/jax/generate_pathfinder.py` — procedurally
   *generates* (not downloads) Pathfinder-style examples: a random-walk "snake" contour + distractor
   snakes, two marker dots, binary connected/disconnected label. **Not a port of the original
   LRA/drewlinsley renderer** (`github.com/drewlinsley/pathfinder`'s `snakes2.py` — unpublished as a
@@ -255,13 +270,144 @@ curl and `gsutil` with the node's ambient GCP credentials; no working mirror fou
   1D array). Verified end-to-end at small scale (32/16 examples, both resolutions): generates
   cleanly, `DataLoaderLite` loads the shards with zero code changes, values fall in the expected
   0-257 range. Not yet scaled up to a real training-size dataset.
-- **ImageNet64**: smoke-testing HF mirrors (`benjamin-paine/imagenet-1k-64x64`,
-  `ChocolateDave/imagenet-64`) via `datasets` streaming (no full download yet) — in progress on
-  tpu7 as of this update, not yet confirmed.
 
 ETAs at steady-state speeds for the still-running baselines (19,073 steps total, 1 epoch): tpu4
 ~27hr total (was ~19hr in at last check), tpu6 ~11hr total. Multi-hour, so don't stream every
 step; check in periodically instead (see below).
+
+### `scripts/jax/bench_generation.py`: jitted, run on tpu7 (2026-08-27)
+
+Rewrote the prefill/generation timing core to wrap each fixed-shape trajectory (prefill, and
+prefill+`--gen-tokens` more steps) in one `jax.jit` call, called repeatedly — not jitting the
+incremental stepper's mutating closure directly (that would silently freeze the KV cache at its
+first-trace values on replay); instead each timed call builds a fresh stepper/cache and runs the
+whole unrolled trajectory in one self-contained trace, so cache growth is correct within a call and
+every call after the first hits the same compiled executable. `generation_only` cost is reported as
+`combined_mean - prefill_alone_mean`, amortized per token.
+
+Found and fixed a real bug surfaced while running this on tpu7: gpt2_jax's flash-attention kernel
+requires `kv_seq_len % 128 == 0`; the naive no-cache generation path (context grows by 1 token/step)
+breaks that on almost every step. Fixed by padding each step's forward pass out to the next
+128-boundary with dummy tokens — causality means padding (appended after all real content) never
+affects any real position's logits, so this is correctness-preserving.
+
+Also found tpu7's `configs/summformer_jax/small_rope_ablation.py` and `gpt2_jax/{model_gpt,
+train_gpt,data_loader}.py` were stale (pre-dated this session's Ks-semantics fix and bf16/flash
+additions respectively) — re-synced before benchmarking; the stale config would have silently
+benchmarked a different (141M-param, `Ks=(2,2,2,2)`/`n_fuse=4`) architecture instead of the actual
+live ablation's `Ks=(2,2,2)`/126.9M.
+
+**Results** (tpu7, TPU device, batch=1, context=1024, 8 generated tokens, 3 warmup/10 repeats):
+
+| Model | Params | Prefill (1024 tok) | Generation (8 tok, after prefill) |
+|---|---|---|---|
+| gpt2-small (flash-attn) | 123.7M | 5.04ms (203K tok/s) | 1.63ms total, 0.20ms/tok (4917 tok/s), naive full-recompute/no cache |
+| summformer-small (Ks=2,2,2) | 126.9M | 2.80ms (366K tok/s) | 2.18ms total, 0.27ms/tok (3673 tok/s), real incremental KV-cache |
+
+At this small scale/short generation length, gpt2's naive-recompute generation is actually
+*faster per-token* than summformer's real KV-cache path (4917 vs 3673 tok/s) — plausible since
+gpt2-small's 1024-length forward pass is itself cheap enough (5ms) that recomputing it 8 times
+barely costs more than one incremental step's dispatch/bookkeeping overhead; the KV-cache
+advantage should widen as context/gen_tokens grow (naive cost scales with context, incremental
+doesn't) -- not yet tested at larger context or longer generation. Both prefill numbers (203K/366K
+tok/s) are consistent with the FLOPs findings in `scripts/jax/compare_summformer_gpt2.py`'s own results
+(summformer cheaper per-token at this matched d_model/n_heads).
+
+Raw results: `bench_results/gpt2_small_rope_default_tpu_1787863315.json`,
+`bench_results/summformer_small_rope_ablation_tpu_1787863443.json`.
+
+**Fair (no-flash) rerun** (2026-08-28): the table above used gpt2's own config default
+(`use_flash_attention=True`), which isn't apples-to-apples against summformer (no flash-attention
+path at all). Added `--no-flash-attention`/`--flash-attention` override to `bench_generation.py`
+and reran gpt2-small with it off:
+
+| Model | Prefill (1024 tok) | Generation (8 tok) |
+|---|---|---|
+| gpt2-small, no flash | 3.04ms (337K tok/s) | 0.15ms/token (6839 tok/s) |
+| summformer-small | 2.80ms (366K tok/s) | 0.27ms/token (3673 tok/s) |
+
+Two findings: (1) flash-attention was actually *slower* than plain dense SDPA at this size
+(5.04ms vs 3.04ms prefill) -- the Pallas kernel's overhead outweighs its benefit at
+context=1024/gpt2-small scale; (2) with flash off, gpt2's naive full-recompute generation is
+*faster per-token* than summformer's real KV-cache path (6839 vs 3673 tok/s) -- the reverse of
+what the FLOPs numbers alone would suggest, likely because summformer's incremental stepper
+carries more Python/dispatch overhead per call (many small ops across levels/stages) that
+dominates at this short (8-token) a generation run rather than a FLOPs-bound regime. Not yet
+tested at longer generation lengths, where the KV-cache's O(1)-per-token advantage should widen.
+Considered but not pursued: adding flash-attention to summformer itself, so both sides have it --
+its self-attention always prepends a zero-KV-sink token, and this repo's own prior investigation
+(`docs/tpu_setup.md`'s `bytelm_tpu` zero_kv_sink+flash-attention section) found that combination
+costs ~25x throughput due to the kernel's block-alignment requirements colliding with the sink's
+per-layer re-concatenation -- that finding would likely resurface here, so this wasn't attempted.
+
+Raw result: `bench_results/gpt2_small_rope_default_tpu_1787865902.json`.
+
+### gpt2_jax: real incremental KV-cache implemented (2026-08-28)
+
+`gpt2_jax/model_gpt.py` had no cache/generation code at all before this (training-only, confirmed
+earlier this session) -- added `CausalSelfAttention.forward_incremental`/`Block.forward_incremental`
+(mirroring `summformer_jax`'s own proven pattern), `Model._make_incremental_stepper`,
+`generate_no_cache`/`generate_kv_cache`/`check_kv_cache_consistency`. Always plain SDPA in the
+incremental path, never the flash-attention kernel -- that Pallas kernel needs
+`kv_seq_len % 128 == 0` (see the bench finding above), which a growing single-token cache almost
+never satisfies. **Verified bit-exact** (`match_rate=1.0`) against the full-recompute reference for
+all 3 `pos_method`s (rope/learnable/base), run on tpu7.
+
+### Second summformer ablation variants: deeper Ks, launched (2026-08-28)
+
+New variants exploring a different point on the Ks-length/n_layers tradeoff -- max `n_layers` that
+keeps `effective_depth <= baseline's own n_layer` (a hard cap, chosen over the softer "slightly
+smaller params" goal once the two conflicted -- see the sweep below):
+
+| Variant | Ks | n_layers | eff_depth | baseline eff_depth cap | params | Δparams | flops_ratio |
+|---|---|---|---|---|---|---|---|
+| `small_rope_ablation_ks44` | (4,4) | 2 | 10 | 12 | 148.2M | +19.8% | 0.846x |
+| `medium_rope_ablation_ks444` | (4,4,4) | 3 | 21 | 24 | 367.6M | +3.9% | 0.839x |
+
+Both land slightly ABOVE baseline params (not below, as first asked) in exchange for FLOPs much
+closer to "similar" (0.84x both, vs. ~0.6x one layer shallower) -- an explicit tradeoff pick.
+Launched on tpu5 (`summformer_medium_ablation_ks444`) and tpu6 (`summformer_small_ablation_ks44`),
+both idle nodes reusing already-downloaded FineWeb-Edu-10B data.
+
+### Bench follow-ups (2026-08-28): sink isolation, real-cache-vs-real-cache at both sizes
+
+**Zero-KV-sink isolated.** Added `Config.zero_kv_sink: bool = True` to `summformer_jax/
+model_summformer.py` -- a pure runtime toggle (the sink carries no learned parameters, just a
+per-call zero row prepended to K/V), so flipping it doesn't affect any trained checkpoint's weights
+or shapes; `--no-zero-kv-sink` in `bench_generation.py` isolates its cost for benchmarking only
+(never for evaluating a real checkpoint -- all were trained with it on). Re-verified
+`check_kv_cache_consistency` still bit-exact (`match_rate=1.0`) both on and off after the change.
+Result: the sink accounts for a modest ~5-10% overhead (small-ablation prefill 2.67ms without vs.
+2.80ms with; generation 0.25 vs. 0.27ms/token) -- not the dominant factor in any of the gaps found
+below.
+
+**gpt2's real KV-cache benchmarked properly** (bench_generation.py's gpt2 path now defaults to the
+real stepper added above, not the old naive-recompute path -- pass `--naive-generation` for the old
+numbers). Also hit the exact same stale-config bug twice more (`configs/summformer_jax/
+medium_rope_ablation.py` still had the pre-fix `Ks=(2,2,2,2)` on tpu7) -- **standing gotcha: always
+re-sync a node's config files before benchmarking/training on it, don't assume a prior sync
+covered every file that's since been edited locally.**
+
+**Results, both sizes, fair settings** (no flash-attention on gpt2, real KV-cache both sides,
+zero-KV-sink on for summformer -- matches what's actually trained):
+
+| | Prefill (1024 tok) | Generation (8 tok, real cache) |
+|---|---|---|
+| gpt2-small (123.7M) | 3.04ms (337K tok/s) | 0.49ms/token (2053 tok/s) |
+| summformer-small (126.9M) | 2.80ms (366K tok/s) | 0.27ms/token (3673 tok/s) |
+| gpt2-medium (353.8M) | 7.16ms (143K tok/s) | 1.24ms/token (806 tok/s) |
+| summformer-medium (279.4M) | 5.79ms (177K tok/s) | 0.73ms/token (1369 tok/s) |
+
+Consistent pattern at both sizes: summformer's real KV-cache generates ~1.7-1.8x faster per token
+than gpt2's real KV-cache (small: 3673 vs 2053 tok/s; medium: 1369 vs 806 tok/s), and summformer's
+prefill advantage widens with scale (1.09x at small, 1.24x at medium) -- consistent with the FLOPs
+findings in `scripts/jax/compare_summformer_gpt2.py` (summformer cheaper per-token at matched
+d_model/n_heads, the gap growing with model size). This reverses the earlier (naive-generation,
+flash-on) reading that had gpt2 looking faster at generation -- both of those were measurement
+artifacts (naive recompute happened to be cheap at tiny scale/short runs; flash-attention was
+actually slower than plain SDPA at this size), not real architecture advantages.
+
+Raw results: `bench_results/{gpt2,summformer}_{small,medium}_rope_{default,ablation}_tpu_*.json`.
 
 **Checking in on a run yourself** (safe, read-only — none of these mutate the run):
 

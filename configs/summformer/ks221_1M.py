@@ -1,8 +1,10 @@
-"""summformer/ks221_1M: full-scale (full enwik8_1M, n_bytes=None) run of the 3-level
+"""summformer/ks221_1M: full-scale (full enwik8_1M, n_bytes=None) run of the 2-fuse-stage
 hierarchical-summarization case, following the overfit10k sanity check in ks421_overfit10k.py
-(same idea, Ks=(2,2,1) here vs (4,2,1) there). Same architecture/hyperparameter convention as
+(same idea, Ks=(2,2) here vs (4,2) there). Same architecture/hyperparameter convention as
 qcute_zero's own full-scale configs (configs/qcute_zero/ks221_1M.py): d_model=256/n_layers=4/
 context_len=256, attn_window=None (unbounded -- no -1 sentinel exists in this codebase).
+Updated 2026-08-27 to the current Ks convention (n_fuse = len(Ks), no trailing placeholder) --
+was Ks=(2,2,1) under the pre-fix summformer_v1.py semantics.
 
 uv run python -m qcute.summformer.summformer --config configs/summformer/ks221_1M.py
 
@@ -12,7 +14,7 @@ uv run python scripts/plot_run.py logs/summformer_ks221_1M
 from pathlib import Path
 
 run_name = "summformer_ks221_1M"
-Ks = (2, 2, 1)
+Ks = (2, 2)
 d_model = 256
 n_layers = 4
 n_heads = 4

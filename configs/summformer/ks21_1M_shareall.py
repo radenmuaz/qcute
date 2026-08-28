@@ -12,7 +12,7 @@ uv run python scripts/plot_run.py logs/summformer_ks21_1M_shareall
 from pathlib import Path
 
 run_name = "summformer_ks21_1M_shareall"
-Ks = (2, 1)
+Ks = (2,)
 d_model = 256
 n_layers = 4
 n_heads = 4

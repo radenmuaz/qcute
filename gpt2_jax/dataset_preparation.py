@@ -19,26 +19,31 @@ import argparse
 # ------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataname", type=str, choices=["fineweb-10B", "fineweb-edu-10B", "wikitext-103", "wikitext-2"], required=True)
+# Default the tokenized-shard output to tmpfs too, not just the HF download cache above -- a
+# training run needs this dir to exist somewhere readable, and /dev/shm avoids both the disk-fill
+# D-state risk and a slow persistent-disk read path. Pass --out_dir to opt back into persistent
+# disk (e.g. to survive a node preemption).
+parser.add_argument("--out_dir", type=str, default="/dev/shm/qcute_data")
 args = parser.parse_args()
 
 if args.dataname == "fineweb-10B":
-    local_dir = "../data/fineweb-10B"
+    local_dir = "fineweb-10B"
     data_path = "HuggingFaceFW/fineweb"
     sample = "sample-10BT"
     shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
 elif args.dataname == "fineweb-edu-10B":
-    local_dir = "../data/fineweb-edu-10B"
+    local_dir = "fineweb-edu-10B"
     data_path = "HuggingFaceFW/fineweb-edu"
     sample = "sample-10BT"
     shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
 # TODO: Not sure about wikitext-103 specifications!
 elif args.dataname == "wikitext-103":
-    local_dir = "../data/wikitext-103"
+    local_dir = "wikitext-103"
     data_path = "iohadrubin/wikitext-103-raw-v1"
     sample = None
     shard_size = int(5e7) # 50M tokens per shard, total of 4 shards
 elif args.dataname == "wikitext-2":
-    local_dir = "../data/wikitext-2"
+    local_dir = "wikitext-2"
     data_path = "wikitext"
     sample = "wikitext-2-v1"
     shard_size = int(25e3) # 25K tokens per shard, total of 98 shards
@@ -46,7 +51,7 @@ else:
     raise ValueError(f"Unknown dataname {args.dataname}!")
 
 # create the cache the local directory if it doesn't exist yet
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
+DATA_CACHE_DIR = os.path.join(args.out_dir, local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 # download the dataset

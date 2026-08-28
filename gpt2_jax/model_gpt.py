@@ -137,6 +137,46 @@ class CausalSelfAttention(nnx.Module):
         y = y.transpose(0, 2, 1, 3).reshape(B, T, C)
         return self.c_proj(y)
 
+    def forward_incremental(self, x_new, cache, start_pos: int):
+        """Incremental KV-cache step: x_new is only the NEW chunk (usually 1 token), cache is the
+        (k, v) accumulated so far (or None on the first/priming call). Always plain SDPA, never
+        the flash-attention kernel -- that Pallas kernel needs kv_seq_len % 128 == 0 (see
+        docs/status_tpu.md's bench_generation.py finding), which a growing single-token-at-a-time
+        cache essentially never satisfies; production incremental decode kernels are a different
+        thing entirely from a training-time flash kernel, out of scope here."""
+        B, Tn, C = x_new.shape
+        H, hd = self.n_head, self.head_dim
+        qkv = self.c_attn(x_new)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        q = q.reshape(B, Tn, H, hd).transpose(0, 2, 1, 3)
+        k = k.reshape(B, Tn, H, hd).transpose(0, 2, 1, 3)
+        v = v.reshape(B, Tn, H, hd).transpose(0, 2, 1, 3)
+
+        if self.pos_method == "rope":
+            cos, sin = _rope_cos_sin(start_pos + Tn, self.rotary_dim)
+            cos, sin = cos[start_pos : start_pos + Tn], sin[start_pos : start_pos + Tn]
+            q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
+            k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
+            q = jnp.concatenate([_apply_rope(q_rot, cos, sin), q_pass], axis=-1)
+            k = jnp.concatenate([_apply_rope(k_rot, cos, sin), k_pass], axis=-1)
+
+        if cache is None:
+            k_all, v_all = k, v
+        else:
+            k_prev, v_prev = cache
+            k_all, v_all = jnp.concatenate([k_prev, k], axis=2), jnp.concatenate([v_prev, v], axis=2)
+        S = k_all.shape[2]
+
+        scores = jnp.einsum("bhqd,bhkd->bhqk", q, k_all) / math.sqrt(hd)
+        query_pos = jnp.arange(start_pos, start_pos + Tn).reshape(-1, 1)
+        key_pos = jnp.arange(S).reshape(1, -1)
+        causal_mask = key_pos <= query_pos  # [Tn, S]
+        scores = jnp.where(causal_mask[None, None], scores.astype(jnp.float32), -jnp.inf)
+        attn = jax.nn.softmax(scores, axis=-1).astype(v_all.dtype)
+        y = jnp.einsum("bhqk,bhkd->bhqd", attn, v_all)
+        y = y.transpose(0, 2, 1, 3).reshape(B, Tn, C)
+        return self.c_proj(y), (k_all, v_all)
+
 
 class Block(nnx.Module):
     def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
@@ -150,6 +190,12 @@ class Block(nnx.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
+    def forward_incremental(self, x_new, cache, start_pos: int):
+        attn_out, new_cache = self.attn.forward_incremental(self.ln_1(x_new), cache, start_pos)
+        x_new = x_new + attn_out
+        x_new = x_new + self.mlp(self.ln_2(x_new))
+        return x_new, new_cache
 
 
 class Model(nnx.Module):
@@ -190,6 +236,74 @@ class Model(nnx.Module):
         x = self.ln_f(x)
         logits = x @ self.wte.embedding.value.T  # tied head
         return logits
+
+    def _forward_next_token_logits(self, idx):
+        """Full recompute over the whole sequence so far, returns logits for the NEXT token."""
+        return self(idx)[:, -1, :]
+
+    def generate_no_cache(self, prompt_tokens, n_new_tokens: int):
+        """Token-by-token, full recompute each step -- correctness reference for
+        generate_kv_cache. Same convention as summformer_jax's SummTransformer."""
+        if prompt_tokens.ndim == 1:
+            prompt_tokens = prompt_tokens[None]
+        all_tokens = prompt_tokens
+        for _ in range(n_new_tokens):
+            logits = self._forward_next_token_logits(all_tokens)
+            next_token = jnp.argmax(logits, axis=-1, keepdims=True)
+            all_tokens = jnp.concatenate([all_tokens, next_token], axis=1)
+        return all_tokens[0]
+
+    def _make_incremental_stepper(self, Bsz: int):
+        """Factory for the real incremental-KV-cache stepper -- O(1) new attention work per new
+        token (vs. generate_no_cache's full O(L) recompute), one cache per layer."""
+        caches = [None] * self.config.n_layer
+
+        def step(token_chunk, start_pos: int):
+            Tn = token_chunk.shape[1]
+            x = self.wte(token_chunk)
+            if self.config.pos_method == "learnable":
+                pos = jnp.arange(start_pos, start_pos + Tn)
+                x = x + self.wpe(pos)[None]
+            for l, block in enumerate(self.h):
+                x, caches[l] = block.forward_incremental(x, caches[l], start_pos)
+            x = self.ln_f(x)
+            return x @ self.wte.embedding.value.T
+
+        return step
+
+    def generate_kv_cache(self, prompt_tokens, n_new_tokens: int):
+        """Real incremental KV cache. Produces the exact same argmax trajectory as
+        generate_no_cache (see check_kv_cache_consistency)."""
+        if prompt_tokens.ndim == 1:
+            prompt_tokens = prompt_tokens[None]
+        step = self._make_incremental_stepper(prompt_tokens.shape[0])
+
+        all_tokens = prompt_tokens
+        logits_all = step(all_tokens, 0)  # prime the cache with the whole prompt
+        next_logits = logits_all[:, -1, :]
+        for _ in range(n_new_tokens):
+            next_token = jnp.argmax(next_logits, axis=-1, keepdims=True)
+            all_tokens = jnp.concatenate([all_tokens, next_token], axis=1)
+            logits_all = step(next_token, all_tokens.shape[1] - 1)
+            next_logits = logits_all[:, -1, :]
+
+        return all_tokens[0]
+
+    def check_kv_cache_consistency(self, val_data, key, n_checks: int = 3, prompt_len: int = 8,
+                                    n_new_tokens: int = 24) -> dict:
+        """Diagnostic: generate_no_cache vs generate_kv_cache MUST produce bit-exact identical
+        greedy trajectories. Should always return match_rate == 1.0."""
+        n_match = 0
+        for i in range(n_checks):
+            pl = max(1, prompt_len - i * (prompt_len // max(1, n_checks)))
+            key, subkey = jax.random.split(key)
+            start = int(jax.random.randint(subkey, (), 0, max(1, val_data.shape[0] - pl - n_new_tokens)))
+            prompt = val_data[start:start + pl]
+            out_full = self.generate_no_cache(prompt, n_new_tokens)
+            out_cache = self.generate_kv_cache(prompt, n_new_tokens)
+            if jnp.array_equal(out_full, out_cache):
+                n_match += 1
+        return {"match_rate": n_match / n_checks, "n_checks": n_checks}
 
 
 def cross_entropy_loss(logits, targets):

@@ -33,6 +33,53 @@ or `small_rope_ablation.py` (vs. `small_rope_default.py`) -- same `--config` con
 still exists via `--vocab-size 0`/`summformer_jax/dataset_preparation.py`, see model docstring,
 but isn't what these ablation configs use).
 
+## How `_cascade` works (worked example, `Ks=(2,2,2)`, `L=8`)
+
+`n_fuse = len(Ks) = 3`, so 4 levels exist (`lms[0..3]`) and 3 fuse stages (`fuse_stages[0..2]`).
+
+**Level-0 pass**: `h = _run_blocks(0, embed(token_ids), ...)` -- ordinary causal self-attention over
+the raw 8 tokens. `cur_h = x_cross = h`, both `(B, 8, D)`.
+
+**Stage `s`, loop over `range(n_fuse)`** -- `cur_h` is the *previous* stage's compressed code
+sequence (or the level-0 output for `s=0`); `x_cross` is always the full token-length stream:
+
+| Stage | `cur_h` len (in) | `K_s` | KV len out (`h_code`) | `cum_K` | `code_pos_abs` | `x_cross` len (Q, unchanged) |
+|---|---|---|---|---|---|---|
+| level-0 | -- | -- | -- | -- | -- | **8** |
+| `s=0` | 8 | 2 | **4** | 2 | `[1,3,5,7]` | 8 |
+| `s=1` | 4 | 2 | **2** | 4 | `[3,7]` | 8 |
+| `s=2` | 2 | 2 | **1** | 8 | `[7]` | 8 |
+
+Per stage:
+1. `code_h = cur_h[:, K_s-1::K_s, :][:, :n_blocks, :]` -- picks the *last* token's hidden state of
+   each non-overlapping `K_s`-sized block (no learned pooling, just strided selection).
+2. `h_code = _run_blocks(s+1, code_h, ...)` -- a **separate** transformer stack (`lms[s+1]`, own
+   weights) runs causal self-attention over just this stage's compressed code sequence.
+3. `code_pos_abs = (arange(n_blocks)+1)*cum_K - 1` -- maps each code back to the absolute raw-token
+   position it represents (needed for both RoPE and causal gating).
+4. `fuse_mask`: query position `q` may only attend to a code whose `code_pos_abs <= q` -- e.g. at
+   `s=2` only position 7 ever sees the single global summary (`code_pos_abs=[7]`); everyone else's
+   row is all-masked, which `sdpa_with_sink` resolves to attending only the zero sink (a no-op for
+   them this stage). Strict causality: you can never see a summary of a block containing future
+   tokens.
+5. `x_cross = fuse_stages[s](x_cross, h_code, ..., fuse_mask, ...)` -- cross-attention (all 8 query
+   positions against this stage's `h_code` KV) + MLP refinement (`FuseStage`'s own weights).
+6. `x_cross = _run_blocks(0, x_cross, ...)` -- **reruns `lms[0]`** (same weights as the initial
+   pass -- "shared across token-level pass and refinement") so tokens re-mix after absorbing the
+   injected summary.
+7. `cur_h = h_code` -- the next stage cascades on *this* stage's compressed sequence.
+
+**Shape summary**: `x_cross` (the query stream) is `(B, L, D)` for the whole cascade -- only its
+*content* is progressively updated. What shrinks is the KV side each stage cross-attends to:
+`KV_len(s) = L // prod(Ks[0..s])` (`8 → 4 → 2 → 1` above). So each cross-attention call costs
+`O(L * L/cum_K)`, not `O(L^2)`, geometrically cheaper as `cum_K` grows -- at the real 1024-context
+scale, stage 0's KV is 512, stage 1's is 256, stage 2's is 128, vs. a dense decoder's every-layer
+`L^2`. Measured end-to-end (`scripts/compare_summformer_gpt2.py`, medium ablation vs. medium
+baseline, both rope, matched `d_model`/`n_heads`/context): **0.65x the FLOPs, 3.0x smaller
+single-sequence KV cache** (`(1+n_fuse)*n_layers=8` effective cached layers vs. gpt2-medium's 24 --
+current ablation configs use `attn_window=None`/unbounded, so this saving is purely from fewer
+cached layers, not from any KV sequence-length compression).
+
 ## What works (confirmed 2026-08-27)
 
 - **Model correctness**: forward pass correct for all 3 `pos_method`s (loss ≈ ln(vocab) at random
