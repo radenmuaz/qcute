@@ -12,7 +12,7 @@ n_layers = 3
 main_window = 8
 context_len = 12288
 fuse_stages = (
-    ((-1, 1), (8, None), (2, 256, 4)),
+    ((-1, 1), (8, -1), (2, 256, 4)),
 )
 mtp_heads = 24
 batch_size = 2

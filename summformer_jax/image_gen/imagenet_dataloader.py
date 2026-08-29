@@ -73,14 +73,48 @@ class ImageByteLoader:
             return self.rng.integers(0, 256, size=(self.batch_size, self.seq_len), dtype=np.uint8)
 
         rows = []
-        while len(rows) < self.batch_size:
+        n_collected = 0
+        while n_collected < self.batch_size:
             if self._row_idx >= len(self._perm):
                 self._load_shard(self._shard_idx + 1)
-            take = min(self.batch_size - len(rows), len(self._perm) - self._row_idx)
+            take = min(self.batch_size - n_collected, len(self._perm) - self._row_idx)
             idxs = self._perm[self._row_idx:self._row_idx + take]
             rows.append(self._data[idxs])
             self._row_idx += take
+            n_collected += take
         return np.concatenate(rows, axis=0)
+
+    @property
+    def n_images(self) -> int | None:
+        """Total images across all shards of this split -- None for synthetic (unbounded).
+        Cheap: np.load(mmap_mode='r') only reads the .npy header, not the array data."""
+        if self.synthetic:
+            return None
+        return sum(np.load(p, mmap_mode="r").shape[0] for p in self.shard_paths)
+
+    def state_dict(self) -> dict:
+        """Exact-resume state: shard position, row position within the shard, the in-progress
+        shard's own permutation (saved verbatim rather than reconstructed from an RNG state,
+        since re-deriving it would require capturing the RNG state from BEFORE the permutation
+        call -- saving the array directly is simpler and exactly correct), and the RNG's own
+        bit-generator state (for whichever future permutation call comes next)."""
+        if self.synthetic:
+            return {"synthetic": True, "rng_state": self.rng.bit_generator.state}
+        return {
+            "synthetic": False,
+            "shard_idx": self._shard_idx,
+            "row_idx": self._row_idx,
+            "perm": self._perm,
+            "rng_state": self.rng.bit_generator.state,
+        }
+
+    def load_state_dict(self, d: dict) -> None:
+        self.rng.bit_generator.state = d["rng_state"]
+        if d["synthetic"]:
+            return
+        self._load_shard(d["shard_idx"])
+        self._perm = np.asarray(d["perm"])
+        self._row_idx = d["row_idx"]
 
     def full_sweep(self, batch_size: int | None = None):
         """Yields (batch_size, seq_len) uint8 batches covering every image in this split EXACTLY

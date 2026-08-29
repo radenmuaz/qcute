@@ -9,5 +9,5 @@ n_heads = 2
 n_layers = 2
 main_window = 8
 context_len = 192
-fuse_stages = (((0, 1), (8, None), (1, 32, 4)),)
+fuse_stages = (((0, 1), (8, -1), (1, 32, 4)),)
 batch_size = 2

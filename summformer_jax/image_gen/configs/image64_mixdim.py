@@ -18,7 +18,7 @@ plan (docs/image_gen_design.md's "where this left off" section) -- 23 extra head
 predicts t+1, extra_heads[i] predicts t+(i+2)) trained as an auxiliary loss now; the eventual
 point is using these as draft heads for speculative decoding, not yet wired up.
 
-    uv run python summformer_jax/image_gen/train.py --config summformer_jax/image_gen/configs/image64_mixdim.py --resolution 64 --steps 20
+uv run python summformer_jax/image_gen/train.py --config summformer_jax/image_gen/configs/image64_mixdim.py --resolution 64 --steps 20
 """
 pos_method = "rope"
 vocab_size = 256
@@ -28,8 +28,8 @@ n_layers = 3
 main_window = 24
 context_len = 12288
 fuse_stages = (
-    ((-1, 1), (8, None), (2, 256, 4)),
-    ((-1, 3), (64, None), (4, 512, 8)),
+    ((-1, 1), (8, -1), (2, 256, 4)),
+    ((-1, 3), (64, -1), (4, 512, 8)),
 )
 mtp_heads = 24
 batch_size = 4

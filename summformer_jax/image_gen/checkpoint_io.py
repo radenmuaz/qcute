@@ -2,8 +2,7 @@
 array pytrees, single-device -- multi-device callers strip the leading pmap-device axis first,
 `jax.tree.map(lambda x: x[0], pytree)`), plus step count + dataloader position via plain `pickle`
 alongside (small, irregularly-shaped data -- python ints and a numpy RNG state dict don't map
-cleanly onto orbax's array-restore-args machinery, not worth fighting that for a few KB). Mirrors
-summformer_jax/image_gen/checkpoint_io.py exactly -- no model imports, works for any nnx model.
+cleanly onto orbax's array-restore-args machinery, not worth fighting that for a few KB).
 
     <path>/params/    -- orbax PyTreeCheckpointer, nnx.to_pure_dict(state)
     <path>/opt_state/  -- orbax PyTreeCheckpointer, optax opt_state pytree

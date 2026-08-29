@@ -9,17 +9,21 @@ Semantics differences from v1:
 - v1's periodic cascade (run all n_fuse stages every forward pass, always reusing the SAME
   n_layers-sized block for both the initial pass and every post-cross-attn refinement) is replaced
   by explicit placement: `Config.fuse_stages` is a tuple of independently-configured insertion
-  points, each a 5-tuple `(insert_after, stride, window, code_n_layers, source_index)`:
-    - insert_after: main_blocks index after which this fuse-stage's cross-attention runs (the
+  points, each `((src, dst), (stride, window), (code_n_layers, code_d_model=None, code_n_heads=None))`
+  -- matches image_gen summformer's fuse_stages format, see `_parse_fuse_stage`:
+    - dst (insert_after): main_blocks index after which this fuse-stage's cross-attention runs (the
       main stack's own NEXT layer serves as the "refinement" step -- no separate reused block).
+    - src (source_index): where to pool the summary FROM. 0 = the raw embedded stream (before any
+      main_blocks layer touches it); -1 = whatever `x` is at this exact insertion point (the
+      layer that just ran); a specific int j = main_blocks[j-1]'s output (1-indexed: j=1 is the
+      output after main_blocks[0]).
     - stride: pooling factor for this stage's own code/summary sequence (same meaning as v1's stride[s]).
     - window: this fuse-stage's cross-attention window (None = unbounded).
     - code_n_layers: depth of this stage's own dedicated "summary LM" (self-attention over the
       pooled sequence) -- own weights, not shared with main_blocks or any other fuse-stage.
-    - source_index: where to pool the summary FROM. 0 = the raw embedded stream (before any
-      main_blocks layer touches it); -1 = whatever `x` is at this exact insertion point (the
-      layer that just ran); a specific int j = main_blocks[j-1]'s output (1-indexed: j=1 is the
-      output after main_blocks[0]).
+    - code_d_model/code_n_heads: optional per-stage code-LM width/head-count override, omitted ->
+      defaults to trunk dims; when given, code_in_proj/code_out_proj bridge trunk dim <-> code dim
+      at the fuse-stage boundary (FuseStageV2's own cross-attention stays trunk-dim only).
   The FuseStage's own cross-attention depth is auto-matched to code_n_layers, not independently
   configurable -- FuseStageV2's layer l cross-attends to the code-LM's OWN intermediate output
   after ITS layer l (l=0..code_n_layers-1), not a single frozen final summary reused at every fuse
@@ -80,7 +84,14 @@ class ConfigV2:
     rope_preset: str | None = None
     context_len: int = 1024
     main_window: int | tuple | None = None   # int (all layers), tuple of len n_layers, or None
-    fuse_stages: tuple = ()           # tuple of (insert_after, stride, window, code_n_layers, source_index)
+    # Each stage: ((src, dst), (stride, window), (code_n_layers, code_d_model=None, code_n_heads=None))
+    #   src = source_index (0 = raw embedded x0; -1 = current x at this insertion point; specific
+    #         int j = main_blocks[j-1]'s output). dst = insert_after (main_blocks index this stage's
+    #         cross-attention fires after). code_d_model/code_n_heads omitted -> default to trunk
+    #         dims; given -> the code-LM runs at its own (typically wider) dim, bridged to/from
+    #         trunk dim at the fuse-stage boundary via code_in_proj/code_out_proj (Attn/FuseStageV2
+    #         themselves stay trunk-dim only). See _parse_fuse_stage. Matches image_gen semantics.
+    fuse_stages: tuple = ()
     input_preset: int = 8
     vocab_size: int | None = 50304
     mtp_heads: int = 1
@@ -89,6 +100,20 @@ class ConfigV2:
     zero_kv_sink: bool = True
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
+
+
+def _parse_fuse_stage(spec):
+    """spec: ((src, dst), (stride, window), (code_n_layers, code_d_model=None, code_n_heads=None)).
+    window: -1 = unbounded (converted to None for causal_mask). code_d_model/code_n_heads omitted
+    -> None, caller defaults to trunk dims. code_n_layers is always required (first in its group,
+    not last, so the optional width/head-count pair trails a variable-length tuple instead of
+    sitting in the middle)."""
+    (src, dst), (stride, window), code_part = spec
+    window = None if window == -1 else window
+    code_n_layers = code_part[0]
+    code_d_model = code_part[1] if len(code_part) > 1 else None
+    code_n_heads = code_part[2] if len(code_part) > 2 else None
+    return src, dst, stride, window, code_n_layers, code_d_model, code_n_heads
 
 
 def _resolve_main_windows(w, n_layers: int) -> tuple:
@@ -114,7 +139,7 @@ class SummTransformerV2(nnx.Module):
         # NANOGPT_SCALE_INIT: every main layer AND every fuse-stage/code-lm layer is a genuine,
         # independent residual-stream-additive block here (no reuse), so scale_layers is simply
         # the total count of all of them -- the true "effective depth" of this architecture.
-        n_fuse_layers_total = sum(spec[3] * 2 for spec in cfg.fuse_stages)  # code-lm layers + auto-matched fuse layers
+        n_fuse_layers_total = sum(_parse_fuse_stage(spec)[4] * 2 for spec in cfg.fuse_stages)  # code-lm layers + auto-matched fuse layers
         scale_layers = cfg.n_layers + n_fuse_layers_total
 
         init = nnx.initializers.normal(stddev=0.02)
@@ -130,24 +155,48 @@ class SummTransformerV2(nnx.Module):
         self.main_windows = _resolve_main_windows(cfg.main_window, cfg.n_layers)
         self.ln_f = nnx.LayerNorm(D, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
 
+        # per-stage code-LM dim: defaults to trunk dim D when code_d_model/code_n_heads are omitted
+        # from a stage's spec, or its own (larger, typically) dim when given -- code-LM runs
+        # cheaply-infrequently (once per stride trunk positions) so it can afford to be
+        # wider/deeper than the trunk without dominating cost. Attn/FuseStageV2 themselves stay
+        # trunk-dim only; code_in_proj/code_out_proj bridge the boundary so no cross-attention
+        # machinery needs to support mixed dims directly.
+        parsed = [_parse_fuse_stage(spec) for spec in cfg.fuse_stages]
+        code_dims = [(cd if cd is not None else D) for _, _, _, _, _, cd, _ in parsed]
+        code_n_heads_list = [(ch if ch is not None else cfg.n_heads) for _, _, _, _, _, _, ch in parsed]
+        for cd, ch in zip(code_dims, code_n_heads_list):
+            assert cd % ch == 0, f"code_d_model={cd} must be divisible by code_n_heads={ch}"
+        self.code_dims = code_dims
+        self.code_head_dims = [cd // ch for cd, ch in zip(code_dims, code_n_heads_list)]
+
         self.fuse_stages = nnx.List([
-            FuseStageV2(D, cfg.n_heads, cfg.mlp_mult, spec[3], scale_layers, dtype, param_dtype,
+            FuseStageV2(D, cfg.n_heads, cfg.mlp_mult, p[4], scale_layers, dtype, param_dtype,
                         rngs=rngs, use_sink=cfg.zero_kv_sink)
-            for spec in cfg.fuse_stages
+            for p in parsed
         ])
         self.code_lms = nnx.List([
-            nnx.List([Block(D, cfg.n_heads, cfg.mlp_mult, scale_layers, dtype, param_dtype,
-                             rngs=rngs, use_sink=cfg.zero_kv_sink) for _ in range(spec[3])])
-            for spec in cfg.fuse_stages
+            nnx.List([Block(cd, ch, cfg.mlp_mult, scale_layers, dtype, param_dtype,
+                             rngs=rngs, use_sink=cfg.zero_kv_sink) for _ in range(p[4])])
+            for p, cd, ch in zip(parsed, code_dims, code_n_heads_list)
         ])
         self.code_ln_fs = nnx.List([
-            nnx.LayerNorm(D, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs) for _ in cfg.fuse_stages
+            nnx.LayerNorm(cd, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs) for cd in code_dims
         ])
-        # group fuse-stage indices by their insert_after layer (multiple stages CAN share an
+        # projections at the trunk<->code-LM boundary -- identity-shaped (D->D) when code_d_model==D,
+        # still allocated for a uniform code path (cheap, one Linear per stage either way).
+        self.code_in_proj = nnx.List([
+            nnx.Linear(D, cd, use_bias=True, kernel_init=init, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+            for cd in code_dims
+        ])
+        self.code_out_proj = nnx.List([
+            nnx.Linear(cd, D, use_bias=True, kernel_init=init, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+            for cd in code_dims
+        ])
+        # group fuse-stage indices by their insert_after (dst) layer (multiple stages CAN share an
         # insertion point -- applied in the order they appear in cfg.fuse_stages)
         self.insertions: dict[int, list[int]] = {}
-        for i, spec in enumerate(cfg.fuse_stages):
-            self.insertions.setdefault(spec[0], []).append(i)
+        for i, p in enumerate(parsed):
+            self.insertions.setdefault(p[1], []).append(i)  # p[1] = dst (insert_after)
 
         self.head = (
             nnx.Linear(D, V, use_bias=False, kernel_init=init, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
@@ -162,27 +211,30 @@ class SummTransformerV2(nnx.Module):
         return self.embed.embedding.value if self.weight_tie else self.head.kernel.value.T  # type: ignore[union-attr]
 
     def _run_code_lm(self, stage_i: int, code_h, cos, sin, mask) -> list:
-        """Returns the code-LM's output after EACH layer (not just the final one) -- FuseStageV2
-        cross-attends layer l to this list's element l, so fuse depth auto-matches code depth."""
+        """code_h/outs are at this stage's OWN code_d_model (post code_in_proj); returned list is
+        projected back to trunk dim (code_out_proj) so FuseStageV2's cross-attention -- trunk-dim
+        only -- needs no changes for mixed dims."""
         outs = []
         for block in self.code_lms[stage_i]:
             code_h = block(code_h, cos, sin, mask, self.cfg.pos_method)
-            outs.append(self.code_ln_fs[stage_i](code_h))
+            normed = self.code_ln_fs[stage_i](code_h)
+            outs.append(self.code_out_proj[stage_i](normed))
         return outs
 
     def _pool_and_fuse(self, stage_i: int, x, x0, layer_hist, seq_pos, cos_b, sin_b):
         cfg = self.cfg
         hd = self.head_dim
-        insert_after, stride, window, code_n_layers, source_index = cfg.fuse_stages[stage_i]
+        code_hd = self.code_head_dims[stage_i]
+        source_index, _insert_after, stride, window, _code_n_layers, _, _ = _parse_fuse_stage(cfg.fuse_stages[stage_i])
         source = x0 if source_index == 0 else (x if source_index == -1 else layer_hist[source_index])
 
         L = source.shape[1]
         n_blocks = L // stride
         if n_blocks < 1:
             return x
-        code_h = source[:, stride - 1::stride, :][:, :n_blocks, :]
+        code_h = self.code_in_proj[stage_i](source[:, stride - 1::stride, :][:, :n_blocks, :])
         code_local_pos = jnp.arange(n_blocks)
-        cos_c, sin_c = (rope_cos_sin_for_positions(code_local_pos, hd, cfg.rope_base) if cfg.pos_method == "rope" else (None, None))
+        cos_c, sin_c = (rope_cos_sin_for_positions(code_local_pos, code_hd, cfg.rope_base) if cfg.pos_method == "rope" else (None, None))
         code_mask = causal_mask(code_local_pos, code_local_pos, None)
         h_code_list = self._run_code_lm(stage_i, code_h, cos_c, sin_c, code_mask)
 

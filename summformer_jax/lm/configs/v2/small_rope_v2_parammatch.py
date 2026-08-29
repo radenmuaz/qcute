@@ -17,6 +17,6 @@ d_model = 768
 n_heads = 12
 n_layers = 2
 sequence_length = 1024
-fuse_stages = ((1, 2, None, 1, -1), (2, 2, None, 1, -1))
+fuse_stages = (((-1, 1), (2, -1), (1,)), ((-1, 2), (2, -1), (1,)))
 batch_size = 4
 total_batch_size = 524288

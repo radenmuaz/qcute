@@ -1,20 +1,23 @@
-"""Offline variant of prep_imagenet64_stream.py: reads ILSVRC/imagenet-1k directly from an
-already-downloaded HF cache (streaming=False, HF_HUB_OFFLINE=1 -- no network) instead of
-streaming. Run download_imagenet.py first to populate the cache. Same resize/shard logic as the
-streaming version:
+"""Streams ILSVRC/imagenet-1k from HF (no raw/Arrow caching -- streaming=True avoids the
+tmpfs-fill failure mode hit downloading the full dataset via plain load_dataset), resizes each
+image to 64x64 using the exact method from openai/improved-diffusion's image_datasets.py
+(canonical ImageNet64 preprocessing used across the density-estimation literature, incl. the
+Fractal Generative Models paper's own baselines):
 
   1. Repeatedly PIL.Image.BOX-downsample by 2x while min(size) >= 2*resolution.
   2. BICUBIC-resize so min(size) == resolution.
   3. Center-crop to resolution x resolution.
 
 Writes flat raster-order uint8 RGB bytes (resolution*resolution*3 per image) into fixed-size
-np.memmap shards. Non-RGB images (CMYK/L/RGBA) are resized in their native mode then converted to
-RGB as the last step (see center_crop_resize's docstring). Images that fail to decode are skipped
-and counted, not silently dropped without a trace.
+np.memmap shards -- same shard-per-file streaming pattern as scripts/jax/generate_pathfinder.py,
+chosen for the same reason: never hold a whole split in RAM.
 
-    uv run python summformer_jax/image_gen/scripts/download_imagenet.py   # once, first
-    uv run python summformer_jax/image_gen/scripts/prep_imagenet64.py --split train --out_dir /dev/shm/imagenet64
-    uv run python summformer_jax/image_gen/scripts/prep_imagenet64.py --split validation --out_dir /dev/shm/imagenet64
+Non-RGB images (CMYK/L/RGBA) are resized in their native mode then converted to RGB as the last
+step, exactly matching the reference's order (see center_crop_resize's docstring). Images that
+fail to decode are skipped and counted, not silently dropped without a trace.
+
+    uv run python summformer_jax/image_gen/scripts/prep_imagenet64_stream.py --split train --out_dir /dev/shm/imagenet64
+    uv run python summformer_jax/image_gen/scripts/prep_imagenet64_stream.py --split validation --out_dir /dev/shm/imagenet64
 """
 from __future__ import annotations
 
@@ -23,7 +26,6 @@ import os
 
 os.environ.setdefault("HF_HOME", "/dev/shm/hf_cache")
 os.environ.setdefault("HF_DATASETS_CACHE", "/dev/shm/hf_cache/datasets")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import numpy as np
 from PIL import Image
@@ -62,7 +64,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     bytes_per_image = args.resolution * args.resolution * 3
 
-    ds = load_dataset("ILSVRC/imagenet-1k", split=args.split, streaming=False)
+    ds = load_dataset("ILSVRC/imagenet-1k", split=args.split, streaming=True)
 
     shard_idx = 0
     n_in_shard = 0

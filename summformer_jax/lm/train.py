@@ -1,16 +1,19 @@
-"""JAX/pmap training loop for summformer_jax's v2 architecture (model_summformer_v2.py) -- a
-GPT-style deep backbone with FuseStage cross-attention spliced in at chosen depths, no weight
-sharing anywhere (contrast with train_summformer.py's v1: small n_layers + uniform Ks-cascade
-reusing one block for every refinement pass). Otherwise mirrors train_summformer.py's mechanics
-exactly (fused grad-accum/eval scan, background prefetch, donate_argnums, tqdm, qcute-style
---config parsing, same dataset/optimizer/schedule conventions).
+"""JAX/pmap training loop for summformer_jax's architecture, now sourced from the shared,
+feature-frozen summformer.py (duplicated verbatim from image_gen/summformer.py -- same file
+content in both folders, not an import across directories) -- a GPT-style deep backbone with
+FuseStage cross-attention spliced in at chosen depths, no weight sharing anywhere (contrast with
+train_summformer_v1.py: small n_layers + uniform Ks-cascade reusing one block for every refinement
+pass). Otherwise mirrors train_summformer_v1.py's mechanics exactly (fused grad-accum/eval scan,
+background prefetch, donate_argnums, tqdm, qcute-style --config parsing, same dataset/optimizer/
+schedule conventions). Supports custom vocab (e.g. GPT2 BPE, vocab_size~50257) via ConfigV2's
+already-generic vocab_size field -- nothing in summformer.py assumes byte-level vocab.
 
 `fuse_stages` and `main_window` are structured values (a tuple of tuples, and an int-or-tuple) --
 config-file-only, no CLI flag equivalent, pulled directly out of the config module rather than
 through argparse's normal flat-scalar allowlist.
 
-    uv run python summformer_jax/train_summformer_v2.py --config configs/summformer_jax_v2/small_rope_v2.py
-    uv run python summformer_jax/train_summformer_v2.py --config configs/summformer_jax_v2/medium_rope_v2.py
+    uv run python summformer_jax/lm/train.py --config configs/summformer_jax_v2/small_rope_v2.py
+    uv run python summformer_jax/lm/train.py --config configs/summformer_jax_v2/medium_rope_v2.py
 """
 from __future__ import annotations
 
@@ -31,7 +34,7 @@ from tqdm import tqdm
 
 from checkpoint_io import save_checkpoint
 from data_loader import DataLoaderLite
-from model_summformer_v2 import ConfigV2, SummTransformerV2
+from summformer import ConfigV2, SummTransformerV2
 
 TOTAL_BATCH_SIZE_DEFAULT = 2**19
 MAX_LR = 6e-4
@@ -121,7 +124,7 @@ def main():
     if args.dataset_dir is None:
         p.error("--dataset-dir is required (directly or via --config)")
     if not fuse_stages:
-        p.error("--config must set fuse_stages (a tuple of (insert_after, Ks, window, code_n_layers, source_index, fuse_n_layers))")
+        p.error("--config must set fuse_stages (a tuple of ((src, dst), (stride, window), (code_n_layers, code_d_model=None, code_n_heads=None)))")
 
     global MAX_LR, MIN_LR
     if args.lr is not None:
@@ -139,7 +142,7 @@ def main():
     val_loader = DataLoaderLite(B, T, 0, 1, "val", args.dataset_dir)
     max_steps = args.max_steps or args.num_epochs * (train_loader.num_total_tokens // total_batch_size)
 
-    run_name = args.run_name or (pre_args.config.stem if pre_args.config else f"summformer_v2_{args.pos_method}")
+    run_name = args.run_name or (pre_args.config.stem if pre_args.config else f"summformer_{args.pos_method}")
     log_dir = Path(args.save_dir) / run_name
     log_dir.mkdir(parents=True, exist_ok=True)
     resolved_lines = [f"{k} = {v!r}" for k, v in sorted(vars(args).items()) if k != "config"]
@@ -296,9 +299,10 @@ def main():
             print(f"[compile] step 0 wall time (includes first-call XLA compile): {dt:.2f}s", flush=True)
 
         if last_step:
-            single = jax.tree.map(lambda x: x[0], params)
+            single_params = jax.tree.map(lambda x: x[0], params)
+            single_opt_state = jax.tree.map(lambda x: x[0], opt_state)
             ckpt_path = log_dir / f"model_{step}"
-            save_checkpoint(ckpt_path, single)
+            save_checkpoint(ckpt_path, nnx.to_pure_dict(single_params), single_opt_state, {"step": step})
             log(step=step, event="checkpoint", path=str(ckpt_path.resolve()))
 
 
