@@ -32,4 +32,4 @@ fuse_stages = (
     ((-1, 3), (64, None), (4, 512, 8)),
 )
 mtp_heads = 24
-batch_size = 2
+batch_size = 4

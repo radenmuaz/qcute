@@ -38,6 +38,8 @@ import numpy as np
 import optax
 from flax import nnx
 from PIL import Image
+from tqdm import tqdm
+from tqdm import tqdm
 
 from summformer import ConfigV2, SummTransformerV2
 from imagenet_dataloader import ImageByteLoader
@@ -55,24 +57,26 @@ def build_config(config_vars: dict) -> ConfigV2:
     return ConfigV2(**{k: v for k, v in config_vars.items() if k in valid})
 
 
-def full_val_bpd(model: SummTransformerV2, val_loader: ImageByteLoader, batch_size: int,
+def full_val_bpd(eval_step, val_loader: ImageByteLoader, batch_size: int,
                   eval_batches: int | None = None) -> tuple[float, float]:
     """Real sweep over the val split (or the first eval_batches batches, for speed) -- not one
-    random batch. Returns (mean_loss, mean_bpd); bpd == bpb here (one RGB byte = one dimension),
-    named bpd to match the density-estimation literature's own reporting convention."""
+    random batch. `eval_step` is a jitted (state, tokens) -> loss callable so the sweep doesn't
+    re-trace every batch. Returns (mean_loss, mean_bpd); bpd == bpb here (one RGB byte = one
+    dimension), named bpd to match the density-estimation literature's own reporting convention."""
     losses = []
-    for i, batch in enumerate(val_loader.full_sweep(batch_size)):
+    for i, batch in enumerate(tqdm(val_loader.full_sweep(batch_size), desc="val sweep",
+                                    total=eval_batches, leave=False)):
         if eval_batches is not None and i >= eval_batches:
             break
         tokens = jnp.asarray(batch, dtype=jnp.int32)
-        loss, _ = model(tokens)
+        loss = eval_step(tokens)
         losses.append(float(loss))
     mean_loss = sum(losses) / len(losses)
     return mean_loss, mean_loss / math.log(2)
 
 
-def eval_and_sample(model: SummTransformerV2, val_loader: ImageByteLoader, resolution: int, batch_size: int,
-                     n_samples: int, prompt_len: int, eval_batches: int | None,
+def eval_and_sample(model: SummTransformerV2, eval_step, val_loader: ImageByteLoader, resolution: int,
+                     batch_size: int, n_samples: int, prompt_len: int, eval_batches: int | None,
                      sample_dir: Path, tag: str, seed: int) -> dict:
     """Full-val-set bpd (not one batch), plus n_samples generated images saved to
     sample_dir/<tag>_<i>.png -- each seeded from a REAL val image's first prompt_len bytes
@@ -80,7 +84,7 @@ def eval_and_sample(model: SummTransformerV2, val_loader: ImageByteLoader, resol
     prompt looks like noise, not the start of a coherent image) and drawn via true stochastic
     sampling (temperature=1, not the greedy default -- a qualitative sample should be an actual
     draw from the model's distribution, not the single most-likely, often-repetitive continuation)."""
-    val_loss, val_bpd = full_val_bpd(model, val_loader, batch_size, eval_batches)
+    val_loss, val_bpd = full_val_bpd(eval_step, val_loader, batch_size, eval_batches)
 
     sample_dir.mkdir(parents=True, exist_ok=True)
     prompt_batch = val_loader.next_batch()
@@ -108,6 +112,7 @@ def main():
     p.add_argument("--eval-batches", type=int, default=None, help="cap the full-val-set bpd sweep to this many batches (default: sweep the whole val split)")
     p.add_argument("--sample-dir", type=str, default="summformer_jax/image_gen/samples")
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--warmup-steps", type=int, default=200)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--run-name", type=str, default=None, help="defaults to the config file's stem")
     p.add_argument("--save-dir", type=str, default="summformer_jax/image_gen/logs")
@@ -122,9 +127,10 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     log_f = open(log_dir / "log.jsonl", "a")
 
-    def log(**record):
+    def log(*, console=True, **record):
         record["t"] = time.time()
-        print(record)
+        if console:
+            tqdm.write(str(record))
         log_f.write(json.dumps(record) + "\n")
         log_f.flush()
 
@@ -140,13 +146,22 @@ def main():
 
     model = SummTransformerV2(cfg, rngs=nnx.Rngs(args.seed))
     graphdef, state = nnx.split(model)
-    optimizer = optax.adamw(args.lr, b1=0.9, b2=0.95, weight_decay=0.1)
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0, peak_value=args.lr, warmup_steps=args.warmup_steps,
+        decay_steps=args.steps, end_value=args.lr * 0.1,
+    )
+    optimizer = optax.adamw(lr_schedule, b1=0.9, b2=0.95, weight_decay=0.1)
     opt_state = optimizer.init(state)
 
     def loss_fn(state, tokens):
         model = nnx.merge(graphdef, state)
         loss, metrics = model(tokens)
         return loss, metrics
+
+    @jax.jit
+    def eval_step_fn(state, tokens):
+        loss, _ = loss_fn(state, tokens)
+        return loss
 
     @jax.jit
     def train_step(state, opt_state, tokens):
@@ -160,20 +175,24 @@ def main():
 
     sample_dir = Path(args.sample_dir) / run_name
     epoch = 0
-    for step in range(args.steps):
+    pbar = tqdm(range(args.steps))
+    for step in pbar:
         batch = train_loader.next_batch()
         tokens = jnp.asarray(batch, dtype=jnp.int32)
         t0 = time.time()
         state, opt_state, loss, metrics = train_step(state, opt_state, tokens)
         dt_ms = (time.time() - t0) * 1000
-        log(step=step, split="train", loss=float(loss), bpb=float(metrics["bpb"]), dt_ms=dt_ms)
+        lr_now = float(lr_schedule(step))
+        pbar.set_postfix(loss=float(loss), bpb=float(metrics["bpb"]), dt_ms=f"{dt_ms:.1f}", lr=f"{lr_now:.2e}")
+        log(console=False, step=step, split="train", loss=float(loss), bpb=float(metrics["bpb"]), dt_ms=dt_ms, lr=lr_now)
 
         if (step + 1) % args.steps_per_epoch == 0:
             epoch += 1
             eval_model = nnx.merge(graphdef, state)
             eval_metrics = eval_and_sample(
-                eval_model, val_loader, args.resolution, batch_size, args.eval_samples, args.eval_prompt_len,
-                args.eval_batches, sample_dir, tag=f"epoch{epoch}_step{step+1}", seed=args.seed + epoch,
+                eval_model, lambda tokens: eval_step_fn(state, tokens), val_loader, args.resolution, batch_size,
+                args.eval_samples, args.eval_prompt_len, args.eval_batches, sample_dir,
+                tag=f"epoch{epoch}_step{step+1}", seed=args.seed + epoch,
             )
             log(step=step + 1, split="eval", epoch=epoch, **eval_metrics,
                 samples=[str(sample_dir / f"epoch{epoch}_step{step+1}_{i}.png") for i in range(args.eval_samples)])

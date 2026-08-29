@@ -769,6 +769,212 @@ class SummTransformerV2(nnx.Module):
 
         return all_tokens[0]
 
+    def _make_draft_stepper(self, Bsz: int):
+        """Near-duplicate of _make_incremental_stepper, NOT shared with it -- generate_kv_cache
+        and check_kv_cache_consistency (the proven mtp_heads=1 / no-draft path) stay completely
+        untouched by anything here. Two differences from _make_incremental_stepper's `step`:
+        (1) returns (logits, x_final) instead of just logits -- x_final (pre-head hidden state) is
+        what the MTP extra_heads need to draft from; (2) also returns `refs`, a dict of references
+        to this stepper's mutable cache containers (main_caches, hist, code_lm_layer_caches,
+        h_code_out_bufs, stage_n_blocks_done) -- lets a caller snapshot/restore state for
+        speculative-decode rollback (all Python list/dict identity, safe to shallow-copy since the
+        JAX arrays inside are immutable; restoring means overwriting contents in place so the
+        `step` closure -- which captured these containers by reference -- sees the restored data)."""
+        cfg = self.cfg
+        D = cfg.d_model
+        hd = self.head_dim
+        pm = cfg.pos_method
+        n_stages = len(cfg.fuse_stages)
+
+        main_caches = [None] * cfg.n_layers
+        referenced_depths = {0}
+        for spec in cfg.fuse_stages:
+            src, dst, _, _, _, _, _ = _parse_fuse_stage(spec)
+            if src == -1:
+                referenced_depths.add(dst)
+            elif src != 0:
+                referenced_depths.add(src)
+        hist = {j: jnp.zeros((Bsz, 0, D), dtype=cfg.compute_dtype) for j in referenced_depths}
+        stage_n_blocks_done = [0] * n_stages
+
+        code_lm_layer_caches = [None] * n_stages
+        h_code_out_bufs = [None] * n_stages
+        for stage_i, spec in enumerate(cfg.fuse_stages):
+            _, _, _, _, code_n_layers_i, _, _ = _parse_fuse_stage(spec)
+            max_nb_i = self.max_n_blocks[stage_i]
+            n_code_heads_i = self.code_dims[stage_i] // self.code_head_dims[stage_i]
+            code_hd_i = self.code_head_dims[stage_i]
+
+            def _zero_layer_cache():
+                k0 = jnp.zeros((Bsz, n_code_heads_i, max_nb_i, code_hd_i), dtype=cfg.compute_dtype)
+                v0 = jnp.zeros((Bsz, n_code_heads_i, max_nb_i, code_hd_i), dtype=cfg.compute_dtype)
+                pos0 = jnp.full((max_nb_i,), -10 ** 9, dtype=jnp.int32)
+                return (k0, v0, pos0, jnp.array(0, dtype=jnp.int32))
+
+            code_lm_layer_caches[stage_i] = tuple(_zero_layer_cache() for _ in range(code_n_layers_i))
+            h_code_out_bufs[stage_i] = tuple(
+                jnp.zeros((Bsz, max_nb_i, D), dtype=cfg.compute_dtype) for _ in range(code_n_layers_i))
+
+        def pool_and_fuse_incremental(stage_i: int, x_new, new_pos, cos_new, sin_new, current_depth: int):
+            source_index, _insert_after, stride, window, _code_n_layers, _, _ = _parse_fuse_stage(cfg.fuse_stages[stage_i])
+            code_hd = self.code_head_dims[stage_i]
+            max_nb = self.max_n_blocks[stage_i]
+            if source_index == 0:
+                source_hist = hist[0]
+            elif source_index == -1:
+                source_hist = hist[current_depth]
+            else:
+                source_hist = hist[source_index]
+
+            n_blocks = source_hist.shape[1] // stride
+            for old_nb_done in range(stage_n_blocks_done[stage_i], n_blocks):
+                sample_pos = (old_nb_done + 1) * stride - 1
+                sample = jax.lax.dynamic_slice_in_dim(source_hist, sample_pos, 1, axis=1)
+                h = self.code_in_proj[stage_i](sample)
+                code_local_pos = jnp.array([old_nb_done], dtype=jnp.int32)
+                cos_c, sin_c = (rope_cos_sin_for_positions(code_local_pos, code_hd, cfg.rope_base) if pm == "rope" else (None, None))
+                new_caches, new_out_bufs = [], []
+                for l, block in enumerate(self.code_lms[stage_i]):
+                    h, new_cache = block.forward_incremental_static(h, cos_c, sin_c, code_lm_layer_caches[stage_i][l], max_nb, pm)
+                    new_caches.append(new_cache)
+                    projected = self.code_out_proj[stage_i](self.code_ln_fs[stage_i](h))
+                    new_out_bufs.append(jax.lax.dynamic_update_slice_in_dim(h_code_out_bufs[stage_i][l], projected, old_nb_done, axis=1))
+                code_lm_layer_caches[stage_i] = tuple(new_caches)
+                h_code_out_bufs[stage_i] = tuple(new_out_bufs)
+                stage_n_blocks_done[stage_i] = old_nb_done + 1
+
+            n_blocks_now = stage_n_blocks_done[stage_i]
+            if n_blocks_now == 0:
+                return x_new
+            h_code_list = h_code_out_bufs[stage_i]
+            code_pos_abs = (jnp.arange(max_nb) + 1) * stride - 1
+            cos_k, sin_k = (rope_cos_sin_for_positions(code_pos_abs, hd, cfg.rope_base) if pm == "rope" else (None, None))
+            valid = (jnp.arange(max_nb) < n_blocks_now).reshape(1, 1, 1, max_nb)
+            fuse_mask = causal_mask(new_pos, code_pos_abs, window) & valid
+            return self.fuse_stages[stage_i](x_new, h_code_list, cos_new, sin_new, cos_k, sin_k, fuse_mask, pm)
+
+        def step(token_chunk: jnp.ndarray, start_pos: int):
+            Tn = token_chunk.shape[1]
+            pos = jnp.arange(start_pos, start_pos + Tn)
+            cos_b, sin_b = (rope_cos_sin_for_positions(pos, hd, cfg.rope_base) if pm == "rope" else (None, None))
+            x0_new = self.embed(token_chunk)
+            if pm == "learnable":
+                x0_new = x0_new + self.wpe(pos)[None]
+            if 0 in hist:
+                hist[0] = jnp.concatenate([hist[0], x0_new], axis=1)
+
+            x = x0_new
+            for stage_i in self.insertions.get(0, []):
+                x = pool_and_fuse_incremental(stage_i, x, pos, cos_b, sin_b, current_depth=0)
+
+            for i, block in enumerate(self.main_blocks):
+                w = self.main_windows[i]
+                x, main_caches[i] = block.forward_incremental(x, cos_b, sin_b, main_caches[i], w, pm)
+                depth = i + 1
+                if depth in hist:
+                    hist[depth] = jnp.concatenate([hist[depth], x], axis=1)
+                for stage_i in self.insertions.get(depth, []):
+                    x = pool_and_fuse_incremental(stage_i, x, pos, cos_b, sin_b, current_depth=depth)
+
+            x_final = self.ln_f(x)
+            return x_final @ self._head_weight().T, x_final
+
+        refs = {
+            "main_caches": main_caches, "hist": hist,
+            "code_lm_layer_caches": code_lm_layer_caches, "h_code_out_bufs": h_code_out_bufs,
+            "stage_n_blocks_done": stage_n_blocks_done,
+        }
+        return step, refs
+
+    def generate_mtp_draft(self, prompt_tokens: jnp.ndarray, n_new_tokens: int, k: int | None = None,
+                            verify: bool = False, tolerance: int = 0) -> jnp.ndarray:
+        """New, standalone generation path using the trained MTP extra_heads as within-step
+        drafters -- separate machinery from generate_kv_cache (mtp_heads=1 path), which this does
+        not touch or depend on. At each step, drafts up to `k` tokens in ONE parallel batch from
+        the current hidden state (main head -> t+1, extra_heads[0..k-2] -> t+2..t+k, all from the
+        SAME hidden state -- these are non-sequential/approximate for k>1, unlike a real
+        autoregressive prediction), then either:
+
+        verify=False (default, "no-verify" mode): trust all k drafted tokens outright and advance
+        the KV cache with them as one chunk -- no correctness guarantee, but for byte-level RGB
+        images a wrong pixel value is usually imperceptible, so this trades a bounded amount of
+        visual error for up to k tokens' worth of decode work collapsed into one forward call.
+
+        verify=True ("lax verify" mode): after drafting, runs the SAME chunk through the model
+        again to get the true sequential prediction at each position, and accepts a draft token if
+        it's within `tolerance` of the true greedy argmax (tolerance=0 means exact match, i.e.
+        standard lossless speculative decoding; tolerance>0 accepts small byte-value drift as
+        "close enough" for an image). On the first rejection, rolls back to the pre-draft cache
+        state (snapshot/restore via _make_draft_stepper's `refs`) and commits only the accepted
+        prefix plus the true token at the rejection point.
+
+        Not a speed win yet on its own: _make_draft_stepper is EAGER (not jitted), same as
+        generate_kv_cache -- see docs/image_gen_design.md for why real wall-clock speedup needs a
+        jitted Tn=K version of forward_incremental_static (currently Tn=1-only), not yet built."""
+        if prompt_tokens.ndim == 1:
+            prompt_tokens = prompt_tokens[None]
+        Bsz = prompt_tokens.shape[0]
+        step, refs = self._make_draft_stepper(Bsz)
+        k = k if k is not None else (len(self.extra_heads) + 1)
+        assert k >= 1
+
+        def snapshot():
+            return {name: (list(v) if isinstance(v, list) else dict(v)) for name, v in refs.items()}
+
+        def restore(snap):
+            for name, v in snap.items():
+                target = refs[name]
+                if isinstance(target, list):
+                    target[:] = v
+                else:
+                    target.clear()
+                    target.update(v)
+
+        w = self._head_weight()
+        all_tokens = prompt_tokens
+        logits, x_final = step(all_tokens, 0)
+        generated = 0
+        while generated < n_new_tokens:
+            kk = min(k, n_new_tokens - generated)
+            last_h = x_final[:, -1:, :]
+            draft = [jnp.argmax(last_h @ w.T, axis=-1)]
+            for i in range(kk - 1):
+                logits_i = self.extra_heads[i](last_h)
+                draft.append(jnp.argmax(logits_i, axis=-1))
+            draft_chunk = jnp.concatenate(draft, axis=1)  # (B, kk)
+            start_pos = all_tokens.shape[1]
+
+            if not verify:
+                all_tokens = jnp.concatenate([all_tokens, draft_chunk], axis=1)
+                logits, x_final = step(draft_chunk, start_pos)
+                generated += kk
+                continue
+
+            snap = snapshot()
+            verify_logits, verify_x = step(draft_chunk, start_pos)
+            accepted = 1  # position 0 is the main head's own greedy choice -- trivially "verified"
+            for j in range(1, kk):
+                true_tok = int(jnp.argmax(verify_logits[0, j - 1, :]))
+                draft_tok = int(draft_chunk[0, j])
+                if abs(true_tok - draft_tok) <= tolerance:
+                    accepted += 1
+                else:
+                    break
+
+            if accepted < kk:
+                restore(snap)
+                correction = jnp.argmax(verify_logits[:, accepted - 1, :], axis=-1, keepdims=True)
+                final_chunk = jnp.concatenate([draft_chunk[:, :accepted], correction], axis=1)
+                all_tokens = jnp.concatenate([all_tokens, final_chunk], axis=1)
+                logits, x_final = step(final_chunk, start_pos)
+                generated += accepted + 1
+            else:
+                all_tokens = jnp.concatenate([all_tokens, draft_chunk], axis=1)
+                logits, x_final = verify_logits, verify_x
+                generated += kk
+
+        return all_tokens[0, : prompt_tokens.shape[1] + n_new_tokens]
+
     def _prime_pure_growing(self, prompt_tokens):
         """Trunk-only pure prefill (no fuse_stages support -- for isolating/benching plain
         self-attn KV-cache cost against gpt2_jax's identical growing-cache design). Not jitted

@@ -1,153 +1,61 @@
 # TPU VM setup
 
-End-to-end steps to get from a bare TPU VM (see [TPU.md](../TPU.md) for available queued
-resources — **never create a new one yourself**, only use nodes already listed there) to a
-running training job. Originated with `qcute.bytelm_tpu` (session-tested on a `v6e-1` node,
-`v2-alpha-tpuv6e` runtime, Ubuntu 22.04) — the general steps (ssh, uv/venv setup, tmux/monitoring
-conventions) apply to any lineage trained on these nodes; sections that are specific to one
-lineage (torch/torch_xla install+flash-attention, the FineWeb-Edu byte-level prep) say so in their
-own headings. See [docs/status_tpu.md](status_tpu.md) for which lineage is actually running where
-right now. **Right after step 0 below (confirming the node is READY), set up direct ssh per
-[docs/tpu_direct_ssh.md](tpu_direct_ssh.md) before doing anything else** — every step from 1
-onward should go through that persistent connection, not repeated `gcloud ... ssh` calls; this
-doc's own command blocks are still written with plain `gcloud ... ssh` for copy-paste clarity,
-substitute the direct-ssh form once the connection is live.
+End-to-end steps from a bare TPU VM (see [TPU.md](../TPU.md) for available queued resources —
+**never create a new one**, only use nodes already listed) to a running JAX training job. Active
+lineages (`gpt2_jax/`, `summformer_jax/`) are pure JAX/Flax — no torch/torch_xla install, no
+version pinning, no flash-attention kernel setup needed. **Right after confirming the node is
+READY, set up direct ssh per [docs/tpu_direct_ssh.md](tpu_direct_ssh.md) before anything else** —
+every step below should go through that persistent connection, not repeated `gcloud ... ssh` calls
+(shown here in `gcloud` form only for copy-paste clarity).
 
-## Run long/interactive work inside `tmux` on the VM, not a bare `gcloud ssh --command`
-
-Any command that takes more than a few seconds, or that the user should be able to watch/attach
-to live — installs, data prep, and especially training — should run inside a `tmux` session on
-the TPU VM itself, not as a single blocking `gcloud ... ssh --command="..."` call. A bare
-`--command` call ties up the local shell for the whole duration and gives the user no way to
-reattach if they want to look in later; `tmux` decouples the remote process's lifetime from any
-one SSH connection and lets the user (or a later Claude session) reattach at any time. `tmux` is
-preinstalled on the standard TPU VM image (Ubuntu 22.04, confirmed `tmux 3.2a`).
-
-Launch inside a named session:
-
-```bash
-gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> \
-  --command="tmux new-session -d -s bytelm 'cd ~/qcute && <the actual long-running command>; exec bash'"
-```
-
-(the trailing `; exec bash` keeps the pane open after the command exits/crashes, instead of the
-session vanishing — useful for post-mortem.) Give the user the exact attach command so they can
-watch it themselves:
-
-```bash
-gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> -- -t "tmux attach -t bytelm"
-```
-
-(`Ctrl-b d` detaches without killing the session.) To check on it without fully attaching:
-
-```bash
-gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> \
-  --command="tmux capture-pane -t bytelm -p -S -40"   # last 40 lines
-```
-
-## 0. Get the node name + confirm it's READY
-
-The queued-resource name (e.g. `tpu1r`) and the actual node name (e.g. `tpu1`) can differ —
-gcloud ssh's own `Finished preparing node <name>.` line reveals the real one.
+## 0. Confirm the node is READY
 
 ```bash
 gcloud compute tpus queued-resources describe <qr-name> --project raden-tpu --zone <zone> \
   --format="value(state.state)"
-# must print READY (or ACTIVE for the queued resource itself)
 ```
 
-## 0.5. Set up direct ssh — do this now, before anything else
+Queued-resource name (e.g. `tpu1r`) and actual node name (e.g. `tpu1`) can differ — `gcloud ssh`'s
+`Finished preparing node <name>.` line reveals the real one.
 
-See [docs/tpu_direct_ssh.md](tpu_direct_ssh.md) in full. Short version: one `gcloud ... ssh
---command="echo ok"` call (propagates your key), get the node's external IP via
-`gcloud compute tpus tpu-vm describe <node-name> --format="yaml(networkEndpoints,state)"`, then
+## 1. Direct ssh (do this immediately)
+
+See [docs/tpu_direct_ssh.md](tpu_direct_ssh.md) in full — one `gcloud ... ssh --command="echo ok"`
+to propagate the key, get the external IP, then set up the persistent `ControlMaster` connection.
+Every command below should use that connection, not `gcloud ... ssh`.
+
+## 2. Install `uv` and sync the env
 
 ```bash
-mkdir -p ~/.ssh/controlmasters
-ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ControlMaster=auto \
-  -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -o ControlPersist=6h \
-  -i ~/.ssh/google_compute_engine -fN muaz@<external_ip>
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-From here on, every command on this node uses
-`ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@<external_ip> "<command>"`
-(and `scp` with the same `-o ControlPath=...`) instead of `gcloud ... ssh`/`scp` — this doc's
-remaining command blocks show the `gcloud` form for copy-paste clarity only.
-
-## 1. Install `uv` on the VM
-
-The stock VM ships Python 3.10 and no `uv`; `uv` will fetch its own Python 3.12 (this repo's
-`pyproject.toml` requires `>=3.12`).
+`uv` fetches its own Python 3.12 (`pyproject.toml` requires `>=3.12`, stock VM ships 3.10).
 
 ```bash
-gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> \
-  --command="curl -LsSf https://astral.sh/uv/install.sh | sh"
+source $HOME/.local/bin/env && cd ~/qcute && uv sync
 ```
 
-## 2. Create the venv and install torch + torch_xla + deps
+`uv sync` installs JAX + deps straight from `pyproject.toml`/`uv.lock` — no separate venv juggling,
+no ABI version pinning against a plugin (that was a torch_xla-specific problem, doesn't apply).
 
-**Pin `torch` to exactly match `torch_xla`'s version** — letting the resolver pick torch's
-latest (2.13.0 as of this session) against `torch_xla[tpu]`'s latest available (2.9.0) installs
-fine but fails at import time (`undefined symbol` in `_XLAC...so`, an ABI mismatch). `torch_xla`
-lags `torch`'s own release cadence, so always check what `torch_xla[tpu]`'s top available
-version actually is and pin `torch==` to the same number.
+## 3. Sanity-check JAX sees the TPU chips
 
 ```bash
-gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> --command="
-  source \$HOME/.local/bin/env && \
-  cd ~ && mkdir -p qcute && cd qcute && \
-  uv venv --python 3.12 && source .venv/bin/activate && \
-  uv pip install 'torch==2.9.0' 'torch_xla[tpu]==2.9.0' \
-    -f https://storage.googleapis.com/libtpu-releases/index.html \
-    -f https://storage.googleapis.com/libtpu-wheels/index.html && \
-  uv pip install matplotlib sentencepiece tqdm
-"
+cd ~/qcute && .venv/bin/python3 -c "import jax; print(jax.devices())"
 ```
 
-(If a fresh install without the explicit pin ends up with mismatched versions, reinstall both
-pinned to torch_xla's actual max — check with
-`uv pip install 'torch_xla[tpu]' --dry-run -f https://storage.googleapis.com/libtpu-releases/index.html` first.)
-
-### `libpython` not found
-
-uv's standalone Python build doesn't put its shared library on the default loader path —
-`import torch_xla` fails with `ImportError: libpython3.12.so.1.0: cannot open shared object
-file`. Fix by adding it to `LD_LIBRARY_PATH` (needed on every subsequent Python invocation, not
-just once):
-
-```bash
-export LD_LIBRARY_PATH=/home/muaz/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib:$LD_LIBRARY_PATH
-```
-
-(path will differ if uv picks a different exact patch version — check with
-`find ~/.local/share/uv/python -name 'libpython3.12.so.1.0'` if the above doesn't exist.)
-
-## 3. Sanity-check torch_xla sees the TPU chip
-
-```bash
-gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> --command="
-  cd ~/qcute && source .venv/bin/activate && \
-  export LD_LIBRARY_PATH=/home/muaz/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib:\$LD_LIBRARY_PATH && \
-  python3 -c \"import torch_xla.core.xla_model as xm; d=xm.xla_device(); print(d); import torch; x=torch.randn(4,4).to(d); print((x@x).sum())\"
-"
-```
-
-Expect `WARNING:root:libtpu.so and TPU device found. Setting PJRT_DEVICE=TPU.` then `xla:0` and
-a real tensor sum. If this hangs or errors, stop — fix it before scp'ing the project (the most
-likely causes are the torch/torch_xla version mismatch above, or the TPU having been preempted;
-check `gcloud compute tpus queued-resources describe <qr-name> ... --format="value(state.state)"`).
+Expect a list of `TpuDevice`s. If this hangs, errors, or shows CPU devices only, stop and fix it
+before scp'ing further — most likely cause is TPU preemption (check
+`gcloud compute tpus queued-resources describe <qr-name> ... --format="value(state.state)"`).
 
 ## 4. scp the project over
-
-Exclude `.venv`, `.git`, `datasets`, `logs`, `checkpoints`, `__pycache__` — none of those should
-cross the wire (venv gets rebuilt remotely, datasets get regenerated, logs/checkpoints are
-per-machine run state).
 
 ```bash
 tar czf /tmp/qcute_src.tar.gz \
   --exclude='.venv' --exclude='.git' --exclude='datasets' --exclude='logs' \
   --exclude='checkpoints' --exclude='__pycache__' --exclude='*.pyc' \
-  qcute configs scripts docs pyproject.toml uv.lock CLAUDE.md TPU.md
+  gpt2_jax summformer_jax configs scripts docs pyproject.toml uv.lock CLAUDE.md TPU.md
 
 gcloud compute tpus queued-resources scp /tmp/qcute_src.tar.gz <qr-name>:~/qcute_src.tar.gz \
   --project raden-tpu --zone <zone>
@@ -156,506 +64,69 @@ gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <z
   --command="cd ~/qcute && tar xzf ~/qcute_src.tar.gz && rm ~/qcute_src.tar.gz && ls"
 ```
 
-(`tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'`
-warnings from a macOS-built tarball are harmless — ignore them.)
+To re-sync after local edits, redo the tar+scp+extract (no rsync-over-gcloud-ssh path set up) —
+**or** `scp` individual changed files directly over the direct-ssh connection, cheaper for a
+one-file edit.
 
-To re-sync after local edits, redo the tar+scp+extract (a plain `--exclude`d re-tar is cheap;
-this repo has no rsync-over-gcloud-ssh path set up).
+## 5. Launch training inside `tmux`, never a bare blocking `gcloud ssh --command`
 
-## 5. Prepare the dataset
+Any long-running or user-monitorable command (installs, data prep, training) goes inside a named
+`tmux` session on the VM — decouples the remote process's lifetime from any one SSH connection, so
+the user (or a later session) can reattach anytime. `tmux` is preinstalled on the standard image.
 
-```bash
-gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> --command="
-  source \$HOME/.local/bin/env && cd ~/qcute && source .venv/bin/activate && \
-  python3 scripts/prepare_data.py
-"
-```
-
-Downloads/writes `datasets/enwik8.gz` (full 100,000,000-byte corpus) and
-`datasets/enwik8_1M.gz` (dev slice).
-
-## 6. Smoke test: `--device xla` actually needed
-
-`qcute.bytelm_tpu` (unlike plain `qcute.bytelm`/`qcute.qcute_lagcodec.qcute_lagcodec`) auto-detects and uses
-the TPU by default — but always check the run's own startup log line for `device=xla(...)`, not
-just that the process didn't crash; a silent CPU fallback (e.g. torch_xla import failing) is easy
-to miss otherwise.
-
-Launch inside `tmux` (see above) so the user can attach and watch it live:
+**Prefer no stdout redirect** — tqdm/prints land straight in the pane:
 
 ```bash
-gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> --command="
-  tmux new-session -d -s bytelm 'cd ~/qcute && source \$HOME/.local/bin/env && source .venv-nightly/bin/activate && \
-    export LD_LIBRARY_PATH=/home/muaz/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib:\$LD_LIBRARY_PATH && \
-    python3 -m qcute.bytelm_tpu --config configs/bytelm_tpu/bytelm_tpu_overfit10k.py --device xla --use_flash_attention --no_zero_kv_sink; exec bash'
-"
+tmux new-session -d -s <run_name> "cd ~/qcute && .venv/bin/python3 -u <module/script.py> --config <config.py> --run-name <run_name>"
 ```
 
-(`.venv-nightly` and `--use_flash_attention --no_zero_kv_sink` are the default here — see step
-3.5 above. Only fall back to `.venv`/no flash-attention if the nightly build genuinely isn't
-usable on this node.)
+Only redirect (via `tee`, not a plain `>`) when the run's log needs periodic `scp`-pulling — see
+CLAUDE.md's training-run-conventions section for why plain `>` leaves the tmux pane blank.
 
-Give the user the attach command:
+Give the user the attach/peek commands:
 
 ```bash
-gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> -- -t "tmux attach -t bytelm"
+tmux attach -t <run_name>              # Ctrl-b d to detach without killing
+tmux capture-pane -t <run_name> -p -S -40   # peek without attaching
 ```
-
-or peek without attaching:
-
-```bash
-gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> \
-  --command="tmux capture-pane -t bytelm -p -S -40"
-```
-
-Check for:
-- the startup line: `preset=xs  params=3.4M  device=xla:0  xla=True  ...`
-- `val_bpb` printed every `eval_every` steps and trending down
-- no traceback
-
-Once that's confirmed good, kill/replace the session and launch the real target run the same way
-(a fresh session name, e.g. `bytelm_sd`, avoids clobbering the smoke test's pane history):
-
-```bash
-gcloud compute tpus queued-resources ssh <qr-name> --project raden-tpu --zone <zone> --command="
-  tmux new-session -d -s bytelm_sd 'cd ~/qcute && source \$HOME/.local/bin/env && source .venv/bin/activate && \
-    export LD_LIBRARY_PATH=/home/muaz/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib:\$LD_LIBRARY_PATH && \
-    python3 -m qcute.bytelm_tpu --config configs/bytelm_tpu/bytelm_tpu_sd_full_enwik8.py --device xla; exec bash'
-"
-```
-
-Attach with `tmux attach -t bytelm_sd` (same `-- -t "tmux attach -t bytelm_sd"` pattern above), or
-watch `~/qcute/logs/bytelm_tpu_sd_full_enwik8/run.log` directly (structured, real-time — see
-[CLAUDE.md](../CLAUDE.md)'s logging convention) — and per that same doc, **watch actual
-elapsed-time/it-rate early** rather than trusting the config docstring's step estimate; retune
-`--steps` (or edit the config and relaunch) once real throughput is known.
-
-## 3.5. Nightly build (`.venv-nightly`) — default setup, required for `--use_flash_attention`
-
-**Do this on every fresh node, not just when flash-attention is explicitly requested** —
-`--use_flash_attention` + `--no_zero_kv_sink` is now the default way `qcute.bytelm_tpu` is run in
-this project (see CLAUDE.md), so skipping this step means falling back to a slower default that
-doesn't match how runs are actually launched.
-
-The stable pin above (torch/torch_xla 2.9.0) can't use `qcute.bytelm_tpu`'s
-`--use_flash_attention` flag — that kernel needs `libtpu>=0.0.44`, and 2.9.0 locks `libtpu==0.0.21`
-as its own dependency. Bumping libtpu alone on top of the stable pin is a confirmed hard break
-(`RuntimeError: Unexpected PJRT_ExecuteOptions size: expected 112, got 80` — plugin/framework PJRT
-API versions disagree). What works instead, confirmed directly on a `v4-8` node (Ubuntu 22.04):
-
-**Install into a separate `.venv-nightly`, not `.venv`** — step 2 above already created `.venv`
-with the stable pin; reusing that same name here would silently clobber it. Keeping both lets you
-run flash-attention (`.venv-nightly`) and non-flash-attention (`.venv`) processes side by side on
-the same node (this is what a real multi-chip sweep needs in practice — e.g. tpu6 ran both):
-
-```bash
-uv venv --python 3.12 .venv-nightly && source .venv-nightly/bin/activate
-UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install \
-  https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch-2.10.0.dev-cp312-cp312-linux_x86_64.whl \
-  https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-2.10.0.dev-cp312-cp312-linux_x86_64.whl
-uv pip install libtpu jax   # left unpinned — resolves to libtpu 0.0.46 + matching jax/jaxlib
-sudo apt-get update -qq && sudo apt-get install -y -qq libopenblas0   # nightly torch's wheel needs this; stable doesn't
-```
-
-Every subsequent command on this node needs the matching venv active for what it's doing —
-`source .venv-nightly/bin/activate` before any `--use_flash_attention` launch, `source
-.venv/bin/activate` (the stable one) otherwise. Don't assume whichever venv happens to be active
-in your current shell; check `which python3` if unsure.
-
-(`UV_SKIP_WHEEL_FILENAME_CHECK=1` is needed because uv strictly checks wheel-filename-vs-metadata
-version agreement, and this particular nightly wheel's internal metadata says `2.10.0+git...`
-while the filename says `2.10.0.dev` — a real nightly-build quirk, not file corruption.) Verify
-with the same device + tensor-op smoke test as step 3 above, then confirm flash-attention itself:
-
-```bash
-python3 -c "
-import torch, torch.nn.functional as F, torch_xla
-from torch_xla.experimental.custom_kernel import flash_attention
-device = torch_xla.device()
-q = torch.randn(8, 4, 4096, 64, device=device)
-k = torch.randn(8, 4, 4096, 64, device=device)
-v = torch.randn(8, 4, 4096, 64, device=device)
-y_flash = flash_attention(q, k, v, causal=True, sm_scale=1.0/8.0)
-y_ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-torch_xla.sync()
-print('max abs diff:', (y_flash - y_ref).abs().max().item())  # ~0.01 is normal (algorithm variance, not a bug)
-"
-```
-
-Nightly builds are less stable than the pinned release — re-verify this whole chain (including
-the generation-consistency check, `qcute.bytelm_tpu.validate_generation`) after any nightly
-version bump, don't assume it still works.
-
-**`--use_flash_attention` MUST always be paired with `--no_zero_kv_sink`** — `zero_kv_sink`
-defaults on and the two don't mix well (correctness fix exists but costs ~25x steady-state
-throughput; see this doc's "zero_kv_sink + flash-attention: investigation" section below for the
-full story). There is no known-good reason to launch `--use_flash_attention` without
-`--no_zero_kv_sink` in this project. Forgetting this flag is the most common way to launch a
-"working" flash-attention run that's actually 25x slower than it should be, with no error to flag
-it — every launch command/config in this doc that uses `--use_flash_attention` includes
-`--no_zero_kv_sink` right alongside it; do the same in any new launch.
-
-## Optional: multiple TPU chips on one host
-
-A multi-chip TPU slice (e.g. `v4-8` = 4 chips) exposes more than one device on a single VM.
-
-**`qcute.bytelm_tpu --multichip` (true collective data-parallel training via `torch_xla.launch`)
-WORKS on the stable `torch==2.9.0`/`torch_xla==2.9.0` pin** — confirmed directly on a fresh `v4-8`
-node (2026-08-23, `tiny` preset, `--no_torch_compile`, `--no_flash_attention`): `ps aux` during the
-run showed 4 real `multiprocessing.spawn_main` worker processes, each with steadily climbing CPU
-time (not the stuck-at-launch symptom below), a 2000-step run completed cleanly (`TRAIN_EXIT=0`,
-val_bpb converged 7.7→2.46), and the log correctly reported `world_size=4 global_batch=64` (after
-fixing a real bug found along the way: `world_size` was computed via
-`xr.addressable_runtime_device_count()`, which returns the *calling process's own* local device
-count — 1, inside an already-spawned worker — not the total across all processes; fixed to
-`xr.world_size()`, the actual global replica count). **Previously reported as "confirmed broken"
-below — that finding was specific to the nightly `torch_xla==2.10.0.dev0` build, not a bug in this
-project's multichip wiring**, exactly as the static-review hypothesis from 2026-08-22 predicted.
-**`--use_flash_attention` + `--multichip` together: confirmed hanging (2026-08-23, tpu5, fresh
-v4-8 node, nightly build).** A `--steps 5` smoke test showed all 4 worker processes' cumulative
-CPU *time* (via `ps -o time`, not the noisier `%cpu` column) flat across repeated snapshots ~20s
-apart (`00:00:18`/`00:00:19`, unchanged) — the exact "spin up then go idle, no further progress"
-signature described below. Standalone `flash_attention()` calls work fine on this same node/build
-(verified via the smoke-test snippet above, max abs diff ~0.011, normal variance).
-
-**UPDATE (2026-08-25, tpu5): `--multichip` ALONE (no `--use_flash_attention`) also hangs on the
-nightly build** — this corrects the "nightly can do multichip alone" claim in the previous
-paragraph, which turned out to have never actually been tested (all prior multichip testing was on
-the *stable* pin; all prior nightly testing was flash-only, single-chip). Isolation test: fresh
-`.venv-nightly` on tpu5 (mirroring tpu7's setup), `qcute.bytelm_tpu --preset tiny --multichip
---no_torch_compile --steps 20` (no flash), all 4 chips. Result: 4 `multiprocessing.spawn_main`
-workers spawned, but `ps -o pid,time,%cpu` showed CPU *time* frozen at the exact same value
-(`00:00:13` workers / `00:00:24` main) across 3 snapshots spanning over a minute, despite nonzero
-`%cpu` (busy-waiting, not real progress) — identical signature to the flash+multichip hang above,
-and no new stdout past the initial `PJRT_Api` startup lines. **Conclusion: the hang is in the
-nightly build's own multi-process PJRT bootstrap in general, not something specific to
-flash-attention's kernel init** — flash-attention was never the actual variable; nightly-vs-stable
-was. `--multichip` only works on the stable pin (confirmed above); the stable pin can't do
-flash-attention at all. There is currently no build/config combination that gets both
-`--multichip` and `--use_flash_attention` working together, nor even `--multichip` alone on
-nightly. Use `TPU_VISIBLE_CHIPS`-based independent single-chip processes (see below) for real
-multi-chip utilization whenever flash-attention (or the nightly build for any other reason) is
-needed — not investigated further: no strace/gdb dive into the PJRT client, no upstream bug filed.
-
-**Not a staleness issue**: the wheel used above (`torch-2.10.0.dev-cp312-cp312-linux_x86_64.whl`,
-no date suffix) turned out to be frozen at 2025-11-19 (checked via `gsutil ls -L` on the GCS
-bucket — that's the actual upload date of both the "rolling latest" and the last dated `cp312`
-snapshot; no `cp312`/`cp313` dated snapshots exist after that, only `cp310`/`cp311` kept getting
-new daily builds). Retested with the actual latest available anywhere in the bucket at the time
-(`cp311`, dated 2026-02-08, ~3 months newer) in a fresh `.venv-nightly-cp311` (`uv venv --python
-3.11`, same install steps otherwise) — **identical hang**, CPU time frozen at the exact same
-`00:00:18`/`00:00:19` values across two snapshots ~85s apart. So this isn't a bug that's since been
-fixed upstream and just needs a newer nightly; it reproduces on the newest build available.
-
-**Also not fixed by going the other direction** (an early `2.10.0.dev` build, close to the `2.9.0`
-stable cut, on the theory that a later nightly regressed something that worked right after
-release): `torch_xla-2.10.0.dev20251008` is the *earliest* dated snapshot the GCS bucket still has
-for `cp311`/`cp312` (nothing older archived) — installed in a fresh `.venv-nightly-early`, same
-`libtpu`/`jax` install steps. Two findings: (1) no ABI break pairing this ~6-week-older wheel
-against today's `libtpu==0.0.46` (device init and a plain smoke test both worked, unlike the
-stable-pin-vs-newer-libtpu break described earlier in this doc), and (2) **the multichip hang
-still reproduces identically** — CPU time frozen at the same values across a ~22s gap. So the bug
-has been present since at least the earliest nightly build available after `2.9.0` shipped — not a
-later regression introduced partway through the `2.10.0.dev` line. Conclusion: **no nightly build
-tried (earliest available through newest available, both `cp311` and `cp312`) avoids this hang**;
-it looks structural to the `2.9.0`→`2.10.0.dev` transition itself (a real behavior difference in
-the branch, not a bisectable commit within what's archived), not something a different nightly
-pick can route around.
-
-Static code review (2026-08-22) found nothing wrong in this project's own collective usage (every
-rank reaches `optimizer_step`'s all-reduce in lockstep every step, no other collective appears
-anywhere in the file) — consistent with the bug living in the nightly PJRT client's multi-process
-bootstrap itself, not in `qcute.bytelm_tpu`/`qcute.bytelm_fineweb`'s own code.
-
-**Summary matrix (all confirmed directly, `v4-8`)**:
-
-| build | `--multichip` | `--use_flash_attention` | result |
-|---|---|---|---|
-| stable (`torch==2.9.0`) | yes | no | ✅ works (real collective data-parallel) |
-| stable | yes | — | flash unavailable at all (`libtpu==0.0.21` too old for the kernel) |
-| nightly (`torch==2.10.0.dev0`) | no | yes | ✅ works (single-chip; what tpu7's real fineweb run uses) |
-| nightly | yes | no | ❌ hangs |
-| nightly | yes | yes | ❌ hangs |
-
-Only `stable + --multichip + no flash` gets real multi-chip data-parallelism today. Trading away
-flash-attention's memory savings for genuine `world_size>1` (bigger effective batch, one shared
-set of weights) is the one working way to use more than one chip collectively — otherwise use
-`TPU_VISIBLE_CHIPS`-pinned independent single-chip processes (below) for embarrassingly-parallel
-multi-chip utilization instead (own weights/logs per process, not a shared bigger batch).
-
-**What else works**: independent single-chip processes via `TPU_VISIBLE_CHIPS`, confirmed directly
-— two concurrent single-device processes with `TPU_VISIBLE_CHIPS=0` and `TPU_VISIBLE_CHIPS=1` both
-ran and computed correctly with no conflict, no collectives, no rendezvous needed. This is
-embarrassingly-parallel, not larger-batch data-parallel: each process is a fully independent
-training run (own `--run_name`, own logs/checkpoints), and it's on you to make each process's
-`--run_name` distinct (a collision silently interleaves two runs' log lines into one file). Check
-the real device count first — a "v4-8" slice's "8" is TensorCores, not addressable devices (v4
-runs 2 cores per chip fused as one "megacore" logical device by default): confirmed 4 addressable
-devices on this session's `v4-8` node via three independent sources —
-`torch_xla.runtime.addressable_runtime_device_count()`, `ls /dev/accel*`, and `tpu-info`. Launch
-one process per chip:
-
-**One named `tmux` session per chip** (not 4 background `&` jobs in a single shell — those all die
-together if that one shell's session ends; separate sessions survive and can be
-attached/detached/killed independently), each with a distinct `--run_name` and its own
-`--config` (a 4-way hparam sweep, say — this is what a genuinely useful use of 4 chips on one host
-looks like, since `--multichip` doesn't work):
-
-```bash
-ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine \
-  muaz@<external_ip> "
-  tmux new-session -d -s sweep_a 'cd ~/qcute && source .venv/bin/activate && \
-    export LD_LIBRARY_PATH=/home/muaz/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib && \
-    export TPU_VISIBLE_CHIPS=0 && \
-    python3 -m qcute.bytelm_tpu --config configs/bytelm_tpu/<variant_a>.py --device xla; echo TRAIN_EXIT=\$?; exec bash'
-  tmux new-session -d -s sweep_b 'cd ~/qcute && source .venv/bin/activate && \
-    export LD_LIBRARY_PATH=/home/muaz/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib && \
-    export TPU_VISIBLE_CHIPS=1 && \
-    python3 -m qcute.bytelm_tpu --config configs/bytelm_tpu/<variant_b>.py --device xla; echo TRAIN_EXIT=\$?; exec bash'
-  # ... one more tmux new-session block per remaining chip (TPU_VISIBLE_CHIPS=2, =3, ...)
-"
-```
-
-List and attach to any of them from the local machine:
-
-```bash
-ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine \
-  muaz@<external_ip> "tmux ls"                    # list all sessions on the node
-
-ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine \
-  -t muaz@<external_ip> "tmux attach -t sweep_a"   # attach to one (Ctrl-b d to detach)
-```
-
-or peek at each without attaching, same `tmux capture-pane -t <session> -p -S -N` pattern as the
-single-run case above, once per session name.
-
-## Rough sizing estimate: model/context for 1.0 bpb in 12h on a v4-16 pod
-
-Back-of-envelope only (2026-08-22) — not fit from this project's own scaling data, no controlled
-sweep has been run yet. Treat as a starting guess, re-derive once real throughput numbers exist
-at a larger model scale.
-
-- v4-16 = 16 TensorCores = **8 addressable chips** (megacore fuses 2 cores/chip, confirmed on the
-  `v4-8` node this session: 4 addressable devices via `addressable_runtime_device_count()`/
-  `/dev/accel*`/`tpu-info`).
-- Compute budget: `8 chips * 275 TFLOPS/chip (bf16 peak) * 35% assumed MFU * 12h = ~3.3e19 FLOPs`.
-- `6*N*D` heuristic (N=params, D=bytes trained on) → `N*D <= ~5.5e18`.
-- Anchoring to published near-1.0-bpc enwik8 results (Transformer-XL-large 277M, Perceiver AR
-  358M/context=8192, ~0.97-0.99 bpc): `N~250-350M`, `D~1-2e10` bytes (~150-220 epochs of enwik8's
-  ~90M-byte train split) — product ~2.5-3.5e18, fits the budget with headroom.
-- **Pareto point: N≈250-300M params, context≈4096-8192, ~180-200 epochs.**
-
-**Critical caveat**: this budget assumes all 8 chips combine into one data-parallel run via
-`--multichip`. Update 2026-08-23: `--multichip` is now **confirmed working** on the stable
-`torch==2.9.0`/`torch_xla==2.9.0` pin (see "Optional: multiple TPU chips on one host" below) — the
-8-chip budget above is achievable in principle, not blocked on a broken collective anymore. On one
-chip alone the same math gives `~4.1e18 FLOPs` → `N*D<=6.9e17`, roughly 4-5x short of the anchor
-above; realistic single-chip outcome in 12h is closer to `N≈60-90M`, landing bpb ~1.1-1.2, not
-confidently 1.0. Still untested: `--multichip` + `--use_flash_attention` together (nightly-only,
-needed for the flash-attention memory savings this doc's zero_kv_sink section below relies on).
-
-## zero_kv_sink + flash-attention: investigation (2026-08-23)
-
-`qcute.bytelm_tpu`'s `zero_kv_sink` (default on) prepends one all-zero, always-attendable K/V
-token before every real token, freshly re-concatenated at **every attention layer, every step**
-(a static, non-learned attention sink, not a learnable BOS token). Combining it with
-`--use_flash_attention` turned out to be a multi-stage investigation, ending in: **don't** —
-plain flash-attention without the sink wins on every axis tried.
-
-**Stage 1 — naive combination crashes.** The Pallas kernel's `causal=True` assumes `q_len==kv_len`
-(diagonal-aligned); the sink makes `kv_len=T+1` while `q_len=T`, silently misaligning the mask
-(confirmed: max abs diff ~2.6 vs. the explicit-mask SDPA reference — not the ~0.01 normal
-flash-attention variance, a real correctness bug, not noise). `CausalSelfAttention.forward` (in
-`qcute/bytelm_tpu.py`) used to just always fall back to the O(T²)-memory explicit-mask SDPA path
-whenever `zero_kv_sink` was on, regardless of the flash flag.
-
-**Stage 2 — the "square" fix.** Padding `q` with one dummy leading row (`q_padded =
-cat([zero, q])`) makes `q_len==kv_len==T+1` exactly, restoring correctness — verified against the
-explicit-mask reference (max abs diff ~0.007-0.01, matching flash-attention's normal algorithmic
-variance). But the kernel *also* requires that common length divisible by its internal block size
-(`1024`, observed via the exact error message `q_seq_len=N should be divisible by block_q_dq=1024`)
-— so this only works when `context+1` is itself a multiple of 1024 (e.g. `context=8191`, not
-`8192`). Implemented in `CausalSelfAttention.forward`, gated on `(T+1) % 1024 == 0`; falls back to
-the explicit-mask path otherwise (a real bug was found and fixed here too: the fallback check
-originally lived only in `main()`'s startup warning, which printed the warning but never actually
-disabled the flash path, so a misconfigured `context` crashed instead of gracefully falling back
-— fixed by moving the check into `forward()` itself).
-
-**Stage 3 — it's correct but ~25x too slow.** At `context=8191, batch=4`: **10.0-10.06s/it**,
-vs. **0.4s/it** for plain flash-attention without the sink — confirmed identical slowdown with and
-without `torch.compile` (10.01s/it uncompiled, 12.2-24s/it compiled, `torch.compile` actually made
-it *worse*, not better), and confirmed a pre-allocated `register_buffer` for the zero tensor
-(avoiding a fresh `torch.zeros(...)` allocation every call) made **no measurable difference**
-(10.06s/it either way) — so the cost is the `torch.cat` itself materializing new
-`[B,H,T+1,hd]` K/V/Q tensors at every layer, every step, not allocation overhead or compile
-strategy.
-
-**Stage 4 — cheaper alternatives considered, none viable without changing what the sink is.**
-- Moving the padding to the *end* of Q instead of the front (to avoid slicing) is **not just
-  slower, it's incorrect**: with the sink at kv-index 0 and real queries kept at their original
-  (unshifted) indices, every real query systematically misses attending to its own current-byte
-  key (worked example: for `T=3`, query 0 attends only `{sink}`, query 1 only `{sink, k0}`, etc.
-  — never including its own key). The front-padding version is the only one that's both
-  length-compatible and correct.
-- A true zero-cost "attention sink" (the off-by-one-softmax / additive-denominator-bias trick from
-  the StreamingLLM-style literature — no extra K/V token at all, just a constant added to the
-  softmax denominator) isn't implementable through this kernel's exposed API (`ab`/`segment_ids`
-  operate on the existing q/kv grid, not on the softmax normalizer).
-- The genuinely cheap restructuring — prepend the sink **once**, at the input embedding stage
-  (like a normal learnable BOS/CLS token), not re-injected per-layer — uses the plain,
-  already-fast flash-attention path unchanged. But it changes what the mechanism *is*: a
-  per-layer static zero anchor becomes a single learnable token that evolves through the residual
-  stream like any other position. Not implemented (out of scope of the investigation, would need
-  `ByteLM.forward`-level restructuring, not just the attention module) — worth doing later if the
-  sink's benefit is ever actually verified to matter for convergence.
-
-**Stage 5 — a from-scratch JAX reimplementation didn't rescue it either.** `qcute/bytelm_jax.py`
-(pure JAX, same architecture, same enwik8 data, single `jax.jit`-compiled train step — the
-natural JAX pattern, unlike torch_xla's per-step lazy-graph tracing plus a Pallas-kernel
-`jax.jit` re-invocation from *inside* a torch custom op on every call, visible in the crash
-traceback from Stage 1) measured **~3.03s/it** for the sink+flash combination — ~3.3x faster than
-torch_xla's 10s/it, suggesting the torch_xla wrapper itself carries real overhead. But a properly
-controlled follow-up (sink on/off × fp32/bf16, all 4 combinations) showed **the sink made no
-measurable difference in JAX at all** — 0.330, 0.332, and 0.350 it/s across all four variants,
-all within noise of each other. So the initial "3.3x faster, confirms the wrapper is the problem"
-read was wrong/confounded: JAX's own ~3s/it floor has some other, unidentified cause unrelated to
-the sink (candidates not yet investigated: host/device pipelining, the flash kernel's behavior
-under `jax.jit` tracing for this exact shape — genuinely unresolved, not chased further since it's
-tangential to the main goal).
-
-**Bottom line**: no variant of `zero_kv_sink`-with-flash-attention (torch_xla or JAX, any dtype)
-beat plain flash-attention without the sink (0.4s/it on torch_xla) at this model scale. Use
-`--no_zero_kv_sink` when `--use_flash_attention` is on, or accept `context=1024*k-1` and the
-~25x throughput cost if the sink's architectural benefit is later confirmed to matter enough to
-justify it.
 
 ## Monitoring a multi-hour run
 
-For a run sized in hours (not minutes), check in periodically — roughly hourly is a reasonable
-default cadence, tighter early on if the step budget/throughput estimate hasn't been validated
-yet — rather than leaving it fully unattended or babysitting continuously. Each check:
+Check in periodically (~hourly for a multi-hour run):
 
 ```bash
 ssh -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine \
-  muaz@<external_ip> "tmux capture-pane -t bytelm -p -S -20"
+  muaz@<external_ip> "tmux capture-pane -t <run_name> -p -S -20"
 ```
 
-note the latest `val_bpb` (and whether it's still falling or has plateaued/started climbing —
-overfitting on a small corpus over many epochs is expected for small models, see
-configs/bytelm_tpu/bytelm_tpu_sm_full_enwik8.py's own docstring), and confirm no traceback.
-
-**If that command suddenly can't connect** (hangs, or fails immediately with `Connection
-refused`/`No route to host`) **on a node that was working at the last check-in, check for
-preemption before anything else** — every TPU here is a spot instance (see [TPU.md](../TPU.md)),
-reclaimable with no warning mid-run, and a dead node is indistinguishable from a flaky connection
-until you check state:
-`gcloud compute tpus queued-resources describe <qr-name> --project raden-tpu --zone <zone> --format="value(state.state)"`.
-`PREEMPTED` means the node and everything on it (the training process, anything not already
-copied back) is gone for good — report it and ask how to proceed rather than retrying the
-connection or standing up a replacement node unasked. Full detail:
-[docs/tpu_direct_ssh.md](tpu_direct_ssh.md)'s caveats section.
-
-**Pull back only `run.jsonl`, not `run.log` or checkpoints, to save egress**: `run.jsonl` is the
-small structured record `scripts/plot_run.py` reads; `run.log` is the same data plus tqdm
-progress-bar noise (redundant, larger), and checkpoints are large binary files with no reason to
-leave the TPU VM mid-run. Copy it to the *same relative path* under the local repo's own `logs/`
-(so `scripts/plot_run.py logs/<run_name>` works locally without edits):
+- Note the latest metric (val_bpb/val_loss) trend, confirm no traceback.
+- **Connection suddenly fails on a previously-working node** → check for preemption first:
+  `gcloud compute tpus queued-resources describe <qr-name> ... --format="value(state.state)"`.
+  `PREEMPTED` = node and everything on it is gone; report and ask before retrying/replacing.
+  Full detail: [docs/tpu_direct_ssh.md](tpu_direct_ssh.md).
+- **Pull back only `run.jsonl`/`log.jsonl`, not `run.log`/checkpoints**, to save egress — copy to
+  the same relative path under the local repo's `logs/<run_name>/` so `scripts/plot_run.py
+  logs/<run_name>` works unedited:
 
 ```bash
 scp -o ControlPath=~/.ssh/controlmasters/<tag>-%r@%h:%p -i ~/.ssh/google_compute_engine \
-  muaz@<external_ip>:~/qcute/logs/<run_name>/run.jsonl logs/<run_name>/run.jsonl
+  muaz@<external_ip>:~/qcute/logs/<run_name>/log.jsonl logs/<run_name>/log.jsonl
 ```
 
-(`mkdir -p logs/<run_name>` first if this is the first pull for that run.) Re-running the same
-command later just overwrites the local copy with the latest one — safe to repeat every check-in.
-
-## FineWeb-Edu byte-level training (`qcute.bytelm_fineweb`)
-
-Standalone fork of `qcute.bytelm_tpu` for training on FineWeb-Edu's `sample-10BT` subset instead
-of enwik8 -- see `qcute/bytelm_fineweb.py`'s own module docstring for what's different (mmap'd
-flat-binary data loading instead of an in-RAM tensor, loss as the primary metric with bpb
-secondary, no tokenizer/BPE -- pure byte-level). Node setup is otherwise identical to the rest of
-this doc: do steps 0/0.5/1/2/3 above first (stable `.venv`), and step 3.5 (`.venv-nightly`) if
-you'll use `--use_flash_attention` (recommended -- see batch-size findings below).
-
-### 1. Download the corpus
-
-```bash
-uv run python scripts/download_fineweb_edu.py --dest_dir datasets/fineweb_edu_10BT
-```
-
-Reads `HF_TOKEN` from the repo's `.env`. Downloads `sample/10BT/` (14 parquet shards, ~28.5GB) via
-`huggingface_hub.snapshot_download`. Run this on the TPU node itself (not locally then scp'd --
-28.5GB is large enough that downloading directly on-node is much faster).
-
-### 2. Byte-encode into flat mmap-able binaries
-
-```bash
-uv run python scripts/prep_fineweb_edu_bytes.py --dest_dir datasets/fineweb_edu_10BT
-```
-
-Reads the 14 parquet shards (pyarrow, streaming per row-group), UTF-8-encodes each document's
-`text` column straight to bytes -- no tokenizer -- and writes `train.bin` (13 shards,
-45,109,723,621 bytes) / `val.bin` (1 held-out shard, 874,306,351 bytes). Default: plain
-concatenation, no document separator (matches `qcute.bytelm_tpu`'s own enwik8 loader). Pass
-`--use_separator` to insert one `0x00` byte between documents instead -- confirmed via
-`scripts/count_separator_byte.py` that `0x00` occurs **zero** times naturally anywhere in this
-corpus (9,672,101 docs, 45,974,357,885 bytes scanned), so it's an unambiguous boundary marker
-whenever that flag is used.
-
-**Known gotcha (2026-08-25, tpu7): don't use `np.memmap` for the final write.** The first version
-of this script wrote via one `np.memmap(..., mode="w+")` + a single whole-file `mm.flush()`, which
-entered an **uninterruptible D-state disk-I/O wait that not even `SIGKILL` could clear** on this
-node's disk (GCP persistent-disk throughput throttling reacting badly to one giant flush/msync
-call over a ~45GB file -- `/proc/<pid>/wchan` showed `wb_wait_for_completion` then `rq_qos_wait`,
-stuck for 10+ minutes with zero CPU/disk-usage progress). Fixed by switching to plain buffered
-`file.write()` in bounded 64MB chunks instead (`_WRITE_CHUNK` in the script) -- no more mmap, no
-more single giant flush, and the hang has not recurred. If you ever see a `python` process for
-this script stuck in `D` state with a frozen CPU time in `ps aux`, this is almost certainly it --
-check `cat /proc/<pid>/io`'s `write_bytes` across a couple of real (not `ScheduleWakeup`-timed --
-those have been observed to drift from real elapsed time) `sleep`d checks; if it's genuinely flat,
-kill `-9` won't work, you have to wait it out or investigate further.
-
-### 3. Launch training
-
-```bash
-uv run python -m qcute.bytelm_fineweb --config configs/bytelm_fineweb/small_d512x8_mlp4_1epoch_ctx1024_flash.py --device xla --use_flash_attention
-```
-
-(needs `.venv-nightly` active -- this config uses `--use_flash_attention`.)
-
-**Batch-size/context sweep confirmed on tpu7 (v4-8, 31.75GB usable HBM per chip), `d512x8_mlp4`
-preset (~34.2M params)**:
-
-| context | batch_size | flash | result |
-|---|---|---|---|
-| 2048 | 128 | no | OOM (8G needed, only 5.77G free after torch.compile's transient overhead) |
-| 2048 | 64  | no | OOM (45.4G needed) |
-| 2048 | 32  | no | fits |
-| 2048 | 128 | yes | OOM (49.04G needed) |
-| 2048 | 64  | yes | fits, ~1.4-1.5 it/s |
-| 1024 | 256 | yes | OOM (49.04G needed -- same batch*seq_len product as the 2048/128 row above) |
-| 1024 | 128 | yes | fits, ~1.13 it/s (**best util found -- used by the config above**) |
-
-`--no_torch_compile` throughout this sweep (not yet verified in combination with
-`--use_flash_attention` on this node -- try enabling it for a possible further speedup, but
-re-verify memory headroom first, torch.compile's tracing overhead was what caused the very first
-OOM in this table). `--multichip` is NOT compatible with `--use_flash_attention` (confirmed
-hanging, see "Optional: multiple TPU chips on one host" above) -- pick one or the other, not both.
-
-## Common failure modes recap
+## Common failure modes
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `uv: command not found` on a later ssh call | each `ssh --command=...` is a fresh non-login shell | `source $HOME/.local/bin/env` at the start of every command |
-| `ImportError: libpython3.12.so.1.0` | uv Python's shared lib not on loader path | `export LD_LIBRARY_PATH=...` (step 2) |
-| `undefined symbol: ...deleteNodeEPN...` importing `_XLAC` | torch/torch_xla version mismatch | pin both to torch_xla's exact max version (step 2) |
 | `ssh ... exited with return code 255` / hangs | TPU preempted (spot), or transient SSH flakiness | check `queued-resources describe ... state.state`; retry |
-| training log shows `device=cpu` | forgot `--device xla`, or torch_xla import silently failed | always check the startup log line, not just exit code |
-| `RuntimeError: Unexpected PJRT_ExecuteOptions size: expected 112, got 80` | libtpu bumped independently of the torch/torch_xla pin — plugin/framework PJRT API versions disagree | use the matched nightly build (see above), don't mix a newer libtpu with the stable pin |
-| `RuntimeError: Pallas TPU requires a recent libtpu version` | `--use_flash_attention` on the stable pin (`libtpu==0.0.21` < required `0.0.44`) | use the nightly build (see above) |
-| `ModuleNotFoundError: No module named 'jax'` calling `flash_attention` | jax not installed — it's the flash-attention kernel's implementation dependency, not a normal project dep | `uv pip install jax` (in the nightly venv) |
-| `ImportError: libopenblas.so.0` on the nightly torch wheel | missing system package (the stable release doesn't need it) | `sudo apt-get install -y libopenblas0` |
-| `error: ... Wheel version does not match filename` installing a nightly wheel via uv | known nightly-build wheel-metadata quirk, not real corruption | `UV_SKIP_WHEEL_FILENAME_CHECK=1` |
-| `--multichip` hangs (workers spin up, CPU time stops climbing, no progress) | stuck PJRT multi-process rendezvous, unresolved on this session's nightly+v4-8 combo | don't use `--multichip`; use independent single-chip processes via `TPU_VISIBLE_CHIPS` instead (see above) |
-| `RuntimeError: TPU initialization failed: ... Device or resource busy` | a previous process (stuck, killed slow, or just concurrent) still holds the chip | `ps aux \| grep python3`, `kill -9` the stale PID, retry — `TPU_VISIBLE_CHIPS` conflicts show the same error if two processes claim the same chip index |
+| `jax.devices()` shows CPU only | TPU not actually attached, or a stale process still holds it | `ps aux \| grep python3`, kill stale PID; check preemption |
+| training silently uses growing-prefix data | dataloader reads whatever shards exist at startup | confirm data prep (`scripts/prep_imagenet64.py` etc.) actually finished before launching |
+| `/dev/shm` data vanishes mid-run | `systemd-logind` `RemoveIPC=yes` wiping tmpfs after SSH session ends | `sudo loginctl enable-linger muaz` once per node (see CLAUDE.md) |
+
+## Archived: torch/torch_xla setup (`qcute.bytelm_tpu` lineage, superseded by JAX)
+
+The `qcute.bytelm_tpu` lineage (torch_xla, flash-attention Pallas kernels, `--multichip`
+collective training, `zero_kv_sink` cost investigation, FineWeb-Edu byte-level prep) is archived —
+no longer the active TPU path. Full history (version-pin ABI mismatches, nightly-build setup, the
+`--multichip` hang investigation, batch-size sweeps) preserved in git history of this file if ever
+needed again; not repeated here since none of it applies to the active JAX lineages.

@@ -457,4 +457,93 @@ architecture choices: **`docs/image_gen_design.md`**. Currently training `image6
 `/dev/shm/imagenet64` (`scripts/prep_imagenet64.py`, still growing in the background -- the
 training run reads whatever shards exist at startup, not the complete 1.28M-image set yet). Exact
 setup/launch commands and log/sample paths: see `docs/image_gen_design.md`'s "First real TPU
-training run" section.
+training run" section. **ImageNet64 prep finished (2026-08-29)**: 1,281,167 train images + full
+validation split written, 0 failed/skipped, 26 train shards + 1 val shard, `/dev/shm/imagenet64` --
+ready for a real (not growing-prefix) training launch.
+
+### tpu1-4 v2 ablation: final results (2026-08-29, all 4 runs finished)
+
+All four `configs/summformer_jax_v2/*.py` runs completed 18793/18793 steps (1 epoch,
+`total_batch_size=524288`, paper-faithful). gpt2 baselines (`small_paper_match`@tpu6,
+`medium_paper_match_b8`@tpu4-earlier) also finished at 19072/19072 steps -- see the "New OOM found"
+section above for their launch config.
+
+| Tier | Model | Run | Val loss | Val bpb | Val PPL | vs. gpt2 baseline |
+|---|---|---|---|---|---|---|
+| Small | gpt2-small (baseline) | `small_paper_match` | 3.036 | -- | **20.83** | -- |
+| Small | summformer, param-match | `small_rope_v2_parammatch`@tpu1 | 3.199 | -- | **24.51** | +17.7% worse |
+| Small | summformer, flops-match | `small_rope_v2_flopsmatch`@tpu2 | 3.010 | -- | **20.28** | 2.6% better |
+| Medium | gpt2-medium (baseline) | `medium_paper_match_b8` | 2.809 | -- | **16.60** | -- |
+| Medium | summformer, flops-match | `medium_rope_v2_flopsmatch`@tpu3 | 2.804 | 4.046 | **16.52** | 0.5% better |
+| Medium | summformer, param-match | `medium_rope_v2_parammatch`@tpu4 | 2.871 | 4.142 | **17.66** | 6.4% worse |
+
+**Pattern holds at both scales**: flops-matched (same compute, fewer effective layers) beats its
+gpt2 baseline by a small margin at both small and medium; param-matched (same param count, but
+therefore *more* compute since it's not shallower) loses at both scales, worse at small (+17.7%)
+than medium (+6.4%). Consistent with the ablation's real advantage being explainable by compute
+savings from being architecturally shallower at matched params, not a representational edge from
+the hierarchical-summarization mechanism itself -- see chat discussion (not yet written up) for the
+"controlled param-vs-flops-matching critique" framing this suggests, and what it would take to turn
+into a real result (3+ seeds per config, a third scale point, a couple of cheap zero-shot eval
+tasks -- none of that done yet, this table is loss/ppl-only, single seed per config).
+
+### KV-cache memory estimate (2026-08-29): a real, architecture-derived win independent of the above
+
+`scripts/estimate_memory.py` (new) -- analytic KV-cache memory from each model's own config fields
+(closed-form, not benchmarked), verified against real `nnx.state` param counts (matched the
+config docstrings' documented params exactly). At `context_len=1024`, `batch=1`, bf16:
+
+| Model | Params | KV cache | vs. gpt2 baseline |
+|---|---|---|---|
+| gpt2-small | 123.7M | 36.0MB | -- |
+| summformer-small, param-match | 119.8M | **9.0MB** | **25%** (4x smaller) |
+| summformer-small, flops-match | 169.4M | 30.0MB | 83% |
+| gpt2-medium | 353.8M | 96.0MB | -- |
+| summformer-medium, param-match | 329.8M | **48.0MB** | **50%** (2x smaller) |
+| summformer-medium, flops-match | 430.5M | 80.0MB | 83% |
+
+Holds even though these ablation configs use `main_window=None` (unbounded trunk attention, same
+as gpt2) -- savings come purely from fewer main layers (2 vs 12, 10 vs 24) while each fuse-stage's
+code-LM cross-attention buffer adds back only a small fraction (3-8MB). The param-matched variants
+are the standout: 2-4x less KV-cache memory at roughly matched params, and (per the ppl table
+above) equal-or-better perplexity at medium scale specifically (small param-match still loses on
+ppl, so that one's memory win comes with a real quality tradeoff). This is a different,
+architecture-derived axis from the perplexity result -- doesn't need more seeds/scales to hold
+(it's a closed-form consequence of the config, not a noisy training outcome), and doesn't depend on
+matching Block Transformer/MEGABYTE's compute scale to be a valid claim. Not yet done: applying a
+bounded `main_window` (these configs deliberately left it unbounded) would shrink the trunk term
+further still -- not measured yet.
+
+## 2026-08-29: tpu8 image_gen real-data launch, tpu5 full-download ImageNet64 prep, tqdm console fix
+
+**tpu8**: ImageNet64 prep (`scripts/prep_imagenet64.py`) finished overnight -- full 1.28M train
+images across 26 shards + 1 validation shard at `/dev/shm/imagenet64`, no longer a growing prefix.
+Launched `image_gen/train.py` against the complete dataset (`image64_mixdim.py` config,
+`--eval-samples 0` since sample generation is still ~674ms/token -- see
+[docs/image_gen_design.md](image_gen_design.md)'s "JIT fix" section).
+
+**`train.py` now uses tqdm for console output** (`from tqdm import tqdm`, `pbar.set_postfix(loss=,
+bpb=, dt_ms=)`), matching `prep_imagenet64.py`'s existing convention. Per-step `log()` calls now
+take a `console=False` flag for the train-step case specifically, so the per-step JSON dict isn't
+also printed to the console on top of the tqdm bar (it still writes to `log.jsonl` every step,
+unchanged) -- eval/done events still print via `tqdm.write(...)` so they don't corrupt the bar's
+line. First version (no `console` flag) printed a JSON dict every single step, defeating the point
+of having a progress bar at all; caught immediately when the pane showed spam instead of a moving
+bar, fixed same session (`image64_mixdim_v5` killed, relaunched clean as `image64_mixdim_v6`).
+
+**Standing convention update**: for a TPU run launched in `tmux`, prefer running the command with
+**no stdout redirect at all** (`tmux new-session -d -s <run_name> 'python3 ...'`) rather than the
+`tee`-to-logfile pattern -- tqdm/prints land directly in the pane, so `tmux capture-pane`/`tmux
+attach` show live output with no extra plumbing. Only redirect (via `tee`, never a plain `>`) when
+the run's own log genuinely needs periodic `scp`-pulling back to this repo (the multi-hour-run
+monitoring routine reads `log.jsonl`/`run.jsonl` off disk, not the pane) -- that's an orthogonal
+need from watching the pane live. See CLAUDE.md's launch-conventions section for the updated rule.
+
+**tpu5**: cleared for a fresh use (`/dev/shm` was already empty, no cleanup needed), linger
+enabled. New script `summformer_jax/image_gen/scripts/prep_imagenet64_full.py` -- copy of
+`prep_imagenet64.py` with `streaming=False` (a genuine full non-streaming download+cache instead of
+iterating a streamed split) -- launched in tmux session `imagenet64_full_prep`, train split first
+then validation, into `/dev/shm/imagenet64`. Not yet finished as of this note; check
+`tmux capture-pane -t imagenet64_full_prep -p -S -20` or `~/imagenet64_full_train.log` /
+`~/imagenet64_full_val.log` on the node for current progress. Worth watching `/dev/shm` free space
+given the full raw-parquet download is much larger than the streaming approach's footprint.
