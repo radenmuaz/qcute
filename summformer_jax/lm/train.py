@@ -1,29 +1,21 @@
-"""JAX/pmap training loop for summformer_jax's architecture, now sourced from the shared,
-feature-frozen summformer.py (duplicated verbatim from image_gen/summformer.py -- same file
-content in both folders, not an import across directories) -- a GPT-style deep backbone with
-FuseStage cross-attention spliced in at chosen depths, no weight sharing anywhere (contrast with
-train_summformer_v1.py: small n_layers + uniform Ks-cascade reusing one block for every refinement
-pass). Otherwise mirrors train_summformer_v1.py's mechanics exactly (fused grad-accum/eval scan,
-background prefetch, donate_argnums, tqdm, qcute-style --config parsing, same dataset/optimizer/
-schedule conventions). Supports custom vocab (e.g. GPT2 BPE, vocab_size~50257) via ConfigV2's
-already-generic vocab_size field -- nothing in summformer.py assumes byte-level vocab.
+"""Training loop for the new-architecture (summformer.py) lm lineage -- pmap data-parallel across
+all local devices, config file exposes a `build_summformer(rngs) -> ARHead` factory (see
+configs/thin512_win16_allfuse8_chained.py) instead of the old flat ConfigV2 dict, since the new
+architecture composes Embedder/Encoder/Decoder objects rather than a single dataclass.
 
-`fuse_stages` and `main_window` are structured values (a tuple of tuples, and an int-or-tuple) --
-config-file-only, no CLI flag equivalent, pulled directly out of the config module rather than
-through argparse's normal flat-scalar allowlist.
-
-    uv run python summformer_jax/lm/train.py --config configs/summformer_jax_v2/small_rope_v2.py
-    uv run python summformer_jax/lm/train.py --config configs/summformer_jax_v2/medium_rope_v2.py
+    uv run python summformer_jax/lm/train.py --config configs/thin512_win16_allfuse8_chained.py --data-dir data/fineweb-edu-10B
 """
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
-import math
-import queue
-import threading
+import os
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # summformer_jax/
 
 import jax
 import jax.numpy as jnp
@@ -32,278 +24,131 @@ import optax
 from flax import nnx
 from tqdm import tqdm
 
-from checkpoint_io import save_checkpoint
-from data_loader import DataLoaderLite
-from summformer import ConfigV2, SummTransformerV2
 
-TOTAL_BATCH_SIZE_DEFAULT = 2**19
-MAX_LR = 6e-4
-MIN_LR = MAX_LR * 0.1
-WARMUP_STEPS = 715
-STRUCTURED_KEYS = ("fuse_stages", "main_window")  # config-file-only, not argparse flags
-
-
-def build_optimizer(max_steps: int):
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=MAX_LR, warmup_steps=WARMUP_STEPS,
-        decay_steps=max(WARMUP_STEPS + 1, max_steps), end_value=MIN_LR,
-    )
-
-    def decay_mask(params):
-        return jax.tree.map(lambda p: p.ndim >= 2, params)
-
-    return optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(schedule, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.1, mask=decay_mask),
-    ), schedule
-
-
-def load_config_module(path: Path) -> dict:
-    import importlib.util
-
+def load_config_module(path: Path):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return {k: v for k, v in vars(module).items() if not k.startswith("_")}
+    return module
+
+
+class ShardedTokenLoader:
+    """Reads pre-tokenized .npy/.bin uint16 GPT-2 BPE shards (gpt2_jax/dataset_preparation.py's
+    output format -- reused directly, same tokenizer/vocab). Falls back to a tiny synthetic corpus
+    if no shards are found at data_dir, so this script is runnable without real data present."""
+    def __init__(self, data_dir: str, seq_len: int, split: str, seed: int = 0):
+        self.seq_len = seq_len
+        self.rng = np.random.default_rng(seed)
+        d = Path(data_dir)
+        shard_glob = f"*{split}*.npy" if split != "train" else "*train*.npy"
+        self.shards = sorted(d.glob(shard_glob)) if d.exists() else []
+        if not self.shards:
+            print(f"[ShardedTokenLoader] no shards found at {data_dir} (split={split}) -- using synthetic random tokens")
+            self.tokens = None
+        else:
+            self.tokens = np.concatenate([np.load(s).astype(np.int32) for s in self.shards])
+            print(f"[ShardedTokenLoader] loaded {len(self.shards)} shard(s), {len(self.tokens)} tokens (split={split})")
+
+    def next_batch(self, batch_size: int) -> np.ndarray:
+        if self.tokens is None:
+            return self.rng.integers(0, 50257, size=(batch_size, self.seq_len + 1), dtype=np.int32)
+        starts = self.rng.integers(0, len(self.tokens) - self.seq_len - 1, size=batch_size)
+        return np.stack([self.tokens[s:s + self.seq_len + 1] for s in starts])
+
+
+def replicate(pytree, devices):
+    mesh = jax.sharding.Mesh(devices, ("d",))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("d"))
+    stacked = jax.tree.map(lambda x: jnp.stack([x] * len(devices)), pytree)
+    return jax.tree.map(lambda x: jax.device_put(x, sharding), stacked)
 
 
 def main():
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", type=Path, default=None)
-    pre_args, _ = pre.parse_known_args()
-
-    p = argparse.ArgumentParser(description="summformer_jax v2 training", parents=[pre])
-    p.add_argument("--d-model", type=int, default=1024)
-    p.add_argument("--n-layers", type=int, default=12, help="main backbone depth (distinct weights each layer)")
-    p.add_argument("--n-heads", type=int, default=16)
-    p.add_argument("--mlp-mult", type=int, default=4)
-    p.add_argument("--pos-method", choices=["rope", "learnable", "base"], default="rope")
-    p.add_argument("--rope-base", type=float, default=10000.0)
-    p.add_argument("--input-preset", type=int, default=8, help="byte-alphabet fallback, only used if --vocab-size is 0/unset")
-    p.add_argument("--vocab-size", type=int, default=50304, help="0 = fall back to the byte alphabet (2**input_preset)")
-    p.add_argument("--mtp-heads", type=int, default=1)
-    p.add_argument("--mtp-weight", type=float, default=1.0)
-    p.add_argument("--weight-tie", action="store_true")
-    p.add_argument("--zero-kv-sink", dest="zero_kv_sink", action="store_true", default=True)
-    p.add_argument("--no-zero-kv-sink", dest="zero_kv_sink", action="store_false")
-
-    p.add_argument("--dataset-dir", type=str, default=None,
-                    help="dir of train_*.npy/val_*.npy GPT2-BPE token shards from gpt2_jax/dataset_preparation.py")
-    p.add_argument("--save-dir", type=str, default="summformer_jax/logs")
-    p.add_argument("--num-epochs", type=int, default=1)
-    p.add_argument("--total-batch-size", type=int, default=TOTAL_BATCH_SIZE_DEFAULT)
-    p.add_argument("--batch-size", type=int, default=8, help="per-device micro batch size")
-    p.add_argument("--sequence-length", type=int, default=1024)
-    p.add_argument("--eval-every", type=int, default=250)
-    p.add_argument("--eval-steps", type=int, default=20)
-    p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--max-steps", type=int, default=None)
-    p.add_argument("--lr", type=float, default=None)
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", type=Path, required=True)
+    p.add_argument("--data-dir", type=str, default="data/fineweb-edu-10B")
+    p.add_argument("--batch-size", type=int, default=None, help="per-device; overrides config")
+    p.add_argument("--total-steps", type=int, default=2000)
+    p.add_argument("--eval-every", type=int, default=200)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument("--run-name", type=str, default=None)
-
-    fuse_stages, main_window = (), None
-    if pre_args.config:
-        config_vars = load_config_module(pre_args.config)
-        fuse_stages = tuple(tuple(spec) for spec in config_vars.get("fuse_stages", ()))
-        main_window = config_vars.get("main_window", None)
-        defaults_before = {a.dest: a.default for a in p._actions}
-        known = set(defaults_before)
-        unknown = sorted(set(config_vars) - known - set(STRUCTURED_KEYS))
-        recognized = {k: v for k, v in config_vars.items() if k in known}
-        added = sorted(k for k, v in recognized.items() if defaults_before[k] is None and v is not None)
-        updated = sorted(k for k, v in recognized.items() if k not in added and v != defaults_before[k])
-        print(f"config: {pre_args.config}  parsed={recognized}  fuse_stages={fuse_stages}  main_window={main_window}")
-        if added:
-            print(f"config: added (was unset) -> {', '.join(added)}")
-        if updated:
-            print(f"config: updated (overrides a hardcoded default) -> {', '.join(updated)}")
-        if unknown:
-            print(f"config: WARNING unrecognized keys, ignored -> {', '.join(unknown)}")
-        p.set_defaults(**recognized)
+    p.add_argument("--save-dir", type=str, default="summformer_jax/lm/logs")
     args = p.parse_args()
-    if args.dataset_dir is None:
-        p.error("--dataset-dir is required (directly or via --config)")
-    if not fuse_stages:
-        p.error("--config must set fuse_stages (a tuple of ((src, dst), (stride, window), (code_n_layers, code_d_model=None, code_n_heads=None)))")
 
-    global MAX_LR, MIN_LR
-    if args.lr is not None:
-        MAX_LR = args.lr
-        MIN_LR = args.lr * 0.1
+    cfg_mod = load_config_module(args.config)
+    batch_size = args.batch_size or getattr(cfg_mod, "batch_size", 4)
+    seq_len = cfg_mod.SEQUENCE_LENGTH
 
-    n_devices = jax.local_device_count()
-    B = args.batch_size
-    T = args.sequence_length
-    total_batch_size = args.total_batch_size
-    assert total_batch_size % (B * T * n_devices) == 0, "total_batch_size must be divisible by batch_size * sequence_length * n_devices"
-    grad_accum_steps = total_batch_size // (B * T * n_devices)
-
-    train_loader = DataLoaderLite(B, T, 0, 1, "train", args.dataset_dir)
-    val_loader = DataLoaderLite(B, T, 0, 1, "val", args.dataset_dir)
-    max_steps = args.max_steps or args.num_epochs * (train_loader.num_total_tokens // total_batch_size)
-
-    run_name = args.run_name or (pre_args.config.stem if pre_args.config else f"summformer_{args.pos_method}")
+    run_name = args.run_name or args.config.stem
     log_dir = Path(args.save_dir) / run_name
     log_dir.mkdir(parents=True, exist_ok=True)
-    resolved_lines = [f"{k} = {v!r}" for k, v in sorted(vars(args).items()) if k != "config"]
-    resolved_lines += [f"fuse_stages = {fuse_stages!r}", f"main_window = {main_window!r}"]
-    (log_dir / "resolved_config.py").write_text("\n".join(resolved_lines) + "\n")
     log_f = open(log_dir / "log.jsonl", "a")
 
-    def log(**record):
+    def log(*, console=True, **record):
         record["t"] = time.time()
-        print(record)
+        if console:
+            tqdm.write(str(record))
         log_f.write(json.dumps(record) + "\n")
         log_f.flush()
 
-    print(f"n_devices={n_devices}  batch_size(per-device)={B}  seq_len={T}  grad_accum_steps={grad_accum_steps}  "
-          f"total_batch_size={total_batch_size}  max_steps={max_steps}  pos_method={args.pos_method}  "
-          f"n_layers={args.n_layers}  fuse_stages={fuse_stages}")
-
-    cfg = ConfigV2(
-        n_layers=args.n_layers, d_model=args.d_model, n_heads=args.n_heads, mlp_mult=args.mlp_mult,
-        pos_method=args.pos_method, rope_base=args.rope_base, context_len=T, main_window=main_window,
-        fuse_stages=fuse_stages, input_preset=args.input_preset, vocab_size=(args.vocab_size or None),
-        mtp_heads=args.mtp_heads, mtp_weight=args.mtp_weight, weight_tie=args.weight_tie,
-        zero_kv_sink=args.zero_kv_sink,
-    )
-    rngs = nnx.Rngs(args.seed)
-    model = SummTransformerV2(cfg, rngs=rngs)
-    graphdef, params = nnx.split(model)
-    num_params = sum(x.size for x in jax.tree.leaves(params))
-    print(f"num_params={num_params:,}")
-
-    optimizer, schedule = build_optimizer(max_steps)
-    opt_state = optimizer.init(params)
-
     devices = jax.local_devices()
-    mesh = jax.sharding.Mesh(devices, ("d",))
-    replicate_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("d"))
+    n_devices = len(devices)
 
-    def replicate(pytree):
-        stacked = jax.tree.map(lambda x: jnp.stack([x] * len(devices)), pytree)
-        return jax.tree.map(lambda x: jax.device_put(x, replicate_sharding), stacked)
+    train_loader = ShardedTokenLoader(args.data_dir, seq_len, "train", seed=args.seed)
+    val_loader = ShardedTokenLoader(args.data_dir, seq_len, "val", seed=args.seed + 1)
 
-    params = replicate(params)
-    opt_state = replicate(opt_state)
+    head = cfg_mod.build_summformer(nnx.Rngs(args.seed))
+    graphdef, state = nnx.split(head)
+    optimizer = optax.adamw(args.lr, b1=0.9, b2=0.95, weight_decay=0.1)
+    opt_state = optimizer.init(state)
 
-    def loss_fn(params, batch):
-        m = nnx.merge(graphdef, params)
-        x, y = batch
-        del y  # SummTransformerV2's own shift-by-1 produces the same pairing as batch's y
-        loss, metrics = m(x)
+    def loss_fn(state, batch):
+        m = nnx.merge(graphdef, state)
+        loss, metrics = m(batch)
         return loss, metrics
 
-    def grad_accum_step(params, batch):
-        x_all, y_all = batch
+    def train_step(state, opt_state, batch):
+        (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state, batch)
+        loss, metrics, grads = (jax.lax.pmean(x, "d") for x in (loss, metrics, grads))
+        updates, opt_state = optimizer.update(grads, opt_state, state)
+        state = optax.apply_updates(state, updates)
+        return state, opt_state, loss, metrics
 
-        def scan_fn(carry, xy):
-            loss_sum, grads_sum, metrics_sum = carry
-            x, y = xy
-            (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, (x, y))
-            loss_sum = loss_sum + loss
-            grads_sum = jax.tree.map(jnp.add, grads_sum, grads)
-            metrics_sum = jax.tree.map(jnp.add, metrics_sum, metrics)
-            return (loss_sum, grads_sum, metrics_sum), None
+    p_train_step = jax.pmap(train_step, axis_name="d", donate_argnums=(0, 1))
 
-        zero_grads = jax.tree.map(jnp.zeros_like, params)
-        dummy_loss, dummy_metrics = jax.eval_shape(loss_fn, params, (x_all[0], y_all[0]))
-        zero_metrics = jax.tree.map(lambda s: jnp.zeros(s.shape, s.dtype), dummy_metrics)
-        zero_loss = jnp.zeros((), dtype=jnp.float32)
-        (loss_sum, grads_sum, metrics_sum), _ = jax.lax.scan(
-            scan_fn, (zero_loss, zero_grads, zero_metrics), (x_all, y_all))
-        loss_mean = loss_sum / grad_accum_steps
-        grads_mean = jax.tree.map(lambda g: g / grad_accum_steps, grads_sum)
-        metrics_mean = jax.tree.map(lambda m: m / grad_accum_steps, metrics_sum)
-        loss_mean = jax.lax.pmean(loss_mean, "batch")
-        grads_mean = jax.lax.pmean(grads_mean, "batch")
-        metrics_mean = jax.lax.pmean(metrics_mean, "batch")
-        return loss_mean, grads_mean, metrics_mean
+    def eval_step(state, batch):
+        loss, metrics = loss_fn(state, batch)
+        return jax.lax.pmean(loss, "d"), jax.lax.pmean(metrics["bpb"], "d")
 
-    p_grad_accum_step = jax.pmap(grad_accum_step, axis_name="batch")
+    p_eval_step = jax.pmap(eval_step, axis_name="d")
 
-    def apply_step(params, opt_state, grads):
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state
+    state = replicate(state, devices)
+    opt_state = replicate(opt_state, devices)
 
-    p_apply_step = jax.pmap(apply_step, axis_name="batch", donate_argnums=(0, 1))
+    n_params = sum(x.size for x in jax.tree.leaves(nnx.state(head, nnx.Param)))
+    print(f"run_name={run_name} n_devices={n_devices} batch_size(per-device)={batch_size} "
+          f"seq_len={seq_len} n_params={n_params} ({n_params/1e6:.1f}M) total_steps={args.total_steps}")
 
-    def eval_accum_step(params, batch):
-        x_all, y_all = batch
+    def fetch_pmap_batch(loader):
+        return jnp.asarray(np.stack([loader.next_batch(batch_size) for _ in range(n_devices)]), dtype=jnp.int32)
 
-        def scan_fn(carry, xy):
-            loss_sum, metrics_sum = carry
-            x, y = xy
-            loss, metrics = loss_fn(params, (x, y))
-            return (loss_sum + loss, jax.tree.map(jnp.add, metrics_sum, metrics)), None
-
-        dummy_loss, dummy_metrics = jax.eval_shape(loss_fn, params, (x_all[0], y_all[0]))
-        zero_metrics = jax.tree.map(lambda s: jnp.zeros(s.shape, s.dtype), dummy_metrics)
-        (loss_sum, metrics_sum), _ = jax.lax.scan(
-            scan_fn, (jnp.zeros((), dtype=jnp.float32), zero_metrics), (x_all, y_all))
-        n = x_all.shape[0]
-        return jax.lax.pmean(loss_sum / n, "batch"), jax.lax.pmean(jax.tree.map(lambda m: m / n, metrics_sum), "batch")
-
-    p_eval_accum_step = jax.pmap(eval_accum_step, axis_name="batch")
-
-    def fetch_pmap_batch(loader: DataLoaderLite, steps: int):
-        xs = np.empty((n_devices, steps, B, T), dtype=np.int32)
-        ys = np.empty((n_devices, steps, B, T), dtype=np.int32)
-        for s in range(steps):
-            for d in range(n_devices):
-                x, y = loader.next_batch()
-                xs[d, s] = np.asarray(x)
-                ys[d, s] = np.asarray(y)
-        return jnp.asarray(xs), jnp.asarray(ys)
-
-    _prefetch_q: queue.Queue = queue.Queue(maxsize=2)
-
-    def _prefetch_worker():
-        while True:
-            _prefetch_q.put(fetch_pmap_batch(train_loader, grad_accum_steps))
-
-    threading.Thread(target=_prefetch_worker, daemon=True).start()
-
-    pbar = tqdm(range(max_steps), desc="train", dynamic_ncols=True,
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]")
-    val_loss = None
+    pbar = tqdm(range(args.total_steps))
     for step in pbar:
+        batch = fetch_pmap_batch(train_loader)
         t0 = time.time()
-        last_step = step == max_steps - 1
+        state, opt_state, loss, metrics = p_train_step(state, opt_state, batch)
+        dt_ms = (time.time() - t0) * 1000
+        loss0, bpb0 = float(loss[0]), float(metrics["bpb"][0])
+        pbar.set_postfix(loss=loss0, bpb=bpb0, dt_ms=f"{dt_ms:.1f}")
+        log(console=False, step=step, split="train", loss=loss0, bpb=bpb0, dt_ms=dt_ms)
 
-        if step % args.eval_every == 0 or last_step:
-            val_loader.reset()
-            val_batch = fetch_pmap_batch(val_loader, args.eval_steps)
-            val_loss_arr, _ = p_eval_accum_step(params, val_batch)
-            val_loss = float(val_loss_arr[0])
-            log(step=step, split="val", loss=val_loss, bpb=val_loss / math.log(2),
-                ppl=math.exp(min(val_loss, 20)))
+        if (step + 1) % args.eval_every == 0:
+            val_batch = fetch_pmap_batch(val_loader)
+            val_loss, val_bpb = p_eval_step(state, val_batch)
+            log(step=step + 1, split="eval", val_loss=float(val_loss[0]), val_bpb=float(val_bpb[0]))
 
-        batch = _prefetch_q.get()
-        loss, grads, metrics = p_grad_accum_step(params, batch)
-        params, opt_state = p_apply_step(params, opt_state, grads)
-        loss_accum = float(loss[0])
-
-        dt = time.time() - t0
-        tok_per_sec = (B * T * grad_accum_steps * n_devices) / dt
-        lr = float(schedule(step))
-        log(step=step, split="train", loss=loss_accum, bpb=loss_accum / math.log(2),
-            ppl=math.exp(min(loss_accum, 20)), lr=lr, dt_ms=dt * 1000, tok_per_sec=tok_per_sec)
-        postfix = {"loss": f"{loss_accum:.6f}", "bpb": f"{loss_accum/math.log(2):.6f}",
-                   "tok/s": f"{tok_per_sec:.2f}", "lr": f"{lr:.8f}"}
-        if val_loss is not None:
-            postfix["val_loss"] = f"{val_loss:.6f}"
-        pbar.set_postfix(postfix)
-        if step == 0:
-            print(f"[compile] step 0 wall time (includes first-call XLA compile): {dt:.2f}s", flush=True)
-
-        if last_step:
-            single_params = jax.tree.map(lambda x: x[0], params)
-            single_opt_state = jax.tree.map(lambda x: x[0], opt_state)
-            ckpt_path = log_dir / f"model_{step}"
-            save_checkpoint(ckpt_path, nnx.to_pure_dict(single_params), single_opt_state, {"step": step})
-            log(step=step, event="checkpoint", path=str(ckpt_path.resolve()))
+    log(event="done", step=args.total_steps)
 
 
 if __name__ == "__main__":

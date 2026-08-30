@@ -21,6 +21,9 @@ import glob
 import io
 import mmap
 import os
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from PIL import Image
@@ -81,9 +84,22 @@ class ImageNetClassificationLoader:
     [8-byte length][raw JPEG bytes] entries, one shard per worker/split. Decodes+preprocesses
     on the fly (no separate resize-to-disk pass, unlike image_gen's pipeline -- classification
     needs per-epoch random-crop augmentation, which can't be baked into a fixed-size shard the
-    way image_gen's deterministic resize can)."""
+    way image_gen's deterministic resize can).
 
-    def __init__(self, batch_size: int, image_size: int, shard_dir: str, split: str, seed: int = 0):
+    next_batch() is backed by a background thread pool (num_workers threads, each independently
+    producing whole batches into a bounded queue) so JPEG decode/crop/resize -- entirely
+    single-threaded before this fix -- overlaps with the TPU's own compute instead of blocking it.
+    Confirmed a real bottleneck (2026-08-30): measured step times alternated ~35ms (compute-bound)
+    / ~250-270ms (serial decode stalling the TPU) with the old synchronous version, at real
+    training scale (query_hourglass_tiny_2.py). PIL's C-level decode/resize/crop release the GIL,
+    so threads (not processes) give real parallelism here without the pickling/shared-mmap-state
+    complexity multiprocessing would add. Index-advancing (_perm/_pos) is the only genuinely
+    shared mutable state -- protected by a lock, kept cheap (just integer bookkeeping) so it's
+    never the parallelism bottleneck; each worker gets its OWN RNG (np.random.Generator is not
+    thread-safe for concurrent use on one shared instance) for augmentation randomness."""
+
+    def __init__(self, batch_size: int, image_size: int, shard_dir: str, split: str, seed: int = 0,
+                 num_workers: int = 8, prefetch_batches: int = 4):
         self.batch_size = batch_size
         self.image_size = image_size
         self.seq_len = image_size * image_size * 3
@@ -121,6 +137,12 @@ class ImageNetClassificationLoader:
         self._perm = self.rng.permutation(len(self._index))
         self._pos = 0
 
+        self._index_lock = threading.Lock()
+        self._queue: queue.Queue = queue.Queue(maxsize=prefetch_batches)
+        self._stop = threading.Event()
+        self._executor = ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix=f"loader-{split}")
+        self._worker_futures = [self._executor.submit(self._worker_loop, seed + 1000 + i) for i in range(num_workers)]
+
     @property
     def n_images(self) -> int:
         return len(self._index)
@@ -136,7 +158,46 @@ class ImageNetClassificationLoader:
         raw = mm[offset:offset + length]
         return label, raw
 
+    def _next_indices(self, n: int) -> list[int]:
+        """Thread-safe: only the cheap index-bookkeeping is under the lock -- the expensive
+        decode/preprocess work happens OUTSIDE it, in the caller, so workers don't serialize on
+        anything but this O(n) integer-array indexing."""
+        with self._index_lock:
+            idxs = []
+            for _ in range(n):
+                if self._pos >= len(self._perm):
+                    self._perm = self.rng.permutation(len(self._index))
+                    self._pos = 0
+                idxs.append(int(self._perm[self._pos]))
+                self._pos += 1
+            return idxs
+
+    def _worker_loop(self, worker_seed: int):
+        local_rng = np.random.default_rng(worker_seed)
+        while not self._stop.is_set():
+            idxs = self._next_indices(self.batch_size)
+            images = np.empty((self.batch_size, self.seq_len), dtype=np.uint8)
+            labels = np.empty((self.batch_size,), dtype=np.int32)
+            for b, idx in enumerate(idxs):
+                label, raw = self._read_entry(idx)
+                images[b] = preprocess(raw, self.image_size, self.train, local_rng)
+                labels[b] = label
+            while not self._stop.is_set():
+                try:
+                    self._queue.put((images, labels), timeout=1.0)
+                    break
+                except queue.Full:
+                    continue
+
     def close(self):
+        self._stop.set()
+        # drain so any worker blocked on a full queue.put() can observe _stop and exit promptly
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._executor.shutdown(wait=True, cancel_futures=True)
         for mm in self._shard_mmaps:
             mm.close()
         for f in self._shard_files:
@@ -149,20 +210,10 @@ class ImageNetClassificationLoader:
             pass
 
     def next_batch(self) -> tuple[np.ndarray, np.ndarray]:
-        """Returns (images (B, seq_len) uint8, labels (B,) int32). Reshuffles indefinitely for
-        training; wraps for eval too (use full_sweep for a bounded one-pass eval)."""
-        images = np.empty((self.batch_size, self.seq_len), dtype=np.uint8)
-        labels = np.empty((self.batch_size,), dtype=np.int32)
-        for b in range(self.batch_size):
-            if self._pos >= len(self._perm):
-                self._perm = self.rng.permutation(len(self._index))
-                self._pos = 0
-            idx = self._perm[self._pos]
-            self._pos += 1
-            label, raw = self._read_entry(idx)
-            images[b] = preprocess(raw, self.image_size, self.train, self.rng)
-            labels[b] = label
-        return images, labels
+        """Returns (images (B, seq_len) uint8, labels (B,) int32) -- pulled from the prefetch
+        queue (background threads keep it filled); blocks only if the queue is empty, which in
+        steady state means it never waits on the TPU's own compute time."""
+        return self._queue.get()
 
     def full_sweep(self, batch_size: int | None = None):
         """Yields (images, labels) batches covering every image in this split exactly once,

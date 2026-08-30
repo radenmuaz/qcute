@@ -79,6 +79,13 @@ Three enwik8 lineages are active (see Commands); current results/design state in
 | 11 | `(4,2,1)` | 3 | 8 | 4 |
 | 12 | `(4,4,2)` | 3 | 32 | 4 |
 
+## summformer_jax
+
+Separate JAX/Flax lineage (`summformer_jax/`), not part of the `qcute/` (PyTorch, enwik8) tree above — shares the "summary-token fusion" idea but is its own codebase, used for the `lm/` (BPE language modeling), `image_gen/` (byte-level image generation), and `image_classification/` (byte-level ImageNet classification) tasks.
+
+- **Core design idea**: efficient long-sequence modeling via a hierarchy of causal transformers that each summarize (pool, then self-attend over) the sequence at a progressively coarser timescale — one stage's summary becomes the next stage's input, so the effective stride compounds *multiplicatively* across the chain (a handful of stages covers exponentially more context, not linearly). Each stage's summary is cross-attended back into the main decoder sequence, giving it long-range context at a fraction of dense attention's cost — the main decoder itself only ever does small-window local self-attention plus these periodic summary lookups.
+- **Canonical model file**: `summformer_jax/summformer.py` — one shared module (`Embedder`, `Encoder`, `Decoder`, `SummFormer`), imported by all three task lineages, not duplicated per-lineage. No version suffix in the filename (`_v2`/`_v3`, etc.) — git history is the version record now, not the filename. Earlier per-lineage frozen copies (and the old `_v1`/`_v2` design iterations) are archived under `summformer_old/` for reference only; **`summformer_old/model_summformer_v1.py` is the only old implementation confirmed structurally correct** (it genuinely chains stage-to-stage stride compounding) — the `_v2`-derived per-lineage copies that were active through 2026-08-29 had a real bug where fuse stages re-pooled from the full sequence independently every time instead of chaining, so their stride never compounded (see `docs/status_tpu.md` 2026-08-30 entries for the full derivation/fix history).
+
 ## Code style
 
 - Docstrings/comments extremely concise — code should be self-descriptive, comments ≤2 lines. Module-level (top-of-file) docstrings exempt but still kept tight.
