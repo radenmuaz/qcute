@@ -543,7 +543,100 @@ need from watching the pane live. See CLAUDE.md's launch-conventions section for
 enabled. New script `summformer_jax/image_gen/scripts/prep_imagenet64_full.py` -- copy of
 `prep_imagenet64.py` with `streaming=False` (a genuine full non-streaming download+cache instead of
 iterating a streamed split) -- launched in tmux session `imagenet64_full_prep`, train split first
-then validation, into `/dev/shm/imagenet64`. Not yet finished as of this note; check
-`tmux capture-pane -t imagenet64_full_prep -p -S -20` or `~/imagenet64_full_train.log` /
-`~/imagenet64_full_val.log` on the node for current progress. Worth watching `/dev/shm` free space
-given the full raw-parquet download is much larger than the streaming approach's footprint.
+then validation, into `/dev/shm/imagenet64`. **Superseded same session** -- the non-streaming
+approach hit the exact disk-fill failure mode it was meant to avoid (raw parquet + separate Arrow
+"Generating split" cache, both persisted, 98% of `/dev/shm` used) and was abandoned in favor of
+`download_imagenet.py` (streaming, custom `.bin` shard persistence, see below).
+
+## 2026-08-29 (later): windowed cross-attention, lm/image_gen summformer.py consolidation, tpu5 labeled ImageNet download, image_classification pipeline
+
+**`summformer.py` (image_gen's model file) gained real windowed cross-attention.** Previously only
+the trunk (`main_window`) and code-LM self-attention (`code_window`, added same session) routed
+through the compute-saving `chunked_windowed_attention` kernel -- the fuse-stage cross-attention
+(`(stride, window)` pair) always fell back to dense-plus-mask regardless of `window`'s value, an
+`O(T*S)` cost (`S = context_len/stride`) that dominates total model compute at small strides
+(measured: ~19.3 GFLOP for `tiny_1`'s stride=8 stage vs ~0.6 GFLOP for the entire trunk combined --
+cross-attention was the actual bottleneck, not the trunk). Added `windowed_cross_attention` (gather
+with **static, trace-time-known indices** -- same performance class as `chunked_windowed_attention`'s
+own `k_ext[:, :, idx]` trick, not the "slow, data-dependent gather" gather-slowness concerns are
+usually about), `Attn.forward_cross_windowed`, `FuseStageV2.forward_windowed`, wired into
+`_pool_and_fuse`'s training-forward path only (the incremental/fully-static generation paths are
+untouched, separately re-verified bit-exact via `check_kv_cache_consistency`/
+`check_kv_cache_consistency_fully_static` after the change -- match_rate 1.0 in both). Verified
+correct against the dense reference across 16 (T, stride, window) combinations including
+non-divisible lengths, `window<stride` degenerate cases, and both sink modes (max diff ~1e-6,
+floating-point noise). Measured 12.8x real speedup at `tiny_1`'s actual scale (CPU: 518.78ms dense
+vs 40.62ms windowed) -- lower than the ~32x FLOP-count estimate (real dispatch/gather overhead), but
+a large, real win. Also added `ConfigV2.force_dense_attn: bool = False` -- overrides `main_window`/
+`code_window` to unbounded regardless of their configured value, for debugging/comparison against
+the known-dense reference path.
+
+Caveat found while wiring `code_window` into `tiny_1.py`: fuse-stage cross-attention window and
+code-LM self-attention window are two *separate* knobs on different attention surfaces (trunk<->code
+vs code<->code) that don't auto-follow each other or `main_window` -- nothing in the code derives
+one from another, each is read/applied completely independently. Setting all three to the same
+value (as `tiny_1.py` now does) is a convenience choice, not a structural requirement.
+
+**`lm/` and `image_gen/` now share one frozen `summformer.py`** instead of `lm/model_summformer_v2.py`
+being a separate, leaner fork -- `image_gen/summformer.py` was already a strict superset (same
+`ConfigV2`/`FuseStageV2`/`SummTransformerV2` core, plus everything `lm`'s version lacked:
+incremental/KV-cache generation, windowed attention, `check_block_locality`) with zero image-specific
+dependencies (pure `jax`/`flax`, no RGB/resolution assumptions in the model itself). Duplicated
+verbatim into `lm/summformer.py` (not a cross-directory import -- matches this repo's existing
+flat-file-per-training-script convention), `lm/train_summformer_v2.py` renamed to `lm/train.py` and
+its import switched to the shared file. Both copies are now **feature-frozen** -- confirmed custom/
+BPE vocab support works (real forward pass at `vocab_size=50257` succeeds, correct output-head
+shape) since `ConfigV2.vocab_size` was already generic, nothing in the model assumed byte-level.
+`lm/configs/v2/thin512_win2_allfuse12.py` (171M params, 12 fuse stages, `window=2==stride=2` --
+the boundary-valid case for the new windowed cross-attention) confirmed loading/constructing/
+eval'ing correctly through the shared file; a full training-step timing run wasn't completed before
+being paused.
+
+**tpu5: `download_imagenet.py` rewritten to also capture labels** (`[4-byte signed label][8-byte
+length][raw JPEG bytes]` per entry, was label-less before) -- needed for the new `image_classification`
+task, verified round-trip correct against real HF data before relaunching. Old label-less data
+(144GB, 84 shards) is a breaking-format mismatch with the new reader, so `/dev/shm` was cleared and
+the full dataset re-downloaded with 32 workers: **train 1,281,167 images + validation 50,000
+images, both exactly matching official ImageNet-1k split sizes**, confirmed via a manual shard
+byte-count parse (not just trusting the script's own tally). One real bug hit and understood (not
+a data-loss issue): `--num_workers 32` on the validation split (only 14 underlying parquet files)
+crashes for the 18 workers with no file to shard (`IndexError` in HF `datasets`' own
+`_merge_gen_kwargs`) -- the 14 workers that *did* get a valid shard had already written their files
+before the crash surfaced, so all 50,000 images were still captured; cap `--num_workers` at the
+split's file count to avoid the error message in future runs.
+
+**New `summformer_jax/image_classification/` lineage** -- byte-level ImageNet-1k classification
+(not generation), reusing the frozen `summformer.py` backbone as a general vision encoder. `d_model=128,
+n_layers=16` (~4.66M params, `ViT-Ti/16` reference is ~5.7M), `context_len=224*224*3=150528`.
+`classifier.py`'s `SummClassifier` hooks `SummTransformerV2._cascade` directly (trunk forward pass,
+already returns final hidden states, no generation/LM-head/MTP machinery touched) with a linear
+head; two pooling variants -- unidirectional (last-position) and a dual causal-pass
+forward+reversed-sequence mean-pool (NOT true bidirectional attention -- this codebase's windowed
+attention is only defined for a causal direction, so genuine non-causal windowing isn't supported;
+approximated by running the causal backbone twice instead). Training recipe approximates **DeiT**
+(Touvron et al. 2021) -- AdamW, `weight_decay=0.05`, `base_lr=5e-4` scaled by `batch/512` (DeiT's
+own convention, not the Flax ResNet50 reference's `/256`), linear-warmup+cosine-decay. **Real
+caveat**: DeiT-Tiny's own paper reports ~72.2% top-1, not 75%, and that's with a full augmentation
+stack (RandAugment/Mixup/CutMix/stochastic depth/label smoothing) this pipeline doesn't implement
+yet (only random-resized-crop + flip) -- matching ViT-Tiny's param count alone doesn't get to 75%.
+
+Two real bugs found and fixed while first launching on tpu5 (v4-8, all 4 chips):
+- **Unbounded cross-attention OOMs at this sequence length** -- `context_len=150528` is ~12x
+  `image_gen`'s `12288`; leaving fuse-stage cross-attention windows at `-1` (image_gen/tiny_1.py's
+  own convention) blew HBM directly (165GB needed vs 30.75GB available, confirmed). Fixed by
+  setting each stage's cross-attention window to its own stride (minimum valid value), routing
+  through the new `windowed_cross_attention` kernel.
+- **Eager full-shard reads duplicated tmpfs's own RAM** -- `dataloader.py`'s first draft read each
+  shard fully into a Python `bytes` object to build its entry index; since shards already live on
+  `/dev/shm` (already RAM), this doubled memory for no reason (136GB RSS and climbing, confirmed).
+  Fixed via `mmap`-ing each shard file instead (zero-copy view into the same pages).
+
+After both fixes: confirmed working end-to-end on real TPU (dataloader -> model forward -> loss/
+accuracy -> `pmap` train step across all 4 chips), 160/160 smoke-test steps completed cleanly, no
+errors. Not yet run as a real multi-epoch training session. Full detail, file list, usage commands:
+[summformer_jax/image_classification/README.md](../summformer_jax/image_classification/README.md).
+
+**tpu8**: `tiny_1` (image_gen, uniform `d_model=256`/`n_layers=2` across trunk and both fuse
+stages, `main_window=code_window=24`, cross-attention `stride=8` both stages) still running
+continuously through all the above -- at last check, 26% through its 5-epoch (`100,095`-step)
+budget, first eval+checkpoint completed cleanly at step 20,019 (`val_bpd=8.48`, early/noisy).

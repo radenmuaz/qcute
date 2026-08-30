@@ -52,3 +52,24 @@ class SummClassifier(nnx.Module):
 def cross_entropy_logits(logits: jnp.ndarray, labels: jnp.ndarray) -> jnp.ndarray:
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     return -jnp.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1).mean()
+
+
+def topk_accuracy(logits: jnp.ndarray, labels: jnp.ndarray, k: int) -> jnp.ndarray:
+    """Standard ImageNet-style top-k: fraction of examples where the true label is among the
+    k highest-scoring classes."""
+    topk_preds = jax.lax.top_k(logits, k)[1]  # (B, k)
+    hit = jnp.any(topk_preds == labels[:, None], axis=-1)
+    return hit.astype(jnp.float32).mean()
+
+
+def loss_and_metrics(model: SummClassifier, token_ids: jnp.ndarray, labels: jnp.ndarray) -> tuple:
+    """Returns (loss, metrics) -- metrics includes top1/top5 accuracy, matching the standard
+    ImageNet reporting convention (see ref_impl_files/README.md's own Top-1 accuracy column)."""
+    logits = model(token_ids)
+    loss = cross_entropy_logits(logits, labels)
+    metrics = {
+        "loss": loss,
+        "top1_acc": topk_accuracy(logits, labels, 1),
+        "top5_acc": topk_accuracy(logits, labels, 5),
+    }
+    return loss, metrics
