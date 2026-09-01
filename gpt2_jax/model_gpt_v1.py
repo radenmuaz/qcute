@@ -34,10 +34,6 @@ class ModelConfig:
     # matching torch.autocast's own policy in Cable's original.
     compute_dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.float32
-    # gradient checkpointing: wraps the whole block stack's forward in jax.checkpoint (via
-    # nnx.remat), recomputing activations in the backward pass instead of storing them --
-    # same opt-in, whole-stack-wrapped pattern as summformer_jax's BlockStack.use_remat.
-    use_remat: bool = False
 
 
 def _linear_init(std: float):
@@ -231,11 +227,6 @@ class Model(nnx.Module):
         # directly in __call__ (no separate nnx.Linear/param -- see forward below), matching
         # `self.transformer.wte.weight = self.lm_head.weight` in the PyTorch original.
 
-    def _blocks_forward(self, x):
-        for block in self.h:
-            x = block(x)
-        return x
-
     def __call__(self, idx):
         # idx: [B, T] int32 -> logits [B, T, vocab]
         B, T = idx.shape
@@ -247,24 +238,8 @@ class Model(nnx.Module):
             )
             pos = jnp.arange(T)
             x = x + self.wpe(pos)[None]
-        # use_remat=True (default False, opt-in) wraps the whole block stack's forward in
-        # jax.checkpoint, recomputing activations in the backward pass instead of storing them,
-        # trading TensorCore cycles for HBM. Same pattern as summformer_jax's BlockStack.use_remat
-        # -- uses plain jax.checkpoint over a split/merge'd pure function, not nnx.remat directly
-        # on the bound method, since that raised flax.errors.TraceContextError ("Cannot mutate
-        # Param from a different trace level") once nested inside train_gpt.py's own
-        # pmap+lax.scan (grad_accum) tracing (confirmed 2026-09-01, same failure as
-        # summformer_jax's BlockStack).
-        if self.config.use_remat:
-            graphdef, state = nnx.split(self)
-
-            def pure_blocks_forward(state, x):
-                module = nnx.merge(graphdef, state)
-                return module._blocks_forward(x)
-
-            x = jax.checkpoint(pure_blocks_forward)(state, x)
-        else:
-            x = self._blocks_forward(x)
+        for block in self.h:
+            x = block(x)
         x = self.ln_f(x)
         logits = x @ self.wte.embedding.value.T  # tied head
         return logits

@@ -90,6 +90,11 @@ def main():
     p.add_argument("--num-epochs", type=int, default=None)
     p.add_argument("--total-batch-size", type=int, default=TOTAL_BATCH_SIZE_DEFAULT)
     p.add_argument("--batch-size", type=int, default=None, help="per-device micro batch size")
+    p.add_argument("--eval-batch-size", type=int, default=None,
+                    help="per-device eval micro batch size, decoupled from --batch-size -- eval doesn't need to "
+                         "match total_batch_size, so it can stay small at large sequence lengths where a "
+                         "training-sized eval batch would OOM (eval has no backward pass, so remat/checkpointing "
+                         "doesn't reduce its memory the way it does for training). Defaults to --batch-size if unset.")
     p.add_argument("--sequence-length", type=int, default=1024)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-steps", type=int, default=20)
@@ -98,6 +103,7 @@ def main():
     p.add_argument("--lr", type=float, default=None, help="override MAX_LR (peak learning rate); MIN_LR stays 0.1x this")
     p.add_argument("--run-name", type=str, default=None, help="override the auto-derived run_name (else derived from --config/model/pos-method)")
     p.add_argument("--use-flash-attention", action="store_true")
+    p.add_argument("--use-remat", action="store_true")
 
     if pre_args.config:
         config_vars = load_config_module(pre_args.config)
@@ -126,6 +132,7 @@ def main():
 
     n_devices = jax.local_device_count()
     B = args.batch_size or MICRO_BATCH_SIZES[args.model]
+    B_eval = args.eval_batch_size or B
     T = args.sequence_length
     num_epochs = args.num_epochs or NUM_EPOCHS_DEFAULT[args.model]
     total_batch_size = args.total_batch_size
@@ -154,15 +161,17 @@ def main():
         log_f.write(json.dumps(record) + "\n")
         log_f.flush()
 
-    print(f"n_devices={n_devices}  batch_size(per-device)={B}  seq_len={T}  grad_accum_steps={grad_accum_steps}  "
-          f"total_batch_size={total_batch_size}  max_steps={max_steps}  pos_method={args.pos_method}  "
-          f"use_flash_attention={args.use_flash_attention} (available={_HAS_FLASH_ATTENTION})")
+    print(f"n_devices={n_devices}  batch_size(per-device)={B}  eval_batch_size(per-device)={B_eval}  seq_len={T}  "
+          f"grad_accum_steps={grad_accum_steps}  total_batch_size={total_batch_size}  max_steps={max_steps}  pos_method={args.pos_method}  "
+          f"use_flash_attention={args.use_flash_attention} (available={_HAS_FLASH_ATTENTION})  "
+          f"use_remat={args.use_remat}")
 
     train_loader = DataLoaderLite(B, T, 0, 1, "train", args.dataset_dir)
-    val_loader = DataLoaderLite(B, T, 0, 1, "val", args.dataset_dir)
+    val_loader = DataLoaderLite(B_eval, T, 0, 1, "val", args.dataset_dir)
 
     cfg = ModelConfig(pos_method=args.pos_method, block_size=T, vocab_size=50304,
-                       use_flash_attention=args.use_flash_attention, **MODEL_SHAPES[args.model])
+                       use_flash_attention=args.use_flash_attention, use_remat=args.use_remat,
+                       **MODEL_SHAPES[args.model])
     rngs = nnx.Rngs(args.seed)
     model = Model(cfg, rngs=rngs)
     graphdef, params = nnx.split(model)
@@ -241,13 +250,13 @@ def main():
 
     p_eval_accum_step = jax.pmap(eval_accum_step, axis_name="batch")
 
-    def fetch_pmap_batch(loader: DataLoaderLite, steps: int):
-        # Builds one combined [n_devices, steps, B, T] batch (steps = grad_accum_steps or
+    def fetch_pmap_batch(loader: DataLoaderLite, steps: int, batch_size: int):
+        # Builds one combined [n_devices, steps, batch_size, T] batch (steps = grad_accum_steps or
         # eval_steps) so the whole accumulation loop above can run as a single scan/pmap call --
         # each of the n_devices gets its own independently-advanced slice of the SAME loader
         # (sequential-not-random), consistent across the `steps` dimension.
-        xs = np.empty((n_devices, steps, B, T), dtype=np.int32)
-        ys = np.empty((n_devices, steps, B, T), dtype=np.int32)
+        xs = np.empty((n_devices, steps, batch_size, T), dtype=np.int32)
+        ys = np.empty((n_devices, steps, batch_size, T), dtype=np.int32)
         for s in range(steps):
             for d in range(n_devices):
                 x, y = loader.next_batch()
@@ -262,7 +271,7 @@ def main():
 
     def _prefetch_worker():
         while True:
-            _prefetch_q.put(fetch_pmap_batch(train_loader, grad_accum_steps))
+            _prefetch_q.put(fetch_pmap_batch(train_loader, grad_accum_steps, B))
 
     threading.Thread(target=_prefetch_worker, daemon=True).start()
 
@@ -275,7 +284,7 @@ def main():
 
         if step % args.eval_every == 0 or last_step:
             val_loader.reset()
-            val_batch = fetch_pmap_batch(val_loader, args.eval_steps)
+            val_batch = fetch_pmap_batch(val_loader, args.eval_steps, B_eval)
             val_loss = float(p_eval_accum_step(params, val_batch)[0])
             log(step=step, split="val", loss=val_loss, ppl=math.exp(min(val_loss, 20)))
 

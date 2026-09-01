@@ -20,6 +20,59 @@ except ImportError:
     _HAS_FLASH_ATTENTION = False
 
 
+def chunked_windowed_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, window: int) -> jnp.ndarray:
+    """Real O(T*window) windowed causal self-attention -- ported from summformer_jax/summformer.py's
+    chunked_windowed_attention (no zero-KV sink, no flash option -- gpt2_windowed_jax's own
+    windowed-attention ablation baseline, kept as a self-contained copy per this repo's
+    flat-file-per-training-script convention rather than a cross-lineage import). Reshapes into
+    `window`-sized blocks; each block attends only to itself + the immediately preceding block
+    (2*window keys, not T keys). Falls back to dense causal sdpa when T<=window or T%window!=0."""
+    B, H, T, hd = q.shape
+    w = window
+    scale = 1.0 / math.sqrt(hd)
+
+    def _dense_sdpa(q, k, v, mask):
+        scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        scores = jnp.where(mask, scores.astype(jnp.float32), -jnp.inf)
+        attn = jax.nn.softmax(scores, axis=-1).astype(v.dtype)
+        return jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+
+    if T <= w or T % w != 0:
+        mask = jnp.tril(jnp.ones((T, T), dtype=bool))[None, None]
+        return _dense_sdpa(q, k, v, mask)
+
+    n_chunks = T // w
+    qb = q.reshape(B, H, n_chunks, w, hd)
+    kb = k.reshape(B, H, n_chunks, w, hd)
+    vb = v.reshape(B, H, n_chunks, w, hd)
+    pad_k = jnp.zeros((B, H, 1, w, hd), dtype=k.dtype)
+    pad_v = jnp.zeros((B, H, 1, w, hd), dtype=v.dtype)
+    k_ext = jnp.concatenate([pad_k, kb], axis=2)
+    v_ext = jnp.concatenate([pad_v, vb], axis=2)
+
+    idx = jnp.arange(n_chunks).reshape(n_chunks, 1) + jnp.arange(2).reshape(1, 2)
+    k_win = k_ext[:, :, idx].reshape(B, H, n_chunks, 2 * w, hd)
+    v_win = v_ext[:, :, idx].reshape(B, H, n_chunks, 2 * w, hd)
+
+    pos = jnp.arange(T)
+    pos_b = pos.reshape(n_chunks, w)
+    pad_pos = jnp.full((1, w), -10 ** 9, dtype=pos.dtype)
+    pos_ext = jnp.concatenate([pad_pos, pos_b], axis=0)
+    pos_win = pos_ext[idx].reshape(n_chunks, 2 * w)
+
+    ti = pos_b[:, :, None]
+    tj = pos_win[:, None, :]
+    allow = (tj <= ti) & (ti - tj < w)  # (n_chunks, w, 2*w)
+    mask_flat = jnp.broadcast_to(allow[None, :, None], (B, n_chunks, 1, w, 2 * w)).reshape(B * n_chunks, 1, w, 2 * w)
+
+    qb_flat = qb.transpose(0, 2, 1, 3, 4).reshape(B * n_chunks, H, w, hd)
+    k_win_flat = k_win.transpose(0, 2, 1, 3, 4).reshape(B * n_chunks, H, 2 * w, hd)
+    v_win_flat = v_win.transpose(0, 2, 1, 3, 4).reshape(B * n_chunks, H, 2 * w, hd)
+
+    y = _dense_sdpa(qb_flat, k_win_flat, v_win_flat, mask_flat)
+    return y.reshape(B, n_chunks, H, w, hd).transpose(0, 2, 1, 3, 4).reshape(B, H, T, hd)
+
+
 @dataclass
 class ModelConfig:
     pos_method: str = "rope"  # one of "rope", "learnable", "base"
@@ -29,6 +82,10 @@ class ModelConfig:
     n_head: int = 8
     n_embd: int = 512
     use_flash_attention: bool = False
+    # bounded local self-attention window (chunked_windowed_attention above), -1 = dense/unbounded
+    # (default, original gpt2_jax behavior). Mutually exclusive with use_flash_attention in
+    # practice -- when window > 0 the flash-attention kernel is bypassed, see __call__ below.
+    window: int = -1
     # mixed precision: matmuls (Linear/Embed) compute in this dtype, params stored in
     # param_dtype (fp32) as the master copy; LayerNorm/softmax/loss stay fp32 for stability,
     # matching torch.autocast's own policy in Cable's original.
@@ -99,6 +156,7 @@ class CausalSelfAttention(nnx.Module):
         self.rotary_dim = min(64, self.head_dim)  # matches Cable's RotaryEmbedding(dim=64)
         self.block_size = config.block_size
         self.use_flash_attention = config.use_flash_attention and _HAS_FLASH_ATTENTION
+        self.window = config.window
         self.c_attn = nnx.Linear(
             config.n_embd, 3 * config.n_embd, kernel_init=_linear_init(0.02),
             dtype=config.compute_dtype, param_dtype=config.param_dtype, rngs=rngs,
@@ -125,7 +183,11 @@ class CausalSelfAttention(nnx.Module):
             q = jnp.concatenate([_apply_rope(q_rot, cos, sin), q_pass], axis=-1)
             k = jnp.concatenate([_apply_rope(k_rot, cos, sin), k_pass], axis=-1)
 
-        if self.use_flash_attention:
+        if self.window > 0:
+            # Bounded local attention -- bypasses flash-attention (no windowed Pallas kernel
+            # wired up here, matches summformer_jax's own choice not to combine the two).
+            y = chunked_windowed_attention(q, k, v, self.window)
+        elif self.use_flash_attention:
             # Pallas TPU kernel wants bf16 q/k/v; output comes back in that dtype too.
             y = _tpu_flash_attention(
                 q.astype(jnp.bfloat16), k.astype(jnp.bfloat16), v.astype(jnp.bfloat16),

@@ -583,14 +583,28 @@ class BlockStack(nnx.Module):
 
     def __call__(self, x: jnp.ndarray, seq_pos: jnp.ndarray) -> jnp.ndarray:
         """cfg.use_remat=True (default False, opt-in) wraps the whole stack's forward in
-        jax.checkpoint (via nnx.remat) -- recomputes activations in the backward pass instead of
-        storing them, trading (mostly idle, see chat 2026-08-30: measured MFU ~6%) TensorCore
-        cycles for HBM. Added specifically for the Embedder (processes the full raw sequence at
-        small d_model -- the single largest activation tensor in the model) and Encoder chain
-        stages (layers_cfg.use_remat propagates to every stage_cfg uniformly, same pattern as
-        use_sink/use_flash)."""
+        jax.checkpoint -- recomputes activations in the backward pass instead of storing them,
+        trading (mostly idle, see chat 2026-08-30: measured MFU ~6%) TensorCore cycles for HBM.
+        Added specifically for the Embedder (processes the full raw sequence at small d_model --
+        the single largest activation tensor in the model) and Encoder chain stages
+        (layers_cfg.use_remat propagates to every stage_cfg uniformly, same pattern as
+        use_sink/use_flash).
+
+        Uses plain jax.checkpoint over a split/merge'd pure function, not nnx.remat directly on
+        the bound method -- nnx.remat wrapping a mutating `self` call raised
+        flax.errors.TraceContextError ("Cannot mutate Param from a different trace level") once
+        nested inside train.py's own pmap+lax.scan (grad_accum) tracing, confirmed 2026-09-01.
+        The split/merge form never mutates `self` from inside the checkpointed trace -- it
+        constructs a fresh module from `state` inside the checkpoint and only returns a plain
+        array, so nothing needs writing back across the trace boundary."""
         if self.cfg.use_remat:
-            return nnx.remat(BlockStack._forward_impl)(self, x, seq_pos)
+            graphdef, state = nnx.split(self)
+
+            def pure_forward(state, x, seq_pos):
+                module = nnx.merge(graphdef, state)
+                return module._forward_impl(x, seq_pos)
+
+            return jax.checkpoint(pure_forward)(state, x, seq_pos)
         return self._forward_impl(x, seq_pos)
 
     def cache_caps(self, max_len: int) -> list:
