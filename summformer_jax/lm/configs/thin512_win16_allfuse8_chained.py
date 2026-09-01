@@ -48,7 +48,7 @@ CROSS_WINDOW = 16      # explicit, NOT -1/auto-derive (see module docstring)
 SEQUENCE_LENGTH = 1024
 WEIGHT_TIE = False
 
-batch_size = 4
+batch_size = 16
 total_batch_size = 524288
 
 

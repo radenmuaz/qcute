@@ -30,6 +30,106 @@ in the number of CHAINED encoder stages via cum_stride = product(stage strides) 
 n_layers, and NOT automatically "K**n_layers" just from having many decoder layers. A stage's own
 code_window, mapped back to absolute input positions, spans `code_window * cum_stride_at_that_stage`
 -- so cum_stride growth is what compounds, bounded by how many stages are actually chained.
+
+TODO (unimplemented, this file is currently a byte-identical copy of summformer_slow.py -- see
+chat 2026-08-31/09-01 for the full derivation): query-sparse Encoder chain pooling, to save compute
+at chain stages whose full output is never actually consumed.
+
+PROBLEM. Encoder.__call__'s chain loop (see Encoder class below) does, per stage i:
+    stage_h = cur_h[:, stage.stride-1::stage.stride, :][:, :n_blocks, :]   # subsample FIRST
+    stage_h = self.transformers[i](stage_h, local_pos)                     # then attend among survivors
+This is already cheap WITHIN stage i's own transformer call (BlockStack only ever processes the
+already-subsampled n_blocks_i positions, never the full pre-subsample length -- confirmed by
+reading BlockStack._forward_impl, it just loops over whatever length it's handed, no hidden
+full-length work). The real waste is ACROSS stages: stage i computes ALL n_blocks_i outputs, but if
+stage i is not read by the Decoder's cross-attention (i.e. not in that CrossAttnSpec's
+`encoder_output` set) and only feeds stage i+1 forward, then stage i+1's OWN subsample immediately
+discards all but 1/stride_{i+1} of what stage i just computed. That (stride_{i+1}-1)/stride_{i+1}
+fraction of stage i's query/attention-score/out-projection/MLP compute is provably never read by
+anything -- proven via a forward-pass argument (self-attention at query position j depends only on
+q_j and the keys/values in j's own window, never on whether some OTHER position's output was also
+computed), NOT by a numerical equivalence test (that test was run and DISCONFIRMED: a
+"gather-raw-window-then-attend" rectangular-attention variant, prototyped and then deleted this
+session, is NOT numerically equivalent to this file's subsample-then-square-attend pooling --
+0.14%-7.3% relative diff at a single stage in isolation, depending on weight scale -- see chat).
+This TODO is explicitly a compatibility-BREAKING optimization: an existing checkpoint trained on
+plain summformer.py/summformer_slow.py will not reproduce the same outputs after this change (same
+param shapes, different learned function) -- confirmed acceptable per user instruction
+("just break compatibility") once the narrower fully-compatible version (skip only the
+provably-dead OUTPUT computation for known-discarded positions, keeping the exact same window/mask
+math) was scoped out as strictly more conservative but harder to wire generically through the
+Decoder's CrossAttnSpec-driven `encoder_output` set.
+
+FIX. For each chain stage i NOT needed in full downstream (see "which stages" below), replace
+subsample-then-attend with a single strided-window ("causal strided-conv-with-attention-weights")
+op that computes queries ONLY at the positions that survive onward, with keys/values gathered from
+a LOCAL RAW window (not the full stage input, and not just other survivors):
+    query_idx  = arange(stride-1, n_blocks*stride, stride)                       # static, from stride
+    offsets    = arange(window-1, -1, -1)                                        # static, from window
+    gather_idx = clip(query_idx[:, None] - offsets[None, :], 0, L-1)             # static -- (n_blocks, window)
+    valid      = (query_idx[:, None] - offsets[None, :]) >= 0                    # static
+    x_q        = take(cur_h, query_idx, axis=1)              # (B, n_blocks, D)          -- gather BEFORE projecting
+    kv_raw     = take(cur_h, gather_idx, axis=1)              # (B, n_blocks, window, D)  -- gather BEFORE projecting
+    q          = wq(x_q); k, v = split(wkv(kv_raw))            # project only the gathered positions, not all of L
+    out        = attend(q, k, v, mask=valid)                   # (B, n_blocks, D) -- ALREADY next stage's input shape
+Gathering raw positions BEFORE projecting through wq/wkv (rather than projecting the whole stage
+input then gathering afterward) is a pure compute-cost fix with ZERO numerical effect (wq/wkv are
+per-position nnx.Linear, no cross-position mixing, so gather-then-project == project-then-gather
+for the selected positions, up to floating-point reassociation) -- this is what makes the op cost
+`n_blocks * window` instead of `O(L)`; the earlier deleted rectangular-attention prototype got this
+part wrong (projected wkv over the FULL L then gathered, confirmed via GFLOPs benchmark to be the
+dominant cost: ~3.08 of 6.60 GFLOPs in query_hourglass_tiny_2.py). `stride` and `window` are exactly
+ChainStageConfig's existing fields -- no new config semantics needed, just consuming both together
+in one op instead of sequentially (slice, then separately window-attend on the slice).
+
+WHICH STAGES benefit (savings are NOT uniform across a chain): a stage feeding the Decoder's
+cross-attention (its index appears as some CrossAttnSpec.encoder_output) needs ALL n_blocks_i
+positions regardless -- zero savings there, must stay as full self-attention over all n_blocks_i
+survivors (either the current subsample-then-attend, or this same op with query_idx = arange(n_blocks_i),
+i.e. no cut). A stage NOT cross-attended, whose only consumer is the next chain stage, can cut its
+OWN query count down to n_blocks_i / stride_{i+1} (single-hop: push the next stage's stride into
+this stage's own output) -- see chat's cumulative-savings derivation: with uniform stride s and
+depth >= 2, this yields a flat, DEPTH-INDEPENDENT cumulative saving of exactly (s-1)/s on the
+affected sub-chain (50% at s=2, 75% at s=4), confirmed both analytically (geometric-series partial
+sums are self-similar) and by direct enumeration for depth=8. A more aggressive fully-cascaded
+version (collapse an entire run of consecutive non-cross-attended stages to directly target the
+count needed by the nearest downstream consumer, skipping the intermediate stages' own
+representation-building self-attention entirely) yields much larger savings (~85x on the collapsed
+sub-chain in the query_hourglass_tiny_2_last4.py numeric example) but is a bigger architectural
+change -- not scoped here, implement single-hop first.
+
+CONCRETE EXAMPLE (query_hourglass_tiny_2_last4.py: T=150528, stride=4, 8 stages,
+CROSS_STAGES=(4,5,6,7)): stages 0-3 are the only ones eligible (not in CROSS_STAGES); single-hop
+fix cuts their combined chain-attention cost from ~51.2M to ~12.8M (D^2-weighted proxy units) --
+overall chain-attention total drops from ~63.9M to ~25.5M, i.e. ~2.5x cheaper chain compute (~60%
+reduction), stages 4-7 unaffected (cross-attended, no savings possible). Rough Amdahl estimate for
+TOTAL model GFLOPs (chain-attention is roughly half of total per the query_hourglass_tiny_2 GFLOPs
+breakdown): ~1.3-1.4x total speedup. Verify the real number with
+summformer_jax/image_classification/scripts/bench_last4_fast_vs_slow.py's cost_analysis() method
+once implemented, rather than trusting this estimate.
+
+IMPLEMENTATION NOTES.
+  - `stride`/`window` per stage, and which stages are cross-attended (derive from the Decoder's
+    `cross: tuple[CrossAttnSpec]` passed alongside the Encoder, or thread an explicit
+    `cross_stages: frozenset[int]` into Encoder.__init__/__call__ -- Encoder currently has no idea
+    which of its own stages the Decoder reads, this needs wiring through).
+  - `query_idx`/`gather_idx`/`valid` are pure functions of static config ints (context_len, chain
+    strides up to stage i, that stage's window) -- precompute ONCE at Encoder.__init__ (mirroring
+    how `_resolve_windows`/`cum_strides`/`max_blocks` are already precomputed there), not inside
+    __call__, and definitely not from traced/dynamic shapes.
+  - Level 1 (the Embedder, upstream of the whole Encoder chain) is explicitly OUT OF SCOPE for this
+    trick in the lm/ lineage: NTP loss needs a valid per-position output at every raw position, so
+    Embedder must stay dense/square. This constraint doesn't apply to image_classification (no
+    per-position loss, only a pooled query head) -- worth checking separately whether Embedder-level
+    savings are worth adding there too, but keep that as a distinct change from this Encoder-chain fix.
+  - Numerical check for whatever gets implemented: it will NOT match summformer_slow.py bit-for-bit
+    (that's expected and accepted, see PROBLEM above) -- the correctness bar instead is (a) shapes
+    match summformer_slow.py's Encoder output list exactly (same (stage_h_trunk, pos_abs,
+    cum_stride) structure, same dtypes), (b) forward pass produces finite, non-NaN outputs across a
+    real config, (c) at the degenerate stride=1 case (no compression at all), this scheme MUST
+    reduce to bit-identical output vs summformer_slow.py (query_idx becomes arange(L), gather_idx
+    becomes a plain causal window -- a genuine regression check that the gather machinery itself has
+    no bug, independent of the stride>1 architecture-change question).
 """
 from __future__ import annotations
 

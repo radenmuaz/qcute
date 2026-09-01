@@ -640,3 +640,35 @@ errors. Not yet run as a real multi-epoch training session. Full detail, file li
 stages, `main_window=code_window=24`, cross-attention `stride=8` both stages) still running
 continuously through all the above -- at last check, 26% through its 5-epoch (`100,095`-step)
 budget, first eval+checkpoint completed cleanly at step 20,019 (`val_bpd=8.48`, early/noisy).
+
+## 2026-08-31/09-01: tpu1-4 `thin512_win{8,12,16,32}_allfuse8_chained` self-attn-window sweep, all 4 finished
+
+`summformer_jax/lm/` window sweep (`configs/thin512_win{8,12,16,32}_allfuse8_chained.py`, 8 fuse
+stages, chained pooling, `stride=4`/paper-faithful `total_batch_size=524288`) -- only `SELF_WINDOW`
+varies across the 4 configs (8/12/16/32), isolating window size as the single variable vs. the
+`medium_paper_match_b8` gpt2-medium baseline (2.809 val loss / 16.60 PPL, finished 2026-08-29, see
+above). All 4 launched 2026-08-31 07:14 UTC, finished 19073/19073 steps (1 epoch) between
+2026-09-01 ~05:05-06:14 UTC (~7h50m-8h59m wall clock each, tok/s dropping with larger window:
+~199K/195K/190K/170K tok/s for win=8/12/16/32 respectively). `log.jsonl` pulled to local
+`logs/thin512_win{8,12,16,32}_allfuse8_chained/` (no checkpoints pulled -- egress-conscious, per
+convention).
+
+| Run | window | Val loss | Val PPL | vs. gpt2-medium baseline |
+|---|---|---|---|---|
+| gpt2-medium (`medium_paper_match_b8`, earlier sweep) | -- | 2.809 | **16.60** | -- |
+| `thin512_win8_allfuse8_chained` | 8 | 3.344 | **28.33** | +70.7% worse |
+| `thin512_win12_allfuse8_chained` | 12 | 3.298 | **27.06** | +63.0% worse |
+| `thin512_win16_allfuse8_chained` | 16 | 3.266 | **26.21** | +57.9% worse |
+| `thin512_win32_allfuse8_chained` | 32 | 3.210 | **24.79** | +49.3% worse |
+
+Monotonic, still-improving trend: larger self-attention window keeps helping, no sign of saturating
+yet, but even the best of this sweep (window=32) remains ~50% worse in PPL than the gpt2-medium
+baseline -- this `thin512`/`allfuse8_chained` architecture point hasn't closed the gap at any window
+tested so far. Since window is the only variable changed across these 4 runs, the causal claim
+"larger window helps" is unconfounded for this comparison; the comparison AGAINST gpt2-medium is
+suspect/confounded (different architecture entirely, not an isolated variable). Natural next step:
+a `win64` (or larger) config to check whether the trend keeps improving or plateaus -- not yet
+launched.
+
+Nodes freed after this sweep: tpu1 (35.186.98.243), tpu2 (35.186.39.107), tpu3 (107.167.160.20),
+tpu4 (35.186.15.67), all idle as of 2026-09-01, available for the next run.

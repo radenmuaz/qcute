@@ -1,7 +1,10 @@
-"""Same as gpt2_jax/data_loader.py's DataLoaderLite -- kept as a local copy (not a cross-directory
-import) so this file runs standalone via `uv run python summformer_jax/train_summformer.py`, same
-as gpt2_jax's own convention. Reads the GPT2-BPE uint16 .npy shards from
-gpt2_jax/dataset_preparation.py (this ablation intentionally shares that exact dataset/vocab)."""
+"""Verbatim port of gpt2_jax/data_loader.py's DataLoaderLite -- sequential (NOT random), per-process
+deterministic access, one shard in memory at a time, wraps to the next shard on exhaustion. Copied
+rather than imported (no cross-directory dependency, matches this codebase's other lineages'
+convention) so the LM lineage's dataloader is bit-for-bit the same access pattern as the gpt2_jax
+baseline it's compared against -- the earlier version of this file used random sampling with
+replacement from a concatenated array, a real, unauthorized divergence from the baseline (see chat
+2026-08-31). Do not reintroduce random sampling here without an explicit instruction to do so."""
 from __future__ import annotations
 
 import os
