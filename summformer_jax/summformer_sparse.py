@@ -130,6 +130,22 @@ IMPLEMENTATION NOTES.
     reduce to bit-identical output vs summformer_slow.py (query_idx becomes arange(L), gather_idx
     becomes a plain causal window -- a genuine regression check that the gather machinery itself has
     no bug, independent of the stride>1 architecture-change question).
+  - CROSS-ATTENTION CONSTRAINT (do not violate without reworking windowed_cross_attention too):
+    "WHICH STAGES benefit" above already restricts sparse survivor-selection to stages NOT read by
+    any CrossAttnSpec -- this isn't just a missed-savings note, it's a correctness boundary.
+    windowed_cross_attention (summformer.py) assumes a cross-attended stage's code array is
+    CONTIGUOUS and evenly spaced by cum_stride (code_pos_abs[j] = (j+1)*cum_stride - 1, every
+    position present, no gaps -- see Encoder.__call__'s dense pos_abs construction). Sparse mode
+    makes a stage's kv shorter by keeping only SURVIVING positions (whichever ones the next stage's
+    subsample would have kept) -- gaps in the underlying position sequence, not a uniform stride.
+    If sparse is ever extended to a cross-attended stage, `windowed_cross_attention`'s
+    stride-arithmetic index derivation (`j_max = floor((seq_pos+1)/stride) - 1`, `gather_idx =
+    j_max - offsets`) breaks silently -- it would compute indices into a code array that no longer
+    has a position at every one of those slots, producing wrong (not just less-complete) attention
+    targets, not a clean error. Any future work letting sparse touch a cross-attended stage MUST
+    rework windowed_cross_attention to index by the stage's own (now-irregular) surviving position
+    list rather than by stride arithmetic -- until then, keep the "zero savings on cross-attended
+    stages" restriction as a hard invariant, not just a missed optimization.
 """
 from __future__ import annotations
 

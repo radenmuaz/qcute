@@ -12,7 +12,7 @@ N_HEADS = 8
 N_LAYERS = 8
 N_STAGES = 8
 STRIDE = 2
-SEQUENCE_LENGTH = 8192
+SEQUENCE_LENGTH = 1024
 WEIGHT_TIE = False
 sequence_length = SEQUENCE_LENGTH  # lowercase alias so train.py's config loader picks it up
 

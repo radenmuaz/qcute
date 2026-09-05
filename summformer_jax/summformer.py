@@ -40,6 +40,13 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+try:
+    from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention as _tpu_flash_attention
+    _HAS_TPU_FLASH = True
+except ImportError:
+    _tpu_flash_attention = None
+    _HAS_TPU_FLASH = False
+
 # ----------------------------------------------------------------------------
 # RoPE + attention primitives (from model_summformer.py)
 # ----------------------------------------------------------------------------
@@ -110,15 +117,24 @@ def causal_mask(query_pos: jnp.ndarray, key_pos: jnp.ndarray, window) -> jnp.nda
 
 def chunked_windowed_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, window: int,
                                 use_sink: bool = True, use_flash: bool = False) -> jnp.ndarray:
-    """Real O(T*window) windowed self-attention -- ported from
-    qcute/qcute_lagcodec/qcute_lagcodec_common.py's chunked_windowed_attention (torch), JAX'd and
-    extended with the zero-KV sink. Reshapes into `window`-sized blocks; each block attends only
-    to itself + the immediately preceding block (2*window keys, not T keys) -- exactly matches
-    causal_mask(..., window)'s semantics (verified: for a query at local position li in its chunk,
-    a same-chunk key is always within window by construction; a previous-chunk key at local
-    position lj is within window iff li < lj, which is exactly what causal_mask's `i-j < window`
-    condition gives), not an approximation. Falls back to dense sdpa_with_sink when T<=window or
-    T%window!=0, same as the reference."""
+    """Windowed self-attention via jax.lax.scan over query chunks -- each chunk does one small,
+    SELF-CONTAINED sdpa_with_sink call over just its own window (current + previous block, 2*window
+    keys), no running/online-softmax needed (every query's whole window fits in one iteration, so
+    each chunk's softmax is exact and complete on its own, unlike real FlashAttention which streams
+    over more KV blocks than fit in memory and must incrementally combine partial results).
+
+    Replaces an earlier gather/batch-then-attend version (materialized ALL chunks' (2*window)-key
+    slices as one (B,H,n_chunks,2*window,hd) array via fancy-indexing before ever calling
+    attention) -- confirmed via jax.jit(...).compile().memory_analysis() (gpt2_windowed_jax's
+    identical function, same bug) that THAT materialization step, not the attention math itself,
+    was the real memory cost (grew linearly with window: 3.0G/3.5G/4.5G/6.5G at window=32/64/128/
+    256, T=8192, B=16,H=16,hd=64). This scan version keeps k/v at their natural (B,H,T,hd) shape
+    throughout (dynamic_slice per iteration, no upfront copy) and reuses one iteration's buffers
+    across the loop (same property this codebase's grad_accum_step scan already relies on) --
+    confirmed roughly FLAT memory across the same window sweep (1.76G/1.78G/1.81G/1.86G) on the
+    gpt2_windowed_jax twin, correctness verified bit-exact (float32 rounding only) against the old
+    implementation across 6 (T,window,B,H) shapes including the T<=window/T%window!=0 fallback
+    boundary. Falls back to dense sdpa_with_sink when T<=window or T%window!=0, unchanged."""
     B, H, T, hd = q.shape
     w = window
     if T <= w:
@@ -129,35 +145,26 @@ def chunked_windowed_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, w
         return sdpa_with_sink(q, k, v, mask, use_sink, use_flash)
 
     n_chunks = T // w
-    qb = q.reshape(B, H, n_chunks, w, hd)
-    kb = k.reshape(B, H, n_chunks, w, hd)
-    vb = v.reshape(B, H, n_chunks, w, hd)
-    pad_k = jnp.zeros((B, H, 1, w, hd), dtype=k.dtype)
-    pad_v = jnp.zeros((B, H, 1, w, hd), dtype=v.dtype)
-    k_ext = jnp.concatenate([pad_k, kb], axis=2)
-    v_ext = jnp.concatenate([pad_v, vb], axis=2)
+    k_pad = jnp.pad(k, ((0, 0), (0, 0), (w, 0), (0, 0)))
+    v_pad = jnp.pad(v, ((0, 0), (0, 0), (w, 0), (0, 0)))
+    q_chunks = q.reshape(B, H, n_chunks, w, hd)
+    pos_local = jnp.arange(w)
 
-    idx = jnp.arange(n_chunks).reshape(n_chunks, 1) + jnp.arange(2).reshape(1, 2)
-    k_win = k_ext[:, :, idx].reshape(B, H, n_chunks, 2 * w, hd)
-    v_win = v_ext[:, :, idx].reshape(B, H, n_chunks, 2 * w, hd)
+    def body(carry, i):
+        q_i = jax.lax.dynamic_index_in_dim(q_chunks, i, axis=2, keepdims=False)  # (B,H,w,hd)
+        k_i = jax.lax.dynamic_slice_in_dim(k_pad, i * w, 2 * w, axis=2)          # (B,H,2w,hd)
+        v_i = jax.lax.dynamic_slice_in_dim(v_pad, i * w, 2 * w, axis=2)
+        ti = i * w + pos_local
+        tj = (i - 1) * w + jnp.arange(2 * w)
+        # tj < 0 is PADDING (real zeros from jnp.pad), not a real key -- must be excluded
+        # explicitly since tj here is real (small-negative-capable) arithmetic, not a sentinel.
+        allow = (tj[None, :] >= 0) & (tj[None, :] <= ti[:, None]) & (ti[:, None] - tj[None, :] < w)
+        mask_i = allow.reshape(1, 1, w, 2 * w)
+        out_i = sdpa_with_sink(q_i, k_i, v_i, mask_i, use_sink, use_flash)  # (B,H,w,hd)
+        return carry, out_i
 
-    pos = jnp.arange(T)
-    pos_b = pos.reshape(n_chunks, w)
-    pad_pos = jnp.full((1, w), -10 ** 9, dtype=pos.dtype)
-    pos_ext = jnp.concatenate([pad_pos, pos_b], axis=0)
-    pos_win = pos_ext[idx].reshape(n_chunks, 2 * w)
-
-    ti = pos_b[:, :, None]
-    tj = pos_win[:, None, :]
-    allow = (tj <= ti) & (ti - tj < w)  # (n_chunks, w, 2*w)
-    mask_flat = jnp.broadcast_to(allow[None, :, None], (B, n_chunks, 1, w, 2 * w)).reshape(B * n_chunks, 1, w, 2 * w)
-
-    qb_flat = qb.transpose(0, 2, 1, 3, 4).reshape(B * n_chunks, H, w, hd)
-    k_win_flat = k_win.transpose(0, 2, 1, 3, 4).reshape(B * n_chunks, H, 2 * w, hd)
-    v_win_flat = v_win.transpose(0, 2, 1, 3, 4).reshape(B * n_chunks, H, 2 * w, hd)
-
-    y = sdpa_with_sink(qb_flat, k_win_flat, v_win_flat, mask_flat, use_sink, use_flash)
-    return y.reshape(B, n_chunks, H, w, hd).transpose(0, 2, 1, 3, 4).reshape(B, H, T, hd)
+    _, out_chunks = jax.lax.scan(body, None, jnp.arange(n_chunks))  # (n_chunks,B,H,w,hd)
+    return out_chunks.transpose(1, 2, 0, 3, 4).reshape(B, H, T, hd)
 
 
 def windowed_cross_attention(q, k, v, seq_pos, code_pos_abs, stride: int, window: int,
@@ -177,6 +184,20 @@ def windowed_cross_attention(q, k, v, seq_pos, code_pos_abs, stride: int, window
     B, H, T, hd = q.shape
     _, _, S, _ = k.shape
     n_gather = min(S, max(1, -(-window // stride) + 1))  # ceil(window/stride) + 1, capped at S
+    # WARNING GUARD (added 2026-09-01): `window` is a fixed absolute-position budget applied
+    # uniformly across every cross-attn stage regardless of that stage's own stride -- at a
+    # low-stride (fine-grained) stage, n_gather = ceil(window/stride)+1 grows large, and the
+    # gathered k_g/v_g tensors (B, H, T, n_gather, hd) scale with T directly. This is a real
+    # single-op peak-memory blowup, NOT fixed by gradient checkpointing (remat only reduces
+    # memory summed/stored across layers, not one op's own peak) -- confirmed root cause of the
+    # sweep_seqlen_small_1 OOMs (n_gather=129 at T=16384/stride=2 alone needing ~17GB per k_g/v_g
+    # tensor, unaffected by the Decoder remat fix). No behavior change, print-only.
+    _est_bytes = 2 * B * H * T * n_gather * hd * 2  # k_g + v_g, bf16
+    if n_gather > 16 or _est_bytes > 2 * 1024**3:
+        print(f"[summformer] WARNING windowed_cross_attention: n_gather={n_gather} (window={window}, "
+              f"stride={stride}) at T={T} -- estimated k_g+v_g alone ~{_est_bytes / 1024**3:.1f}GB. "
+              f"Large n_gather usually means `window` is too big relative to this stage's stride; "
+              f"consider scaling window down for low-stride stages or capping n_gather explicitly.")
 
     j_max = jnp.floor_divide(seq_pos + 1, stride) - 1  # (T,) most recent code index <= this query
     offsets = jnp.arange(n_gather - 1, -1, -1)
@@ -206,13 +227,32 @@ def windowed_cross_attention(q, k, v, seq_pos, code_pos_abs, stride: int, window
 
 class Attn(nnx.Module):
     def __init__(self, d_model: int, n_heads: int, scale_layers: int, dtype, param_dtype, *,
-                 rngs: nnx.Rngs, use_sink: bool = True, use_flash: bool = False):
+                 rngs: nnx.Rngs, use_sink: bool = True, use_flash: bool = False,
+                 use_real_flash: bool = False):
         self.n_heads = n_heads
         self.d_model = d_model
         self.head_dim = d_model // n_heads
         self.attn_dim = n_heads * self.head_dim
         self.use_sink = use_sink
         self.use_flash = use_flash
+        # use_real_flash=True dispatches forward() (self-attention only, never
+        # forward_cross/forward_cross_windowed) through the actual Pallas TPU flash-attention
+        # kernel (genuinely O(T) memory, confirmed via live tpu-info on gpt2_jax's dense baseline
+        # -- unlike use_flash=True, which routes through jax.nn.dot_product_attention and was
+        # confirmed NOT to reduce memory, see chat 2026-09-01). Only valid for SQUARE
+        # (q_len==kv_len) causal self-attention -- decoder/embedder/encoder self-attention are
+        # naturally square, cross-attention (q_len=T vs kv_len=S=T/stride) is not and is NOT
+        # supported by this path. Requires use_sink=False (the real kernel has no sink-token
+        # concept) -- safe for self-attention specifically since a causal query always has at
+        # least itself as a valid key (unlike cross-attention's early-position empty-key risk,
+        # which is why use_sink stays True there).
+        self.use_real_flash = use_real_flash
+        if use_real_flash and not _HAS_TPU_FLASH:
+            raise RuntimeError("use_real_flash=True but jax.experimental.pallas.ops.tpu.flash_attention "
+                                "is unavailable in this environment")
+        if use_real_flash and use_sink:
+            raise ValueError("use_real_flash=True requires use_sink=False (the real Pallas kernel has "
+                              "no sink-token concept)")
         init = nnx.initializers.normal(stddev=0.02)
         out_init = nnx.initializers.normal(stddev=0.02 * (2 * scale_layers) ** -0.5)
         self.wq = nnx.Linear(d_model, self.attn_dim, use_bias=True, kernel_init=init, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
@@ -237,7 +277,44 @@ class Attn(nnx.Module):
         q, k, v = self._qkv(x, B, T)
         if pos_method == "rope":
             q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        y = sdpa_with_sink(q, k, v, attn_mask, self.use_sink, self.use_flash)
+        if self.use_real_flash:
+            # attn_mask is ignored here -- real-flash path is only ever reached for full causal
+            # self-attention (force_dense=True; forward_windowed handles the bounded-window case
+            # separately and never sets use_real_flash), so causal=True is exactly equivalent to
+            # whatever attn_mask would have encoded (verified: causal_mask(..., window=None) is
+            # plain key_pos<=query_pos, identical to the kernel's own causal semantics).
+            #
+            # The Pallas kernel requires kv_seq_len (and q_seq_len) divisible by its block size
+            # (128, confirmed via BlockSizes.get_default) -- T itself is always a power of 2 in
+            # these configs, but ARHead's forward concatenates one extra position
+            # (jnp.concatenate([x, y[:, -1:]])) before calling the decoder, so the ACTUAL sequence
+            # length reaching here is T+1 (e.g. 1025, 2049, ...), never a multiple of 128.
+            # Confirmed via real error: "kv_seq_len=1025 should be divisible by block_k_major=128"
+            # on real TPU hardware, 2026-09-01. Fix: pad q/k/v up to the next multiple of 128 with
+            # trailing (post-sequence) zeros, run causal flash-attention on the padded length, then
+            # slice back to T. Safe because padding sits AFTER every real position: causal masking
+            # (key_pos <= query_pos) means no real query ever attends to a padded key (padded keys
+            # only exist at positions > T-1, always > any real query index), and the padded EXTRA
+            # query rows are simply discarded by the final slice, never observed by anything
+            # downstream.
+            block = 128
+            pad_to = -(-T // block) * block
+            pad_amt = pad_to - T
+            if pad_amt > 0:
+                pad_widths = ((0, 0), (0, 0), (0, pad_amt), (0, 0))
+                q_p = jnp.pad(q, pad_widths)
+                k_p = jnp.pad(k, pad_widths)
+                v_p = jnp.pad(v, pad_widths)
+            else:
+                q_p, k_p, v_p = q, k, v
+            scale = 1.0 / math.sqrt(self.head_dim)
+            y_p = _tpu_flash_attention(
+                q_p.astype(jnp.bfloat16), k_p.astype(jnp.bfloat16), v_p.astype(jnp.bfloat16),
+                causal=True, sm_scale=scale,
+            ).astype(x.dtype)
+            y = y_p[:, :, :T] if pad_amt > 0 else y_p
+        else:
+            y = sdpa_with_sink(q, k, v, attn_mask, self.use_sink, self.use_flash)
         return self.out(y.transpose(0, 2, 1, 3).reshape(B, T, self.attn_dim))
 
     def prime_static_cache(self, x, cos, sin, cap: int, window, pos_method: str):
@@ -382,9 +459,16 @@ class MLP(nnx.Module):
 
 class Block(nnx.Module):
     def __init__(self, d_model: int, n_heads: int, mlp_mult: int, scale_layers: int, dtype, param_dtype, *,
-                 rngs: nnx.Rngs, use_sink: bool = True, use_flash: bool = False):
+                 rngs: nnx.Rngs, use_sink: bool = True, use_flash: bool = False,
+                 use_real_flash: bool = False):
+        # use_real_flash forces use_sink=False on this Block's own Attn -- safe here since Block
+        # is only ever used for SELF-attention (Embedder's own layers, Encoder's non-cross-attend
+        # layers, each chain stage's own transformer), never cross-attention. Same reasoning as
+        # DecoderLayer's self_attn (a causal query always has at least itself as a valid key).
         self.ln1 = nnx.LayerNorm(d_model, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
-        self.attn = Attn(d_model, n_heads, scale_layers, dtype, param_dtype, rngs=rngs, use_sink=use_sink, use_flash=use_flash)
+        attn_use_sink = False if use_real_flash else use_sink
+        self.attn = Attn(d_model, n_heads, scale_layers, dtype, param_dtype, rngs=rngs,
+                          use_sink=attn_use_sink, use_flash=use_flash, use_real_flash=use_real_flash)
         self.ln2 = nnx.LayerNorm(d_model, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
         self.mlp = MLP(d_model, mlp_mult, scale_layers, dtype, param_dtype, rngs=rngs)
 
@@ -481,6 +565,20 @@ class StackConfig:
     # explicitly per-config only where the topology guarantees no empty-key rows are possible.
     use_flash: bool = False  # only takes effect where use_sink=False (see sdpa_with_sink docstring)
     use_remat: bool = False  # gradient checkpointing on BlockStack's forward (see BlockStack.__call__)
+    use_real_flash: bool = False  # ONLY consumed by Decoder (self-attention only, never cross-attn or
+    # BlockStack/Embedder/Encoder) -- real Pallas TPU flash-attention kernel, genuinely O(T) memory,
+    # not the jax.nn.dot_product_attention path use_flash routes to. See Attn.use_real_flash's
+    # docstring. Forces use_sink=False on the Decoder's self_attn specifically (handled in
+    # DecoderLayer.__init__), independent of this cfg's own use_sink (which cross_attn still uses).
+    share_layers: bool = False  # ablation flag, default False (no behavior change to past runs):
+    # ONLY consumed by Decoder -- when True, all cfg.n_layers DecoderLayer positions reuse ONE
+    # shared DecoderLayer instance/params (ALBERT-style depth-wise weight tying) instead of each
+    # having its own. Each position still cross-attends to its own configured encoder stage (the
+    # cross-attn target is looked up per-layer-index from cross_by_layer at call time, independent
+    # of which weights that layer uses) -- only the self-attn/cross-attn/MLP PARAMS are shared, not
+    # which stage each position attends to. Requires has_cross to be uniform across every layer
+    # position (checked at construction) since the shared instance is built with one has_cross
+    # value. See chat 2026-09-02.
 
 
 @dataclass
@@ -496,6 +594,11 @@ class ChainStageConfig:
     n_heads: int | None = None  # None -> trunk n_heads
     window: int | tuple = -1
     force_dense: bool = False
+    rope_scale_by_stride: bool = False  # ablation flag, default False (no behavior change to past
+    # runs): when True, this stage's own self-attention RoPE positions are `local_pos * cum_stride`
+    # (i.e. the stage's absolute original-sequence position) instead of the default `local_pos`
+    # (plain 0,1,2,... over the pooled sequence, oblivious to how coarse this stage's timescale is
+    # relative to the trunk). See chat 2026-09-02.
 
 
 @dataclass
@@ -564,7 +667,8 @@ class BlockStack(nnx.Module):
         self.windows = _resolve_windows(cfg.window, cfg.n_layers, max_len, cfg.force_dense, label)
         self.blocks = nnx.List([
             Block(cfg.d_model, cfg.n_heads, cfg.mlp_mult, max(1, cfg.n_layers), cfg.compute_dtype,
-                  cfg.param_dtype, rngs=rngs, use_sink=cfg.use_sink, use_flash=cfg.use_flash)
+                  cfg.param_dtype, rngs=rngs, use_sink=cfg.use_sink, use_flash=cfg.use_flash,
+                  use_real_flash=cfg.use_real_flash)
             for _ in range(cfg.n_layers)
         ])
 
@@ -733,7 +837,8 @@ class Encoder(nnx.Module):
                                      mlp_mult=layers_cfg.mlp_mult, window=stage.window, force_dense=stage.force_dense,
                                      pos_method=layers_cfg.pos_method, rope_base=layers_cfg.rope_base,
                                      compute_dtype=dtype, param_dtype=param_dtype, use_sink=layers_cfg.use_sink,
-                                     use_flash=layers_cfg.use_flash, use_remat=layers_cfg.use_remat)
+                                     use_flash=layers_cfg.use_flash, use_remat=layers_cfg.use_remat,
+                                     use_real_flash=layers_cfg.use_real_flash)
             transformers.append(BlockStack(stage_cfg, max_blocks[-1], label=f"Encoder.chain[{len(transformers)}]", rngs=rngs))
             ln_fs.append(nnx.LayerNorm(sD, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs))
             prev_dim = sD
@@ -766,10 +871,10 @@ class Encoder(nnx.Module):
             stage_h = cur_h[:, stage.stride - 1::stage.stride, :][:, :n_blocks, :]
             stage_h = in_proj(stage_h) if in_proj is not None else stage_h
 
-            local_pos = jnp.arange(n_blocks)
+            cum_stride *= stage.stride
+            local_pos = jnp.arange(n_blocks) * cum_stride if stage.rope_scale_by_stride else jnp.arange(n_blocks)
             stage_h = self.ln_fs[i](self.transformers[i](stage_h, local_pos)).astype(stage_h.dtype)
 
-            cum_stride *= stage.stride
             pos_abs = (jnp.arange(n_blocks) + 1) * cum_stride - 1
 
             out_proj = self.out_projs[i]
@@ -852,9 +957,16 @@ class Encoder(nnx.Module):
 
 class DecoderLayer(nnx.Module):
     def __init__(self, d_model, n_heads, mlp_mult, scale_layers, dtype, param_dtype, has_cross: bool,
-                 *, rngs: nnx.Rngs, use_sink: bool = True, use_flash: bool = False):
+                 *, rngs: nnx.Rngs, use_sink: bool = True, use_flash: bool = False,
+                 self_use_real_flash: bool = False):
+        # self_use_real_flash only ever applies to self_attn (real Pallas kernel, needs
+        # use_sink=False -- safe for self-attention specifically, see Attn.__init__'s docstring).
+        # cross_attn always keeps the caller's own use_sink/use_flash unchanged -- cross-attention
+        # is non-square (q_len=T vs kv_len=S=T/stride) and NOT supported by the real-flash path.
         self.ln1 = nnx.LayerNorm(d_model, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
-        self.self_attn = Attn(d_model, n_heads, scale_layers, dtype, param_dtype, rngs=rngs, use_sink=use_sink, use_flash=use_flash)
+        self_use_sink = False if self_use_real_flash else use_sink
+        self.self_attn = Attn(d_model, n_heads, scale_layers, dtype, param_dtype, rngs=rngs,
+                               use_sink=self_use_sink, use_flash=use_flash, use_real_flash=self_use_real_flash)
         self.has_cross = has_cross
         if has_cross:
             self.ln_cross = nnx.LayerNorm(d_model, dtype=jnp.float32, param_dtype=param_dtype, rngs=rngs)
@@ -920,12 +1032,24 @@ class Decoder(nnx.Module):
         cross_by_layer = {s.dst: s for s in cross_specs}
         self.cross_by_layer = cross_by_layer
         self._printed_cross_windows = set()  # layer indices already auto-derive-printed (print once, not per call)
-        self.layers = nnx.List([
-            DecoderLayer(cfg.d_model, cfg.n_heads, cfg.mlp_mult, max(1, cfg.n_layers), cfg.compute_dtype,
-                         cfg.param_dtype, has_cross=(i in cross_by_layer), rngs=rngs, use_sink=cfg.use_sink,
-                         use_flash=cfg.use_flash)
-            for i in range(cfg.n_layers)
-        ])
+        if cfg.share_layers:
+            has_cross_vals = {i in cross_by_layer for i in range(cfg.n_layers)}
+            assert len(has_cross_vals) <= 1, (
+                "share_layers=True requires has_cross to be uniform across every layer position "
+                f"(got a mix: {has_cross_vals}) -- the single shared DecoderLayer instance is built "
+                "with one has_cross value, so every position must agree on whether it cross-attends.")
+            shared_layer = DecoderLayer(cfg.d_model, cfg.n_heads, cfg.mlp_mult, max(1, cfg.n_layers),
+                                         cfg.compute_dtype, cfg.param_dtype,
+                                         has_cross=(0 in cross_by_layer), rngs=rngs, use_sink=cfg.use_sink,
+                                         use_flash=cfg.use_flash, self_use_real_flash=cfg.use_real_flash)
+            self.layers = nnx.List([shared_layer for _ in range(cfg.n_layers)])
+        else:
+            self.layers = nnx.List([
+                DecoderLayer(cfg.d_model, cfg.n_heads, cfg.mlp_mult, max(1, cfg.n_layers), cfg.compute_dtype,
+                             cfg.param_dtype, has_cross=(i in cross_by_layer), rngs=rngs, use_sink=cfg.use_sink,
+                             use_flash=cfg.use_flash, self_use_real_flash=cfg.use_real_flash)
+                for i in range(cfg.n_layers)
+            ])
         self.ln_f = nnx.LayerNorm(cfg.d_model, dtype=jnp.float32, param_dtype=cfg.param_dtype, rngs=rngs)
 
     def _resolve_cross_window(self, layer_idx: int, spec, cum_stride: int):
@@ -948,7 +1072,7 @@ class Decoder(nnx.Module):
             self._printed_cross_windows.add(layer_idx)
         return cum_stride
 
-    def __call__(self, x: jnp.ndarray, seq_pos: jnp.ndarray, encoder_outputs: list) -> jnp.ndarray:
+    def _forward_impl(self, x: jnp.ndarray, seq_pos: jnp.ndarray, encoder_outputs: list) -> jnp.ndarray:
         cfg = self.cfg
         hd = cfg.d_model // cfg.n_heads
         cos, sin = (rope_cos_sin_for_positions(seq_pos, hd, cfg.rope_base) if cfg.pos_method == "rope" else (None, None))
@@ -973,6 +1097,38 @@ class Decoder(nnx.Module):
                       cross_kv=code_h, cross_pos_abs=code_pos_abs, cross_stride=cum_stride,
                       cross_window=cross_window, cross_cos_k=cos_k, cross_sin_k=sin_k, seq_pos=seq_pos)
         return self.ln_f(x)
+
+    def __call__(self, x: jnp.ndarray, seq_pos: jnp.ndarray, encoder_outputs: list) -> jnp.ndarray:
+        """cfg.use_remat=True wraps the whole decoder forward (self-attn + cross-attn to every
+        encoder stage, cfg.n_layers deep) in jax.checkpoint -- recomputes activations in the
+        backward pass instead of storing them. Added 2026-09-01: cfg.use_remat was already
+        threaded into Decoder's own StackConfig by every caller (same convention as
+        BlockStack.use_remat) but had silently had ZERO effect here -- Decoder implements its own
+        forward loop directly rather than delegating to BlockStack (the only place that ever read
+        cfg.use_remat before this fix), so remat was never actually applied to the Decoder despite
+        being requested. Confirmed root cause of the sweep_seqlen_small_1 OOMs (227G/709G needed
+        at T=8192/16384 with use_remat=True already set in every config). Same split/merge'd
+        pure-function pattern as BlockStack.__call__ (jax.checkpoint over a pure function, not
+        nnx.remat on a bound method -- see that method's docstring for why)."""
+        if self.cfg.use_remat:
+            graphdef, state = nnx.split(self)
+            # encoder_outputs' third element (cum_stride) is a plain Python int consumed by
+            # Python-level arithmetic downstream (_resolve_cross_window, windowed_cross_attention's
+            # -(-window // stride)) -- jax.checkpoint traces ALL positional args as dynamic by
+            # default, which turns cum_stride into a traced scalar and breaks that arithmetic
+            # (TracerBoolConversionError, confirmed 2026-09-01). Split into a dynamic part (the
+            # arrays) and a static part (the strides, passed via static_argnums) instead of trying
+            # to mark the whole mixed-type encoder_outputs static.
+            dyn_outputs = [(h, pos) for (h, pos, _s) in encoder_outputs]
+            strides = tuple(s for (_h, _pos, s) in encoder_outputs)
+
+            def pure_forward(state, x, seq_pos, dyn_outputs, strides):
+                module = nnx.merge(graphdef, state)
+                rebuilt = [(h, pos, s) for (h, pos), s in zip(dyn_outputs, strides)]
+                return module._forward_impl(x, seq_pos, rebuilt)
+
+            return jax.checkpoint(pure_forward, static_argnums=(4,))(state, x, seq_pos, dyn_outputs, strides)
+        return self._forward_impl(x, seq_pos, encoder_outputs)
 
     def init_incremental_state(self, Bsz: int) -> list:
         return [None] * len(self.layers)  # per-layer self-attn cache; None = not yet primed

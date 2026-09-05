@@ -22,6 +22,8 @@ dependencies = [
     "torch>=2.13.0",
     "tqdm>=4.70.0",
     "tpu-info>=0.14.2",
+    "pillow>=12.3.0",
+    "equinox>=0.13.8",
 ]
 
 [tool.uv]

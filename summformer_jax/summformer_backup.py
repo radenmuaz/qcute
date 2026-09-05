@@ -110,15 +110,24 @@ def causal_mask(query_pos: jnp.ndarray, key_pos: jnp.ndarray, window) -> jnp.nda
 
 def chunked_windowed_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, window: int,
                                 use_sink: bool = True, use_flash: bool = False) -> jnp.ndarray:
-    """Real O(T*window) windowed self-attention -- ported from
-    qcute/qcute_lagcodec/qcute_lagcodec_common.py's chunked_windowed_attention (torch), JAX'd and
-    extended with the zero-KV sink. Reshapes into `window`-sized blocks; each block attends only
-    to itself + the immediately preceding block (2*window keys, not T keys) -- exactly matches
-    causal_mask(..., window)'s semantics (verified: for a query at local position li in its chunk,
-    a same-chunk key is always within window by construction; a previous-chunk key at local
-    position lj is within window iff li < lj, which is exactly what causal_mask's `i-j < window`
-    condition gives), not an approximation. Falls back to dense sdpa_with_sink when T<=window or
-    T%window!=0, same as the reference."""
+    """Windowed self-attention via jax.lax.scan over query chunks -- each chunk does one small,
+    SELF-CONTAINED sdpa_with_sink call over just its own window (current + previous block, 2*window
+    keys), no running/online-softmax needed (every query's whole window fits in one iteration, so
+    each chunk's softmax is exact and complete on its own, unlike real FlashAttention which streams
+    over more KV blocks than fit in memory and must incrementally combine partial results).
+
+    Replaces an earlier gather/batch-then-attend version (materialized ALL chunks' (2*window)-key
+    slices as one (B,H,n_chunks,2*window,hd) array via fancy-indexing before ever calling
+    attention) -- confirmed via jax.jit(...).compile().memory_analysis() (gpt2_windowed_jax's
+    identical function, same bug) that THAT materialization step, not the attention math itself,
+    was the real memory cost (grew linearly with window: 3.0G/3.5G/4.5G/6.5G at window=32/64/128/
+    256, T=8192, B=16,H=16,hd=64). This scan version keeps k/v at their natural (B,H,T,hd) shape
+    throughout (dynamic_slice per iteration, no upfront copy) and reuses one iteration's buffers
+    across the loop (same property this codebase's grad_accum_step scan already relies on) --
+    confirmed roughly FLAT memory across the same window sweep (1.76G/1.78G/1.81G/1.86G) on the
+    gpt2_windowed_jax twin, correctness verified bit-exact (float32 rounding only) against the old
+    implementation across 6 (T,window,B,H) shapes including the T<=window/T%window!=0 fallback
+    boundary. Falls back to dense sdpa_with_sink when T<=window or T%window!=0, unchanged."""
     B, H, T, hd = q.shape
     w = window
     if T <= w:
@@ -129,35 +138,26 @@ def chunked_windowed_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, w
         return sdpa_with_sink(q, k, v, mask, use_sink, use_flash)
 
     n_chunks = T // w
-    qb = q.reshape(B, H, n_chunks, w, hd)
-    kb = k.reshape(B, H, n_chunks, w, hd)
-    vb = v.reshape(B, H, n_chunks, w, hd)
-    pad_k = jnp.zeros((B, H, 1, w, hd), dtype=k.dtype)
-    pad_v = jnp.zeros((B, H, 1, w, hd), dtype=v.dtype)
-    k_ext = jnp.concatenate([pad_k, kb], axis=2)
-    v_ext = jnp.concatenate([pad_v, vb], axis=2)
+    k_pad = jnp.pad(k, ((0, 0), (0, 0), (w, 0), (0, 0)))
+    v_pad = jnp.pad(v, ((0, 0), (0, 0), (w, 0), (0, 0)))
+    q_chunks = q.reshape(B, H, n_chunks, w, hd)
+    pos_local = jnp.arange(w)
 
-    idx = jnp.arange(n_chunks).reshape(n_chunks, 1) + jnp.arange(2).reshape(1, 2)
-    k_win = k_ext[:, :, idx].reshape(B, H, n_chunks, 2 * w, hd)
-    v_win = v_ext[:, :, idx].reshape(B, H, n_chunks, 2 * w, hd)
+    def body(carry, i):
+        q_i = jax.lax.dynamic_index_in_dim(q_chunks, i, axis=2, keepdims=False)  # (B,H,w,hd)
+        k_i = jax.lax.dynamic_slice_in_dim(k_pad, i * w, 2 * w, axis=2)          # (B,H,2w,hd)
+        v_i = jax.lax.dynamic_slice_in_dim(v_pad, i * w, 2 * w, axis=2)
+        ti = i * w + pos_local
+        tj = (i - 1) * w + jnp.arange(2 * w)
+        # tj < 0 is PADDING (real zeros from jnp.pad), not a real key -- must be excluded
+        # explicitly since tj here is real (small-negative-capable) arithmetic, not a sentinel.
+        allow = (tj[None, :] >= 0) & (tj[None, :] <= ti[:, None]) & (ti[:, None] - tj[None, :] < w)
+        mask_i = allow.reshape(1, 1, w, 2 * w)
+        out_i = sdpa_with_sink(q_i, k_i, v_i, mask_i, use_sink, use_flash)  # (B,H,w,hd)
+        return carry, out_i
 
-    pos = jnp.arange(T)
-    pos_b = pos.reshape(n_chunks, w)
-    pad_pos = jnp.full((1, w), -10 ** 9, dtype=pos.dtype)
-    pos_ext = jnp.concatenate([pad_pos, pos_b], axis=0)
-    pos_win = pos_ext[idx].reshape(n_chunks, 2 * w)
-
-    ti = pos_b[:, :, None]
-    tj = pos_win[:, None, :]
-    allow = (tj <= ti) & (ti - tj < w)  # (n_chunks, w, 2*w)
-    mask_flat = jnp.broadcast_to(allow[None, :, None], (B, n_chunks, 1, w, 2 * w)).reshape(B * n_chunks, 1, w, 2 * w)
-
-    qb_flat = qb.transpose(0, 2, 1, 3, 4).reshape(B * n_chunks, H, w, hd)
-    k_win_flat = k_win.transpose(0, 2, 1, 3, 4).reshape(B * n_chunks, H, 2 * w, hd)
-    v_win_flat = v_win.transpose(0, 2, 1, 3, 4).reshape(B * n_chunks, H, 2 * w, hd)
-
-    y = sdpa_with_sink(qb_flat, k_win_flat, v_win_flat, mask_flat, use_sink, use_flash)
-    return y.reshape(B, n_chunks, H, w, hd).transpose(0, 2, 1, 3, 4).reshape(B, H, T, hd)
+    _, out_chunks = jax.lax.scan(body, None, jnp.arange(n_chunks))  # (n_chunks,B,H,w,hd)
+    return out_chunks.transpose(1, 2, 0, 3, 4).reshape(B, H, T, hd)
 
 
 def windowed_cross_attention(q, k, v, seq_pos, code_pos_abs, stride: int, window: int,

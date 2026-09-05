@@ -7,16 +7,16 @@ pos_method = "rope"
 dataset_dir = "data/fineweb-edu-10B"
 vocab_size = 50257  # GPT-2 BPE
 
-D_MODEL = 512
-N_HEADS = 8
-N_LAYERS = 8
-N_STAGES = 8
+D_MODEL = 768
+N_HEADS = 12
+N_LAYERS = 12
+N_STAGES = 12
 STRIDE = 2
 SEQUENCE_LENGTH = 8192
 WEIGHT_TIE = False
 sequence_length = SEQUENCE_LENGTH  # lowercase alias so train.py's config loader picks it up
 
-batch_size = 32
+batch_size = 8
 total_batch_size = 524288
 
 
