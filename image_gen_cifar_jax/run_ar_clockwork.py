@@ -10,6 +10,7 @@ reason to duplicate logic that doesn't touch params. Adds checkpoint save/resume
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from dataclasses import asdict
 from pathlib import Path
@@ -21,7 +22,7 @@ import numpy as np
 import optax
 from tqdm import tqdm
 
-from image_gen_cifar_jax.eqx_common import Attention, Block, RMSNorm, load_checkpoint, save_checkpoint
+from image_gen_cifar_jax.eqx_common import Attention, Block, RMSNorm, load_checkpoint, save_checkpoint, sinkgd
 from image_gen_cifar_jax.run_ar_clockwork_v1 import (
     BatchIterator, Config, Logger, MODULE_DIR, REPO_ROOT, collector_of, level_order,
     load_cifar10, load_config_module, reads_of, save_sample_grid, warmup_schedule,
@@ -154,6 +155,82 @@ class SequentialRGBHead(eqx.Module):
         return r_col, g_col, b_col, rng
 
 
+class DiffusionRGBHead(eqx.Module):
+    """Discrete-diffusion-style masked head: each of the 3 R/G/B tokens for a column is
+    independently replaced with a learned MASK embedding with probability mask_prob during
+    training (else it keeps its real byte value), and a single BIDIRECTIONAL (non-causal)
+    block attends over the 3 tokens (each already carrying the shared row/column context) to
+    predict the ORIGINAL value at every masked position -- loss/accuracy computed only there,
+    standard MLM convention (an unmasked position's "prediction" is trivial, it was just handed
+    the answer). At generation time all three start fully masked (no real byte info at all),
+    so the single-shot default pass reduces to independent-per-channel prediction from shared
+    context only -- same behavior as the parallel head. True iterative multi-step remasking/
+    refinement is NOT implemented here, only this single-shot default."""
+    in_proj: jnp.ndarray
+    col_embed: jnp.ndarray
+    byte_embed: jnp.ndarray
+    mask_embed: jnp.ndarray
+    channel_embed: jnp.ndarray
+    block: Block
+    ln_f: RMSNorm
+    img_size: int = eqx.field(static=True)
+    mtp_dim: int = eqx.field(static=True)
+    n_heads: int = eqx.field(static=True)
+    mask_prob: float = eqx.field(static=True)
+
+    def __init__(self, key, d_model: int, img_size: int, mtp_dim: int, mtp_n_heads: int,
+                 mtp_mlp_mult: int, rope_base: float, mask_prob: float):
+        k_in, k_col, k_byte, k_mask, k_chan, k_blk = jax.random.split(key, 6)
+        self.in_proj = jax.random.normal(k_in, (d_model, mtp_dim)) * 0.02
+        self.col_embed = jax.random.normal(k_col, (img_size, mtp_dim)) * 0.02
+        self.byte_embed = jax.random.normal(k_byte, (256, mtp_dim)) * 0.02
+        self.mask_embed = jax.random.normal(k_mask, (mtp_dim,)) * 0.02
+        self.channel_embed = jax.random.normal(k_chan, (3, mtp_dim)) * 0.02
+        self.block = Block(k_blk, mtp_dim, mtp_n_heads, mtp_n_heads, mtp_mlp_mult, rope_base)
+        self.ln_f = RMSNorm(mtp_dim)
+        self.img_size, self.mtp_dim, self.n_heads, self.mask_prob = img_size, mtp_dim, mtp_n_heads, mask_prob
+
+    def _run(self, seq: jnp.ndarray) -> jnp.ndarray:
+        return self.ln_f(self.block(seq, causal=False))
+
+    def forward(self, h_out: jnp.ndarray, r: jnp.ndarray, g: jnp.ndarray, b: jnp.ndarray, rng) -> tuple:
+        """Teacher-forced training pass, vectorized over B*img*img_size. Returns
+        (logits_r,g,b each (B,img,img_size,256), mask_r,g,b each (B,img,img_size) bool --
+        True where that channel's real byte was replaced by the MASK embedding)."""
+        B, img, _ = h_out.shape
+        ctx = (h_out @ self.in_proj)[:, :, None, :] + self.col_embed[None, None, :, :]
+        mask = jax.random.bernoulli(rng, self.mask_prob, (B, img, self.img_size, 3))
+        mask_r, mask_g, mask_b = mask[..., 0], mask[..., 1], mask[..., 2]
+
+        def tok(byte_val, is_masked, chan_idx):
+            real = self.byte_embed[byte_val]
+            return jnp.where(is_masked[..., None], self.mask_embed, real) + self.channel_embed[chan_idx]
+
+        seq_in = jnp.stack([ctx + tok(r, mask_r, 0), ctx + tok(g, mask_g, 1), ctx + tok(b, mask_b, 2)], axis=-2)
+        seq_in = seq_in.reshape(B * img * self.img_size, 3, self.mtp_dim)
+        out = self._run(seq_in)
+        logits = (out @ self.byte_embed.T).reshape(B, img, self.img_size, 3, 256)
+        return logits[..., 0, :], logits[..., 1, :], logits[..., 2, :], mask_r, mask_g, mask_b
+
+    def generate(self, h_out_row: jnp.ndarray, sample_fn, rng) -> tuple:
+        """Default single-shot inference: all three channels fully masked (no real byte info
+        at all) -- reduces to independent-per-channel prediction from shared context, same
+        behavior as the parallel head's forward_row."""
+        n = h_out_row.shape[0]
+        ctx = (h_out_row @ self.in_proj)[:, None, :] + self.col_embed[None, :, :]
+        seq_in = jnp.stack([ctx + self.mask_embed + self.channel_embed[0],
+                             ctx + self.mask_embed + self.channel_embed[1],
+                             ctx + self.mask_embed + self.channel_embed[2]], axis=-2)
+        seq_in = seq_in.reshape(n * self.img_size, 3, self.mtp_dim)
+        out = self._run(seq_in)
+        logits = (out @ self.byte_embed.T).reshape(n, self.img_size, 3, 256)
+        rng, kr, kg, kb = jax.random.split(rng, 4)
+        r_col = sample_fn(logits[:, :, 0, :], kr)
+        g_col = sample_fn(logits[:, :, 1, :], kg)
+        b_col = sample_fn(logits[:, :, 2, :], kb)
+        return r_col, g_col, b_col, rng
+
+
 # ---------------------------------------------------------------------------
 # Full model
 # ---------------------------------------------------------------------------
@@ -193,6 +270,10 @@ class ClockworkModel(eqx.Module):
         if cfg.head_type == "sequential":
             self.rgb_head = SequentialRGBHead(keys[4 + 2 * n], cfg.d_model[-1], cfg.img_size,
                                                cfg.mtp_dim, cfg.mtp_n_heads, cfg.mtp_mlp_mult, cfg.rope_base)
+        elif cfg.head_type == "diffusion":
+            self.rgb_head = DiffusionRGBHead(keys[4 + 2 * n], cfg.d_model[-1], cfg.img_size,
+                                              cfg.mtp_dim, cfg.mtp_n_heads, cfg.mtp_mlp_mult, cfg.rope_base,
+                                              cfg.mask_prob)
         else:
             self.rgb_head = ParallelRGBHead(keys[4 + 2 * n], cfg.d_model[-1], cfg.img_size)
         cond_key = keys[5 + 2 * n]
@@ -211,7 +292,7 @@ class ClockworkModel(eqx.Module):
         self.class_embed = (jax.random.normal(keys[6 + 2 * n], (cfg.n_classes, cfg.embed_dim)) * 0.02
                              if cfg.class_conditional else None)
 
-    def __call__(self, r: jnp.ndarray, g: jnp.ndarray, b: jnp.ndarray, y: jnp.ndarray) -> tuple:
+    def __call__(self, r: jnp.ndarray, g: jnp.ndarray, b: jnp.ndarray, y: jnp.ndarray, rng=None) -> tuple:
         cfg = self.cfg
         B, img, _ = r.shape
         row_e = pool_row(r, g, b, self.r_embed, self.g_embed, self.b_embed)
@@ -234,18 +315,35 @@ class ClockworkModel(eqx.Module):
             held[i] = jnp.repeat(hi, stride_i, axis=1)[:, :img]
 
         h_out = held[collector_of(cfg)]
-        if cfg.head_type == "sequential":
-            logits_r, logits_g, logits_b = self.rgb_head.forward(h_out, r, g)
-        else:
-            logits_r, logits_g, logits_b = self.rgb_head.forward(h_out)
 
         def ce(logits, target):
             logp = jax.nn.log_softmax(logits, axis=-1)
             return -jnp.mean(jnp.take_along_axis(logp, target[..., None], axis=-1))
 
-        loss_r, loss_g, loss_b = ce(logits_r, r), ce(logits_g, g), ce(logits_b, b)
-        acc_main = (jnp.mean(jnp.argmax(logits_r, -1) == r) + jnp.mean(jnp.argmax(logits_g, -1) == g)
-                    + jnp.mean(jnp.argmax(logits_b, -1) == b)) / 3
+        def masked_ce_acc(logits, target, mask):
+            logp = jax.nn.log_softmax(logits, axis=-1)
+            nll = -jnp.take_along_axis(logp, target[..., None], axis=-1)[..., 0]
+            correct = (jnp.argmax(logits, -1) == target).astype(jnp.float32)
+            denom = jnp.maximum(jnp.sum(mask), 1.0)
+            return jnp.sum(nll * mask) / denom, jnp.sum(correct * mask) / denom
+
+        if cfg.head_type == "sequential":
+            logits_r, logits_g, logits_b = self.rgb_head.forward(h_out, r, g)
+            loss_r, loss_g, loss_b = ce(logits_r, r), ce(logits_g, g), ce(logits_b, b)
+            acc_main = (jnp.mean(jnp.argmax(logits_r, -1) == r) + jnp.mean(jnp.argmax(logits_g, -1) == g)
+                        + jnp.mean(jnp.argmax(logits_b, -1) == b)) / 3
+        elif cfg.head_type == "diffusion":
+            logits_r, logits_g, logits_b, mask_r, mask_g, mask_b = self.rgb_head.forward(h_out, r, g, b, rng)
+            mr, mg, mb = mask_r.astype(jnp.float32), mask_g.astype(jnp.float32), mask_b.astype(jnp.float32)
+            loss_r, acc_r = masked_ce_acc(logits_r, r, mr)
+            loss_g, acc_g = masked_ce_acc(logits_g, g, mg)
+            loss_b, acc_b = masked_ce_acc(logits_b, b, mb)
+            acc_main = (acc_r + acc_g + acc_b) / 3
+        else:
+            logits_r, logits_g, logits_b = self.rgb_head.forward(h_out)
+            loss_r, loss_g, loss_b = ce(logits_r, r), ce(logits_g, g), ce(logits_b, b)
+            acc_main = (jnp.mean(jnp.argmax(logits_r, -1) == r) + jnp.mean(jnp.argmax(logits_g, -1) == g)
+                        + jnp.mean(jnp.argmax(logits_b, -1) == b)) / 3
         loss_main = (loss_r + loss_g + loss_b) / 3
 
         ntp_logits_r = h_out @ self.ntp_head_r
@@ -317,7 +415,7 @@ class ClockworkModel(eqx.Module):
                 row_r, row_g, row_b = prompt_r[:, t, :], prompt_g[:, t, :], prompt_b[:, t, :]
             else:
                 h_out = held[collector]
-                if cfg.head_type == "sequential":
+                if cfg.head_type in ("sequential", "diffusion"):
                     row_r, row_g, row_b, rng = self.rgb_head.generate(h_out, sample, rng)
                 else:
                     logits_r, logits_g, logits_b = self.rgb_head.forward_row(h_out)
@@ -358,11 +456,11 @@ def count_params(model: ClockworkModel) -> int:
 # ---------------------------------------------------------------------------
 
 def make_train_step(optimizer):
-    def loss_fn(model, r, g, b, y):
-        return model(r, g, b, y)
+    def loss_fn(model, r, g, b, y, rng):
+        return model(r, g, b, y, rng)
 
-    def train_step(model, opt_state, r, g, b, y):
-        (loss, aux), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(model, r, g, b, y)
+    def train_step(model, opt_state, r, g, b, y, rng):
+        (loss, aux), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(model, r, g, b, y, rng)
         grads = jax.lax.pmean(grads, axis_name="d")
         aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
         updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
@@ -373,8 +471,8 @@ def make_train_step(optimizer):
 
 
 def make_eval_step():
-    def eval_step(model, r, g, b, y):
-        _, aux = model(r, g, b, y)
+    def eval_step(model, r, g, b, y, rng):
+        _, aux = model(r, g, b, y, rng)
         return jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
 
     return jax.pmap(eval_step, axis_name="d")
@@ -382,7 +480,27 @@ def make_eval_step():
 
 CONFIG_FIELDS = ("embed_dim", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
                   "mlp_mult", "rope_base", "class_conditional", "n_classes", "row_weight", "ntp_weight",
-                  "head_type", "mtp_dim", "mtp_n_heads", "mtp_mlp_mult")
+                  "head_type", "mtp_dim", "mtp_n_heads", "mtp_mlp_mult", "mask_prob")
+
+
+def warmup_const_decay_schedule(peak_lr: float, warmup_steps: int, constant_steps: int, total_steps: int,
+                                 min_lr_ratio: float = 0.01):
+    """Linear warmup -> flat at peak_lr for constant_steps -> cosine decay down to
+    peak_lr*min_lr_ratio over the remaining steps. For long "overfit as hard as possible"
+    runs: flat-forever LR (the old warmup_schedule) oscillates once near a sharp minimum
+    instead of settling into it -- decaying late in training takes smaller, more precise
+    steps toward the memorized optimum."""
+    decay_start = warmup_steps + constant_steps
+
+    def schedule(step):
+        warmup_lr = jnp.minimum(1.0, (step + 1) / max(warmup_steps, 1)) * peak_lr
+        decay_total = max(total_steps - decay_start, 1)
+        decay_frac = jnp.clip((step - decay_start) / decay_total, 0.0, 1.0)
+        cosine = 0.5 * (1 + jnp.cos(jnp.pi * decay_frac))
+        decayed_lr = (min_lr_ratio + (1 - min_lr_ratio) * cosine) * peak_lr
+        return jnp.where(step < warmup_steps, warmup_lr, jnp.where(step < decay_start, peak_lr, decayed_lr))
+
+    return schedule
 
 
 def main():
@@ -397,6 +515,19 @@ def main():
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--warmup_steps", type=int, default=1000)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sinkgd"])
+    p.add_argument("--optimizer_kwargs", type=json.loads, default={},
+                    help="extra kwargs forwarded to the optimizer constructor (optax.adamw or "
+                         "eqx_common.sinkgd) -- set as a plain dict literal in the config file, "
+                         "or a JSON string on the CLI, e.g. sinkgd's linear_lr_scale/sinkhorn_iters")
+    p.add_argument("--lr_decay", type=lambda x: x.lower() != "false", default=False,
+                    help="if true, use warmup + constant + cosine-decay (warmup_epochs/constant_epochs/"
+                         "epochs, computed in steps from the actual per-epoch step count) instead of "
+                         "the plain flat-after-warmup schedule")
+    p.add_argument("--warmup_epochs", type=float, default=1.0)
+    p.add_argument("--constant_epochs", type=float, default=10.0)
+    p.add_argument("--min_lr_ratio", type=float, default=0.01)
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--eval_every_epochs", type=int, default=1)
     p.add_argument("--checkpoint_every_epochs", type=int, default=10)
@@ -419,7 +550,9 @@ def main():
     p.add_argument("--n_classes", type=int, default=Config.n_classes)
     p.add_argument("--row_weight", type=float, default=Config.row_weight)
     p.add_argument("--ntp_weight", type=float, default=Config.ntp_weight)
-    p.add_argument("--head_type", type=str, default=Config.head_type, choices=["parallel", "sequential"])
+    p.add_argument("--head_type", type=str, default=Config.head_type,
+                    choices=["parallel", "sequential", "diffusion"])
+    p.add_argument("--mask_prob", type=float, default=Config.mask_prob)
     p.add_argument("--mtp_dim", type=int, default=Config.mtp_dim)
     p.add_argument("--mtp_n_heads", type=int, default=Config.mtp_n_heads)
     p.add_argument("--mtp_mlp_mult", type=int, default=Config.mtp_mlp_mult)
@@ -447,9 +580,25 @@ def main():
     rng = jax.random.PRNGKey(args.seed)
     model = ClockworkModel(rng, cfg)
     n_params = count_params(model)
+    data_rng = jax.random.PRNGKey(args.seed + 1000)  # drives diffusion-head masking only
 
-    lr_schedule = warmup_schedule(args.lr, args.warmup_steps)
-    optimizer = optax.adamw(lr_schedule)
+    if args.lr_decay:
+        steps_per_epoch = len(train_np) // (args.batch_size * n_devices)
+        total_steps = args.epochs * steps_per_epoch
+        warmup_steps = round(args.warmup_epochs * steps_per_epoch)
+        constant_steps = round(args.constant_epochs * steps_per_epoch)
+        lr_schedule = warmup_const_decay_schedule(args.lr, warmup_steps, constant_steps, total_steps,
+                                                   args.min_lr_ratio)
+        print(f"lr schedule: warmup {warmup_steps} steps, constant {constant_steps} steps, "
+              f"cosine decay to {args.lr * args.min_lr_ratio:.2e} over remaining "
+              f"{total_steps - warmup_steps - constant_steps} steps (total {total_steps})")
+    else:
+        lr_schedule = warmup_schedule(args.lr, args.warmup_steps)
+    if args.optimizer == "sinkgd":
+        optimizer = sinkgd(lr_schedule, **args.optimizer_kwargs)
+    else:
+        optimizer = optax.adamw(lr_schedule, weight_decay=args.weight_decay, **args.optimizer_kwargs)
+    print(f"optimizer: {args.optimizer} kwargs={args.optimizer_kwargs}")
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
     start_epoch = 1
@@ -478,9 +627,12 @@ def main():
     logger(f"params: {n_params / 1e6:.2f}M, devices={jax.devices()}")
 
     def run_eval() -> float:
+        nonlocal data_rng
         bpbs, accs, ntp_bpbs, ntp_accs = [], [], [], []
         for i, (r, g, b, y) in enumerate(val_iter):
-            bpb, acc, ntp_bpb, ntp_acc = eval_step(p_model, r, g, b, y)
+            data_rng, step_rng = jax.random.split(data_rng)
+            step_rngs = jax.random.split(step_rng, n_devices)
+            bpb, acc, ntp_bpb, ntp_acc = eval_step(p_model, r, g, b, y, step_rngs)
             bpbs.append(float(bpb[0]))
             accs.append(float(acc[0]))
             ntp_bpbs.append(float(ntp_bpb[0]))
@@ -527,7 +679,9 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         pbar = tqdm(train_iter, desc=f"epoch {epoch}/{args.epochs}")
         for r, g, b, y in pbar:
-            p_model, p_opt_state, (bpb, acc, ntp_bpb, ntp_acc) = train_step(p_model, p_opt_state, r, g, b, y)
+            data_rng, step_rng = jax.random.split(data_rng)
+            step_rngs = jax.random.split(step_rng, n_devices)
+            p_model, p_opt_state, (bpb, acc, ntp_bpb, ntp_acc) = train_step(p_model, p_opt_state, r, g, b, y, step_rngs)
             step += 1
             if step % args.log_every == 0:
                 logger(f"epoch={epoch} step={step} bpb_main(32ahead)={float(bpb[0]):.4f} acc_main={float(acc[0]):.4f} "

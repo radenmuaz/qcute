@@ -69,11 +69,15 @@ class Config:
     ntp_weight: float = 1.0    # weight on the auxiliary NTP (next single pixel) head's loss --
     # anchor task only, never used at generation time, dropped for sampling
     head_type: str = "parallel"  # "parallel" (independent R/G/B linear heads, columns+channels
-    # all-at-once) or "sequential" (DeepSeek-MTP-style: tiny causal decoder chains R->G->B per
-    # column via real byte embeddings; columns stay independent/parallel, only channels chain)
-    mtp_dim: int = 64          # sequential head's internal width (unused if head_type=parallel)
+    # all-at-once), "sequential" (DeepSeek-MTP-style: tiny causal decoder chains R->G->B per
+    # column via real byte embeddings; columns stay independent/parallel, only channels chain),
+    # or "diffusion" (discrete-diffusion-style: bidirectional block predicts each R/G/B channel
+    # from a MASK-token-corrupted version of the other two, masked independently at mask_prob;
+    # default single-shot generation starts fully masked, reducing to parallel-style behavior)
+    mtp_dim: int = 64          # sequential/diffusion head's internal width (unused if parallel)
     mtp_n_heads: int = 2       # plain MHA (no GQA -- already tiny, no KV cache used anyway)
     mtp_mlp_mult: int = 4
+    mask_prob: float = 0.8     # diffusion head only: per-channel probability of masking
 
     def __post_init__(self):
         n = len(self.strides)
@@ -82,7 +86,9 @@ class Config:
             and len(self.n_kv_heads) == n
         assert self.strides[0] == 1
         assert self.strides[-1] == 1
-        assert all(self.strides[i] <= self.strides[i + 1] for i in range(n - 2))
+        # No monotonicity constraint on the middle strides: level_order()/reads_of() sort and
+        # filter by stride VALUE, not array position, so an arbitrary shape (including a true
+        # rise-then-fall sandwich like (1,2,4,4,2,1)) is already handled correctly.
         resolved_kv = []
         for i in range(n):
             kv = self.n_kv_heads[i] if self.n_kv_heads[i] is not None else max(1, self.n_heads[i] // 4)
@@ -90,7 +96,7 @@ class Config:
             assert self.d_model[i] % self.n_heads[i] == 0
             resolved_kv.append(kv)
         self.n_kv_heads = tuple(resolved_kv)
-        assert self.head_type in ("parallel", "sequential")
+        assert self.head_type in ("parallel", "sequential", "diffusion")
         assert self.mtp_dim % self.mtp_n_heads == 0
 
 

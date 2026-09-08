@@ -24,8 +24,8 @@ import numpy as np
 import optax
 from tqdm import tqdm
 
-from image_gen_cifar_jax.eqx_common import Attention, Block, RMSNorm, load_checkpoint, save_checkpoint, sinkgd
-from image_gen_cifar_jax.run_causalattn_v1 import (
+from image_lagcodec.eqx_common import Attention, Block, RMSNorm, load_checkpoint, save_checkpoint, sinkgd
+from image_lagcodec.run_causalattn_v1 import (
     SLOT_B, SLOT_G, SLOT_L0, SLOT_L0_MTP, SLOT_L1, SLOT_L2, SLOT_R, SLOT_RGB_MTP,
     BatchIterator, Config, Logger, MODULE_DIR, REPO_ROOT, code_embed, codebook_utilization,
     load_cifar10, load_config_module, quantize_hard, save_sample_grid, warmup_schedule,

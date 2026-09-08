@@ -8,6 +8,7 @@ checkpoint save/resume (v1 had none).
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import asdict
 from pathlib import Path
 
@@ -18,7 +19,7 @@ import numpy as np
 import optax
 from tqdm import tqdm
 
-from image_gen_cifar_jax.eqx_common import Attention, Block, RMSNorm, load_checkpoint, save_checkpoint
+from image_gen_cifar_jax.eqx_common import Attention, Block, RMSNorm, load_checkpoint, save_checkpoint, sinkgd
 from image_gen_cifar_jax.run_fullattn_noquant_v1 import (
     BatchIterator, Config, Logger, MODULE_DIR, REPO_ROOT, SLOT_B, SLOT_G, SLOT_L0, SLOT_L0_MTP,
     SLOT_L1, SLOT_L2, SLOT_R, SLOT_RGB_MTP, load_cifar10, load_config_module, save_sample_grid,
@@ -449,6 +450,12 @@ def main():
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--warmup_steps", type=int, default=1000)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sinkgd"])
+    p.add_argument("--optimizer_kwargs", type=json.loads, default={},
+                    help="extra kwargs forwarded to the optimizer constructor (optax.adamw or "
+                         "eqx_common.sinkgd) -- set as a plain dict literal in the config file, "
+                         "or a JSON string on the CLI, e.g. sinkgd's linear_lr_scale/sinkhorn_iters")
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--eval_every_epochs", type=int, default=1)
     p.add_argument("--checkpoint_every_epochs", type=int, default=10)
@@ -492,7 +499,11 @@ def main():
     n_params = count_params(model)
 
     lr_schedule = warmup_schedule(args.lr, args.warmup_steps)
-    optimizer = optax.adamw(lr_schedule)
+    if args.optimizer == "sinkgd":
+        optimizer = sinkgd(lr_schedule, **args.optimizer_kwargs)
+    else:
+        optimizer = optax.adamw(lr_schedule, weight_decay=args.weight_decay, **args.optimizer_kwargs)
+    print(f"optimizer: {args.optimizer} kwargs={args.optimizer_kwargs}")
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
     start_epoch = 1

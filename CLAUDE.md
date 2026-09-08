@@ -42,4 +42,5 @@ Guidance to Claude Code for this repository.
 
 - Prefix every reply with the current timestamp (run `date` — never guess it).
 - Keep chat replies terse: results and next steps directly, no restated context, no padding, no multi-paragraph recaps. Detail goes in `docs/status.md`, not chat.
+- **Bullet points, not prose.** User doesn't read everything — brief, concise bullets over paragraphs. Applies to chat replies AND docs (README/status files) — keep doc bullets short (1-2 lines), not long explanatory paragraphs.
 - When comparing two runs/configs that differ in more than one variable, flag causal claims as "suspect"/"maybe" — an unconfounded isolation (one variable changed at a time) is required before stating cause as fact.
