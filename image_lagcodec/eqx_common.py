@@ -7,6 +7,7 @@ copying v1's array weights in and checking exact output match.
 """
 from __future__ import annotations
 
+import math
 import pickle
 from pathlib import Path
 
@@ -14,6 +15,49 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel as splash_kernel_lib
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash_mask_lib
+
+_SPLASH_BLOCK = 128  # Pallas TPU lane width -- block_kv_compute must be a multiple of this.
+
+
+def _splash_pad(x: jnp.ndarray, block: int) -> jnp.ndarray:
+    """Pads x's seq axis (-2) to a multiple of block; causal-safe (padded kv sits past any real
+    query, padded query rows get sliced off by the caller) -- needed for T<128 or non-128-multiple
+    T (e.g. incremental-decode diagnostics), which splash_attention's lane-width constraint rejects."""
+    T = x.shape[-2]
+    pad = (-T) % block
+    if pad:
+        x = jnp.pad(x, [(0, 0)] * (x.ndim - 2) + [(0, pad), (0, 0)])
+    return x
+
+
+def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool):
+    """Not cached: caching a SplashAttentionKernel (holds jnp.array-converted MaskInfo, created
+    during whichever trace first calls this) across separate jax traces (train vs eval, or a
+    retrace) leaks a tracer from the first, now-closed trace -- confirmed 2026-09-08, all 4 TPU
+    nodes crashed with UnexpectedTracerError from an lru_cache'd version of this function."""
+    mask_cls = splash_mask_lib.CausalMask if causal else splash_mask_lib.FullMask
+    mask = splash_mask_lib.MultiHeadMask(
+        [mask_cls((padded_T, padded_T)) for _ in range(n_heads)]
+    )
+    block = min(_SPLASH_BLOCK, padded_T)
+    block_sizes = splash_kernel_lib.BlockSizes(
+        block_q=block, block_kv=block, block_kv_compute=block,
+        block_q_dkv=block, block_kv_dkv=block, block_kv_dkv_compute=block,
+        block_q_dq=block, block_kv_dq=block,
+    )  # backward blocks are required too -- training runs grad, not just forward.
+    return splash_kernel_lib.make_splash_mha_single_device(mask=mask, block_sizes=block_sizes)
+
+
+def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: bool, sm_scale: float) -> jnp.ndarray:
+    """q:(B,Hq,T,hd), k/v:(B,Hkv,T,hd), Hq%Hkv==0 (native GQA -- splash groups kv heads internally,
+    no repeat_kv needed unlike Pallas flash_attention). Returns (B,Hq,T,hd)."""
+    B, Hq, T, hd = q.shape
+    q_p, k_p, v_p = _splash_pad(q, _SPLASH_BLOCK), _splash_pad(k, _SPLASH_BLOCK), _splash_pad(v, _SPLASH_BLOCK)
+    kernel = _splash_attn_kernel(Hq, q_p.shape[-2], causal)
+    y = jax.vmap(kernel)(q_p * sm_scale, k_p, v_p)
+    return y[:, :, :T, :]
 
 
 def rmsnorm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
@@ -95,9 +139,9 @@ class Attention(eqx.Module):
         self.n_heads, self.n_kv_heads, self.rope_base = n_heads, n_kv_heads, rope_base
 
     def __call__(self, x: jnp.ndarray, causal: bool = True) -> jnp.ndarray:
-        """Batched training-time forward: x is (B,T,D). causal=True (default, matches every
-        existing call site) applies the usual lower-triangular mask; causal=False is full
-        bidirectional attention (used by the discrete-diffusion-style masked head)."""
+        """Batched training-time forward: x is (B,T,D). causal=False is full bidirectional
+        attention (discrete-diffusion-style masked head). Uses the Pallas TPU splash_attention
+        kernel (block-sparse, genuine O(T) memory, native GQA -- see splash_attention() above)."""
         B, T, D = x.shape
         hd = D // self.n_heads
         qkv = x @ self.qkv
@@ -108,16 +152,8 @@ class Attention(eqx.Module):
         q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
         cos, sin = rope_cos_sin(T, hd, self.rope_base)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        n_rep = self.n_heads // self.n_kv_heads
-        if n_rep > 1:
-            k, v = jnp.repeat(k, n_rep, axis=1), jnp.repeat(v, n_rep, axis=1)
-        scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
-        logits = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
-        if causal:
-            mask = jnp.tril(jnp.ones((T, T), dtype=bool))
-            logits = jnp.where(mask[None, None], logits, -1e9)
-        attn = jax.nn.softmax(logits, axis=-1)
-        y = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+        scale = 1.0 / math.sqrt(hd)
+        y = splash_attention(q, k, v, causal=causal, sm_scale=scale)  # (B,H,T,hd)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
         return y @ self.out
 

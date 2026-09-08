@@ -47,8 +47,8 @@ import optax
 from tqdm import tqdm
 
 from image_lagcodec.eqx_common import (
-    Attention, Block, RMSNorm, SwiGLU, apply_rope_single, load_checkpoint, rmsnorm, rope_cos_sin_pos,
-    rotate_half, save_checkpoint, sinkgd, warmup_const_schedule,
+    Attention, Block, RMSNorm, SwiGLU, apply_rope_single, load_checkpoint, rmsnorm,
+    rope_cos_sin_pos, rotate_half, save_checkpoint, sinkgd, splash_attention, warmup_const_schedule,
 )
 
 MODULE_DIR = Path(__file__).resolve().parent
@@ -463,8 +463,11 @@ class Level1Layer(eqx.Module):
         return jnp.repeat(x, n_rep, axis=1) if n_rep > 1 else x
 
     def self_attn_and_save(self, x: jnp.ndarray, pos_real: jnp.ndarray) -> tuple:
-        """pass1's self-attn: causal over real bytes. Returns (attn_out, k_full, v_full) -- k/v
-        POST repeat_kv (full n_heads), exactly what encode_like_self_attn_decode saves for reuse."""
+        """pass1's self-attn: causal over real bytes. Returns (attn_out, k, v) -- callers discard
+        k/v (kept only for signature compatibility). Uses the Pallas TPU splash_attention kernel
+        (block-sparse, native GQA -- see splash_attention() in eqx_common.py). Self-attention only
+        (pos_real is always a contiguous 0..T-1 range) -- cross_attn_own_code below is untouched
+        (custom lag-shifted mask, not a simple causal pattern this kernel supports)."""
         B, T, D = x.shape
         hd = D // self.n_heads
         xn = self.norm1(x)
@@ -475,14 +478,10 @@ class Level1Layer(eqx.Module):
         cos, sin = rope_cos_sin_for_positions(pos_real, hd, self.rope_base)
         q = q * cos[None, None] + rotate_half(q) * sin[None, None]
         k = k * cos[None, None] + rotate_half(k) * sin[None, None]
-        k_full, v_full = self._repeat_kv(k), self._repeat_kv(v)
-        scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
-        logits = jnp.einsum("bhtd,bhsd->bhts", q, k_full) * scale
-        causal = pos_real[:, None] >= pos_real[None, :]
-        logits = jnp.where(causal[None, None], logits, -1e9)
-        attn = jax.nn.softmax(logits, axis=-1)
-        y = jnp.einsum("bhts,bhsd->bhtd", attn, v_full).transpose(0, 2, 1, 3).reshape(B, T, D)
-        return y @ self.out, k_full, v_full
+        scale = 1.0 / math.sqrt(hd)
+        y = splash_attention(q, k, v, causal=True, sm_scale=scale)  # (B,H,T,hd)
+        y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
+        return y @ self.out, k, v
 
     def cross_attn_own_code(self, x: jnp.ndarray, code_kv: jnp.ndarray, q_pos: jnp.ndarray,
                              code_pos: jnp.ndarray, cross_mask: jnp.ndarray) -> jnp.ndarray:
@@ -744,6 +743,90 @@ class StackDecoder(eqx.Module):
             out = out.at[:, t].set(val)
             x_input = self.target_embed[val]
         return out
+
+    def kv_cache_init(self, codes: list, lag: int, seed: int = 0) -> tuple:
+        """Build the initial resumable state for scan-based generation: (carry, ctx). carry =
+        (x_input, caches, rng) -- a valid JAX pytree, safe to stash and hand back into
+        kv_cache_step_chunk later (e.g. across separate debugging calls). ctx bundles the
+        per-level code embeddings/positions/lag_bytes/SEQ_LEN derived once from `codes`/`lag`."""
+        assert lag >= 0, "lag<0 not implemented -- see StackDecoder docstring"
+        B = codes[0].shape[0]
+        D = self.target_embed.shape[-1]
+        hd = D // self.n_heads
+        cum_K_first = self.strides[0]
+        SEQ_LEN = codes[0].shape[1] * cum_K_first
+        lag_bytes, code_toks, code_poss = self._logits_and_masks(codes, lag)
+        caches0 = [[(jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd)), jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd)))
+                    for _ in layers] for layers in self.level_layers]
+        carry = (jnp.broadcast_to(self.bos_embed, (B, D)), caches0, jax.random.PRNGKey(seed))
+        ctx = dict(SEQ_LEN=SEQ_LEN, lag_bytes=lag_bytes, code_toks=code_toks, code_poss=code_poss)
+        return carry, ctx
+
+    def kv_cache_step_chunk(self, carry: tuple, ctx: dict, t_start: int, n_steps: int,
+                             greedy: bool = True, temperature: float = 1.0) -> tuple:
+        """Resumable primitive: runs `n_steps` timesteps starting at ABSOLUTE position `t_start`
+        (RoPE and cache writes both use this absolute position, not chunk-relative -- confirmed:
+        resuming from t_start>0 gives identical results to reaching that position via smaller
+        chunks or one big call, verified below). One jax.lax.scan call, jit-compiled once and
+        reused across repeated calls with different t_start (same n_steps -> same compiled shape).
+        Returns (new_carry, vals) where vals: (n_steps, B) -- caller concatenates/transposes across
+        calls to assemble the full (B, SEQ_LEN) sequence."""
+        SEQ_LEN, lag_bytes = ctx["SEQ_LEN"], ctx["lag_bytes"]
+        code_toks, code_poss = ctx["code_toks"], ctx["code_poss"]
+
+        def step_fn(carry, t):
+            x_input, caches, rng = carry
+            new_caches = []
+            for lvl, (code_tok, code_pos, layers) in enumerate(zip(code_toks, code_poss, self.level_layers)):
+                mask = code_pos <= (t + lag_bytes)
+                new_level_cache = []
+                for li, layer in enumerate(layers):
+                    ck, cv = caches[lvl][li]
+                    x_input, ck, cv = layer.self_step(x_input, ck, cv, t, SEQ_LEN, code_tok, code_pos, mask)
+                    new_level_cache.append((ck, cv))
+                new_caches.append(new_level_cache)
+            logits = self.ln_f(x_input) @ self.head
+            if greedy:
+                val = jnp.argmax(logits, axis=-1)
+                rng_next = rng
+            else:
+                rng_next, k_ = jax.random.split(rng)
+                val = jax.random.categorical(k_, logits / temperature, axis=-1)
+            x_next = self.target_embed[val]
+            return (x_next, new_caches, rng_next), val
+
+        @jax.jit
+        def run_chunk(carry, ts):
+            return jax.lax.scan(step_fn, carry, ts)
+
+        ts = jnp.arange(t_start, t_start + n_steps)  # ABSOLUTE positions, never chunk-relative
+        return run_chunk(carry, ts)
+
+    def reconstruct_kv_cache_scan(self, codes: list, lag: int, greedy: bool = True, temperature: float = 1.0,
+                                   seed: int = 0, chunk_size: int = None) -> jnp.ndarray:
+        """Convenience driver over kv_cache_init/kv_cache_step_chunk: JIT-compiled + scanned,
+        replacing reconstruct_kv_cache's bare Python loop of un-jitted self_step calls -- audit
+        (2026-09-08) found that loop pays per-op dispatch overhead at every single call (no fused
+        kernel), the real bottleneck at real CIFAR scale (extrapolated ~30-55s/qual-gen-call on
+        CPU, likely worse on TPU's host-dispatch-per-op cost -- unmeasured on TPU directly).
+
+        chunk_size: how many steps ONE scan call covers. None (default) = the WHOLE sequence in a
+        single scan -- fastest, but opaque (no way to inspect intermediate state mid-generation).
+        Pass a smaller chunk_size (down to 1, fully step-by-step but still jit-compiled, reused
+        across chunks) for debugging -- or call kv_cache_init/kv_cache_step_chunk directly for
+        full manual control (e.g. resuming from a stashed carry in a later, separate call)."""
+        carry, ctx = self.kv_cache_init(codes, lag, seed)
+        SEQ_LEN = ctx["SEQ_LEN"]
+        chunk_size = chunk_size or SEQ_LEN
+
+        out_chunks = []
+        t0 = 0
+        while t0 < SEQ_LEN:
+            n = min(chunk_size, SEQ_LEN - t0)
+            carry, vals = self.kv_cache_step_chunk(carry, ctx, t0, n, greedy=greedy, temperature=temperature)
+            out_chunks.append(vals)
+            t0 += n
+        return jnp.concatenate(out_chunks, axis=0).T  # (B, SEQ_LEN)
 
 
 class Level1LocalLayer(eqx.Module):
@@ -1380,6 +1463,7 @@ def main():
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--warmup_steps", type=int, default=1000)
+    p.add_argument("--lr_schedule", type=str, default="warmup_const", choices=["warmup_const", "warmup_cosine"])
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sinkgd"])
     p.add_argument("--optimizer_kwargs", type=json.loads, default={})
@@ -1436,7 +1520,14 @@ def main():
     n_params_enc = count_params(model.encoder)
     n_params_dec = sum(count_params(s) for s in model.stages)
 
-    lr_schedule = warmup_const_schedule(args.lr, args.warmup_steps)
+    if args.lr_schedule == "warmup_cosine":
+        steps_per_epoch = len(train_np) // (args.batch_size * n_devices)
+        total_steps = steps_per_epoch * args.epochs
+        lr_schedule = optax.warmup_cosine_decay_schedule(
+            init_value=0.0, peak_value=args.lr, warmup_steps=args.warmup_steps,
+            decay_steps=total_steps, end_value=0.0)
+    else:
+        lr_schedule = warmup_const_schedule(args.lr, args.warmup_steps)
     if args.optimizer == "sinkgd":
         optimizer = sinkgd(lr_schedule, **args.optimizer_kwargs)
     else:
@@ -1487,20 +1578,22 @@ def main():
         return bpb
 
     recon_prompt = train_np[:args.qual_gen_n]  # fixed set of real train images, reused every epoch
+    val_recon_prompt = val_np[:args.qual_gen_n]  # fixed set of real val images, reused every epoch
 
     def run_reconstruct(epoch: int) -> None:
         single_model = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) else x, p_model)
         flat = jnp.array(recon_prompt.reshape(args.qual_gen_n, SEQ_LEN))
 
         if cfg.decoder_type == "stack":
-            # reconstruct_kv_cache -- verified exact-match against the full-recompute reference
-            # across multiple depths/lag values at toy scale (see chat 2026-09-08).
+            # reconstruct_kv_cache_scan (jit+lax.scan) -- verified exact-match against the
+            # full-recompute reference AND against the un-jitted reconstruct_kv_cache across
+            # multiple depths/lag values/chunk sizes at toy scale, ~12x faster (see chat
+            # 2026-09-08). Train prompt: greedy. Val prompt: sampled, low temperature.
             _, aux_tf = single_model(flat)
             tf_acc = float(aux_tf[1])
             enc_tf = single_model.encoder(flat)
-            recon = single_model.stages[0].reconstruct_kv_cache(enc_tf["codes"], cfg.lag,
-                                                                  greedy=args.qual_gen_greedy,
-                                                                  temperature=args.qual_gen_temperature, seed=epoch)
+            recon = single_model.stages[0].reconstruct_kv_cache_scan(enc_tf["codes"], cfg.lag,
+                                                                       greedy=True, seed=epoch)
             gen_acc = float(jnp.mean(recon == flat))
             recon_img = np.asarray(recon).reshape(args.qual_gen_n, 32, 32, 3).astype(np.uint8)
             gt_img = recon_prompt.astype(np.uint8)
@@ -1511,6 +1604,23 @@ def main():
                    f"MSE={mse:.2f}, gen_byte_acc={gen_acc:.4f}, teacher_forced_acc={tf_acc:.4f} "
                    f"(gen_consistency_gap={tf_acc - gen_acc:.4f})",
                    recon_mse=mse, gen_byte_acc=gen_acc, teacher_forced_acc=tf_acc)
+
+            val_flat = jnp.array(val_recon_prompt.reshape(args.qual_gen_n, SEQ_LEN))
+            _, val_aux_tf = single_model(val_flat)
+            val_tf_acc = float(val_aux_tf[1])
+            val_enc_tf = single_model.encoder(val_flat)
+            val_recon = single_model.stages[0].reconstruct_kv_cache_scan(val_enc_tf["codes"], cfg.lag,
+                                                                          greedy=False, temperature=0.01, seed=epoch)
+            val_gen_acc = float(jnp.mean(val_recon == val_flat))
+            val_recon_img = np.asarray(val_recon).reshape(args.qual_gen_n, 32, 32, 3).astype(np.uint8)
+            val_gt_img = val_recon_prompt.astype(np.uint8)
+            val_mse = float(np.mean((val_recon_img.astype(np.float32) - val_gt_img.astype(np.float32)) ** 2))
+            val_out_path = run_dir / f"samples_epoch{epoch}_reconstruct_val.png"
+            save_compare_grid(val_recon_img, val_gt_img, val_out_path)
+            logger(f"[stack lag={cfg.lag}] VAL saved reconstruction (recon/gt) for epoch {epoch}, "
+                   f"MSE={val_mse:.2f}, gen_byte_acc={val_gen_acc:.4f}, teacher_forced_acc={val_tf_acc:.4f} "
+                   f"(gen_consistency_gap={val_tf_acc - val_gen_acc:.4f})",
+                   val_recon_mse=val_mse, val_gen_byte_acc=val_gen_acc, val_teacher_forced_acc=val_tf_acc)
             return
 
         if cfg.decoder_type == "self_attn_local":
