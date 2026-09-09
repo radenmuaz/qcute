@@ -95,7 +95,7 @@ class Config:
     dec_n_layers: tuple = None
     dec_n_heads: tuple = None
     dec_n_kv_heads: tuple = None
-    precision: str = "bf16"   # "bf16" (default, forward/backward matmuls in bfloat16, fp32 master
+    precision: str = "fp32"   # "bf16" (default, forward/backward matmuls in bfloat16, fp32 master
     # weights/optimizer state -- standard mixed precision) | "fp32" (diagnostic correctness mode,
     # e.g. for exact-match checks like reconstruct_full_recompute vs reconstruct_kv_cache_scan).
 
