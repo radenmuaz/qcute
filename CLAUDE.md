@@ -7,6 +7,7 @@ Guidance to Claude Code for this repository.
 - `qcute_lagcodec` = ACTIVE latent-AR / parallel-block-local-decode lineage. Design doc: [docs/qcute_lagcodec_plan.md](docs/qcute_lagcodec_plan.md).
 - `summformer` = ACTIVE summary-token fusion transformer lineage. See Architecture below.
 - `image_gen_cifar` = ACTIVE CIFAR-10 hierarchical latent-AR image generator, single-file hard-fork of the `qcute_lagcodec` idea (`image_gen_cifar/run_causalattn.py`, no imports from `qcute_lagcodec`). Status/design: [docs/status_image_gen_cifar.md](docs/status_image_gen_cifar.md). `uv run python3 -m image_gen_cifar.run_causalattn --config image_gen_cifar/configs/base.py`; runs/checkpoints/configs land in `image_gen_cifar/logs/<run_name>/`, not the repo-root `logs/`.
+- `image_lagcodec` = ACTIVE JAX/Equinox hierarchical VQ-VAE CIFAR-10 codec, faithful generalized port of `qcute_lagcodec`'s `StackDecoder` (`image_lagcodec/run_lagcodec.py` + `image_lagcodec/eqx_common.py`). Status/design: [docs/status_image_lagcodec.md](docs/status_image_lagcodec.md). `uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/<name>.py`; runs/checkpoints/configs land in `image_lagcodec/logs/<run_name>/`.
 - All modules read `--help` for full flags; support `--config path.py` (see `configs/` — each config's own docstring has its exact `uv run` invocation), `--run_name` (else derived from config/preset; logs/checkpoints key off it), `--eval_only --checkpoint_path ...`. `qcute.bytelm` also has `--qual_gen_bytes`.
 - No test suite, linter, or CI yet.
 

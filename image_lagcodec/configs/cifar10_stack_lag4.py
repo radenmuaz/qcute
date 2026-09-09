@@ -23,8 +23,8 @@ lag = 4
 # --- training ---
 batch_size = 64
 n_devices = None
-epochs = 100
-lr = 1e-3
+epochs = 200
+lr = 0.01
 lr_schedule = "warmup_cosine"
 warmup_steps = 1000
 weight_decay = 0

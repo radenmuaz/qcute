@@ -48,7 +48,8 @@ from tqdm import tqdm
 
 from image_lagcodec.eqx_common import (
     Attention, Block, RMSNorm, SwiGLU, apply_rope_single, load_checkpoint, rmsnorm,
-    rope_cos_sin_pos, rotate_half, save_checkpoint, sinkgd, splash_attention, warmup_const_schedule,
+    rope_cos_sin_pos, rotate_half, save_checkpoint, sinkgd, splash_attention, splash_cross_attention,
+    warmup_const_schedule,
 )
 
 MODULE_DIR = Path(__file__).resolve().parent
@@ -94,6 +95,9 @@ class Config:
     dec_n_layers: tuple = None
     dec_n_heads: tuple = None
     dec_n_kv_heads: tuple = None
+    precision: str = "bf16"   # "bf16" (default, forward/backward matmuls in bfloat16, fp32 master
+    # weights/optimizer state -- standard mixed precision) | "fp32" (diagnostic correctness mode,
+    # e.g. for exact-match checks like reconstruct_full_recompute vs reconstruct_kv_cache_scan).
 
     def __post_init__(self):
         n = len(self.strides)
@@ -103,6 +107,7 @@ class Config:
             f"strides must evenly divide {SEQ_LEN} (need not multiply exactly to it)"
         assert self.decoder_type in ("stack", "self_attn_local", "self_attn_lag")
         assert self.kv_lm_mode in ("identity", "shared", "copy")
+        assert self.precision in ("bf16", "fp32")
         if self.dec_d_model is None:
             self.dec_d_model = self.d_model
         if self.dec_n_layers is None:
@@ -173,6 +178,9 @@ class BatchIterator:
         self.shuffle = shuffle
         self.rng = np.random.default_rng(seed)
         self.total = batch_size * n_devices
+
+    def __len__(self):
+        return len(self.images) // self.total
 
     def __iter__(self):
         n = len(self.images)
@@ -484,9 +492,12 @@ class Level1Layer(eqx.Module):
         return y @ self.out, k, v
 
     def cross_attn_own_code(self, x: jnp.ndarray, code_kv: jnp.ndarray, q_pos: jnp.ndarray,
-                             code_pos: jnp.ndarray, cross_mask: jnp.ndarray) -> jnp.ndarray:
+                             code_pos: jnp.ndarray, cum_K: int, lag_bytes: int) -> jnp.ndarray:
         """forward_cross: SHARED wq/wk/wv/out, applied to x_q=norm1(x) (x already updated by the
-        self-attn residual) and x_kv=norm1(code_kv)."""
+        self-attn residual) and x_kv=norm1(code_kv). Uses the Pallas TPU splash_attention kernel
+        (rectangular q x kv, LagCrossMask -- see eqx_common.py) instead of a materialized
+        (B,H,T,Tc) einsum+where+softmax -- cum_K/lag_bytes (Python ints, static per call) rebuild
+        the mask arithmetic that used to be precomputed into a boolean cross_mask tensor."""
         B, T, D = x.shape
         Tc = code_kv.shape[1]
         hd = D // self.n_heads
@@ -499,19 +510,16 @@ class Level1Layer(eqx.Module):
         cos_k, sin_k = rope_cos_sin_for_positions(code_pos, hd, self.rope_base)
         q = q * cos_q[None, None] + rotate_half(q) * sin_q[None, None]
         k = k * cos_k[None, None] + rotate_half(k) * sin_k[None, None]
-        k, v = self._repeat_kv(k), self._repeat_kv(v)
-        scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
-        logits = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale
-        logits = jnp.where(cross_mask[None, None], logits, -1e9)
-        attn = jax.nn.softmax(logits, axis=-1)
-        y = jnp.einsum("bhts,bhsd->bhtd", attn, v).transpose(0, 2, 1, 3).reshape(B, T, D)
+        scale = 1.0 / math.sqrt(hd)
+        y = splash_cross_attention(q, k, v, cum_K, lag_bytes, scale)  # (B,H,T,hd)
+        y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
         return y @ self.out
 
     def forward_pass1(self, x: jnp.ndarray, code_kv: jnp.ndarray, pos_real: jnp.ndarray,
-                       code_pos: jnp.ndarray, cross_mask: jnp.ndarray) -> tuple:
+                       code_pos: jnp.ndarray, cum_K: int, lag_bytes: int) -> tuple:
         a, k_saved, v_saved = self.self_attn_and_save(x, pos_real)
         x = x + a
-        x = x + self.cross_attn_own_code(x, code_kv, pos_real, code_pos, cross_mask)
+        x = x + self.cross_attn_own_code(x, code_kv, pos_real, code_pos, cum_K, lag_bytes)
         x = x + self.mlp(self.norm2(x))
         return x, k_saved, v_saved
 
@@ -645,9 +653,8 @@ class StackDecoder(eqx.Module):
             n_blocks_t = code.shape[1]
             code_tok = code_embed(code, ctx_embed)
             code_pos = (jnp.arange(n_blocks_t) + 1) * cum_K - 1
-            mask = code_pos[None, :] <= (pos_real[:, None] + lag_bytes)
             for layer in layers:
-                x, _, _ = layer.forward_pass1(x, code_tok, pos_real, code_pos, mask)
+                x, _, _ = layer.forward_pass1(x, code_tok, pos_real, code_pos, cum_K, lag_bytes)
 
         h = self.ln_f(x)
         logits = h @ self.head
@@ -659,9 +666,11 @@ class StackDecoder(eqx.Module):
     def _logits_and_masks(self, codes: list, lag: int):
         """Shared setup for both generation paths: per-level code embeddings, code positions, and
         the lag-shifted cross-attn mask builder (mask depends on query position, computed lazily
-        per-call since full-recompute uses a growing pos_real array while KV-cache uses a scalar)."""
+        per-call since full-recompute uses a growing pos_real array while KV-cache uses a scalar).
+        cum_Ks (Python ints, one per level) feed splash_cross_attention's LagCrossMask in
+        reconstruct_full_recompute; the self_step-based generation paths ignore it."""
         lag_bytes = (lag + 1) * math.prod(self.strides[:-1])
-        code_toks, code_poss = [], []
+        code_toks, code_poss, cum_Ks = [], [], []
         cum_K = 1
         for t, ctx_embed in enumerate(self.ctx_embeds):
             cum_K *= self.strides[t]
@@ -669,7 +678,8 @@ class StackDecoder(eqx.Module):
             n_blocks_t = code.shape[1]
             code_toks.append(code_embed(code, ctx_embed))
             code_poss.append((jnp.arange(n_blocks_t) + 1) * cum_K - 1)
-        return lag_bytes, code_toks, code_poss
+            cum_Ks.append(cum_K)
+        return lag_bytes, code_toks, code_poss, cum_Ks
 
     def reconstruct_full_recompute(self, codes: list, lag: int, greedy: bool = True,
                                     temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
@@ -684,17 +694,16 @@ class StackDecoder(eqx.Module):
         cum_K_first = self.strides[0]
         SEQ_LEN = codes[0].shape[1] * cum_K_first
         rng = jax.random.PRNGKey(seed)
-        lag_bytes, code_toks, code_poss = self._logits_and_masks(codes, lag)
+        lag_bytes, code_toks, code_poss, cum_Ks = self._logits_and_masks(codes, lag)
 
         decided = [jnp.broadcast_to(self.bos_embed, (B, D))]
         out = jnp.zeros((B, SEQ_LEN), dtype=jnp.int32)
         for t in tqdm(range(SEQ_LEN), desc=f"decode_full_recompute(stack,lag={lag},L={SEQ_LEN})", leave=False):
             x = jnp.stack(decided, axis=1)  # (B, t+1, D)
             pos_real = jnp.arange(t + 1)
-            for code_tok, code_pos, layers in zip(code_toks, code_poss, self.level_layers):
-                mask = code_pos[None, :] <= (pos_real[:, None] + lag_bytes)
+            for code_tok, code_pos, cum_K, layers in zip(code_toks, code_poss, cum_Ks, self.level_layers):
                 for layer in layers:
-                    x, _, _ = layer.forward_pass1(x, code_tok, pos_real, code_pos, mask)
+                    x, _, _ = layer.forward_pass1(x, code_tok, pos_real, code_pos, cum_K, lag_bytes)
             h_last = self.ln_f(x)[:, -1, :]
             logits = h_last @ self.head
             if greedy:
@@ -720,7 +729,7 @@ class StackDecoder(eqx.Module):
         cum_K_first = self.strides[0]
         SEQ_LEN = codes[0].shape[1] * cum_K_first
         rng = jax.random.PRNGKey(seed)
-        lag_bytes, code_toks, code_poss = self._logits_and_masks(codes, lag)
+        lag_bytes, code_toks, code_poss, _cum_Ks = self._logits_and_masks(codes, lag)
 
         caches = [[(jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd)), jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd)))
                    for _ in layers] for layers in self.level_layers]
@@ -755,7 +764,7 @@ class StackDecoder(eqx.Module):
         hd = D // self.n_heads
         cum_K_first = self.strides[0]
         SEQ_LEN = codes[0].shape[1] * cum_K_first
-        lag_bytes, code_toks, code_poss = self._logits_and_masks(codes, lag)
+        lag_bytes, code_toks, code_poss, _cum_Ks = self._logits_and_masks(codes, lag)
         caches0 = [[(jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd)), jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd)))
                     for _ in layers] for layers in self.level_layers]
         carry = (jnp.broadcast_to(self.bos_embed, (B, D)), caches0, jax.random.PRNGKey(seed))
@@ -1388,24 +1397,46 @@ def save_compare_grid(gen: np.ndarray, gt: np.ndarray, path: Path, pad: int = 2)
 # Training
 # ---------------------------------------------------------------------------
 
-def make_train_step(optimizer):
+def cast_pytree(tree, dtype):
+    """Casts inexact (float) leaves to dtype; ints/bools/statics pass through untouched."""
+    return jax.tree_util.tree_map(lambda x: x.astype(dtype) if eqx.is_inexact_array(x) else x, tree)
+
+
+def to_single_device(tree, device=None):
+    """Forces every array leaf onto one concrete device. Needed before calling any Pallas/Mosaic
+    kernel (splash_attention) on a pytree pulled out of pmap's output via x[0] -- indexing a
+    PmapSharding-backed array that way doesn't fully strip its multi-device sharding metadata,
+    and Mosaic can't auto-partition -- confirmed 2026-09-09: all 4 TPU nodes crashed identically
+    at the first post-pmap forward call (run_reconstruct's single_model(flat)) with
+    "NotImplementedError: Mosaic kernels cannot be automatically partitioned."."""
+    device = device or jax.local_devices()[0]
+    return jax.tree_util.tree_map(lambda x: jax.device_put(x, device) if eqx.is_array(x) else x, tree)
+
+
+def make_train_step(optimizer, compute_dtype=jnp.bfloat16):
+    """compute_dtype casts the model to bf16 (default) transiently inside the loss, forward AND
+    backward matmuls run in bf16 -- master weights/grads/optimizer state stay fp32 (JAX's astype
+    VJP upcasts the cotangent back automatically, so grads come out fp32 with no extra code).
+    Pass compute_dtype=jnp.float32 (Config.precision="fp32") to disable -- diagnostic correctness
+    mode, e.g. exact-match checks against reconstruct_full_recompute."""
     def loss_fn(model, flat_bytes):
-        return model(flat_bytes)
+        return cast_pytree(model, compute_dtype)(flat_bytes)
 
     def train_step(model, opt_state, flat_bytes):
         (loss, aux), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(model, flat_bytes)
         grads = jax.lax.pmean(grads, axis_name="d")
+        loss = jax.lax.pmean(loss, axis_name="d")
         aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
         updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
         model = eqx.apply_updates(model, updates)
-        return model, opt_state, aux
+        return model, opt_state, loss, aux
 
     return jax.pmap(train_step, axis_name="d")
 
 
-def make_eval_step():
+def make_eval_step(compute_dtype=jnp.bfloat16):
     def eval_step(model, flat_bytes):
-        _, aux = model(flat_bytes)
+        _, aux = cast_pytree(model, compute_dtype)(flat_bytes)
         return jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
 
     return jax.pmap(eval_step, axis_name="d")
@@ -1450,7 +1481,8 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
 
 CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight",
-                  "decoder_type", "lag", "kv_lm_mode", "dec_d_model", "dec_n_layers", "dec_n_heads", "dec_n_kv_heads")
+                  "decoder_type", "lag", "kv_lm_mode", "dec_d_model", "dec_n_layers", "dec_n_heads",
+                  "dec_n_kv_heads", "precision")
 
 
 def main():
@@ -1490,6 +1522,7 @@ def main():
                     choices=["stack", "self_attn_local", "self_attn_lag"])
     p.add_argument("--lag", type=int, default=Config.lag)
     p.add_argument("--kv_lm_mode", type=str, default=Config.kv_lm_mode, choices=["identity", "shared", "copy"])
+    p.add_argument("--precision", type=str, default=Config.precision, choices=["bf16", "fp32"])
     p.add_argument("--dec_d_model", type=_tuple_arg, default=Config.dec_d_model)
     p.add_argument("--dec_n_layers", type=_tuple_arg, default=Config.dec_n_layers)
     p.add_argument("--dec_n_heads", type=_tuple_arg, default=Config.dec_n_heads)
@@ -1547,8 +1580,9 @@ def main():
     p_model = replicate(model)
     p_opt_state = replicate(opt_state)
 
-    train_step = make_train_step(optimizer)
-    eval_step = make_eval_step()
+    compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
+    train_step = make_train_step(optimizer, compute_dtype)
+    eval_step = make_eval_step(compute_dtype)
 
     run_dir = MODULE_DIR / "logs" / args.run_name
     logger = Logger(run_dir)
@@ -1564,7 +1598,7 @@ def main():
 
     def run_eval() -> float:
         bpbs, accs, ntp_bpbs, ntp_accs, utils = [], [], [], [], []
-        for i, (flat, y) in enumerate(val_iter):
+        for i, (flat, y) in enumerate(tqdm(val_iter, desc="val", leave=False)):
             bpb, acc, ntp_bpb, ntp_acc, util = eval_step(p_model, flat)
             bpbs.append(float(bpb[0])); accs.append(float(acc[0]))
             ntp_bpbs.append(float(ntp_bpb[0])); ntp_accs.append(float(ntp_acc[0])); utils.append(float(util[0]))
@@ -1581,7 +1615,8 @@ def main():
     val_recon_prompt = val_np[:args.qual_gen_n]  # fixed set of real val images, reused every epoch
 
     def run_reconstruct(epoch: int) -> None:
-        single_model = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) else x, p_model)
+        single_model = cast_pytree(to_single_device(
+            jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) else x, p_model)), compute_dtype)
         flat = jnp.array(recon_prompt.reshape(args.qual_gen_n, SEQ_LEN))
 
         if cfg.decoder_type == "stack":
@@ -1664,15 +1699,27 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
         pbar = tqdm(train_iter, desc=f"epoch {epoch}/{args.epochs}")
+        epoch_losses = []
         for flat, y in pbar:
-            p_model, p_opt_state, (bpb, acc, ntp_bpb, ntp_acc, util) = train_step(p_model, p_opt_state, flat)
+            p_model, p_opt_state, loss, (bpb, acc, ntp_bpb, ntp_acc, util) = train_step(p_model, p_opt_state, flat)
             step += 1
+            loss_v = float(loss[0])
+            lr_v = float(lr_schedule(step))
+            epoch_losses.append(loss_v)
+            pbar.set_postfix(step=step, lr=f"{lr_v:.2e}", loss=f"{loss_v:.3f}", bpb=f"{float(bpb[0]):.3f}",
+                              acc=f"{float(acc[0]):.3f}", ntp_bpb=f"{float(ntp_bpb[0]):.3f}",
+                              ntp_acc=f"{float(ntp_acc[0]):.3f}")
             if step % args.log_every == 0:
-                logger(f"epoch={epoch} step={step} byte_bpb={float(bpb[0]):.4f} byte_acc={float(acc[0]):.4f} "
-                       f"ntp_bpb={float(ntp_bpb[0]):.4f} ntp_acc={float(ntp_acc[0]):.4f} util={float(util[0]):.3f}",
-                       epoch=epoch, step=step, train_bpb=float(bpb[0]), train_acc=float(acc[0]),
-                       train_ntp_bpb=float(ntp_bpb[0]), train_ntp_acc=float(ntp_acc[0]), train_util=float(util[0]))
+                logger(f"epoch={epoch} step={step} lr={lr_v:.6f} loss={loss_v:.4f} byte_bpb={float(bpb[0]):.4f} "
+                       f"byte_acc={float(acc[0]):.4f} ntp_bpb={float(ntp_bpb[0]):.4f} "
+                       f"ntp_acc={float(ntp_acc[0]):.4f} util={float(util[0]):.3f}",
+                       epoch=epoch, step=step, lr=lr_v, train_loss=loss_v, train_bpb=float(bpb[0]),
+                       train_acc=float(acc[0]), train_ntp_bpb=float(ntp_bpb[0]), train_ntp_acc=float(ntp_acc[0]),
+                       train_util=float(util[0]))
         pbar.close()
+        epoch_loss = sum(epoch_losses) / len(epoch_losses)
+        logger(f"epoch={epoch} train_loss_epoch_avg={epoch_loss:.4f}",
+               epoch=epoch, train_loss_epoch_avg=epoch_loss)
 
         if epoch % args.eval_every_epochs == 0 or epoch == args.epochs:
             run_eval()

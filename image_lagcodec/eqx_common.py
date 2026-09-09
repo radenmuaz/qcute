@@ -60,6 +60,63 @@ def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: boo
     return y[:, :, :T, :]
 
 
+class LagCrossMask(splash_mask_lib._ComputableMask):
+    """code_pos=(kv_idx+1)*cum_K-1 <= query_pos=q_idx+lag_bytes -- both are affine in their raw
+    array index in image_lagcodec.run_lagcodec's StackDecoder (pos_real=arange, code_pos=affine
+    map of arange), so the mask needs no closure over real position arrays. real_kv_len bounds out
+    padded kv rows -- unlike causal self-attn, this mask can't rely on padding being automatically
+    excluded (it's not "future", just arithmetically out of range)."""
+
+    cum_K: int
+    lag_bytes: int
+    real_kv_len: int
+
+    def __init__(self, shape, cum_K: int, lag_bytes: int, real_kv_len: int, shard_count: int = 1):
+        self.cum_K, self.lag_bytes, self.real_kv_len = cum_K, lag_bytes, real_kv_len
+
+        def fn(q_ids, kv_ids):
+            lag_ok = ((kv_ids + 1) * cum_K - 1) <= (q_ids + lag_bytes)
+            return lag_ok & (kv_ids < real_kv_len)
+
+        super().__init__(shape=shape, mask_function=fn, shard_count=shard_count)
+
+    def __eq__(self, other):
+        if not isinstance(other, type(self)):
+            return NotImplemented
+        return (self.shape == other.shape and self.cum_K == other.cum_K
+                and self.lag_bytes == other.lag_bytes and self.real_kv_len == other.real_kv_len)
+
+    def __hash__(self):
+        return hash((type(self), self.shape, self.cum_K, self.lag_bytes, self.real_kv_len))
+
+
+def _splash_cross_kernel(n_heads: int, padded_T: int, padded_Tc: int, cum_K: int, lag_bytes: int, real_Tc: int):
+    """Not cached -- see _splash_attn_kernel's docstring (same leaked-tracer hazard)."""
+    mask = splash_mask_lib.MultiHeadMask(
+        [LagCrossMask((padded_T, padded_Tc), cum_K, lag_bytes, real_Tc) for _ in range(n_heads)]
+    )
+    bq, bkv = min(_SPLASH_BLOCK, padded_T), min(_SPLASH_BLOCK, padded_Tc)
+    block_sizes = splash_kernel_lib.BlockSizes(
+        block_q=bq, block_kv=bkv, block_kv_compute=bkv,
+        block_q_dkv=bq, block_kv_dkv=bkv, block_kv_dkv_compute=bkv,
+        block_q_dq=bq, block_kv_dq=bkv,
+    )
+    return splash_kernel_lib.make_splash_mha_single_device(mask=mask, block_sizes=block_sizes)
+
+
+def splash_cross_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray,
+                            cum_K: int, lag_bytes: int, sm_scale: float) -> jnp.ndarray:
+    """q:(B,Hq,T,hd), k/v:(B,Hkv,Tc,hd) -- rectangular splash attention with the lag-shifted cross
+    mask (see LagCrossMask) instead of a materialized (B,H,T,Tc) einsum+where+softmax. Returns
+    (B,Hq,T,hd)."""
+    B, Hq, T, hd = q.shape
+    Tc = k.shape[-2]
+    q_p, k_p, v_p = _splash_pad(q, _SPLASH_BLOCK), _splash_pad(k, _SPLASH_BLOCK), _splash_pad(v, _SPLASH_BLOCK)
+    kernel = _splash_cross_kernel(Hq, q_p.shape[-2], k_p.shape[-2], cum_K, lag_bytes, Tc)
+    y = jax.vmap(kernel)(q_p * sm_scale, k_p, v_p)
+    return y[:, :, :T, :]
+
+
 def rmsnorm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     x = x * jax.lax.rsqrt(jnp.mean(x ** 2, axis=-1, keepdims=True) + eps)
     return x * weight
