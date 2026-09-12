@@ -14,7 +14,7 @@ d_model = (256, 256, 256, 256, 256)
 n_layers = (2, 2, 2, 2, 2)
 n_heads = (4, 4, 4, 4, 4)
 n_kv_heads = (None, None, None, None, None)
-strides = (4, 4, 4, 4, -1)
+strides = (2, 2, 2, 2, -1)   # changed 4->2 (chat 2026-09-12)
 code_vocab = (8, 8, 8, 8, 8)
 pq_chunks = (8, 8, 8, 8, 8)   # eff_vocab: 16777216 per level (8 chunks of vocab=8)
 mlp_mult = 4
