@@ -74,12 +74,20 @@ class Config:
     # collapse to a single code -- qcute_lagcodec's own levels never do either -- so strides
     # only need to evenly DIVIDE SEQ_LEN, not multiply exactly to it: (3,4,4) leaves the top
     # level with SEQ_LEN/(3*4*4)=64 codes, each covering a 4x4-pixel block.
-    code_vocab: int = 8
-    pq_chunks: int = 4
+    code_vocab: tuple = (8, 8, 8)    # per level, level0..levelN-1 -- effective per-level vocab is
+    pq_chunks: tuple = (4, 4, 4)     # code_vocab[i]**pq_chunks[i] (product-quantization within a
+    # level, chat 2026-09-10/11). Tune per level so the CUMULATIVE product across used levels
+    # (prod of code_vocab[i]**pq_chunks[i] for i in 0..i_max, i_max=hier_stage top -- see
+    # train_last_encoder) lands near a target total (e.g. ~1024, matching a single VQ/FSQ code's
+    # budget for the same patch) -- levels[-1] is don't-care when train_last_encoder=False.
     mlp_mult: int = 4
     rope_base: float = 10000.0
     ntp_weight: float = 1.0   # weight on the sum of all levels' auxiliary encoder NTP losses
-    decoder_type: str = "stack"   # "stack" | "self_attn_local" | "self_attn_lag"
+    decoder_type: str = "stack"   # "stack" is the only maintained/updated decoder -- the others
+    # ("self_attn_local", "self_attn_lag", "self_attn_lag_hier") are DISCONTINUED (chat
+    # 2026-09-11): left in the file for reference/history only, not kept in sync with newer
+    # features (e.g. per-level code_vocab/pq_chunks, train_last_encoder) -- do not edit them,
+    # do not use them for new runs.
     lag: int = 0   # decoder_type="self_attn_lag" only -- -1: pure causal byte NTP; 0: own-code
     # only (self_attn_local's block-diagonal design); k>=1: (k+1) codes prepended per group,
     # block-diagonal across groups -- see StageLagDecoder's docstring.
@@ -95,19 +103,29 @@ class Config:
     dec_n_layers: tuple = None
     dec_n_heads: tuple = None
     dec_n_kv_heads: tuple = None
-    precision: str = "fp32"   # "bf16" (default, forward/backward matmuls in bfloat16, fp32 master
+    precision: str = "bf16"   # "bf16" (default, forward/backward matmuls in bfloat16, fp32 master
     # weights/optimizer state -- standard mixed precision) | "fp32" (diagnostic correctness mode,
     # e.g. for exact-match checks like reconstruct_full_recompute vs reconstruct_kv_cache_scan).
+    train_last_encoder: bool = False   # the topmost level's own code is never consumed by any
+    # decoder (see HierEncoder docstring) -- its forward pass exists only to feed an auxiliary,
+    # unconsulted NTP loss term. Default False: HierEncoder skips building/running it entirely,
+    # saving compute. d_model[-1]/n_layers[-1]/n_heads[-1]/n_kv_heads[-1] are then don't-care.
 
     def __post_init__(self):
         n = len(self.strides)
         assert len(self.d_model) == n and len(self.n_layers) == n and len(self.n_heads) == n \
-            and len(self.n_kv_heads) == n
-        assert SEQ_LEN % math.prod(self.strides) == 0, \
-            f"strides must evenly divide {SEQ_LEN} (need not multiply exactly to it)"
-        assert self.decoder_type in ("stack", "self_attn_local", "self_attn_lag")
+            and len(self.n_kv_heads) == n and len(self.code_vocab) == n and len(self.pq_chunks) == n
+        assert self.strides[-1] == -1 or self.strides[-1] >= 1, "top level's stride is unused " \
+            "(its own code output is never consumed) -- use -1 as the don't-care convention"
+        assert all(s >= 1 for s in self.strides[:-1])
+        assert SEQ_LEN % math.prod(self.strides[:-1]) == 0, \
+            f"strides[:-1] must evenly divide {SEQ_LEN} (need not multiply exactly to it)"
+        assert self.decoder_type in ("stack", "self_attn_local", "self_attn_lag", "self_attn_lag_hier")
         assert self.kv_lm_mode in ("identity", "shared", "copy")
         assert self.precision in ("bf16", "fp32")
+        assert self.train_last_encoder or self.kv_lm_mode != "shared", \
+            "kv_lm_mode='shared' reuses the topmost encoder level's live transformer blocks as " \
+            "the decoder's code LM (StackDecoder._code_tok) -- needs train_last_encoder=True"
         if self.dec_d_model is None:
             self.dec_d_model = self.d_model
         if self.dec_n_layers is None:
@@ -189,6 +207,9 @@ class BatchIterator:
             sel = idx[start:start + self.total]
             img = self.images[sel].astype(np.int32)  # (total,32,32,3)
             flat = img.reshape(self.total, SEQ_LEN)   # interleaved R,G,B per pixel, raster order
+            # TODO: raster order can't express a real square patch (e.g. 16x16) as a contiguous
+            # stride run -- needs z-order/Hilbert-curve flattening for that; strides configs
+            # currently approximate "one code per N bytes" as a same-byte-count horizontal strip.
             y = self.labels[sel].astype(np.int32)
 
             def shard(x):
@@ -240,26 +261,33 @@ class EncoderLevel(eqx.Module):
     ln_f: RMSNorm
     code_head: jnp.ndarray
     ntp_head: jnp.ndarray
-    pq_chunks: int = eqx.field(static=True)
+    pq_chunks: int = eqx.field(static=True)          # THIS level's own output code (code_head)
     code_vocab: int = eqx.field(static=True)
+    ntp_pq_chunks: int = eqx.field(static=True)       # NTP predicts this level's OWN INPUT stream
+    ntp_code_vocab: int = eqx.field(static=True)      # -- level(i-1)'s code alphabet (or bytes for
+    # level0) -- DISTINCT from pq_chunks/code_vocab above once per-level values diverge (chat
+    # 2026-09-11: coincidentally identical when code_vocab/pq_chunks were uniform scalars, a real
+    # shape mismatch once they aren't -- input alphabet != this level's own output alphabet).
     stride: int = eqx.field(static=True)
     is_byte_level: bool = eqx.field(static=True)
 
     def __init__(self, key, d_model: int, n_layers: int, n_heads: int, n_kv_heads: int,
                  mlp_mult: int, rope_base: float, pq_chunks: int, code_vocab: int, stride: int,
-                 is_byte_level: bool = False):
+                 is_byte_level: bool = False, ntp_pq_chunks: int = None, ntp_code_vocab: int = None):
         k_blocks, k_head, k_ntp = jax.random.split(key, 3)
         block_keys = jax.random.split(k_blocks, n_layers)
         self.blocks = [Block(k, d_model, n_heads, n_kv_heads, mlp_mult, rope_base) for k in block_keys]
         self.ln_f = RMSNorm(d_model)
         self.code_head = jax.random.normal(k_head, (d_model, pq_chunks * code_vocab)) * 0.02
-        # level0's NTP target alphabet is raw BYTES (256-way), every other level's is this
-        # level's own PQ-chunked code alphabet (pq_chunks*code_vocab-way) -- different sizes,
-        # must not share a head shape (mixing them up silently produces NaN via out-of-range
-        # target indices into a too-small softmax, caught and fixed during initial smoke test).
-        ntp_out = 256 if is_byte_level else pq_chunks * code_vocab
+        # level0's NTP target alphabet is raw BYTES (256-way); every other level's NTP predicts
+        # its own INPUT stream, i.e. level(i-1)'s code alphabet (ntp_pq_chunks*ntp_code_vocab-way)
+        # -- must not conflate with this level's own output alphabet (mixing them up silently
+        # produces NaN via out-of-range target indices into a too-small softmax).
+        ntp_out = 256 if is_byte_level else ntp_pq_chunks * ntp_code_vocab
         self.ntp_head = jax.random.normal(k_ntp, (d_model, ntp_out)) * 0.02
         self.pq_chunks, self.code_vocab, self.stride, self.is_byte_level = pq_chunks, code_vocab, stride, is_byte_level
+        self.ntp_pq_chunks = ntp_pq_chunks
+        self.ntp_code_vocab = ntp_code_vocab
 
     def run(self, x: jnp.ndarray) -> jnp.ndarray:
         for blk in self.blocks:
@@ -267,22 +295,18 @@ class EncoderLevel(eqx.Module):
         return self.ln_f(x)
 
     def forward(self, x: jnp.ndarray, target_idx: jnp.ndarray) -> dict:
-        """x: (B,L,D) this level's own INPUT sequence (level0's real bytes, or level i's own
-        input = level (i-1)'s realized code stream). target_idx: (B,L,pq_chunks) or (B,L) int
-        -- the REAL next-step value in this level's own alphabet, for the NTP loss (non-
-        circular: h[:,p] predicts target_idx[:,p+1], never its own block's code)."""
         h = self.run(x)
         M, L, D = h.shape
         n_blocks = L // self.stride
         h_blocks = h[:, :n_blocks * self.stride, :].reshape(M, n_blocks, self.stride, D)
-        pooled = jnp.mean(h_blocks, axis=2)  # hardcoded mean-pool, see module docstring
+        pooled = h_blocks[:, :, self.stride - 1, :]
         logits = reshape_pq(pooled @ self.code_head, self.pq_chunks, self.code_vocab)
         code_soft, code_idx = quantize_hard(logits)
 
         if self.is_byte_level:
             ntp_logits = h[:, :-1, :] @ self.ntp_head  # (B,L-1,256), plain byte prediction
         else:
-            ntp_logits = reshape_pq(h[:, :-1, :] @ self.ntp_head, self.pq_chunks, self.code_vocab)
+            ntp_logits = reshape_pq(h[:, :-1, :] @ self.ntp_head, self.ntp_pq_chunks, self.ntp_code_vocab)
         tgt = target_idx[:, 1:]
         logp = jax.nn.log_softmax(ntp_logits, axis=-1)
         ntp_loss = -jnp.mean(jnp.take_along_axis(logp, tgt[..., None], axis=-1))
@@ -307,23 +331,21 @@ class HierEncoder(eqx.Module):
     cfg: Config = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config):
-        n = len(cfg.strides)
+        n = len(cfg.strides) if cfg.train_last_encoder else len(cfg.strides) - 1
         keys = jax.random.split(key, 1 + 2 * n)
         self.cfg = cfg
         self.byte_embed = jax.random.normal(keys[0], (256, cfg.d_model[0])) * 0.02
         self.levels = [EncoderLevel(keys[1 + i], cfg.d_model[i], cfg.n_layers[i], cfg.n_heads[i],
-                                     cfg.n_kv_heads[i], cfg.mlp_mult, cfg.rope_base, cfg.pq_chunks,
-                                     cfg.code_vocab, cfg.strides[i], is_byte_level=(i == 0)) for i in range(n)]
-        self.code_embeds = [jax.random.normal(keys[1 + n + i], (cfg.code_vocab, cfg.d_model[i + 1])) * 0.02
+                                     cfg.n_kv_heads[i], cfg.mlp_mult, cfg.rope_base, cfg.pq_chunks[i],
+                                     cfg.code_vocab[i], cfg.strides[i] if cfg.strides[i] != -1 else 1,
+                                     is_byte_level=(i == 0),
+                                     ntp_pq_chunks=None if i == 0 else cfg.pq_chunks[i - 1],
+                                     ntp_code_vocab=None if i == 0 else cfg.code_vocab[i - 1])
+                       for i in range(n)]
+        self.code_embeds = [jax.random.normal(keys[1 + n + i], (cfg.code_vocab[i], cfg.d_model[i + 1])) * 0.02
                              for i in range(n - 1)]
 
     def __call__(self, flat_bytes: jnp.ndarray) -> dict:
-        """flat_bytes: (B,SEQ_LEN) int -- returns per-level codes (hard idx, for the decoder's
-        teacher-forced OWN-value inputs and for inference conditioning) and codes_soft (STE
-        soft one-hot, for the decoder's cross-attn CONTEXT -- differentiable, so the decode loss
-        backprops into this encoder, matching qcute_lagcodec_common.py's embed_for_decode
-        convention of embedding the STE `quantize()` output, not a hard index) and the summed/
-        weighted NTP losses (for the auxiliary training objective)."""
         x = self.byte_embed[flat_bytes]
         target = flat_bytes
         results = []
@@ -337,6 +359,50 @@ class HierEncoder(eqx.Module):
                 x = code_embed(out["code_soft"], self.code_embeds[i])
                 target = out["code_idx"]
         return dict(codes=codes, codes_soft=codes_soft, results=results)
+
+    def generate_lower_codes(self, top_code_idx: jnp.ndarray, seed: int = 0,
+                              greedy: bool = True, temperature: float = 1.0) -> list:
+        """DISCONTINUED, no callers (superseded by StageLagDecoder's cascade) -- left for
+        reference only, NOT updated for per-level code_vocab/pq_chunks (self.cfg.pq_chunks below
+        is stale, assumes the old scalar convention) or train_last_encoder. Do not edit/use.
+
+        top_code_idx: (B,n_blocks,pq_chunks) hard idx -- levels[N-2]'s OWN code (codes[N-2]),
+        given (e.g. from encoding a real image). Autoregressively generates codes[N-3]..codes[0]
+        using each level's OWN trained NTP head: levels[i+1]'s input IS codes[i], so its NTP head
+        already predicts codes[i]'s next value -- reuses EncoderLevel.step, no new decoder
+        weights. Position-0 of each generated level starts from a zero-vector seed, NOT a trained
+        BOS (forward()/training is untouched by this -- doing it properly, like StackDecoder's
+        real bos_embed, would need retrofitting EncoderLevel.forward's architecture and risks
+        already-converged checkpoints; deferred). Returns codes[0..N-2] (hard idx), ready for the
+        existing byte decoder."""
+        N = len(self.levels)
+        B = top_code_idx.shape[0]
+        rng = jax.random.PRNGKey(seed)
+        codes = [None] * (N - 1)
+        codes[N - 2] = top_code_idx
+
+        for i in range(N - 3, -1, -1):
+            gen_level = self.levels[i + 1]
+            D = gen_level.code_head.shape[0]
+            n_heads, n_kv_heads = gen_level.blocks[0].attn.n_heads, gen_level.blocks[0].attn.n_kv_heads
+            hd = D // n_heads
+            n_blocks_i = codes[i + 1].shape[1] * gen_level.stride
+            cache_k = jnp.zeros((len(gen_level.blocks), B, n_kv_heads, n_blocks_i, hd))
+            cache_v = jnp.zeros_like(cache_k)
+            x_input = jnp.zeros((B, D))
+            out = jnp.zeros((B, n_blocks_i, self.cfg.pq_chunks), dtype=jnp.int32)
+            for t in tqdm(range(n_blocks_i), desc=f"generate_lower_codes(level={i},L={n_blocks_i})", leave=False):
+                h, cache_k, cache_v = gen_level.step(x_input, cache_k, cache_v, t, n_blocks_i)
+                ntp_logits = reshape_pq(h @ gen_level.ntp_head, gen_level.pq_chunks, gen_level.code_vocab)
+                if greedy:
+                    val = jnp.argmax(ntp_logits, axis=-1)
+                else:
+                    rng, k_ = jax.random.split(rng)
+                    val = jax.random.categorical(k_, ntp_logits / temperature, axis=-1)
+                out = out.at[:, t, :].set(val)
+                x_input = code_embed(val, self.code_embeds[i])
+            codes[i] = out
+        return codes
 
 
 # ---------------------------------------------------------------------------
@@ -396,8 +462,8 @@ class CrossAttention(eqx.Module):
         q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
         cos_q, sin_q = rope_cos_sin_for_positions(q_pos, hd, self.rope_base)
         cos_k, sin_k = rope_cos_sin_for_positions(k_pos, hd, self.rope_base)
-        q = q * cos_q[None, None] + rotate_half(q) * sin_q[None, None]
-        k = k * cos_k[None, None] + rotate_half(k) * sin_k[None, None]
+        q = (q * cos_q[None, None] + rotate_half(q) * sin_q[None, None]).astype(q.dtype)
+        k = (k * cos_k[None, None] + rotate_half(k) * sin_k[None, None]).astype(k.dtype)
         scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
         logits = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
         logits = jnp.where(mask[None, None], logits, -1e9)
@@ -484,8 +550,8 @@ class Level1Layer(eqx.Module):
         v = (xn @ self.wv).reshape(B, T, self.n_kv_heads, hd).transpose(0, 2, 1, 3)
         q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
         cos, sin = rope_cos_sin_for_positions(pos_real, hd, self.rope_base)
-        q = q * cos[None, None] + rotate_half(q) * sin[None, None]
-        k = k * cos[None, None] + rotate_half(k) * sin[None, None]
+        q = (q * cos[None, None] + rotate_half(q) * sin[None, None]).astype(q.dtype)
+        k = (k * cos[None, None] + rotate_half(k) * sin[None, None]).astype(k.dtype)
         scale = 1.0 / math.sqrt(hd)
         y = splash_attention(q, k, v, causal=True, sm_scale=scale)  # (B,H,T,hd)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
@@ -508,8 +574,8 @@ class Level1Layer(eqx.Module):
         q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
         cos_q, sin_q = rope_cos_sin_for_positions(q_pos, hd, self.rope_base)
         cos_k, sin_k = rope_cos_sin_for_positions(code_pos, hd, self.rope_base)
-        q = q * cos_q[None, None] + rotate_half(q) * sin_q[None, None]
-        k = k * cos_k[None, None] + rotate_half(k) * sin_k[None, None]
+        q = (q * cos_q[None, None] + rotate_half(q) * sin_q[None, None]).astype(q.dtype)
+        k = (k * cos_k[None, None] + rotate_half(k) * sin_k[None, None]).astype(k.dtype)
         scale = 1.0 / math.sqrt(hd)
         y = splash_cross_attention(q, k, v, cum_K, lag_bytes, scale)  # (B,H,T,hd)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
@@ -539,7 +605,7 @@ class Level1Layer(eqx.Module):
         cos_q, sin_q = rope_cos_sin_pos(q_pos, hd, self.rope_base)
         q = apply_rope_single(q, cos_q, sin_q)
         cos_k, sin_k = rope_cos_sin_for_positions(code_pos, hd, self.rope_base)
-        k = k * cos_k[None, None, :, :] + rotate_half(k) * sin_k[None, None, :, :]
+        k = (k * cos_k[None, None, :, :] + rotate_half(k) * sin_k[None, None, :, :]).astype(k.dtype)
         k, v = self._repeat_kv(k), self._repeat_kv(v)
         scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
         logits = jnp.einsum("bhd,bhtd->bht", q, k) * scale
@@ -563,8 +629,8 @@ class Level1Layer(eqx.Module):
         q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
         cos, sin = rope_cos_sin_pos(pos, hd, self.rope_base)
         q, k = apply_rope_single(q, cos, sin), apply_rope_single(k, cos, sin)
-        cache_k = jax.lax.dynamic_update_slice(cache_k, k[:, :, None, :], (0, 0, pos, 0))
-        cache_v = jax.lax.dynamic_update_slice(cache_v, v[:, :, None, :], (0, 0, pos, 0))
+        cache_k = jax.lax.dynamic_update_slice(cache_k, k[:, :, None, :].astype(cache_k.dtype), (0, 0, pos, 0))
+        cache_v = jax.lax.dynamic_update_slice(cache_v, v[:, :, None, :].astype(cache_v.dtype), (0, 0, pos, 0))
         k_full, v_full = self._repeat_kv(cache_k), self._repeat_kv(cache_v)
         scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
         logits = jnp.einsum("bhd,bhtd->bht", q, k_full) * scale
@@ -603,13 +669,21 @@ class StackDecoder(eqx.Module):
     in this file."""
     bos_embed: jnp.ndarray            # separate (D,) param, NOT part of target_embed's table
     target_embed: jnp.ndarray         # (256,D)
-    ctx_embeds: list                  # one (code_vocab,D) table per consulted level (level1..levelL)
+    ctx_embeds: list                  # one (code_vocab,D) table per consulted level -- empty if kv_lm_mode="shared"
     level_layers: list                # list of list-of-Level1Layer, one inner list per consulted level
+    code_lm_blocks: list              # kv_lm_mode="copy" only: fresh causal blocks per consulted level, re-run
+    # over that level's code sequence before cross-attn (a "clone" of the corresponding encoder level's own
+    # blocks -- same depth/shape, independent weights). kv_lm_mode="shared" reuses the ACTUAL encoder's
+    # code_embeds/levels[t+1].blocks instead (passed in at call time as `encoder`, never stored as a field --
+    # storing a second reference to the same arrays would make gradients diverge between the two tree
+    # positions after one optimizer step; passing it as a plain arg keeps the weights as a single pytree leaf,
+    # living only in LagCodecModel.encoder). kv_lm_mode="identity" (default): no LM, just a raw lookup.
     ln_f: RMSNorm
     head: jnp.ndarray
     strides: tuple = eqx.field(static=True)
     n_heads: int = eqx.field(static=True)
     n_kv_heads: int = eqx.field(static=True)
+    kv_lm_mode: str = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config):
         D = cfg.dec_d_model[0]
@@ -617,26 +691,50 @@ class StackDecoder(eqx.Module):
         n_consulted = n_levels - 1  # codes_soft[0..n_levels-2] -- topmost output hard-excluded
         assert n_consulted >= 1, "StackDecoder needs n_levels>=2 (at least one consulted level)"
         self.strides = cfg.strides
+        self.kv_lm_mode = cfg.kv_lm_mode
         self.n_heads, self.n_kv_heads = cfg.dec_n_heads[0], cfg.dec_n_kv_heads[0]
         n_layers = cfg.dec_n_layers[0]
-        keys = jax.random.split(key, 4 + 2 * n_consulted)
+        keys = jax.random.split(key, 4 + 3 * n_consulted)
         self.bos_embed = jax.random.normal(keys[0], (D,)) * 0.02
         self.target_embed = jax.random.normal(keys[1], (256, D)) * 0.02
         self.ctx_embeds = []
         self.level_layers = []
+        self.code_lm_blocks = []
         for t in range(n_consulted):
-            ke = keys[4 + 2 * t]
-            kl = keys[4 + 2 * t + 1]
-            self.ctx_embeds.append(jax.random.normal(ke, (cfg.code_vocab, D)) * 0.02)
+            ke = keys[4 + 3 * t]
+            kl = keys[4 + 3 * t + 1]
+            kc = keys[4 + 3 * t + 2]
+            if self.kv_lm_mode != "shared":
+                self.ctx_embeds.append(jax.random.normal(ke, (cfg.code_vocab[t], D)) * 0.02)
             layer_keys = jax.random.split(kl, n_layers)
             self.level_layers.append([Level1Layer(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult, cfg.rope_base)
                                        for k in layer_keys])
+            if self.kv_lm_mode == "copy":
+                clone_n_layers = cfg.n_layers[t + 1]  # same depth as the encoder level being cloned
+                code_lm_keys = jax.random.split(kc, clone_n_layers)
+                self.code_lm_blocks.append([Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult, cfg.rope_base)
+                                             for k in code_lm_keys])
         self.ln_f = RMSNorm(D)
         self.head = jax.random.normal(keys[2], (D, 256)) * 0.02
 
-    def forward(self, target_seq: jnp.ndarray, codes_soft: list, lag: int) -> tuple:
+    def _code_tok(self, t: int, code: jnp.ndarray, encoder) -> jnp.ndarray:
+        """Builds this level's cross-attn KV token sequence, per kv_lm_mode. `encoder` (the live
+        HierEncoder, only used/required for "shared") is a plain call-time arg, never stored as a
+        field -- see the class docstring's ctx_embeds/code_lm_blocks comment for why."""
+        if self.kv_lm_mode == "shared":
+            code_tok = code_embed(code, encoder.code_embeds[t])
+            for blk in encoder.levels[t + 1].blocks:
+                code_tok = blk(code_tok)
+        else:
+            code_tok = code_embed(code, self.ctx_embeds[t])
+            if self.kv_lm_mode == "copy":
+                for blk in self.code_lm_blocks[t]:
+                    code_tok = blk(code_tok)
+        return code_tok
+
+    def forward(self, target_seq: jnp.ndarray, codes_soft: list, lag: int, encoder=None) -> tuple:
         """target_seq: (B,SEQ_LEN) real bytes. codes_soft: enc["codes_soft"] full list. lag: see
-        class docstring, must be >=0."""
+        class docstring, must be >=0. encoder: the live HierEncoder -- required iff kv_lm_mode="shared"."""
         assert lag >= 0, "lag<0 not implemented -- see StackDecoder docstring"
         B, SEQ_LEN = target_seq.shape
         D = self.target_embed.shape[-1]
@@ -647,11 +745,11 @@ class StackDecoder(eqx.Module):
 
         lag_bytes = (lag + 1) * math.prod(self.strides[:-1])
         cum_K = 1
-        for t, (ctx_embed, layers) in enumerate(zip(self.ctx_embeds, self.level_layers)):
+        for t, layers in enumerate(self.level_layers):
             cum_K *= self.strides[t]
             code = codes_soft[t]
             n_blocks_t = code.shape[1]
-            code_tok = code_embed(code, ctx_embed)
+            code_tok = self._code_tok(t, code, encoder)
             code_pos = (jnp.arange(n_blocks_t) + 1) * cum_K - 1
             for layer in layers:
                 x, _, _ = layer.forward_pass1(x, code_tok, pos_real, code_pos, cum_K, lag_bytes)
@@ -663,26 +761,27 @@ class StackDecoder(eqx.Module):
         acc = jnp.mean(jnp.argmax(logits, -1) == target_seq)
         return loss, acc
 
-    def _logits_and_masks(self, codes: list, lag: int):
+    def _logits_and_masks(self, codes: list, lag: int, encoder=None):
         """Shared setup for both generation paths: per-level code embeddings, code positions, and
         the lag-shifted cross-attn mask builder (mask depends on query position, computed lazily
         per-call since full-recompute uses a growing pos_real array while KV-cache uses a scalar).
         cum_Ks (Python ints, one per level) feed splash_cross_attention's LagCrossMask in
-        reconstruct_full_recompute; the self_step-based generation paths ignore it."""
+        reconstruct_full_recompute; the self_step-based generation paths ignore it. encoder: the
+        live HierEncoder -- required iff kv_lm_mode="shared"."""
         lag_bytes = (lag + 1) * math.prod(self.strides[:-1])
         code_toks, code_poss, cum_Ks = [], [], []
         cum_K = 1
-        for t, ctx_embed in enumerate(self.ctx_embeds):
+        for t in range(len(self.level_layers)):
             cum_K *= self.strides[t]
             code = codes[t]
             n_blocks_t = code.shape[1]
-            code_toks.append(code_embed(code, ctx_embed))
+            code_toks.append(self._code_tok(t, code, encoder))
             code_poss.append((jnp.arange(n_blocks_t) + 1) * cum_K - 1)
             cum_Ks.append(cum_K)
         return lag_bytes, code_toks, code_poss, cum_Ks
 
     def reconstruct_full_recompute(self, codes: list, lag: int, greedy: bool = True,
-                                    temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
+                                    temperature: float = 1.0, seed: int = 0, encoder=None) -> jnp.ndarray:
         """No incremental KV-cache -- reruns the plain batched forward_pass1 stack (the exact
         computation forward() uses) from scratch at every single byte step, over the growing
         BOS+decided-so-far sequence. O(SEQ_LEN^2) total. Diagnostic-grade correctness reference
@@ -694,7 +793,7 @@ class StackDecoder(eqx.Module):
         cum_K_first = self.strides[0]
         SEQ_LEN = codes[0].shape[1] * cum_K_first
         rng = jax.random.PRNGKey(seed)
-        lag_bytes, code_toks, code_poss, cum_Ks = self._logits_and_masks(codes, lag)
+        lag_bytes, code_toks, code_poss, cum_Ks = self._logits_and_masks(codes, lag, encoder)
 
         decided = [jnp.broadcast_to(self.bos_embed, (B, D))]
         out = jnp.zeros((B, SEQ_LEN), dtype=jnp.int32)
@@ -716,22 +815,19 @@ class StackDecoder(eqx.Module):
         return out
 
     def reconstruct_kv_cache(self, codes: list, lag: int, greedy: bool = True,
-                              temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
-        """Incremental KV-cache generation -- one growing self-attn cache PER (level, layer) pair
-        (each level's layer stack operates on a DIFFERENT, progressively-refined residual state
-        than the previous level's, so each needs its own cache -- reuses Level1Layer.self_step,
-        already verified elsewhere in this file). Checked directly against reconstruct_full_recompute
-        via a teacher-forced consistency script, not assumed correct by construction."""
+                              temperature: float = 1.0, seed: int = 0, encoder=None) -> jnp.ndarray:
         assert lag >= 0, "lag<0 not implemented -- see StackDecoder docstring"
         B = codes[0].shape[0]
         D = self.target_embed.shape[-1]
+        dtype = self.target_embed.dtype
         hd = D // self.n_heads
         cum_K_first = self.strides[0]
         SEQ_LEN = codes[0].shape[1] * cum_K_first
         rng = jax.random.PRNGKey(seed)
-        lag_bytes, code_toks, code_poss, _cum_Ks = self._logits_and_masks(codes, lag)
+        lag_bytes, code_toks, code_poss, _cum_Ks = self._logits_and_masks(codes, lag, encoder)
 
-        caches = [[(jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd)), jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd)))
+        caches = [[(jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd), dtype=dtype),
+                    jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd), dtype=dtype))
                    for _ in layers] for layers in self.level_layers]
 
         out = jnp.zeros((B, SEQ_LEN), dtype=jnp.int32)
@@ -753,19 +849,17 @@ class StackDecoder(eqx.Module):
             x_input = self.target_embed[val]
         return out
 
-    def kv_cache_init(self, codes: list, lag: int, seed: int = 0) -> tuple:
-        """Build the initial resumable state for scan-based generation: (carry, ctx). carry =
-        (x_input, caches, rng) -- a valid JAX pytree, safe to stash and hand back into
-        kv_cache_step_chunk later (e.g. across separate debugging calls). ctx bundles the
-        per-level code embeddings/positions/lag_bytes/SEQ_LEN derived once from `codes`/`lag`."""
+    def kv_cache_init(self, codes: list, lag: int, seed: int = 0, encoder=None) -> tuple:
         assert lag >= 0, "lag<0 not implemented -- see StackDecoder docstring"
         B = codes[0].shape[0]
         D = self.target_embed.shape[-1]
+        dtype = self.target_embed.dtype
         hd = D // self.n_heads
         cum_K_first = self.strides[0]
         SEQ_LEN = codes[0].shape[1] * cum_K_first
-        lag_bytes, code_toks, code_poss, _cum_Ks = self._logits_and_masks(codes, lag)
-        caches0 = [[(jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd)), jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd)))
+        lag_bytes, code_toks, code_poss, _cum_Ks = self._logits_and_masks(codes, lag, encoder)
+        caches0 = [[(jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd), dtype=dtype),
+                     jnp.zeros((B, self.n_kv_heads, SEQ_LEN, hd), dtype=dtype))
                     for _ in layers] for layers in self.level_layers]
         carry = (jnp.broadcast_to(self.bos_embed, (B, D)), caches0, jax.random.PRNGKey(seed))
         ctx = dict(SEQ_LEN=SEQ_LEN, lag_bytes=lag_bytes, code_toks=code_toks, code_poss=code_poss)
@@ -812,7 +906,7 @@ class StackDecoder(eqx.Module):
         return run_chunk(carry, ts)
 
     def reconstruct_kv_cache_scan(self, codes: list, lag: int, greedy: bool = True, temperature: float = 1.0,
-                                   seed: int = 0, chunk_size: int = None) -> jnp.ndarray:
+                                   seed: int = 0, chunk_size: int = None, encoder=None) -> jnp.ndarray:
         """Convenience driver over kv_cache_init/kv_cache_step_chunk: JIT-compiled + scanned,
         replacing reconstruct_kv_cache's bare Python loop of un-jitted self_step calls -- audit
         (2026-09-08) found that loop pays per-op dispatch overhead at every single call (no fused
@@ -824,7 +918,7 @@ class StackDecoder(eqx.Module):
         Pass a smaller chunk_size (down to 1, fully step-by-step but still jit-compiled, reused
         across chunks) for debugging -- or call kv_cache_init/kv_cache_step_chunk directly for
         full manual control (e.g. resuming from a stashed carry in a later, separate call)."""
-        carry, ctx = self.kv_cache_init(codes, lag, seed)
+        carry, ctx = self.kv_cache_init(codes, lag, seed, encoder)
         SEQ_LEN = ctx["SEQ_LEN"]
         chunk_size = chunk_size or SEQ_LEN
 
@@ -899,8 +993,8 @@ class Level1LocalLayer(eqx.Module):
         q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
         pos = jnp.arange(K)
         cos, sin = rope_cos_sin_for_positions(pos, hd, self.rope_base)
-        q = q * cos[None, None] + rotate_half(q) * sin[None, None]
-        k = k * cos[None, None] + rotate_half(k) * sin[None, None]
+        q = (q * cos[None, None] + rotate_half(q) * sin[None, None]).astype(q.dtype)
+        k = (k * cos[None, None] + rotate_half(k) * sin[None, None]).astype(k.dtype)
         k, v = self._repeat_kv(k), self._repeat_kv(v)
         scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
         logits = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale
@@ -922,8 +1016,8 @@ class Level1LocalLayer(eqx.Module):
         q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
         zero_pos = jnp.zeros((1,))
         cos0, sin0 = rope_cos_sin_for_positions(zero_pos, hd, self.rope_base)
-        q = q * cos0[None, None] + rotate_half(q) * sin0[None, None]
-        k = k * cos0[None, None] + rotate_half(k) * sin0[None, None]
+        q = (q * cos0[None, None] + rotate_half(q) * sin0[None, None]).astype(q.dtype)
+        k = (k * cos0[None, None] + rotate_half(k) * sin0[None, None]).astype(k.dtype)
         k, v = self._repeat_kv(k), self._repeat_kv(v)
         scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
         logits = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale  # (Bn,H,T,1), no masking needed
@@ -944,7 +1038,11 @@ class Level1LocalLayer(eqx.Module):
 
 
 class StageLocalDecoder(eqx.Module):
-    """CORRECTED, GENERALIZED replacement for StageLocalTrack1DecoderV1 (2026-09-08 rewrite --
+    """DISCONTINUED (chat 2026-09-11): only StackDecoder is maintained going forward. Left for
+    reference/history only -- NOT updated for per-level code_vocab/pq_chunks (still reads
+    cfg.code_vocab/cfg.pq_chunks as scalars below) or train_last_encoder. Do not edit/use.
+
+    CORRECTED, GENERALIZED replacement for StageLocalTrack1DecoderV1 (2026-09-08 rewrite --
     read the reference's decode_level/StackDecoder.__init__/block_local_level1_decode directly
     before writing this, per explicit correction: the V1 version had two real divergences and
     was hardcoded to exactly 2 levels instead of generalizing like the reference's cond_depth
@@ -1065,30 +1163,22 @@ class StageLocalDecoder(eqx.Module):
 
 
 class StageLagDecoder(eqx.Module):
-    """Generalizes self_attn_local's block-diagonal design (each block sees ONLY its own code,
-    zero lookahead) to a configurable `lag`: groups of (lag+1) CONSECUTIVE top-level codes are
-    placed BEFORE any of their combined (lag+1)*K bytes in the sequence (NOT interleaved
-    per-block), so every byte in the group can causally see ALL (lag+1) codes -- including `lag`
-    codes that are causally LATER than it (the true autoregressive generation process wouldn't
-    have them yet without waiting for that many more codes first). Groups remain block-diagonal
-    from EACH OTHER (zero cross-group visibility), exactly like the lag=0 case's per-block
-    isolation, just at group granularity -- lag=0 is the degenerate G=1 case of this same
-    mechanism (own code prepended, K bytes follow, causal, matches self_attn_local exactly).
-    lag=max_lag (== n_blocks-1, ONE group spanning the WHOLE sequence) needs every code before
-    reconstructing anything -- full non-causal, whole-sequence context, single pass.
+    """DISCONTINUED (chat 2026-09-11): only StackDecoder is maintained going forward (used by
+    decoder_type="self_attn_lag"/"self_attn_lag_hier"). Left for reference/history only -- NOT
+    updated for per-level code_vocab/pq_chunks (still reads cfg.code_vocab/cfg.pq_chunks as
+    scalars below) or train_last_encoder. Do not edit/use.
 
-    lag=-1 is a SEPARATE, stricter mode (no `G` grouping applies): no code conditioning at all,
-    pure byte-level next-token-prediction -- the TRUE, hardest causal metric. lag=0 already
-    'cheats' relative to this by handing every byte its own code for free, itself derived by the
-    encoder from seeing the whole block (including bytes not yet decoded at generation time from
-    that byte's perspective) -- lag=-1 removes that shortcut entirely.
-
-    Same weights work for ANY lag value (self_blocks are just per-position transformer blocks,
-    agnostic to how many codes/bytes are grouped) -- `lag` is a forward()/reconstruct() run-time
-    argument, not baked into the model structure, so train-time and eval-time lag can be swept
-    independently (though matching them avoids a train/inference mismatch, same principle as
-    everywhere else in this file)."""
+    Codes and targets share ONE flat token sequence: groups of (lag+1) ctx codes followed by
+    their (lag+1)*K targets (bytes if level==0, else the level-below's own codes -- see
+    Config.decoder_type='self_attn_lag_hier', a chain of one StageLagDecoder per level 0..N-2,
+    each level's stage conditioned on codes[level] and predicting codes[level-1] (or bytes for
+    level=0) -- distinct weights per level, not shared with EncoderLevel; "duplicate EncoderLevel
+    to DecoderLevel", chat 2026-09-10), repeated -- but self-attention is fully causal over the
+    WHOLE sequence, so later groups see every earlier group's ctx and target too (no reset).
+    lag=-1: no ctx conditioning, pure target NTP, seeded with a real BOS token. Same weights work
+    for any lag (run-time arg, not baked into the structure)."""
     target_embed: jnp.ndarray
+    bos_embed: jnp.ndarray
     ctx_embed: jnp.ndarray
     self_blocks: list
     ln_f: RMSNorm
@@ -1096,40 +1186,66 @@ class StageLagDecoder(eqx.Module):
     K: int = eqx.field(static=True)
     n_heads: int = eqx.field(static=True)
     n_kv_heads: int = eqx.field(static=True)
+    is_byte_level: bool = eqx.field(static=True)
+    pq_chunks: int = eqx.field(static=True)
+    code_vocab: int = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config, level: int = 0):
         D = cfg.dec_d_model[level]
         self.K = cfg.strides[level]
         self.n_heads, self.n_kv_heads = cfg.dec_n_heads[level], cfg.dec_n_kv_heads[level]
-        keys = jax.random.split(key, 3)
-        self.target_embed = jax.random.normal(keys[0], (256, D)) * 0.02
+        self.is_byte_level = (level == 0)
+        self.pq_chunks, self.code_vocab = cfg.pq_chunks, cfg.code_vocab
+        keys = jax.random.split(key, 4)
+        target_vocab = 256 if self.is_byte_level else cfg.code_vocab
+        self.target_embed = jax.random.normal(keys[0], (target_vocab, D)) * 0.02
+        self.bos_embed = jax.random.normal(keys[3], (D,)) * 0.02
         self.ctx_embed = jax.random.normal(keys[1], (cfg.code_vocab, D)) * 0.02
         n_layers = cfg.dec_n_layers[level]
         block_keys = jax.random.split(keys[2], n_layers)
         self.self_blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult, cfg.rope_base)
                              for k in block_keys]
         self.ln_f = RMSNorm(D)
-        self.head = jax.random.normal(keys[1], (D, 256)) * 0.02
+        head_out = 256 if self.is_byte_level else cfg.pq_chunks * cfg.code_vocab
+        self.head = jax.random.normal(keys[1], (D, head_out)) * 0.02
+
+    def _embed_target(self, idx: jnp.ndarray) -> jnp.ndarray:
+        return self.target_embed[idx] if self.is_byte_level else code_embed(idx, self.target_embed)
+
+    def _target_logits(self, h: jnp.ndarray) -> jnp.ndarray:
+        logits = h @ self.head
+        return logits if self.is_byte_level else reshape_pq(logits, self.pq_chunks, self.code_vocab)
+
+    def _loss_acc(self, logits: jnp.ndarray, target: jnp.ndarray) -> tuple:
+        logp = jax.nn.log_softmax(logits, axis=-1)
+        loss = -jnp.mean(jnp.take_along_axis(logp, target[..., None], axis=-1))
+        acc = jnp.mean(jnp.argmax(logits, -1) == target)
+        return loss, acc
+
+    def _sample(self, logits: jnp.ndarray, rng, greedy: bool, temperature: float) -> tuple:
+        if greedy:
+            return jnp.argmax(logits, axis=-1), rng
+        rng, k_ = jax.random.split(rng)
+        return jax.random.categorical(k_, logits / temperature, axis=-1), rng
 
     def forward(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray, lag: int) -> tuple:
-        """target_seq: (B, n_blocks*K) real bytes. ctx_code_soft: (B, n_blocks, pq) level1's own
-        code (STE soft, differentiable into the encoder). lag=-1: no code conditioning, pure
-        causal byte NTP. lag>=0: groups of (lag+1) codes prepended before their (lag+1)*K bytes,
+        """target_seq: (B, n_blocks*K[, pq_chunks]) real target -- bytes if level==0, else the
+        level-below's own codes. ctx_code_soft: (B, n_blocks, pq) THIS level's own code (STE
+        soft, differentiable into the encoder). lag=-1: no ctx conditioning, pure causal target
+        NTP. lag>=0: groups of (lag+1) ctx codes prepended before their (lag+1)*K targets,
         block-diagonal across groups."""
         B = target_seq.shape[0]
         D = self.target_embed.shape[-1]
-        te = self.target_embed[target_seq]
+        te = self._embed_target(target_seq)
 
         if lag == -1:
-            x = te
+            bos = jnp.broadcast_to(self.bos_embed, (B, 1, D))
+            x = jnp.concatenate([bos, te[:, :-1, :]], axis=1)  # BOS + targets[:-1], length preserved
             for blk in self.self_blocks:
                 x = blk(x)
             h = self.ln_f(x)
-            logits = h[:, :-1, :] @ self.head
-            logp = jax.nn.log_softmax(logits, axis=-1)
-            loss = -jnp.mean(jnp.take_along_axis(logp, target_seq[:, 1:, None], axis=-1))
-            acc = jnp.mean(jnp.argmax(logits, -1) == target_seq[:, 1:])
-            return loss, acc
+            logits = self._target_logits(h)  # position p predicts target_seq[p]
+            return self._loss_acc(logits, target_seq)
 
         n_blocks = ctx_code_soft.shape[1]
         G = lag + 1
@@ -1147,49 +1263,42 @@ class StageLagDecoder(eqx.Module):
             te = jnp.pad(te, ((0, 0), (0, pad_blocks * self.K), (0, 0)))
         ctx_g = ctx_tok.reshape(B, n_groups, G, D)
         te_g = te.reshape(B, n_groups, G * self.K, D)
-        xe = jnp.concatenate([ctx_g, te_g], axis=2).reshape(B * n_groups, G + G * self.K, D)
+        bos_g = jnp.broadcast_to(self.bos_embed, (B, n_groups, 1, D))
+        per_group_len = G + 1 + G * self.K  # codes, BOS, targets
+        xe = jnp.concatenate([ctx_g, bos_g, te_g], axis=2).reshape(B, n_groups * per_group_len, D)
         for blk in self.self_blocks:
-            xe = blk(xe)
+            xe = blk(xe)  # one sequence, fully causal -- later groups see every earlier group
         h = self.ln_f(xe)
-        h_bytes = h[:, G - 1:-1, :]  # (B*n_groups, G*K, D) -- pos G-1+j predicts target[j]
-        logits = h_bytes.reshape(B, n_groups * G * self.K, -1)[:, :n_blocks * self.K, :] @ self.head
-        logp = jax.nn.log_softmax(logits, axis=-1)
-        loss = -jnp.mean(jnp.take_along_axis(logp, target_seq[..., None], axis=-1))
-        acc = jnp.mean(jnp.argmax(logits, -1) == target_seq)
-        return loss, acc
+        pred_pos = (jnp.arange(n_groups)[:, None] * per_group_len + G
+                    + jnp.arange(G * self.K)[None, :]).reshape(-1)  # pos G+j (within group g) predicts that target
+        h_targets = h[:, pred_pos, :]
+        logits = self._target_logits(h_targets[:, :n_blocks * self.K, :])
+        return self._loss_acc(logits, target_seq)
 
     def reconstruct_full_recompute(self, ctx_idx: jnp.ndarray, lag: int, greedy: bool = True,
                                     temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
         """No incremental KV-cache -- reruns the plain batched self_blocks(...) call (the exact
-        one forward() uses) from scratch at every single byte step, over the growing
+        one forward() uses) from scratch at every single target step, over the growing
         decided-so-far sequence WITHIN the current group only (groups are independent, block-
         diagonal). Diagnostic-grade correctness reference for reconstruct_kv_cache."""
         B, n_blocks, _ = ctx_idx.shape
         D = self.target_embed.shape[-1]
         rng = jax.random.PRNGKey(seed)
+        out_extra = () if self.is_byte_level else (self.pq_chunks,)
 
         if lag == -1:
-            decided = []
-            out = jnp.zeros((B, n_blocks * self.K), dtype=jnp.int32)
             L = n_blocks * self.K
-            # First byte has no prediction target under pure NTP -- seed with a zero byte (never
-            # read back into the loss at train time; here just needs a deterministic starting
-            # embedding token consistent with position 0 existing).
-            decided.append(self.target_embed[jnp.zeros((B,), dtype=jnp.int32)])
-            out = out.at[:, 0].set(0)
-            for t in tqdm(range(1, L), desc=f"decode_full_recompute(lag=-1,L={L})", leave=False):
-                x = jnp.stack(decided, axis=1)
+            decided = [jnp.broadcast_to(self.bos_embed, (B, D))]
+            out = jnp.zeros((B, L) + out_extra, dtype=jnp.int32)
+            for t in tqdm(range(L), desc=f"decode_full_recompute(lag=-1,L={L})", leave=False):
+                x = jnp.stack(decided, axis=1)  # (B, t+1, D)
                 for blk in self.self_blocks:
                     x = blk(x)
                 h_last = self.ln_f(x)[:, -1, :]
-                logits = h_last @ self.head
-                if greedy:
-                    val = jnp.argmax(logits, axis=-1)
-                else:
-                    rng, k_ = jax.random.split(rng)
-                    val = jax.random.categorical(k_, logits / temperature, axis=-1)
+                logits = self._target_logits(h_last)
+                val, rng = self._sample(logits, rng, greedy, temperature)
                 out = out.at[:, t].set(val)
-                decided.append(self.target_embed[val])
+                decided.append(self._embed_target(val))
             return out
 
         G = lag + 1
@@ -1199,41 +1308,40 @@ class StageLagDecoder(eqx.Module):
         ctx_tok = code_embed(ctx_idx, self.ctx_embed)  # (B, n_blocks, D)
         if pad_blocks > 0:
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
-        out = jnp.zeros((B, n_blocks_p * self.K), dtype=jnp.int32)
+        out = jnp.zeros((B, n_blocks_p * self.K) + out_extra, dtype=jnp.int32)
 
+        decided = []  # GLOBAL, growing across the whole sequence -- fully causal, never reset
         for g in tqdm(range(n_groups), desc=f"decode_full_recompute(lag={lag},n_groups={n_groups},G={G})",
                       leave=False):
             group_codes = ctx_tok[:, g * G:(g + 1) * G, :]
-            decided = [group_codes[:, i, :] for i in range(G)]
+            decided.extend(group_codes[:, i, :] for i in range(G))
+            decided.append(jnp.broadcast_to(self.bos_embed, (B, D)))
             for t in range(G * self.K):
                 x = jnp.stack(decided, axis=1)
                 for blk in self.self_blocks:
                     x = blk(x)
                 h_last = self.ln_f(x)[:, -1, :]
-                logits = h_last @ self.head
-                if greedy:
-                    val = jnp.argmax(logits, axis=-1)
-                else:
-                    rng, k_ = jax.random.split(rng)
-                    val = jax.random.categorical(k_, logits / temperature, axis=-1)
+                logits = self._target_logits(h_last)
+                val, rng = self._sample(logits, rng, greedy, temperature)
                 out = out.at[:, g * G * self.K + t].set(val)
-                decided.append(self.target_embed[val])
+                decided.append(self._embed_target(val))
         return out[:, :n_blocks * self.K]
 
     def reconstruct_kv_cache(self, ctx_idx: jnp.ndarray, lag: int, greedy: bool = True,
                               temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
-        """Incremental KV-cache generation -- one growing cache PER GROUP (reset between groups,
-        matching their block-diagonal independence). Prefill: G self_step calls feeding the G
-        known codes in (no prediction taken, pure cache writes) -- the G-1'th (last) prefill step
-        DOES yield the first byte's prediction (matches forward()'s h[:,G-1:-1,:] indexing: pos
-        G-1 predicts target[0]). Then G*K-1 more self_step calls, each predicting the next byte;
-        the very last one (i=G*K-1) takes no prediction (nothing left in this group -- no
-        `K+1`-th extra write needed here, unlike StackDecoder's UNBOUNDED single cache,
-        since later groups never read this group's cache at all)."""
+        """Incremental KV-cache generation -- ONE global cache spanning the whole sequence
+        (fully causal, matches forward()). Per group: the G ctx codes + BOS are entirely KNOWN
+        upfront (not generated), so they're written into the cache with ONE parallel chunk_step
+        call (not G+1 sequential self_step calls -- that was the lag=max bottleneck, chat
+        2026-09-10: G=n_blocks there, so 1024 wasted sequential dispatches per group just to
+        encode already-known content, like re-running a decoder-only LM one token at a time over
+        a prompt instead of prefilling it). Only the actual generation (G*K target steps) is
+        genuinely sequential."""
         B, n_blocks, _ = ctx_idx.shape
         D = self.target_embed.shape[-1]
         hd = D // self.n_heads
         rng = jax.random.PRNGKey(seed)
+        out_extra = () if self.is_byte_level else (self.pq_chunks,)
 
         if lag == -1:
             L = n_blocks * self.K
@@ -1250,72 +1358,100 @@ class StageLagDecoder(eqx.Module):
                 return self.ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
 
             self_step = jax.jit(self_step)
-            out = jnp.zeros((B, L), dtype=jnp.int32)
-            x_input = self.target_embed[jnp.zeros((B,), dtype=jnp.int32)]
-            out = out.at[:, 0].set(0)
-            for pos in tqdm(range(L - 1), desc=f"decode_kv_cache(lag=-1,L={L})", leave=False):
+            out = jnp.zeros((B, L) + out_extra, dtype=jnp.int32)
+            x_input = jnp.broadcast_to(self.bos_embed, (B, D))
+            for pos in tqdm(range(L), desc=f"decode_kv_cache(lag=-1,L={L})", leave=False):
                 h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
-                logits = h @ self.head
-                if greedy:
-                    val = jnp.argmax(logits, axis=-1)
-                else:
-                    rng, k_ = jax.random.split(rng)
-                    val = jax.random.categorical(k_, logits / temperature, axis=-1)
-                out = out.at[:, pos + 1].set(val)
-                x_input = self.target_embed[val]
+                logits = self._target_logits(h)
+                val, rng = self._sample(logits, rng, greedy, temperature)
+                out = out.at[:, pos].set(val)
+                x_input = self._embed_target(val)
             return out
 
         G = lag + 1
         pad_blocks = (-n_blocks) % G  # see forward()'s docstring -- G need not divide n_blocks
         n_blocks_p = n_blocks + pad_blocks
         n_groups = n_blocks_p // G
-        Lg = G + G * self.K  # per-group sequence length
+        per_group_len = G + 1 + G * self.K  # codes, BOS, targets
+        L_total = n_groups * per_group_len  # ONE global cache, fully causal across all groups
         ctx_tok = code_embed(ctx_idx, self.ctx_embed)  # (B, n_blocks, D)
         if pad_blocks > 0:
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
-        out = jnp.zeros((B, n_blocks_p * self.K), dtype=jnp.int32)
+        out = jnp.zeros((B, n_blocks_p * self.K) + out_extra, dtype=jnp.int32)
 
         def self_step(x_new, ck, cv, pos):
             new_ck, new_cv = [], []
             x = x_new
             for i, blk in enumerate(self.self_blocks):
-                x, ck_i, cv_i = blk.step(x, ck[i], cv[i], pos, Lg)
+                x, ck_i, cv_i = blk.step(x, ck[i], cv[i], pos, L_total)
+                new_ck.append(ck_i)
+                new_cv.append(cv_i)
+            return self.ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+
+        def self_chunk_step(x_chunk, ck, cv, pos_start):
+            new_ck, new_cv = [], []
+            x = x_chunk
+            for i, blk in enumerate(self.self_blocks):
+                x, ck_i, cv_i = blk.chunk_step(x, ck[i], cv[i], pos_start, L_total)
                 new_ck.append(ck_i)
                 new_cv.append(cv_i)
             return self.ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
 
         self_step = jax.jit(self_step)
+        self_chunk_step = jax.jit(self_chunk_step)
+        cache_k = jnp.zeros((len(self.self_blocks), B, self.n_kv_heads, L_total, hd))
+        cache_v = jnp.zeros_like(cache_k)
 
+        pos = 0
         for g in tqdm(range(n_groups), desc=f"decode_kv_cache(lag={lag},n_groups={n_groups},G={G})",
                       leave=False):
-            group_codes = ctx_tok[:, g * G:(g + 1) * G, :]
-            cache_k = jnp.zeros((len(self.self_blocks), B, self.n_kv_heads, Lg, hd))
-            cache_v = jnp.zeros_like(cache_k)
-
-            h = None
-            for i in range(G):
-                h, cache_k, cache_v = self_step(group_codes[:, i, :], cache_k, cache_v, i)
-            logits = h @ self.head
-            if greedy:
-                val = jnp.argmax(logits, axis=-1)
-            else:
-                rng, k_ = jax.random.split(rng)
-                val = jax.random.categorical(k_, logits / temperature, axis=-1)
+            group_codes = ctx_tok[:, g * G:(g + 1) * G, :]  # (B,G,D) -- all G codes, entirely known
+            bos_in = jnp.broadcast_to(self.bos_embed, (B, 1, D))
+            chunk = jnp.concatenate([group_codes, bos_in], axis=1)  # (B,G+1,D)
+            h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, pos)
+            pos += G + 1
+            h = h_chunk[:, -1, :]  # BOS's hidden state predicts the first target
+            logits = self._target_logits(h)
+            val, rng = self._sample(logits, rng, greedy, temperature)
             out = out.at[:, g * G * self.K].set(val)
-            x_input = self.target_embed[val]
+            x_input = self._embed_target(val)
 
             for i in range(G * self.K - 1):
-                pos = G + i
                 h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
-                logits = h @ self.head
-                if greedy:
-                    val = jnp.argmax(logits, axis=-1)
-                else:
-                    rng, k_ = jax.random.split(rng)
-                    val = jax.random.categorical(k_, logits / temperature, axis=-1)
+                pos += 1
+                logits = self._target_logits(h)
+                val, rng = self._sample(logits, rng, greedy, temperature)
                 out = out.at[:, g * G * self.K + i + 1].set(val)
-                x_input = self.target_embed[val]
+                x_input = self._embed_target(val)
+
+            # Write the group's LAST target into the cache too (prediction discarded) -- unlike
+            # the old per-group-reset cache, the global cache is read by later groups, so this
+            # write can't be skipped (confirmed via full_recompute divergence 2026-09-10: omitting
+            # it shifted later positions by one). Always done, even for the last group -- matches
+            # full_recompute exactly (it never skips this either), one harmless wasted call.
+            _, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
+            pos += 1
         return out[:, :n_blocks * self.K]
+
+
+def hier_stage_lags(cfg: Config) -> list:
+    """cfg.lag (decoder_type='self_attn_lag_hier') is defined at the TOPMOST used hier level
+    (levels[N-2], the highest decoder level) -- NOT the byte level. It propagates DOWN to lower
+    levels by scaling the group size via the stride multiplier between levels: one top-level
+    group spans strides[i] as many codes at the level directly below, so every level's stage sees
+    the SAME real span of the image, not the same raw code count (chat 2026-09-10 -- using cfg.lag
+    as a uniform G at every level was wrong: it either massively over-pads the lower/finer levels
+    when set to the byte-level max, or gives each level an inconsistent, arbitrary-sized window
+    for any other value). Returns lags[i] for i=0..N-2, e.g. lags[N-2]==cfg.lag exactly."""
+    n_levels = len(cfg.strides)
+    i_max = n_levels - 2  # topmost USED level -- levels[n_levels-1]'s own code is never consumed
+    G_top = cfg.lag + 1
+    lags = [None] * (i_max + 1)
+    mult = 1
+    for i in range(i_max, -1, -1):
+        lags[i] = G_top * mult - 1
+        mult *= cfg.strides[i]  # codes[i-1] is strides[i] times longer than codes[i]
+    return lags
 
 
 class LagCodecModel(eqx.Module):
@@ -1334,6 +1470,14 @@ class LagCodecModel(eqx.Module):
             self.stages = [StackDecoder(keys[1], cfg)]
         elif cfg.decoder_type == "self_attn_local":
             self.stages = [StageLocalDecoder(keys[1], cfg)]
+        elif cfg.decoder_type == "self_attn_lag_hier":
+            # one StageLagDecoder per level 0..N-2 (level N-1's own code is never consumed, see
+            # HierEncoder/strides[-1]=-1 convention) -- stages[i] conditions on codes[i], predicts
+            # codes[i-1] (or bytes for i=0). Distinct weights per level, chained top-down at
+            # generation time (see run_reconstruct's self_attn_lag_hier branch).
+            n_levels = len(cfg.strides)
+            hier_keys = jax.random.split(keys[1], n_levels - 1)
+            self.stages = [StageLagDecoder(hier_keys[i], cfg, level=i) for i in range(n_levels - 1)]
         else:
             self.stages = [StageLagDecoder(keys[1], cfg, level=0)]
 
@@ -1341,13 +1485,28 @@ class LagCodecModel(eqx.Module):
         enc = self.encoder(flat_bytes)
         if self.cfg.decoder_type == "stack":
             # single stage, generalized N-level + lag (see StackDecoder docstring)
-            byte_loss, byte_acc = self.stages[0].forward(flat_bytes, enc["codes_soft"], self.cfg.lag)
+            byte_loss, byte_acc = self.stages[0].forward(flat_bytes, enc["codes_soft"], self.cfg.lag, self.encoder)
             decode_loss_total = byte_loss
         elif self.cfg.decoder_type == "self_attn_local":
             # single stage, generalized N-level: level1 (level1's code) + upper levels (level2..
             # level(n-1)'s codes, sequentially chained) -- no dedicated decoder above level0.
             byte_loss, byte_acc = self.stages[0].forward(flat_bytes, enc["codes_soft"])
             decode_loss_total = byte_loss
+        elif self.cfg.decoder_type == "self_attn_lag_hier":
+            # N-1 stages, each conditioned on codes[i], predicting codes[i-1] (or bytes for i=0)
+            # -- additive losses, no shared weights, gradient into the encoder via STE at every
+            # hop (see StageLagDecoder/LagCodecModel docstrings, chat 2026-09-10). cfg.lag is
+            # defined at the TOP used level and propagated down via hier_stage_lags (matches
+            # StackDecoder's own lag convention -- see its docstring).
+            stage_lags = hier_stage_lags(self.cfg)
+            losses, accs = [], []
+            for i, stage in enumerate(self.stages):
+                target = flat_bytes if i == 0 else enc["codes"][i - 1]
+                loss_i, acc_i = stage.forward(target, enc["codes_soft"][i], stage_lags[i])
+                losses.append(loss_i)
+                accs.append(acc_i)
+            decode_loss_total = jnp.sum(jnp.stack(losses))
+            byte_loss, byte_acc = losses[0], accs[0]
         else:
             # single stage, conditions on level1's code (own code) with `cfg.lag` extra
             # causally-later codes grouped in -- levels above have no dedicated decoder.
@@ -1482,14 +1641,14 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
 CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight",
                   "decoder_type", "lag", "kv_lm_mode", "dec_d_model", "dec_n_layers", "dec_n_heads",
-                  "dec_n_kv_heads", "precision")
+                  "dec_n_kv_heads", "precision", "train_last_encoder")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--data_root", type=str, default=str(REPO_ROOT / "datasets"))
-    p.add_argument("--run_name", type=str, default="cifar_lagcodec")
+    p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--n_devices", type=int, default=None)
     p.add_argument("--epochs", type=int, default=300)
@@ -1513,16 +1672,17 @@ def main():
     p.add_argument("--n_heads", type=_tuple_arg, default=Config.n_heads)
     p.add_argument("--n_kv_heads", type=_tuple_arg, default=Config.n_kv_heads)
     p.add_argument("--strides", type=_tuple_arg, default=Config.strides)
-    p.add_argument("--code_vocab", type=int, default=Config.code_vocab)
-    p.add_argument("--pq_chunks", type=int, default=Config.pq_chunks)
+    p.add_argument("--code_vocab", type=_tuple_arg, default=Config.code_vocab)
+    p.add_argument("--pq_chunks", type=_tuple_arg, default=Config.pq_chunks)
     p.add_argument("--mlp_mult", type=int, default=Config.mlp_mult)
     p.add_argument("--rope_base", type=float, default=Config.rope_base)
     p.add_argument("--ntp_weight", type=float, default=Config.ntp_weight)
     p.add_argument("--decoder_type", type=str, default=Config.decoder_type,
-                    choices=["stack", "self_attn_local", "self_attn_lag"])
+                    choices=["stack", "self_attn_local", "self_attn_lag", "self_attn_lag_hier"])
     p.add_argument("--lag", type=int, default=Config.lag)
     p.add_argument("--kv_lm_mode", type=str, default=Config.kv_lm_mode, choices=["identity", "shared", "copy"])
     p.add_argument("--precision", type=str, default=Config.precision, choices=["bf16", "fp32"])
+    p.add_argument("--train_last_encoder", type=lambda x: x.lower() != "false", default=Config.train_last_encoder)
     p.add_argument("--dec_d_model", type=_tuple_arg, default=Config.dec_d_model)
     p.add_argument("--dec_n_layers", type=_tuple_arg, default=Config.dec_n_layers)
     p.add_argument("--dec_n_heads", type=_tuple_arg, default=Config.dec_n_heads)
@@ -1535,6 +1695,8 @@ def main():
         p.error(f"--config {pre_args.config} sets unknown field(s): {sorted(unknown)}")
     p.set_defaults(**config_vars)
     args = p.parse_args()
+    if args.run_name is None:
+        args.run_name = pre_args.config.stem
 
     n_devices = args.n_devices or jax.local_device_count()
     print(f"jax devices ({n_devices} used of {jax.local_device_count()} local): {jax.devices()}")
@@ -1628,7 +1790,8 @@ def main():
             tf_acc = float(aux_tf[1])
             enc_tf = single_model.encoder(flat)
             recon = single_model.stages[0].reconstruct_kv_cache_scan(enc_tf["codes"], cfg.lag,
-                                                                       greedy=True, seed=epoch)
+                                                                       greedy=True, seed=epoch,
+                                                                       encoder=single_model.encoder)
             gen_acc = float(jnp.mean(recon == flat))
             recon_img = np.asarray(recon).reshape(args.qual_gen_n, 32, 32, 3).astype(np.uint8)
             gt_img = recon_prompt.astype(np.uint8)
@@ -1645,7 +1808,8 @@ def main():
             val_tf_acc = float(val_aux_tf[1])
             val_enc_tf = single_model.encoder(val_flat)
             val_recon = single_model.stages[0].reconstruct_kv_cache_scan(val_enc_tf["codes"], cfg.lag,
-                                                                          greedy=False, temperature=0.01, seed=epoch)
+                                                                          greedy=False, temperature=0.01, seed=epoch,
+                                                                          encoder=single_model.encoder)
             val_gen_acc = float(jnp.mean(val_recon == val_flat))
             val_recon_img = np.asarray(val_recon).reshape(args.qual_gen_n, 32, 32, 3).astype(np.uint8)
             val_gt_img = val_recon_prompt.astype(np.uint8)
@@ -1688,6 +1852,55 @@ def main():
                    f"MSE={mse:.2f}, gen_byte_acc={gen_acc:.4f}, teacher_forced_acc={tf_acc:.4f} "
                    f"(gen_consistency_gap={tf_acc - gen_acc:.4f})",
                    recon_mse=mse, gen_byte_acc=gen_acc, teacher_forced_acc=tf_acc)
+
+            # NOTE: this decoder_type only ever has a stage for codes[0] -- no dedicated decoder
+            # exists for levels above it, so there is no valid cascade to run here. The proper
+            # top-down cascade (given codes[N-2], chained DecoderLevel stages down to bytes) needs
+            # decoder_type="self_attn_lag_hier" (see branch below) -- codes[N-2] used to be fed
+            # through HierEncoder.generate_lower_codes as a stand-in, but that path is structurally
+            # inert (levels' NTP heads are unconditional, see chat 2026-09-10) and was removed.
+            return
+
+        if cfg.decoder_type == "self_attn_lag_hier":
+            _, aux_tf = single_model(flat)
+            tf_acc = float(aux_tf[1])
+            enc_tf = single_model.encoder(flat)
+            n_levels = len(single_model.stages) + 1  # +1 for the discarded top level
+            stage_lags = hier_stage_lags(cfg)
+
+            recon = single_model.stages[0].reconstruct_kv_cache(enc_tf["codes"][0], stage_lags[0],
+                                                                  greedy=args.qual_gen_greedy,
+                                                                  temperature=args.qual_gen_temperature, seed=epoch)
+            gen_acc = float(jnp.mean(recon == flat))
+            recon_img = np.asarray(recon).reshape(args.qual_gen_n, 32, 32, 3).astype(np.uint8)
+            gt_img = recon_prompt.astype(np.uint8)
+            mse = float(np.mean((recon_img.astype(np.float32) - gt_img.astype(np.float32)) ** 2))
+            out_path = run_dir / f"samples_epoch{epoch}_reconstruct.png"
+            save_compare_grid(recon_img, gt_img, out_path)
+            logger(f"[self_attn_lag_hier={cfg.lag}] saved reconstruction (recon/gt) for epoch {epoch}, "
+                   f"MSE={mse:.2f}, gen_byte_acc={gen_acc:.4f}, teacher_forced_acc={tf_acc:.4f} "
+                   f"(gen_consistency_gap={tf_acc - gen_acc:.4f})",
+                   recon_mse=mse, gen_byte_acc=gen_acc, teacher_forced_acc=tf_acc)
+
+            # Full hierarchical cascade: codes[N-2] given/real (level N-1's own code is never
+            # consumed by anyone, see HierEncoder/strides[-1]=-1 convention); chain stages[i] for
+            # i=N-2..1 top-down (each conditioned on codes[i], generating codes[i-1]), then
+            # stages[0] generates bytes from the final codes[0] -- see chat 2026-09-10
+            # ("duplicate EncoderLevel to DecoderLevel", sanity-checked on toy examples).
+            cur_code = enc_tf["codes"][n_levels - 2]
+            for i in range(n_levels - 2, 0, -1):
+                cur_code = single_model.stages[i].reconstruct_kv_cache(cur_code, stage_lags[i], greedy=True, seed=epoch)
+            cascade_recon = single_model.stages[0].reconstruct_kv_cache(cur_code, stage_lags[0],
+                                                                          greedy=args.qual_gen_greedy,
+                                                                          temperature=args.qual_gen_temperature,
+                                                                          seed=epoch)
+            cascade_gen_acc = float(jnp.mean(cascade_recon == flat))
+            cascade_img = np.asarray(cascade_recon).reshape(args.qual_gen_n, 32, 32, 3).astype(np.uint8)
+            cascade_path = run_dir / f"samples_epoch{epoch}_cascade.png"
+            save_compare_grid(cascade_img, gt_img, cascade_path)
+            logger(f"[self_attn_lag_hier={cfg.lag}] CASCADE (top code given, all lower levels generated) "
+                   f"saved for epoch {epoch}, gen_byte_acc={cascade_gen_acc:.4f}",
+                   cascade_gen_byte_acc=cascade_gen_acc)
             return
 
     def run_checkpoint(epoch: int) -> None:
@@ -1697,8 +1910,12 @@ def main():
         save_checkpoint(ckpt_dir, single_model, single_opt_state, step, epoch)
         logger(f"saved checkpoint at epoch {epoch} -> {ckpt_dir}")
 
+    steps_per_epoch = len(train_iter)
+    total_steps = steps_per_epoch * args.epochs
+    run_pbar = tqdm(total=total_steps, initial=step, desc="total", position=0)
+    last_logged_step = step
     for epoch in range(start_epoch, args.epochs + 1):
-        pbar = tqdm(train_iter, desc=f"epoch {epoch}/{args.epochs}")
+        pbar = tqdm(train_iter, desc=f"epoch {epoch}/{args.epochs}", position=1, leave=False)
         epoch_losses = []
         for flat, y in pbar:
             p_model, p_opt_state, loss, (bpb, acc, ntp_bpb, ntp_acc, util) = train_step(p_model, p_opt_state, flat)
@@ -1710,6 +1927,9 @@ def main():
                               acc=f"{float(acc[0]):.3f}", ntp_bpb=f"{float(ntp_bpb[0]):.3f}",
                               ntp_acc=f"{float(ntp_acc[0]):.3f}")
             if step % args.log_every == 0:
+                run_pbar.update(step - last_logged_step)
+                run_pbar.set_postfix(loss=f"{loss_v:.3f}")
+                last_logged_step = step
                 logger(f"epoch={epoch} step={step} lr={lr_v:.6f} loss={loss_v:.4f} byte_bpb={float(bpb[0]):.4f} "
                        f"byte_acc={float(acc[0]):.4f} ntp_bpb={float(ntp_bpb[0]):.4f} "
                        f"ntp_acc={float(ntp_acc[0]):.4f} util={float(util[0]):.3f}",
@@ -1726,6 +1946,7 @@ def main():
             run_reconstruct(epoch)
             run_checkpoint(epoch)
 
+    run_pbar.close()
     logger("training done")
 
 

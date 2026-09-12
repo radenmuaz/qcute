@@ -158,8 +158,11 @@ def rope_cos_sin(seq_len: int, head_dim: int, base: float) -> tuple:
 
 
 def rope_cos_sin_pos(pos, head_dim: int, base: float) -> tuple:
+    """pos: scalar (single-step) or (T,) (chunked prefill) -- broadcasts either way via the
+    trailing-axis expansion, giving (head_dim,) or (T,head_dim) respectively."""
     inv_freq = 1.0 / (base ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
-    freqs = pos * inv_freq
+    pos = jnp.asarray(pos, dtype=jnp.float32)
+    freqs = pos[..., None] * inv_freq
     emb = jnp.concatenate([freqs, freqs], axis=-1)
     return jnp.cos(emb), jnp.sin(emb)
 
@@ -170,11 +173,14 @@ def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
 
 
 def apply_rope(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
-    return x * cos[None, None] + rotate_half(x) * sin[None, None]
+    # cos/sin are fp32 (precision); cast back to x's dtype after -- otherwise bf16 x silently
+    # upcasts to fp32 via type promotion, breaking dynamic_update_slice's dtype-matching cache
+    # writes and defeating the whole point of bf16 compute (confirmed 2026-09-10).
+    return (x * cos[None, None] + rotate_half(x) * sin[None, None]).astype(x.dtype)
 
 
 def apply_rope_single(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
-    return x * cos[None, :] + rotate_half(x) * sin[None, :]
+    return (x * cos[None, :] + rotate_half(x) * sin[None, :]).astype(x.dtype)
 
 
 class Attention(eqx.Module):
@@ -224,8 +230,8 @@ class Attention(eqx.Module):
         q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
         cos, sin = rope_cos_sin_pos(pos, hd, self.rope_base)
         q, k = apply_rope_single(q, cos, sin), apply_rope_single(k, cos, sin)
-        cache_k = jax.lax.dynamic_update_slice(cache_k, k[:, :, None, :], (0, 0, pos, 0))
-        cache_v = jax.lax.dynamic_update_slice(cache_v, v[:, :, None, :], (0, 0, pos, 0))
+        cache_k = jax.lax.dynamic_update_slice(cache_k, k[:, :, None, :].astype(cache_k.dtype), (0, 0, pos, 0))
+        cache_v = jax.lax.dynamic_update_slice(cache_v, v[:, :, None, :].astype(cache_v.dtype), (0, 0, pos, 0))
         n_rep = self.n_heads // self.n_kv_heads
         k_full = jnp.repeat(cache_k, n_rep, axis=1) if n_rep > 1 else cache_k
         v_full = jnp.repeat(cache_v, n_rep, axis=1) if n_rep > 1 else cache_v
@@ -235,6 +241,39 @@ class Attention(eqx.Module):
         logits = jnp.where(valid[None, None, :], logits, -1e9)
         attn = jax.nn.softmax(logits, axis=-1)
         y = jnp.einsum("bht,bhtd->bhd", attn, v_full).reshape(Bc, D)
+        return y @ self.out, cache_k, cache_v
+
+    def chunk_step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray,
+                    pos_start, T_max: int) -> tuple:
+        """Parallel-prefill form: x_new is (Bc,T,D), T new KNOWN positions [pos_start,
+        pos_start+T) written into the cache in ONE batched forward pass (causal within the chunk,
+        full attention back into cache[:pos_start] from earlier chunks/groups) -- for content
+        that's entirely given upfront (e.g. StageLagDecoder's ctx codes), not autoregressively
+        generated one token at a time via step(). Same cache layout/dtype as step(), so the two
+        are freely interleaved (chat 2026-09-10, fixing reconstruct_kv_cache's lag=max slowness --
+        it was calling step() once per ctx code even though none of them need generating)."""
+        Bc, T, D = x_new.shape
+        hd = D // self.n_heads
+        qkv = x_new @ self.qkv
+        q, k, v = jnp.split(qkv, [D, D + self.n_kv_heads * hd], axis=-1)
+        q = q.reshape(Bc, T, self.n_heads, hd).transpose(0, 2, 1, 3)
+        k = k.reshape(Bc, T, self.n_kv_heads, hd).transpose(0, 2, 1, 3)
+        v = v.reshape(Bc, T, self.n_kv_heads, hd).transpose(0, 2, 1, 3)
+        q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
+        pos_ids = pos_start + jnp.arange(T)
+        cos, sin = rope_cos_sin_pos(pos_ids, hd, self.rope_base)  # (T, hd)
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)  # x:(Bc,H,T,hd), cos/sin:(T,hd)
+        cache_k = jax.lax.dynamic_update_slice(cache_k, k.astype(cache_k.dtype), (0, 0, pos_start, 0))
+        cache_v = jax.lax.dynamic_update_slice(cache_v, v.astype(cache_v.dtype), (0, 0, pos_start, 0))
+        n_rep = self.n_heads // self.n_kv_heads
+        k_full = jnp.repeat(cache_k, n_rep, axis=1) if n_rep > 1 else cache_k
+        v_full = jnp.repeat(cache_v, n_rep, axis=1) if n_rep > 1 else cache_v
+        scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
+        logits = jnp.einsum("bhtd,bhsd->bhts", q, k_full) * scale  # (Bc,H,T,T_max)
+        valid = jnp.arange(T_max)[None, :] <= pos_ids[:, None]  # (T,T_max)
+        logits = jnp.where(valid[None, None], logits, -1e9)
+        attn = jax.nn.softmax(logits, axis=-1)
+        y = jnp.einsum("bhts,bhsd->bhtd", attn, v_full).transpose(0, 2, 1, 3).reshape(Bc, T, D)
         return y @ self.out, cache_k, cache_v
 
 
@@ -258,6 +297,13 @@ class Block(eqx.Module):
 
     def step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray, pos, T_max: int) -> tuple:
         attn_out, ck, cv = self.attn.step(self.norm1(x_new), cache_k, cache_v, pos, T_max)
+        x = x_new + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x, ck, cv
+
+    def chunk_step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray,
+                    pos_start, T_max: int) -> tuple:
+        attn_out, ck, cv = self.attn.chunk_step(self.norm1(x_new), cache_k, cache_v, pos_start, T_max)
         x = x_new + attn_out
         x = x + self.mlp(self.norm2(x))
         return x, ck, cv
