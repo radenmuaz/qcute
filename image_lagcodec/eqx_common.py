@@ -127,8 +127,18 @@ def apply_xsa(y: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
     onto the query token's own value vector v (same position, GQA-repeated to match y's head
     count). The paper finds plain attention output is biased toward high cosine similarity with
     v_i -- a point-wise transform the FFN should own -- crowding out genuine contextual mixing.
-    z = y - (y . v_hat) v_hat, v_hat = v / ||v||_2. y and v: (..., hd), same shape."""
-    v_hat = v / (jnp.linalg.norm(v, axis=-1, keepdims=True) + 1e-8)
+    z = y - (y . v_hat) v_hat, v_hat = v / ||v||_2. y and v: (..., hd), same shape.
+
+    chat 2026-09-13 -- eps must go INSIDE the sqrt (rsqrt(sum(v**2)+eps)), not added to the norm
+    afterward (v/(norm+eps)): the latter guards the forward division but jnp.linalg.norm's own
+    gradient is v/||v|| (from d(sqrt(x))/dx), a genuine 0/0 at v==0 -- NaN in the backward pass
+    even though the forward value is finite. Confirmed root cause of the "zero"-init NaN-loss
+    bug (2026-09-13): NaN landed only on qkv leaves, never out/q_norm/k_norm -- the tell that
+    only v's own gradient path was corrupted, regardless of how q/k/v happen to be initialized.
+    Any exactly-zero v vector anywhere (routine under ZerO's partial-identity zero rows) triggers
+    it. rsqrt(sum(v**2)+eps) has no such singularity at v=0 (verified: grad is exactly 0 there,
+    not NaN) -- do not revert to v/(norm(v)+eps), it silently reintroduces this."""
+    v_hat = v * jax.lax.rsqrt(jnp.sum(v ** 2, axis=-1, keepdims=True) + 1e-8)
     return y - jnp.sum(y * v_hat, axis=-1, keepdims=True) * v_hat
 
 
@@ -274,7 +284,8 @@ class Attention(eqx.Module):
         if init_scheme == "zero":
             # self.qkv = init_matrix(k1, (d_model, d_model + 2 * n_kv_heads * hd), scheme="llama")
             # self.out = init_matrix(k2, (d_model, d_model), "llama", residual_out=True, n_layers=n_layers)
-            q_part = jnp.zeros((d_model, d_model))
+            # q_part = jnp.zeros((d_model, d_model))
+            q_part = init_matrix(k1, (d_model, d_model), init_scheme)
             k_part = init_matrix(k1, (d_model, n_kv_heads * hd), init_scheme)
             v_part = init_matrix(k1, (d_model, n_kv_heads * hd), init_scheme)
             self.qkv = jnp.concatenate([q_part, k_part, v_part], axis=-1)
