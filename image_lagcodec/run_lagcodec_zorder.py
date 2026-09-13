@@ -73,8 +73,8 @@ import numpy as np
 import optax
 from tqdm import tqdm
 
-from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, apply_rope, rmsnorm, rope_cos_sin,
-                                        sinkgd, warmup_const_schedule)
+from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, apply_rope, apply_xsa, init_matrix,
+                                        init_vector, rmsnorm, rope_cos_sin, sinkgd, warmup_const_schedule)
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
@@ -101,7 +101,9 @@ class Config:
     # length tuple default would silently break any config with a different level count.
     rope_base: tuple = 10000.0    # chat 2026-09-12 -- now PER-LEVEL, bare-scalar default
     ntp_weight: float = 1.0     # stays global -- a loss-mixing coefficient, not a capacity knob
-    lag: tuple = 0   # chat 2026-09-12 -- now PER-LEVEL (was a single global int), bare-scalar default
+    decoder_ncodes: tuple = 1   # chat 2026-09-13 -- renamed from lag=0 (an offset) to a direct
+    # count of codes the decoder conditions on (1 = current position only, no lookback), avoiding
+    # the G=lag+1 off-by-one. Per-level, bare-scalar default.
     weight_sharing: tuple = True   # chat 2026-09-12 -- now PER-LEVEL, bare-scalar default
     precision: str = "bf16"           # stays global -- whole-model compute dtype
     curriculum_mode: str = "freeze"   # stays global -- training-loop control
@@ -109,6 +111,16 @@ class Config:
     gumbel_temperature: tuple = 1.0   # chat 2026-09-12 -- now PER-LEVEL, bare-scalar default
     gumbel_at_inference: bool = False
     cascade_rollout_prob: float = 0.5
+    init_scheme: str = "llama"   # chat 2026-09-13 -- weight init: "llama" (N(0,0.02^2), residual-
+    # output projections scaled by 1/sqrt(2*n_layers), see eqx_common.init_matrix) or "zero"
+    # (Zhao et al. 2021 arXiv:2110.12661 ZerO init -- deterministic identity/Hadamard, residual-
+    # output projections forced to literal zero). Stays global, not per-level.
+    use_xsa: bool = False   # chat 2026-09-13 -- Exclusive Self-Attention (arXiv:2603.09078):
+    # removes the attention output's projection onto the query's own value vector, applied right
+    # after every attention call (see eqx_common.apply_xsa). Stays global; default off, enable
+    # with True.
+    use_qknorm: bool = True   # chat 2026-09-13 -- per-head RMSNorm on q/k before RoPE+scores.
+    # Stays global; disable with False.
 
     byte_group: int = 1          # level0's own group size, in {1, 3}. 1 = one byte per position
     # (old is_byte_level behavior, default). 3 = one pixel (R,G,B) per position.
@@ -144,6 +156,11 @@ class Config:
     mtp_weight: float = 0.1   # chat 2026-09-12 -- stays global (loss-mixing coefficient, like
     # ntp_weight), scales the auxiliary MTP loss added on top of the main per-position loss.
 
+    entropy_weight: float = 0.0   # chat 2026-09-13 -- IBQ-style (arXiv:2412.02692) entropy bonus
+    # on the encoder's per-position code distribution, pushing codebook usage toward uniform
+    # (combats index collapse -- see codebook_utilization, computed but otherwise unused). Default
+    # 0.0 (off) -- opt-in, existing configs unaffected. Stays global, like ntp_weight/mtp_weight.
+
     traversal: str = "raster"    # "raster" (default, row-major) or "zorder" (Morton curve over
     # pixels, RGB stays contiguous per pixel regardless of byte_group -- see module docstring).
 
@@ -159,7 +176,7 @@ class Config:
         # config doesn't have to spell out e.g. "(4,)*5" for a value uniform across every level.
         bcast("mlp_mult", int)
         bcast("rope_base", (int, float))
-        bcast("lag", int)
+        bcast("decoder_ncodes", int)
         bcast("weight_sharing", bool)
         bcast("gumbel_temperature", (int, float))
         bcast("token_head_type", str)
@@ -170,7 +187,7 @@ class Config:
 
         assert len(self.d_model) == n and len(self.n_layers) == n and len(self.n_heads) == n \
             and len(self.n_kv_heads) == n and len(self.code_vocab) == n and len(self.pq_chunks) == n
-        assert len(self.mlp_mult) == n and len(self.rope_base) == n and len(self.lag) == n
+        assert len(self.mlp_mult) == n and len(self.rope_base) == n and len(self.decoder_ncodes) == n
         assert len(self.weight_sharing) == n and len(self.gumbel_temperature) == n
         assert len(self.token_head_type) == n
         assert all(t in ("linears", "ar", "diffusion") for t in self.token_head_type)
@@ -210,6 +227,7 @@ class Config:
             "cascade-simulated ctx must stay trainable to adapt to it (see module docstring)"
         assert 0.0 <= self.cascade_rollout_prob <= 1.0
         assert self.quantize_mode in ("argmax", "gumbel")
+        assert self.init_scheme in ("llama", "zero")
         resolved_kv = []
         for i in range(n):
             kv = self.n_kv_heads[i] if self.n_kv_heads[i] is not None else max(1, self.n_heads[i] // 4)
@@ -411,7 +429,8 @@ def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False) 
     q = q.reshape(B, T, attn.n_heads, hd).transpose(0, 2, 1, 3)
     k = k.reshape(B, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
     v = v.reshape(B, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
-    q, k = rmsnorm(q, attn.q_norm), rmsnorm(k, attn.k_norm)
+    if attn.use_qknorm:
+        q, k = rmsnorm(q, attn.q_norm), rmsnorm(k, attn.k_norm)
     cos, sin = rope_cos_sin(T, hd, attn.rope_base)
     q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
     rep = attn.n_heads // attn.n_kv_heads
@@ -422,7 +441,9 @@ def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False) 
         mask = jnp.tril(jnp.ones((T, T), dtype=bool))
         scores = jnp.where(mask[None, None, :, :], scores, -jnp.inf)
     weights = jax.nn.softmax(scores, axis=-1)
-    y = jnp.einsum("bhts,bhsd->bhtd", weights, v)
+    y = jnp.einsum("bhts,bhsd->bhtd", weights, v)  # (B,H,T,hd)
+    if attn.use_xsa:
+        y = apply_xsa(y, v)
     y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
     return y @ attn.out
 
@@ -555,38 +576,41 @@ class EncDecLevel(eqx.Module):
         ntp_out = self.in_pq_chunks * self.in_code_vocab
         keys = jax.random.split(key, 20)
 
-        self.own_input_embed = jax.random.normal(keys[0], (own_vocab, D)) * 0.02
+        scheme, use_xsa, use_qknorm = cfg.init_scheme, cfg.use_xsa, cfg.use_qknorm
+        self.own_input_embed = init_matrix(keys[0], (own_vocab, D), scheme)
         n_layers = cfg.n_layers[level]
         block_keys = jax.random.split(keys[1], n_layers)
-        self.blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level])
-                       for k in block_keys]
+        self.blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
+                             n_layers=n_layers, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm) for k in block_keys]
         self.ln_f = RMSNorm(D)
-        self.code_head = jax.random.normal(keys[2], (D, self.pq_chunks * self.code_vocab)) * 0.02
-        self.ntp_head = jax.random.normal(keys[3], (D, ntp_out)) * 0.02
-        self.bos_embed = jax.random.normal(keys[4], (D,)) * 0.02
-        self.ctx_embed = jax.random.normal(keys[5], (self.code_vocab, D)) * 0.02
+        self.code_head = init_matrix(keys[2], (D, self.pq_chunks * self.code_vocab), scheme)
+        self.ntp_head = init_matrix(keys[3], (D, ntp_out), scheme)
+        self.bos_embed = init_vector(keys[4], D, scheme)
+        self.ctx_embed = init_matrix(keys[5], (self.code_vocab, D), scheme)
 
         if has_decoder and not weight_sharing:
             dec_block_keys = jax.random.split(keys[6], n_layers)
-            self.dec_blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level])
+            self.dec_blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
+                                     n_layers=n_layers, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
                                for k in dec_block_keys]
             self.dec_ln_f = RMSNorm(D)
-            self.dec_target_embed = jax.random.normal(keys[7], (own_vocab, D)) * 0.02
-            self.dec_head = jax.random.normal(keys[8], (D, ntp_out)) * 0.02
+            self.dec_target_embed = init_matrix(keys[7], (own_vocab, D), scheme)
+            self.dec_head = init_matrix(keys[8], (D, ntp_out), scheme)
         else:
             self.dec_blocks, self.dec_ln_f, self.dec_target_embed, self.dec_head = None, None, None, None
 
         if has_decoder and self.token_head_type in ("ar", "diffusion"):
             tdim, theads = cfg.token_dim[level], cfg.token_n_heads[level]
-            self.token_in_proj = jax.random.normal(keys[9], (D, tdim)) * 0.02
-            self.token_member_embed = jax.random.normal(keys[10], (self.in_code_vocab, tdim)) * 0.02
+            self.token_in_proj = init_matrix(keys[9], (D, tdim), scheme)
+            self.token_member_embed = init_matrix(keys[10], (self.in_code_vocab, tdim), scheme)
             self.token_norm1 = RMSNorm(tdim)
-            self.token_attn = Attention(keys[11], tdim, theads, theads, cfg.rope_base[level])
+            self.token_attn = Attention(keys[11], tdim, theads, theads, cfg.rope_base[level], n_layers=1,
+                                         init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
             self.token_ln_f = RMSNorm(tdim)
-            self.token_out_head = jax.random.normal(keys[12], (tdim, self.in_code_vocab)) * 0.02
+            self.token_out_head = init_matrix(keys[12], (tdim, self.in_code_vocab), scheme)
             if self.token_head_type == "diffusion":
-                self.token_mask_embed = jax.random.normal(keys[14], (tdim,)) * 0.02
-                self.token_channel_embed = jax.random.normal(keys[15], (self.in_pq_chunks, tdim)) * 0.02
+                self.token_mask_embed = init_vector(keys[14], tdim, scheme)
+                self.token_channel_embed = init_matrix(keys[15], (self.in_pq_chunks, tdim), scheme)
             else:
                 self.token_mask_embed, self.token_channel_embed = None, None
         else:
@@ -597,32 +621,34 @@ class EncDecLevel(eqx.Module):
         (self.mtp_heads_in_proj, self.mtp_heads_member_embed, self.mtp_heads_norm1,
          self.mtp_heads_attn, self.mtp_heads_ln_f, self.mtp_heads_out_head) = (None,) * 6
         if has_decoder and self.mtp_horizon > 1 and self.mtp_mode == "parallel" and self.token_head_type == "linears":
-            self.mtp_out_head = jax.random.normal(keys[13], (D, self.mtp_horizon * ntp_out)) * 0.02
+            self.mtp_out_head = init_matrix(keys[13], (D, self.mtp_horizon * ntp_out), scheme)
             (self.mtp_in_proj, self.mtp_attn, self.mtp_norm1, self.mtp_ln_f, self.mtp_out_proj) = (None,) * 5
         elif has_decoder and self.mtp_horizon > 1 and self.mtp_mode == "parallel" and self.token_head_type == "ar":
             # "duplicate ar heads" (chat 2026-09-12): K FULLY INDEPENDENT copies of the token-ar
             # mechanism, one per future timestep, all applied to the SAME h_t -- no chaining.
             tdim, theads = cfg.token_dim[level], cfg.token_n_heads[level]
             head_keys = jax.random.split(keys[19], self.mtp_horizon * 3)
-            self.mtp_heads_in_proj = [jax.random.normal(head_keys[3 * k], (D, tdim)) * 0.02
+            self.mtp_heads_in_proj = [init_matrix(head_keys[3 * k], (D, tdim), scheme)
                                        for k in range(self.mtp_horizon)]
-            self.mtp_heads_member_embed = [jax.random.normal(head_keys[3 * k + 1], (self.in_code_vocab, tdim)) * 0.02
+            self.mtp_heads_member_embed = [init_matrix(head_keys[3 * k + 1], (self.in_code_vocab, tdim), scheme)
                                             for k in range(self.mtp_horizon)]
-            self.mtp_heads_attn = [Attention(head_keys[3 * k + 2], tdim, theads, theads, cfg.rope_base[level])
+            self.mtp_heads_attn = [Attention(head_keys[3 * k + 2], tdim, theads, theads, cfg.rope_base[level],
+                                              n_layers=1, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
                                     for k in range(self.mtp_horizon)]
             self.mtp_heads_norm1 = [RMSNorm(tdim) for _ in range(self.mtp_horizon)]
             self.mtp_heads_ln_f = [RMSNorm(tdim) for _ in range(self.mtp_horizon)]
-            self.mtp_heads_out_head = [jax.random.normal(k, (tdim, self.in_code_vocab)) * 0.02
+            self.mtp_heads_out_head = [init_matrix(k, (tdim, self.in_code_vocab), scheme)
                                         for k in jax.random.split(keys[19], self.mtp_horizon)]
             (self.mtp_out_head, self.mtp_in_proj, self.mtp_attn, self.mtp_norm1,
              self.mtp_ln_f, self.mtp_out_proj) = (None,) * 6
         elif has_decoder and self.mtp_horizon > 1 and self.mtp_mode == "ar":
             tdim, theads = cfg.token_dim[level], cfg.token_n_heads[level]
-            self.mtp_in_proj = jax.random.normal(keys[16], (D, tdim)) * 0.02
-            self.mtp_attn = Attention(keys[17], tdim, theads, theads, cfg.rope_base[level])
+            self.mtp_in_proj = init_matrix(keys[16], (D, tdim), scheme)
+            self.mtp_attn = Attention(keys[17], tdim, theads, theads, cfg.rope_base[level], n_layers=1,
+                                       init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
             self.mtp_norm1 = RMSNorm(tdim)
             self.mtp_ln_f = RMSNorm(tdim)
-            self.mtp_out_proj = jax.random.normal(keys[18], (tdim, D)) * 0.02
+            self.mtp_out_proj = init_matrix(keys[18], (tdim, D), scheme)
             self.mtp_out_head = None
         else:
             (self.mtp_out_head, self.mtp_in_proj, self.mtp_attn, self.mtp_norm1, self.mtp_ln_f,
@@ -645,13 +671,22 @@ class EncDecLevel(eqx.Module):
         else:
             code_soft, code_idx = quantize_hard(logits)
 
+        # IBQ-style (arXiv:2412.02692) entropy bonus: negative entropy of the batch-averaged soft
+        # code distribution (differentiable, unlike codebook_utilization's hard-idx entropy used
+        # only for logging) -- minimizing this maximizes codebook usage entropy, combating index
+        # collapse. Config.entropy_weight (default 0.0) scales this in phase_forward.
+        probs = jax.nn.softmax(logits, axis=-1)
+        p_avg = jnp.mean(probs, axis=(0, 1))
+        entropy_loss = jnp.mean(jnp.sum(p_avg * jnp.log(jnp.maximum(p_avg, 1e-9)), axis=-1))
+
         ntp_logits = reshape_pq(h[:, :-1, :] @ self.ntp_head, self.in_pq_chunks, self.in_code_vocab)
         tgt = target_idx[:, 1:]
         logp = jax.nn.log_softmax(ntp_logits, axis=-1)
         ntp_loss = -jnp.mean(jnp.take_along_axis(logp, tgt[..., None], axis=-1))
         ntp_acc = jnp.mean(jnp.argmax(ntp_logits, -1) == tgt)
         util = codebook_utilization(code_idx, self.code_vocab)
-        return dict(code_soft=code_soft, code_idx=code_idx, ntp_loss=ntp_loss, ntp_acc=ntp_acc, util=util)
+        return dict(code_soft=code_soft, code_idx=code_idx, ntp_loss=ntp_loss, ntp_acc=ntp_acc, util=util,
+                    entropy_loss=entropy_loss)
 
     # --- decoder role (mirrors StageLagDecoder.forward/reconstruct_kv_cache) ---
 
@@ -814,7 +849,7 @@ class EncDecLevel(eqx.Module):
         denom = jnp.maximum(jnp.sum(m), 1.0)
         return jnp.sum(nll * m) / denom, jnp.sum(correct * m) / denom
 
-    def decode_logits_and_target(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray, lag: int,
+    def decode_logits_and_target(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray, decoder_ncodes: int,
                                   rng=None) -> tuple:
         """Returns (logits, target, mask). mask is None except for "diffusion" (KIV -- only
         masked positions count toward loss/acc, standard MLM convention). target_seq/
@@ -825,7 +860,7 @@ class EncDecLevel(eqx.Module):
         D = self.bos_embed.shape[-1]
         te = self._dec_embed_target(target_seq)
         n_blocks = ctx_code_soft.shape[1]
-        G = lag + 1
+        G = decoder_ncodes
         pad_blocks = (-n_blocks) % G
         n_blocks_p = n_blocks + pad_blocks
         n_groups = n_blocks_p // G
@@ -856,19 +891,19 @@ class EncDecLevel(eqx.Module):
         mtp_loss = self._mtp_loss(h_t, target)
         return logits, target, mask, mtp_loss
 
-    def decode(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray, lag: int, rng=None) -> tuple:
-        logits, target, mask, mtp_loss = self.decode_logits_and_target(target_seq, ctx_code_soft, lag, rng=rng)
+    def decode(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray, decoder_ncodes: int, rng=None) -> tuple:
+        logits, target, mask, mtp_loss = self.decode_logits_and_target(target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
         loss, acc = self._dec_loss_acc(logits, target, mask)
         return loss + self.mtp_weight * mtp_loss, acc
 
-    def decode_generate(self, ctx_idx: jnp.ndarray, lag: int, greedy: bool = True,
+    def decode_generate(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
                          temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
         blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
         B, n_blocks, _ = ctx_idx.shape
         D = self.bos_embed.shape[-1]
         hd = D // self.n_heads
         out_extra = (self.in_pq_chunks,)
-        G = lag + 1
+        G = decoder_ncodes
         pad_blocks = (-n_blocks) % G
         n_blocks_p = n_blocks + pad_blocks
         n_groups = n_blocks_p // G
@@ -941,7 +976,7 @@ class EncDecLevel(eqx.Module):
         out = vals_all.reshape(B, n_groups * G * self.K, *out_extra).astype(jnp.int32)
         return out[:, :n_blocks * self.K]
 
-    def decode_generate_mtp_no_verify(self, ctx_idx: jnp.ndarray, lag: int, greedy: bool = True,
+    def decode_generate_mtp_no_verify(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
                                        temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
         """chat 2026-09-12: true-MTP "no-verify" decode -- draws mtp_horizon positions per KV-
         cache step instead of one, directly accepting the draft with no check against the real
@@ -951,14 +986,14 @@ class EncDecLevel(eqx.Module):
         outer step using the SAME cached hidden state (the K draws share one h -- genuinely
         parallel, not autoregressive)."""
         if self.mtp_horizon <= 1:
-            return self.decode_generate(ctx_idx, lag, greedy, temperature, seed)
+            return self.decode_generate(ctx_idx, decoder_ncodes, greedy, temperature, seed)
         K = self.mtp_horizon
         blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
         B, n_blocks, _ = ctx_idx.shape
         D = self.bos_embed.shape[-1]
         hd = D // self.n_heads
         out_extra = (self.in_pq_chunks,)
-        G = lag + 1
+        G = decoder_ncodes
         pad_blocks = (-n_blocks) % G
         n_blocks_p = n_blocks + pad_blocks
         n_groups = n_blocks_p // G
@@ -1088,7 +1123,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     x = code_embed(flat_bytes, levels[0].own_input_embed)
     target = flat_bytes
     codes, codes_soft = [], []
-    enc_losses, enc_accs, utils = [], [], []
+    enc_losses, enc_accs, utils, entropy_losses = [], [], [], []
     # per-level: one rng for encode()'s optional gumbel noise, one for decode()'s optional
     # diffusion token-head masking (KIV -- see _token_teacher_forced_diffusion).
     level_rngs = [None] * (2 * phase) if rng is None else list(jax.random.split(rng, 2 * phase))
@@ -1099,6 +1134,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
         enc_losses.append(out["ntp_loss"])
         enc_accs.append(out["ntp_acc"])
         utils.append(out["util"])
+        entropy_losses.append(out["entropy_loss"])
         if i < phase - 1:
             x = code_embed(out["code_soft"], levels[i + 1].own_input_embed)
             target = out["code_idx"]
@@ -1109,7 +1145,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
         dec_target = flat_bytes if i == 0 else codes[i - 1]
         dec_rng = level_rngs[2 * i + 1]
         logits, target_i, mask_i, mtp_loss_i = levels[i].decode_logits_and_target(
-            dec_target, ctx, model.cfg.lag[i], rng=dec_rng)
+            dec_target, ctx, model.cfg.decoder_ncodes[i], rng=dec_rng)
         loss_i, acc_i = levels[i]._dec_loss_acc(logits, target_i, mask_i)
         loss_i = loss_i + levels[i].mtp_weight * mtp_loss_i
         dec_losses.append(loss_i)
@@ -1125,7 +1161,8 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     dec_loss_total = jnp.mean(jnp.stack(dec_losses))
     byte_acc = dec_accs[-1]
     ntp_loss_total = jnp.mean(jnp.stack(enc_losses))
-    loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total
+    entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
+    loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total
     bpb = dec_loss_total / jnp.log(2.0)
     return loss, (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
                   jnp.mean(jnp.stack(utils)))
@@ -1198,6 +1235,11 @@ class Logger:
         self.json_f.flush()
 
 
+def _fmt_lr(lr: float) -> str:
+    mantissa, exp = f"{lr:.0e}".split("e")
+    return f"{mantissa}e{int(exp)}"
+
+
 def _tuple_arg(s: str) -> tuple:
     return tuple(None if x.strip().lower() == "none" else int(x) for x in s.split(","))
 
@@ -1228,11 +1270,12 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
 
 
 CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
-                  "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "lag",
+                  "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "decoder_ncodes",
                   "weight_sharing", "precision", "curriculum_mode", "quantize_mode",
-                  "gumbel_temperature", "gumbel_at_inference", "cascade_rollout_prob",
+                  "gumbel_temperature", "gumbel_at_inference", "cascade_rollout_prob", "init_scheme", "use_xsa",
+                  "use_qknorm",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob",
-                  "mtp_horizon", "mtp_mode", "mtp_weight", "traversal")
+                  "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "traversal")
 
 
 def main():
@@ -1259,6 +1302,7 @@ def main():
                     help="global-norm gradient clip threshold, applied before the optimizer "
                          "update; 'none' disables it")
     p.add_argument("--log_every", type=int, default=10)
+    p.add_argument("--gen_eval_every", type=int, default=10, help="mid-phase gen-eval cadence in epochs")
     p.add_argument("--train_subset_n", type=int, default=100)
     p.add_argument("--qual_gen_n", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
@@ -1273,7 +1317,7 @@ def main():
     p.add_argument("--mlp_mult", type=_tuple_arg, default=Config.mlp_mult)
     p.add_argument("--rope_base", type=_float_tuple_arg, default=Config.rope_base)
     p.add_argument("--ntp_weight", type=float, default=Config.ntp_weight)
-    p.add_argument("--lag", type=_tuple_arg, default=Config.lag)
+    p.add_argument("--decoder_ncodes", type=_tuple_arg, default=Config.decoder_ncodes)
     p.add_argument("--weight_sharing", type=_bool_tuple_arg, default=Config.weight_sharing)
     p.add_argument("--precision", type=str, default=Config.precision, choices=["bf16", "fp32"])
     p.add_argument("--curriculum_mode", type=str, default=Config.curriculum_mode, choices=["freeze", "no_freeze"])
@@ -1281,6 +1325,9 @@ def main():
     p.add_argument("--gumbel_temperature", type=_float_tuple_arg, default=Config.gumbel_temperature)
     p.add_argument("--gumbel_at_inference", type=lambda x: x.lower() != "false", default=Config.gumbel_at_inference)
     p.add_argument("--cascade_rollout_prob", type=float, default=Config.cascade_rollout_prob)
+    p.add_argument("--init_scheme", type=str, default=Config.init_scheme, choices=["llama", "zero"])
+    p.add_argument("--use_xsa", type=lambda x: x.lower() != "false", default=Config.use_xsa)
+    p.add_argument("--use_qknorm", type=lambda x: x.lower() != "false", default=Config.use_qknorm)
     p.add_argument("--byte_group", type=int, default=Config.byte_group)
     # type=str (NOT _str_tuple_arg): argparse auto-applies `type=` to ANY string-valued default
     # (even one set via set_defaults from a config file) -- with _str_tuple_arg that silently
@@ -1296,6 +1343,7 @@ def main():
     p.add_argument("--mtp_horizon", type=_tuple_arg, default=Config.mtp_horizon)
     p.add_argument("--mtp_mode", type=str, default=Config.mtp_mode)   # see --token_head_type's note
     p.add_argument("--mtp_weight", type=float, default=Config.mtp_weight)
+    p.add_argument("--entropy_weight", type=float, default=Config.entropy_weight)
     p.add_argument("--traversal", type=str, default=Config.traversal, choices=["raster", "zorder"])
     pre_args, _ = p.parse_known_args()
     config_vars = load_config_module(pre_args.config)
@@ -1343,6 +1391,8 @@ def main():
     logger(f"config: {asdict(cfg)}")
     logger(f"n_levels={n_levels} n_phases={n_phases} n_positions={n_positions} "
            f"params={n_params / 1e6:.2f}M")
+    resolved = {k: v for k, v in sorted(vars(args).items()) if k != "config"}
+    logger(f"resolved_config: {resolved}")
 
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
     recon_prompt = train_np[:args.qual_gen_n]
@@ -1366,15 +1416,15 @@ def main():
 
         recon_acc = None
         if include_reconstruct:
-            recon = m.levels[0].decode_generate(codes[0], cfg.lag[0], greedy=True, seed=0)
+            recon = m.levels[0].decode_generate(codes[0], cfg.decoder_ncodes[0], greedy=True, seed=0)
             recon_acc = float(jnp.mean(recon == flat_prompt))
             recon_img = positions_to_image(np.asarray(recon), cfg, pixel_order)
             save_compare_grid(recon_img, gt_img, run_dir / f"samples_{tag}_reconstruct.png")
 
         cur_code = codes[top]
         for i in range(top, 0, -1):
-            cur_code = m.levels[i].decode_generate(cur_code, cfg.lag[i], greedy=True, seed=0)
-        cascade_recon = m.levels[0].decode_generate(cur_code, cfg.lag[0], greedy=True, seed=0)
+            cur_code = m.levels[i].decode_generate(cur_code, cfg.decoder_ncodes[i], greedy=True, seed=0)
+        cascade_recon = m.levels[0].decode_generate(cur_code, cfg.decoder_ncodes[0], greedy=True, seed=0)
         cascade_acc = float(jnp.mean(cascade_recon == flat_prompt))
         cascade_img = positions_to_image(np.asarray(cascade_recon), cfg, pixel_order)
         save_compare_grid(cascade_img, gt_img, run_dir / f"samples_{tag}_cascade.png")
@@ -1415,6 +1465,8 @@ def main():
             grads = jax.lax.pmean(grads, axis_name="d")
             loss = jax.lax.pmean(loss, axis_name="d")
             aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
+            grad_norm = optax.global_norm(grads)   # before clip -- shows when/how hard grad_clip fires
+            aux = aux + (grad_norm,)
             updates, opt_state = optimizer.update(grads, opt_state, diff_model)
             diff_model = eqx.apply_updates(diff_model, updates)
             return diff_model, opt_state, rng, loss, aux
@@ -1428,26 +1480,41 @@ def main():
         active_desc = f"phase{phase}[{trained_desc}]"
         phase_epochs = args.epochs_per_phase[phase - 1]
         logger(f"=== starting {active_desc} for {phase_epochs} epochs ===")
-        pbar = tqdm(range(1, phase_epochs + 1), desc=active_desc, mininterval=10.0)
+        pbar = tqdm(range(1, phase_epochs + 1), desc=active_desc, dynamic_ncols=True)
+        jit_timed = False
         for epoch in pbar:
             epoch_losses = []
-            for flat in train_iter:
+            step_pbar = tqdm(train_iter, total=len(train_iter), desc=f"epoch{epoch}", leave=False, dynamic_ncols=True)
+            for flat in step_pbar:
                 flat = jnp.array(flat)
+                if not jit_timed:
+                    jit_t0 = time.monotonic()
                 p_diff_model, p_opt_state, p_rng, loss, aux = train_step(p_diff_model, p_opt_state, p_rng, flat)
                 step += 1
-                loss0 = float(loss[0])
+                loss0 = float(loss[0])   # forces device sync -- first call includes jit compile
+                if not jit_timed:
+                    logger(f"{active_desc}: first train_step (incl. jit compile) took "
+                           f"{time.monotonic() - jit_t0:.1f}s")
+                    jit_timed = True
                 epoch_losses.append(loss0)
-                bpb, acc, ntp_bpb, ntp_acc, util = [float(a[0]) for a in aux]
-                pbar.set_postfix(step=step, loss=f"{loss0:.3f}", bpb=f"{bpb:.3f}", acc=f"{acc:.3f}",
-                                  ntp_bpb=f"{ntp_bpb:.3f}", ntp_acc=f"{ntp_acc:.3f}")
+                bpb, acc, ntp_bpb, ntp_acc, util, grad_norm = [float(a[0]) for a in aux]
+                lr = float(lr_schedule(step - 1))
+                lr_str = _fmt_lr(lr)
+                step_pbar.set_postfix(step=step, loss=f"{loss0:.2f}",
+                                    #    bpb=f"{bpb:.2f}",
+                                       acc=f"{acc:.2f}",
+                                    #    ntp_bpb=f"{ntp_bpb:.2f}",
+                                       ntp_acc=f"{ntp_acc:.2f}",
+                                       lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
-                    logger(f"phase={phase} epoch={epoch} step={step} loss={loss0:.4f} "
-                           f"dec_bpb={bpb:.4f} dec_acc={acc:.4f} ntp_bpb={ntp_bpb:.4f} "
-                           f"ntp_acc={ntp_acc:.4f} util={util:.3f}",
+                    logger(f"phase={phase} epoch={epoch} step={step} loss={loss0:.2f} "
+                           f"dec_bpb={bpb:.2f} dec_acc={acc:.2f} ntp_bpb={ntp_bpb:.2f} "
+                           f"ntp_acc={ntp_acc:.2f} util={util:.2f} lr={lr_str} grad_norm={grad_norm:.2f}",
                            phase=phase, epoch=epoch, step=step, loss=loss0, dec_bpb=bpb,
-                           dec_acc=acc, ntp_bpb=ntp_bpb, ntp_acc=ntp_acc, util=util)
+                           dec_acc=acc, ntp_bpb=ntp_bpb, ntp_acc=ntp_acc, util=util,
+                           lr=lr, grad_norm=grad_norm)
 
-            if epoch % 10 == 0:
+            if epoch % args.gen_eval_every == 0:
                 snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
                 run_gen_eval(snapshot, top=phase - 1, tag=f"phase{phase}_epoch{epoch}")
 

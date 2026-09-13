@@ -122,6 +122,25 @@ def rmsnorm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarr
     return x * weight
 
 
+def apply_xsa(y: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
+    """Exclusive Self-Attention (arXiv:2603.09078): removes the attention output's projection
+    onto the query token's own value vector v (same position, GQA-repeated to match y's head
+    count). The paper finds plain attention output is biased toward high cosine similarity with
+    v_i -- a point-wise transform the FFN should own -- crowding out genuine contextual mixing.
+    z = y - (y . v_hat) v_hat, v_hat = v / ||v||_2. y and v: (..., hd), same shape.
+
+    chat 2026-09-13 -- eps must go INSIDE the sqrt (rsqrt(sum(v**2)+eps)), not added to the norm
+    afterward (v/(norm+eps)): the latter guards the forward division but jnp.linalg.norm's own
+    gradient is v/||v|| (from d(sqrt(x))/dx), which is a genuine 0/0 at v==0 -- NaN in the
+    backward pass even though the forward value is finite. Confirmed: this produced NaN grads
+    (traced to exactly the qkv leaves, never out/q_norm/k_norm -- the tell that only v's own
+    gradient path was corrupted) whenever any v vector was exactly zero, which "zero" init
+    (Config.init_scheme) creates routinely via partial-identity zero rows in contracting
+    embedding/head matrices upstream. rsqrt(sum(v**2)+eps) has no such singularity at v=0."""
+    v_hat = v * jax.lax.rsqrt(jnp.sum(v ** 2, axis=-1, keepdims=True) + 1e-8)
+    return y - jnp.sum(y * v_hat, axis=-1, keepdims=True) * v_hat
+
+
 class RMSNorm(eqx.Module):
     weight: jnp.ndarray
     eps: float = eqx.field(static=True, default=1e-6)
@@ -133,17 +152,75 @@ class RMSNorm(eqx.Module):
         return rmsnorm(x, self.weight, self.eps)
 
 
+# ---------------------------------------------------------------------------
+# ZerO init (Zhao et al. 2021, arXiv:2110.12661 "ZerO Initialization: Initializing Residual
+# Networks with only Zeros and Ones") -- fully deterministic, no randomness. Square weight ->
+# identity; contraction (out<in) -> partial identity; expansion (out>in) -> an orthonormal
+# Hadamard matrix (via Sylvester's construction, scaled by 1/sqrt(m) so H H^T = I) sandwiched
+# between partial identities, which is what the paper's dynamical-isometry argument needs --
+# this is the standard orthonormal-Hadamard normalization, since the paper's own m-dependent
+# scaling constant isn't independently reproducible from the paper text alone. The paper also
+# explicitly zero-initializes the LAST layer of each residual branch so the branch starts as a
+# no-op (x + 0 = x) -- ported here as `residual_out=True`.
+# ---------------------------------------------------------------------------
+
+def _next_pow2(n: int) -> int:
+    m = 1
+    while m < n:
+        m *= 2
+    return m
+
+
+def _hadamard(m: int) -> jnp.ndarray:
+    """Sylvester construction of an m x m Hadamard matrix -- m must be a power of 2."""
+    H = jnp.array([[1.0]])
+    while H.shape[0] < m:
+        H = jnp.block([[H, H], [H, -H]])
+    return H
+
+
+def zero_init_matrix(shape: tuple) -> jnp.ndarray:
+    """shape=(in_dim, out_dim), matching this file's x @ W convention."""
+    p, q = shape
+    if p >= q:
+        return jnp.eye(p, q)
+    m = _next_pow2(q)
+    H = _hadamard(m) / jnp.sqrt(m)
+    return H[:p, :q]
+
+
+def init_matrix(key, shape: tuple, scheme: str, residual_out: bool = False, n_layers: int = None) -> jnp.ndarray:
+    """scheme="llama": N(0, 0.02^2); residual_out scales by 1/sqrt(2*n_layers) (GPT-2/LLaMA
+    residual-output convention). scheme="zero": ZerO init above; residual_out forces literal
+    zeros regardless of shape (the paper's "zero-init the residual branch's last layer" rule)."""
+    if scheme == "zero":
+        return jnp.zeros(shape) if residual_out else zero_init_matrix(shape)
+    assert scheme == "llama", f"unknown init_scheme {scheme!r}"
+    std = 0.02 / math.sqrt(2 * n_layers) if (residual_out and n_layers) else 0.02
+    return jax.random.normal(key, shape) * std
+
+
+def init_vector(key, dim: int, scheme: str) -> jnp.ndarray:
+    if scheme == "zero":
+        return jnp.zeros((dim,))
+    return jax.random.normal(key, (dim,)) * 0.02
+
+
 class SwiGLU(eqx.Module):
     gate: jnp.ndarray
     up: jnp.ndarray
     down: jnp.ndarray
 
-    def __init__(self, key, d_model: int, mlp_mult: int):
+    def __init__(self, key, d_model: int, mlp_mult: int, n_layers: int = None, init_scheme: str = "llama"):
+        """init_scheme="llama": input projections at std=0.02; residual-output projection (down)
+        scaled by 1/sqrt(2*n_layers) (GPT-2/LLaMA convention). "zero": ZerO init (see above) --
+        down is forced to literal zeros (residual branch starts as a no-op). n_layers=None keeps
+        the old flat-0.02 llama behavior for call sites that don't pass it."""
         hidden = d_model * mlp_mult
         k1, k2, k3 = jax.random.split(key, 3)
-        self.gate = jax.random.normal(k1, (d_model, hidden)) * 0.02
-        self.up = jax.random.normal(k2, (d_model, hidden)) * 0.02
-        self.down = jax.random.normal(k3, (hidden, d_model)) * 0.02
+        self.gate = init_matrix(k1, (d_model, hidden), init_scheme)
+        self.up = init_matrix(k2, (d_model, hidden), init_scheme)
+        self.down = init_matrix(k3, (hidden, d_model), init_scheme, residual_out=True, n_layers=n_layers)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         return (jax.nn.silu(x @ self.gate) * (x @ self.up)) @ self.down
@@ -191,15 +268,29 @@ class Attention(eqx.Module):
     n_heads: int = eqx.field(static=True)
     n_kv_heads: int = eqx.field(static=True)
     rope_base: float = eqx.field(static=True)
+    use_xsa: bool = eqx.field(static=True)
+    use_qknorm: bool = eqx.field(static=True)
 
-    def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, rope_base: float):
+    def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, rope_base: float, n_layers: int = None,
+                 init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True):
+        """See SwiGLU.__init__ for the init_scheme rationale -- applies identically here, with
+        `out` as the residual-output projection. use_xsa: see apply_xsa() above (arXiv:2603.09078)
+        -- applied right after the attention call, before the out-projection; default off, opt-in.
+        use_qknorm: per-head RMSNorm on q/k before RoPE+scores (stabilizes attention logit scale);
+        can be disabled."""
         hd = d_model // n_heads
         k1, k2 = jax.random.split(key, 2)
-        self.qkv = jax.random.normal(k1, (d_model, d_model + 2 * n_kv_heads * hd)) * 0.02
-        self.out = jax.random.normal(k2, (d_model, d_model)) * 0.02
+        if init_scheme == "zero":
+            self.qkv = init_matrix(k1, (d_model, d_model + 2 * n_kv_heads * hd), scheme="llama")
+            self.out = init_matrix(k2, (d_model, d_model), "llama", residual_out=True, n_layers=n_layers)
+        else:
+            self.qkv = init_matrix(k1, (d_model, d_model + 2 * n_kv_heads * hd), init_scheme)
+            self.out = init_matrix(k2, (d_model, d_model), init_scheme, residual_out=True, n_layers=n_layers)
         self.q_norm = jnp.ones((hd,))
         self.k_norm = jnp.ones((hd,))
         self.n_heads, self.n_kv_heads, self.rope_base = n_heads, n_kv_heads, rope_base
+        self.use_xsa = use_xsa
+        self.use_qknorm = use_qknorm
 
     def __call__(self, x: jnp.ndarray, causal: bool = True) -> jnp.ndarray:
         """Batched training-time forward: x is (B,T,D). causal=False is full bidirectional
@@ -212,11 +303,16 @@ class Attention(eqx.Module):
         q = q.reshape(B, T, self.n_heads, hd).transpose(0, 2, 1, 3)
         k = k.reshape(B, T, self.n_kv_heads, hd).transpose(0, 2, 1, 3)
         v = v.reshape(B, T, self.n_kv_heads, hd).transpose(0, 2, 1, 3)
-        q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
+        if self.use_qknorm:
+            q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
         cos, sin = rope_cos_sin(T, hd, self.rope_base)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         scale = 1.0 / math.sqrt(hd)
         y = splash_attention(q, k, v, causal=causal, sm_scale=scale)  # (B,H,T,hd)
+        if self.use_xsa:
+            n_rep = self.n_heads // self.n_kv_heads
+            v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
+            y = apply_xsa(y, v_self)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
         return y @ self.out
 
@@ -227,7 +323,8 @@ class Attention(eqx.Module):
         qkv = x_new @ self.qkv
         q, k, v = jnp.split(qkv, [D, D + self.n_kv_heads * hd], axis=-1)
         q, k, v = q.reshape(Bc, self.n_heads, hd), k.reshape(Bc, self.n_kv_heads, hd), v.reshape(Bc, self.n_kv_heads, hd)
-        q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
+        if self.use_qknorm:
+            q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
         cos, sin = rope_cos_sin_pos(pos, hd, self.rope_base)
         q, k = apply_rope_single(q, cos, sin), apply_rope_single(k, cos, sin)
         cache_k = jax.lax.dynamic_update_slice(cache_k, k[:, :, None, :].astype(cache_k.dtype), (0, 0, pos, 0))
@@ -240,7 +337,11 @@ class Attention(eqx.Module):
         valid = jnp.arange(T_max) <= pos
         logits = jnp.where(valid[None, None, :], logits, -1e9)
         attn = jax.nn.softmax(logits, axis=-1)
-        y = jnp.einsum("bht,bhtd->bhd", attn, v_full).reshape(Bc, D)
+        y = jnp.einsum("bht,bhtd->bhd", attn, v_full)  # (Bc,H,hd)
+        if self.use_xsa:
+            v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
+            y = apply_xsa(y, v_self)
+        y = y.reshape(Bc, D)
         return y @ self.out, cache_k, cache_v
 
     def chunk_step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray,
@@ -259,7 +360,8 @@ class Attention(eqx.Module):
         q = q.reshape(Bc, T, self.n_heads, hd).transpose(0, 2, 1, 3)
         k = k.reshape(Bc, T, self.n_kv_heads, hd).transpose(0, 2, 1, 3)
         v = v.reshape(Bc, T, self.n_kv_heads, hd).transpose(0, 2, 1, 3)
-        q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
+        if self.use_qknorm:
+            q, k = rmsnorm(q, self.q_norm), rmsnorm(k, self.k_norm)
         pos_ids = pos_start + jnp.arange(T)
         cos, sin = rope_cos_sin_pos(pos_ids, hd, self.rope_base)  # (T, hd)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)  # x:(Bc,H,T,hd), cos/sin:(T,hd)
@@ -273,7 +375,11 @@ class Attention(eqx.Module):
         valid = jnp.arange(T_max)[None, :] <= pos_ids[:, None]  # (T,T_max)
         logits = jnp.where(valid[None, None], logits, -1e9)
         attn = jax.nn.softmax(logits, axis=-1)
-        y = jnp.einsum("bhts,bhsd->bhtd", attn, v_full).transpose(0, 2, 1, 3).reshape(Bc, T, D)
+        y = jnp.einsum("bhts,bhsd->bhtd", attn, v_full)  # (Bc,H,T,hd)
+        if self.use_xsa:
+            v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
+            y = apply_xsa(y, v_self)
+        y = y.transpose(0, 2, 1, 3).reshape(Bc, T, D)
         return y @ self.out, cache_k, cache_v
 
 
@@ -283,12 +389,14 @@ class Block(eqx.Module):
     norm2: RMSNorm
     mlp: SwiGLU
 
-    def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, mlp_mult: int, rope_base: float):
+    def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, mlp_mult: int, rope_base: float,
+                 n_layers: int = None, init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True):
         k1, k2 = jax.random.split(key, 2)
         self.norm1 = RMSNorm(d_model)
-        self.attn = Attention(k1, d_model, n_heads, n_kv_heads, rope_base)
+        self.attn = Attention(k1, d_model, n_heads, n_kv_heads, rope_base, n_layers=n_layers,
+                               init_scheme=init_scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
         self.norm2 = RMSNorm(d_model)
-        self.mlp = SwiGLU(k2, d_model, mlp_mult)
+        self.mlp = SwiGLU(k2, d_model, mlp_mult, n_layers=n_layers, init_scheme=init_scheme)
 
     def __call__(self, x: jnp.ndarray, causal: bool = True) -> jnp.ndarray:
         x = x + self.attn(self.norm1(x), causal=causal)

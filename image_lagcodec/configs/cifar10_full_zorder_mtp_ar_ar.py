@@ -32,7 +32,7 @@ pq_chunks = (4, 4, 4, 4, 4)
 mlp_mult = 2
 rope_base = 10000.0
 ntp_weight = 1.0
-lag = 0
+decoder_ncodes = 1
 weight_sharing = False
 curriculum_mode = "no_freeze"
 quantize_mode = "argmax"
@@ -60,5 +60,5 @@ seed = 0
 train_subset_n = None
 
 # --- logging ---
-log_every = 10
+log_every = 100
 qual_gen_n = 8
