@@ -1507,8 +1507,8 @@ def main():
                                        ntp_acc=f"{ntp_acc:.2f}",
                                        lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
-                    logger(f"phase={phase} epoch={epoch} step={step} loss={loss0:.2f} "
-                           f"dec_bpb={bpb:.2f} dec_acc={acc:.2f} ntp_bpb={ntp_bpb:.2f} "
+                    logger(f"\n"
+                           f"[p={phase} e={epoch} s={step}] loss={loss0:.2f} dec_acc={acc:.2f} "
                            f"ntp_acc={ntp_acc:.2f} util={util:.2f} lr={lr_str} grad_norm={grad_norm:.2f}",
                            phase=phase, epoch=epoch, step=step, loss=loss0, dec_bpb=bpb,
                            dec_acc=acc, ntp_bpb=ntp_bpb, ntp_acc=ntp_acc, util=util,
