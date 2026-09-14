@@ -61,6 +61,7 @@ import argparse
 import json
 import math
 import pickle
+import sys
 import tarfile
 import time
 from dataclasses import asdict, dataclass
@@ -74,7 +75,8 @@ import optax
 from tqdm import tqdm
 
 from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, apply_rope, apply_xsa, init_matrix,
-                                        init_vector, rmsnorm, rope_cos_sin, sinkgd, warmup_const_schedule)
+                                        init_vector, make_lr_schedule, rmsnorm, rope_cos_sin, sinkgd,
+                                        warmup_const_schedule)
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
@@ -121,6 +123,10 @@ class Config:
     # with True.
     use_qknorm: bool = True   # chat 2026-09-13 -- per-head RMSNorm on q/k before RoPE+scores.
     # Stays global; disable with False.
+
+    remat: bool = False   # chat 2026-09-14 -- gradient rematerialization (jax.checkpoint) applied
+    # per-block, every level's encoder AND decoder block stack -- trades recompute for activation
+    # memory. Stays global (uniform on/off), default off.
 
     byte_group: int = 1          # level0's own group size, in {1, 3}. 1 = one byte per position
     # (old is_byte_level behavior, default). 3 = one pixel (R,G,B) per position.
@@ -210,9 +216,11 @@ class Config:
             stride_i = self.strides[i]
             if stride_i != -1:
                 assert self.mtp_horizon[i] >= 1
-                assert self.mtp_horizon[i] <= stride_i, \
-                    f"level {i}: mtp_horizon={self.mtp_horizon[i]} exceeds its own stride=" \
-                    f"{stride_i} -- can't predict further ahead than one stride group"
+                max_horizon = self.decoder_ncodes[i] * stride_i
+                assert self.mtp_horizon[i] <= max_horizon, \
+                    f"level {i}: mtp_horizon={self.mtp_horizon[i]} exceeds decoder_ncodes*stride=" \
+                    f"{self.decoder_ncodes[i]}*{stride_i}={max_horizon} -- can't predict further " \
+                    "ahead than one decode block's own group of target codes"
         assert self.byte_group in (1, 3), "byte_group must be 1 (per-byte) or 3 (per-pixel RGB)"
         assert TOTAL_BYTES % self.byte_group == 0
         assert self.traversal in ("raster", "zorder")
@@ -401,6 +409,14 @@ def sample_idx(logits: jnp.ndarray, rng, greedy: bool, temperature: float) -> tu
     return jax.random.categorical(k_, logits / temperature, axis=-1), rng
 
 
+def run_block(blk: Block, x: jnp.ndarray, remat: bool) -> jnp.ndarray:
+    """chat 2026-09-14: optional per-block gradient rematerialization (jax.checkpoint) -- only
+    the block's OUTPUT is kept for backward, its internal activations (qkv, attention scores,
+    mlp hidden) are recomputed instead of stored. Applied uniformly to every level's encoder and
+    decoder block stacks when Config.remat=True (default off)."""
+    return jax.checkpoint(blk)(x) if remat else blk(x)
+
+
 def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False) -> jnp.ndarray:
     """Plain (non-Pallas) dense self-attention -- the ATTENTION BRANCH ONLY (no residual, no
     norm, no mlp). Originally built for the "diffusion" token head's non-causal case (KIV, kept
@@ -551,12 +567,14 @@ class EncDecLevel(eqx.Module):
     mtp_horizon: int = eqx.field(static=True)
     mtp_mode: str = eqx.field(static=True)
     mtp_weight: float = eqx.field(static=True)
+    remat: bool = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config, level: int, has_decoder: bool, weight_sharing: bool):
         D = cfg.d_model[level]
         self.K = cfg.strides[level] if cfg.strides[level] != -1 else 1
         self.n_heads, self.n_kv_heads = cfg.n_heads[level], cfg.n_kv_heads[level]
         self.quantize_mode = cfg.quantize_mode
+        self.remat = cfg.remat
         self.gumbel_temperature = cfg.gumbel_temperature[level]
         is_byte_level = (level == 0)
         self.pq_chunks, self.code_vocab = cfg.pq_chunks[level], cfg.code_vocab[level]
@@ -659,7 +677,7 @@ class EncDecLevel(eqx.Module):
     def encode(self, x: jnp.ndarray, target_idx: jnp.ndarray, rng=None) -> dict:
         h = x
         for blk in self.blocks:
-            h = blk(h)
+            h = run_block(blk, h, self.remat)
         h = self.ln_f(h)
         M, L, D = h.shape
         n_blocks = L // self.K
@@ -874,7 +892,7 @@ class EncDecLevel(eqx.Module):
         per_group_len = G + 1 + G * self.K
         xe = jnp.concatenate([ctx_g, bos_g, te_g], axis=2).reshape(B, n_groups * per_group_len, D)
         for blk in blocks:
-            xe = blk(xe)
+            xe = run_block(blk, xe, self.remat)
         h = ln_f(xe)
         pred_pos = (jnp.arange(n_groups)[:, None] * per_group_len + G
                     + jnp.arange(G * self.K)[None, :]).reshape(-1)
@@ -1140,6 +1158,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
             target = out["code_idx"]
 
     dec_losses, dec_accs = [], []
+    byte_mse = None
     ctx = codes_soft[phase - 1]
     for i in range(phase - 1, -1, -1):
         dec_target = flat_bytes if i == 0 else codes[i - 1]
@@ -1150,6 +1169,11 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
         loss_i = loss_i + levels[i].mtp_weight * mtp_loss_i
         dec_losses.append(loss_i)
         dec_accs.append(acc_i)
+        if i == 0:
+            # level0's own logits predict real byte VALUES (0-255) -- pixel-space MSE only makes
+            # sense here, not at levels>0 (those predict PQ codebook indices, not pixel values).
+            pred_bytes = jnp.argmax(logits, axis=-1).astype(jnp.float32)
+            byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)
         if i > 0:
             real_ctx = codes_soft[i - 1]
             if use_cascade is None:
@@ -1165,7 +1189,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total
     bpb = dec_loss_total / jnp.log(2.0)
     return loss, (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
-                  jnp.mean(jnp.stack(utils)))
+                  jnp.mean(jnp.stack(utils)), byte_mse)
 
 
 def phase_trainable_filter(model: HierEncDec, phase: int):
@@ -1204,6 +1228,49 @@ def to_single_device(tree, device=None):
     return jax.tree_util.tree_map(lambda x: jax.device_put(x, device) if eqx.is_array(x) else x, tree)
 
 
+# ---------------------------------------------------------------------------
+# Full resumability (chat 2026-09-14): model + optimizer state + live RNG + dataloader shuffle
+# state + phase/epoch/step position, so a killed run resumes bit-for-bit (same n_devices) rather
+# than just reloading final weights. p_rng is the REPLICATED (n_devices,2) array saved as-is (not
+# unreplicated) -- each device's row diverges after splits inside train_step, so only the full
+# array reproduces every device's exact stream; opt_state/model ARE unreplicated first by the
+# caller since pmean keeps every device's copy identical, so device 0 is fully representative.
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(ckpt_dir: Path, model, opt_state, p_rng, train_iter: "BatchIterator",
+                     phase: int, epoch: int, step: int, seed: int) -> None:
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    eqx.tree_serialise_leaves(ckpt_dir / "model.eqx", model)
+    eqx.tree_serialise_leaves(ckpt_dir / "opt_state.eqx", opt_state)
+    eqx.tree_serialise_leaves(ckpt_dir / "p_rng.eqx", p_rng)
+    (ckpt_dir / "dataloader_state.json").write_text(json.dumps(train_iter.rng.bit_generator.state))
+    (ckpt_dir / "meta.json").write_text(json.dumps(dict(phase=phase, epoch=epoch, step=step, seed=seed)))
+
+
+def find_latest_checkpoint(run_dir: Path):
+    """Highest (phase, epoch) checkpoint under run_dir/checkpoints, or None if there isn't one."""
+    ckpt_root = run_dir / "checkpoints"
+    if not ckpt_root.exists():
+        return None
+    candidates = []
+    for d in ckpt_root.iterdir():
+        meta_path = d / "meta.json"
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            candidates.append((meta["phase"], meta["epoch"], d))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: (t[0], t[1]))
+    return candidates[-1][2]
+
+
+def pixel_mse(gen: np.ndarray, gt: np.ndarray) -> float:
+    """Mean squared pixel error, in float64 to avoid uint8 overflow -- averaged over EVERY
+    element (n*h*w*c), not summed. Verified (chat 2026-09-14): mean(per_image_mse) == this,
+    confirming no aggregation blow-up."""
+    return float(np.mean((gen.astype(np.float64) - gt.astype(np.float64)) ** 2))
+
+
 def save_compare_grid(gen: np.ndarray, gt: np.ndarray, path: Path, pad: int = 2) -> None:
     from PIL import Image
     n, h, w, c = gen.shape
@@ -1227,17 +1294,33 @@ class Logger:
         h, rem = divmod(elapsed_s, 3600)
         m, s = divmod(rem, 60)
         line = f"[{h:02d}:{m:02d}:{s:02d}] {msg}"
-        tqdm.write(line)
+        # tqdm.write(line)   # chat 2026-09-13: defaults to stdout, block-buffered when piped
+        # through tee -- lags behind the bar (stderr, unbuffered), then dumps in a burst. Revert
+        # to this line to undo.
+        tqdm.write(line, file=sys.stderr)
         self.text_f.write(line + "\n")
         self.text_f.flush()
         rec = {"elapsed_s": elapsed_s, **({} if record else {"msg": msg}), **record}
-        self.json_f.write(json.dumps(rec) + "\n")
+        self.json_f.write(json.dumps(_round_floats(rec)) + "\n")
         self.json_f.flush()
 
 
 def _fmt_lr(lr: float) -> str:
-    mantissa, exp = f"{lr:.0e}".split("e")
+    mantissa, exp = f"{lr:.3e}".split("e")
     return f"{mantissa}e{int(exp)}"
+
+
+def _round_floats(obj, ndigits: int = 4):
+    """Recursively truncates every float to ndigits decimal places (dict/list/tuple-aware) --
+    chat 2026-09-14, the raw config/resolved_config dumps had long float repr noise (bf16/float32
+    roundtrip artifacts like 0.10000000149011612) that made the log hard to read."""
+    if isinstance(obj, float):
+        return round(obj, ndigits)
+    if isinstance(obj, dict):
+        return {k: _round_floats(v, ndigits) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_round_floats(v, ndigits) for v in obj)
+    return obj
 
 
 def _tuple_arg(s: str) -> tuple:
@@ -1273,7 +1356,7 @@ CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "st
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "decoder_ncodes",
                   "weight_sharing", "precision", "curriculum_mode", "quantize_mode",
                   "gumbel_temperature", "gumbel_at_inference", "cascade_rollout_prob", "init_scheme", "use_xsa",
-                  "use_qknorm",
+                  "use_qknorm", "remat",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob",
                   "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "traversal")
 
@@ -1283,7 +1366,9 @@ def main():
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--data_root", type=str, default=str(REPO_ROOT / "datasets"))
     p.add_argument("--run_name", type=str, default=None)
-    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--batch_size", type=_tuple_arg, default=(16,),
+                    help="training batch size -- a bare int applies uniformly to every phase; a "
+                         "tuple gives one value per phase (length must equal n_phases)")
     p.add_argument("--n_devices", type=int, default=None)
     p.add_argument("--epochs_per_phase", type=_tuple_arg, default=(1000,),
                     help="epochs per phase -- a bare int applies uniformly to every phase; a "
@@ -1295,6 +1380,9 @@ def main():
                          "its only iteration; epochs_per_phase's single/last entry is used.")
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--warmup_steps", type=int, default=100)
+    p.add_argument("--lr_schedule", type=str, default="const", choices=["const", "cosine"],
+                    help="const: warmup then flat forever (default). cosine: warmup then cosine "
+                         "decay to 0 over this phase's own epoch_count*steps_per_epoch")
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--optimizer", type=str, default="sinkgd", choices=["adamw", "sinkgd"])
     p.add_argument("--optimizer_kwargs", type=json.loads, default={"sinkhorn_iters": 1, "weight_decay": 0})
@@ -1303,8 +1391,18 @@ def main():
                          "update; 'none' disables it")
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--gen_eval_every", type=int, default=10, help="mid-phase gen-eval cadence in epochs")
+    p.add_argument("--ckpt_every", type=int, default=10,
+                    help="save a full resumable checkpoint (model+optim+rng+dataloader state) "
+                         "every N epochs, in addition to always at phase end")
+    p.add_argument("--resume", type=lambda x: x.lower() != "false", default=False,
+                    help="resume from the latest checkpoint under this run's log dir, if any")
     p.add_argument("--train_subset_n", type=int, default=100)
     p.add_argument("--qual_gen_n", type=int, default=8)
+    p.add_argument("--val_batch_size", type=_tuple_arg, default=(2,),
+                    help="how many train-set images run_gen_eval reconstructs/generates from -- "
+                         "kept small (default 2) since decode_generate is far more memory-heavy "
+                         "per-example than a teacher-forced training step. Bare int applies "
+                         "uniformly to every phase; a tuple gives one value per phase")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--img_size", type=int, default=Config.img_size)
     p.add_argument("--d_model", type=_tuple_arg, default=Config.d_model)
@@ -1328,6 +1426,7 @@ def main():
     p.add_argument("--init_scheme", type=str, default=Config.init_scheme, choices=["llama", "zero"])
     p.add_argument("--use_xsa", type=lambda x: x.lower() != "false", default=Config.use_xsa)
     p.add_argument("--use_qknorm", type=lambda x: x.lower() != "false", default=Config.use_qknorm)
+    p.add_argument("--remat", type=lambda x: x.lower() != "false", default=Config.remat)
     p.add_argument("--byte_group", type=int, default=Config.byte_group)
     # type=str (NOT _str_tuple_arg): argparse auto-applies `type=` to ANY string-valued default
     # (even one set via set_defaults from a config file) -- with _str_tuple_arg that silently
@@ -1364,21 +1463,27 @@ def main():
     n_positions = n_positions_of(cfg)
     pixel_order = pixel_order_for(cfg)
 
-    # chat 2026-09-12: epochs_per_phase is now per-PHASE -- a bare int, or a length-1 tuple
-    # (Config-file-literal path where it wasn't parsed through _tuple_arg's CLI string form)
-    # broadcasts uniformly; otherwise its length must match n_phases exactly.
-    if isinstance(args.epochs_per_phase, int):
-        args.epochs_per_phase = (args.epochs_per_phase,) * n_phases
-    elif len(args.epochs_per_phase) == 1:
-        args.epochs_per_phase = args.epochs_per_phase * n_phases
-    assert len(args.epochs_per_phase) == n_phases, \
-        f"epochs_per_phase has {len(args.epochs_per_phase)} entries, need {n_phases} (one per phase)"
+    # chat 2026-09-12/14: epochs_per_phase/batch_size/val_batch_size are per-PHASE -- a bare int,
+    # or a length-1 tuple (Config-file-literal path where it wasn't parsed through _tuple_arg's
+    # CLI string form) broadcasts uniformly; otherwise its length must match n_phases exactly.
+    def _bcast_per_phase(name):
+        val = getattr(args, name)
+        if isinstance(val, int):
+            val = (val,) * n_phases
+        elif len(val) == 1:
+            val = val * n_phases
+        assert len(val) == n_phases, f"{name} has {len(val)} entries, need {n_phases} (one per phase)"
+        setattr(args, name, val)
+
+    _bcast_per_phase("epochs_per_phase")
+    _bcast_per_phase("batch_size")
+    _bcast_per_phase("val_batch_size")
 
     (train_np, train_labels), (val_np, val_labels) = load_cifar10(Path(args.data_root))
     if args.train_subset_n:
         train_np = train_np[:args.train_subset_n]
-    train_iter = BatchIterator(train_np, train_labels[:len(train_np)], args.batch_size, n_devices,
-                                shuffle=True, seed=args.seed, cfg=cfg)
+    # train_iter is rebuilt fresh each phase (see phase loop below) since batch_size is now
+    # per-phase -- no single shared BatchIterator here anymore.
 
     rng = jax.random.PRNGKey(args.seed)
     model = HierEncDec(rng, cfg)
@@ -1388,16 +1493,28 @@ def main():
     logger = Logger(run_dir)
     write_resolved_config(run_dir, args)
     (run_dir / f"config_{args.config.name}").write_text(args.config.read_text())
-    logger(f"config: {asdict(cfg)}")
+    logger(f"config: {_round_floats(asdict(cfg))}")
     logger(f"n_levels={n_levels} n_phases={n_phases} n_positions={n_positions} "
            f"params={n_params / 1e6:.2f}M")
     resolved = {k: v for k, v in sorted(vars(args).items()) if k != "config"}
-    logger(f"resolved_config: {resolved}")
+    logger(f"resolved_config: {_round_floats(resolved)}")
+
+    resume_meta, resume_ckpt_dir = None, None
+    if args.resume:
+        resume_ckpt_dir = find_latest_checkpoint(run_dir)
+        if resume_ckpt_dir is not None:
+            resume_meta = json.loads((resume_ckpt_dir / "meta.json").read_text())
+            model = eqx.tree_deserialise_leaves(resume_ckpt_dir / "model.eqx", model)
+            logger(f"resuming from {resume_ckpt_dir}: phase={resume_meta['phase']} "
+                   f"epoch={resume_meta['epoch']} step={resume_meta['step']}")
+        else:
+            logger("--resume set but no checkpoint found under this run_dir -- starting fresh")
 
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
-    recon_prompt = train_np[:args.qual_gen_n]
-    flat_prompt = jnp.array(images_to_positions(recon_prompt, cfg, pixel_order))
-    gt_img = recon_prompt.astype(np.uint8)
+    # recon_prompt/flat_prompt/gt_img are rebuilt fresh each phase (see phase loop below) since
+    # val_batch_size is now per-phase -- run_gen_eval() (defined once, below) closes over these
+    # as free variables and picks up whatever they're reassigned to at call time.
+    recon_prompt = flat_prompt = gt_img = None
 
     def run_gen_eval(eval_model, top: int, tag: str, include_reconstruct: bool = False) -> tuple:
         m = cast_pytree(eval_model, compute_dtype)
@@ -1414,11 +1531,12 @@ def main():
                 x = code_embed(out["code_soft"], m.levels[i + 1].own_input_embed)
                 target = out["code_idx"]
 
-        recon_acc = None
+        recon_acc = recon_mse = None
         if include_reconstruct:
             recon = m.levels[0].decode_generate(codes[0], cfg.decoder_ncodes[0], greedy=True, seed=0)
             recon_acc = float(jnp.mean(recon == flat_prompt))
             recon_img = positions_to_image(np.asarray(recon), cfg, pixel_order)
+            recon_mse = pixel_mse(recon_img, gt_img)
             save_compare_grid(recon_img, gt_img, run_dir / f"samples_{tag}_reconstruct.png")
 
         cur_code = codes[top]
@@ -1427,19 +1545,34 @@ def main():
         cascade_recon = m.levels[0].decode_generate(cur_code, cfg.decoder_ncodes[0], greedy=True, seed=0)
         cascade_acc = float(jnp.mean(cascade_recon == flat_prompt))
         cascade_img = positions_to_image(np.asarray(cascade_recon), cfg, pixel_order)
+        cascade_mse = pixel_mse(cascade_img, gt_img)
         save_compare_grid(cascade_img, gt_img, run_dir / f"samples_{tag}_cascade.png")
 
-        msg = f"[{tag}] top={top} CASCADE gen_byte_acc={cascade_acc:.4f}"
-        rec = dict(tag=tag, gen_cascade_acc=cascade_acc)
+        msg = f"[{tag}] top={top} CASCADE gen_byte_acc={cascade_acc:.4f} gen_cascade_mse={cascade_mse:.2f}"
+        rec = dict(tag=tag, gen_cascade_acc=cascade_acc, gen_cascade_mse=cascade_mse)
         if include_reconstruct:
-            msg += f" reconstruct gen_byte_acc={recon_acc:.4f}"
+            msg += f" reconstruct gen_byte_acc={recon_acc:.4f} gen_recon_mse={recon_mse:.2f}"
             rec["gen_recon_acc"] = recon_acc
+            rec["gen_recon_mse"] = recon_mse
         logger(msg, **rec)
         return recon_acc, cascade_acc
 
-    step = 0
+    step = resume_meta["step"] if resume_meta else 0
     phase_iter = [n_phases] if args.no_curriculum else list(range(1, n_phases + 1))
+    if resume_meta is not None:
+        resume_phase = resume_meta["phase"]
+        phase_complete = resume_meta["epoch"] >= args.epochs_per_phase[resume_phase - 1]
+        phase_iter = [p for p in phase_iter if p > resume_phase] if phase_complete \
+            else [p for p in phase_iter if p >= resume_phase]
     for phase in phase_iter:
+        train_iter = BatchIterator(train_np, train_labels[:len(train_np)], args.batch_size[phase - 1],
+                                    n_devices, shuffle=True, seed=args.seed, cfg=cfg)
+        recon_prompt = val_np[:args.val_batch_size[phase - 1]]   # held-out, not train_np -- see
+        # chat 2026-09-14: run_gen_eval's gen_recon_mse/gen_cascade_mse are genuine validation
+        # metrics now, not train-set metrics.
+        flat_prompt = jnp.array(images_to_positions(recon_prompt, cfg, pixel_order))
+        gt_img = recon_prompt.astype(np.uint8)
+
         filter_spec = phase_trainable_filter(model, phase)
         diff_model, static_model = eqx.partition(model, filter_spec)
 
@@ -1448,7 +1581,9 @@ def main():
             m = cast_pytree(m, compute_dtype)
             return phase_forward(m, flat_bytes, phase, rng=rng, use_cascade=use_cascade)
 
-        lr_schedule = warmup_const_schedule(args.lr, args.warmup_steps)
+        phase_epochs = args.epochs_per_phase[phase - 1]
+        total_steps = phase_epochs * len(train_iter)
+        lr_schedule = make_lr_schedule(args.lr_schedule, args.lr, args.warmup_steps, total_steps)
         if args.optimizer == "sinkgd":
             optimizer = sinkgd(lr_schedule, **args.optimizer_kwargs)
         else:
@@ -1476,11 +1611,24 @@ def main():
         p_opt_state = replicate(opt_state, n_devices)
         p_rng = jax.random.split(jax.random.fold_in(jax.random.PRNGKey(args.seed), phase), n_devices)
 
+        start_epoch = 1
+        if resume_meta is not None and phase == resume_meta["phase"]:
+            # diff_model/p_diff_model already reflect the resumed weights (model was
+            # deserialised from checkpoint before the phase loop) -- only optimizer state, RNG,
+            # and the dataloader's shuffle stream need restoring here.
+            p_opt_state = replicate(
+                eqx.tree_deserialise_leaves(resume_ckpt_dir / "opt_state.eqx", opt_state), n_devices)
+            p_rng = eqx.tree_deserialise_leaves(resume_ckpt_dir / "p_rng.eqx", p_rng)
+            train_iter.rng.bit_generator.state = json.loads(
+                (resume_ckpt_dir / "dataloader_state.json").read_text())
+            start_epoch = resume_meta["epoch"] + 1
+            logger(f"resumed phase {phase}: optimizer/rng/dataloader state restored, "
+                   f"continuing from epoch {start_epoch}")
+
         trained_desc = f"levels0-{phase - 1}" if cfg.curriculum_mode == "no_freeze" else f"level{phase - 1}"
         active_desc = f"phase{phase}[{trained_desc}]"
-        phase_epochs = args.epochs_per_phase[phase - 1]
         logger(f"=== starting {active_desc} for {phase_epochs} epochs ===")
-        pbar = tqdm(range(1, phase_epochs + 1), desc=active_desc, dynamic_ncols=True)
+        pbar = tqdm(range(start_epoch, phase_epochs + 1), desc=active_desc, dynamic_ncols=True)
         jit_timed = False
         for epoch in pbar:
             epoch_losses = []
@@ -1497,38 +1645,48 @@ def main():
                            f"{time.monotonic() - jit_t0:.1f}s")
                     jit_timed = True
                 epoch_losses.append(loss0)
-                bpb, acc, ntp_bpb, ntp_acc, util, grad_norm = [float(a[0]) for a in aux]
+                bpb, acc, ntp_bpb, ntp_acc, util, train_mse, grad_norm = [float(a[0]) for a in aux]
                 lr = float(lr_schedule(step - 1))
                 lr_str = _fmt_lr(lr)
                 step_pbar.set_postfix(step=step, loss=f"{loss0:.2f}",
                                     #    bpb=f"{bpb:.2f}",
                                        acc=f"{acc:.2f}",
                                     #    ntp_bpb=f"{ntp_bpb:.2f}",
-                                       ntp_acc=f"{ntp_acc:.2f}",
+                                    #    ntp_acc=f"{ntp_acc:.2f}", 
+                                    #    train_mse=f"{train_mse:.1f}",
                                        lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
                     logger(f"\n"
                            f"[p={phase} e={epoch} s={step}] loss={loss0:.2f} dec_acc={acc:.2f} "
-                           f"ntp_acc={ntp_acc:.2f} util={util:.2f} lr={lr_str} grad_norm={grad_norm:.2f}",
+                           f"ntp_acc={ntp_acc:.2f} util={util:.2f} train_mse={train_mse:.1f} "
+                           f"lr={lr_str} grad_norm={grad_norm:.2f}",
                            phase=phase, epoch=epoch, step=step, loss=loss0, dec_bpb=bpb,
                            dec_acc=acc, ntp_bpb=ntp_bpb, ntp_acc=ntp_acc, util=util,
-                           lr=lr, grad_norm=grad_norm)
+                           train_mse=train_mse, lr=lr, grad_norm=grad_norm)
 
             if epoch % args.gen_eval_every == 0:
                 snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
-                run_gen_eval(snapshot, top=phase - 1, tag=f"phase{phase}_epoch{epoch}")
+                run_gen_eval(snapshot, top=phase - 1, tag=f"phase{phase}_epoch{epoch}", include_reconstruct=True)
+
+            if epoch % args.ckpt_every == 0:
+                ckpt_model = eqx.combine(to_host(unreplicate(p_diff_model)), static_model)
+                ckpt_opt_state = to_host(unreplicate(p_opt_state))
+                ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_epoch{epoch}"
+                save_checkpoint(ckpt_dir, ckpt_model, ckpt_opt_state, to_host(p_rng), train_iter,
+                                 phase=phase, epoch=epoch, step=step, seed=args.seed)
+                logger(f"checkpoint saved: {ckpt_dir}")
 
         diff_model = to_host(unreplicate(p_diff_model))
         model = eqx.combine(diff_model, static_model)
         freeze_msg = "no freeze (no_freeze mode)" if cfg.curriculum_mode == "no_freeze" else f"freezing level {phase - 1}"
         logger(f"=== {active_desc} done, {freeze_msg} ===")
-        ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}"
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        eqx.tree_serialise_leaves(ckpt_dir / "model.eqx", model)
-        run_gen_eval(model, top=phase - 1, tag=f"phase{phase}_final")
+        ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_epoch{phase_epochs}"
+        save_checkpoint(ckpt_dir, model, to_host(unreplicate(p_opt_state)), to_host(p_rng), train_iter,
+                         phase=phase, epoch=phase_epochs, step=step, seed=args.seed)
+        run_gen_eval(model, top=phase - 1, tag=f"phase{phase}_final", include_reconstruct=True)
 
     logger("=== all phases done, running final top-down cascade eval ===")
-    run_gen_eval(model, top=n_levels - 2, tag="final")
+    run_gen_eval(model, top=n_levels - 2, tag="final", include_reconstruct=True)
     logger("training done")
 
 

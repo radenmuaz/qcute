@@ -38,11 +38,10 @@ rsync -avz --delete \
 rsync -avz \
   -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -i ~/.ssh/google_compute_engine" \
   --exclude="checkpoints/" \
-  muaz@35.186.98.243:~/qcute/image_lagcodec/logs/cifar10_full_zorder_linears/ \
-  /Users/muaz/code/qcute/image_lagcodec/logs/cifar10_full_zorder_linears/
+  muaz@35.186.98.243:~/qcute/image_lagcodec/logs/cifar10_full_zorder_mtp_ar_ar/ \
+  /Users/muaz/code/qcute/image_lagcodec/logs/cifar10_full_zorder_mtp_ar_ar/
 
 '''
-run_name = "cifar10_full_zorder_ar"
 
 # --- model ---
 img_size = 32

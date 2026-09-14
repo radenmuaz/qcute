@@ -5,6 +5,7 @@ gcloud compute tpus queued-resources scp muaz@tpu1:/home/muaz/qcute/image_lagcod
 rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -i ~/.ssh/google_compute_engine" /Users/muaz/code/qcute/image_lagcodec/configs/ muaz@107.167.160.20:~/qcute/image_lagcodec/configs/
 
 # ssh direct
+ssh -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.98.243
 ssh -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@107.167.160.20
 
 # rsync lagcodec
@@ -16,6 +17,18 @@ rsync -avz --filter=":- /Users/muaz/code/qcute/.gitignore" --exclude=".git" \
 # get ip
 curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip"
 
+gcloud compute tpus tpu-vm describe tpunode1 --project raden-tpu --zone us-central2-b --format="value(networkEndpoints[0].accessConfig.externalIp)" 2>&1
+
+# update ssh
+ssh -o ControlMaster=auto -o ControlPersist=4h -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -o StrictHostKeyChecking=accept-new -i ~/.ssh/google_compute_engine -fN muaz@35.186.98.243
+ssh -o ControlMaster=auto -o ControlPersist=4h -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -o StrictHostKeyChecking=accept-new -i ~/.ssh/google_compute_engine -fN muaz@35.186.15.67
+ssh -o ControlMaster=auto -o ControlPersist=4h -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -o StrictHostKeyChecking=accept-new -i ~/.ssh/google_compute_engine -fN muaz@107.167.160.20
+echo "tpu2:"; ssh -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.15.67 "echo connected"
+echo "tpu3:"; ssh -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@107.167.160.20 "echo connected"
+
+gcloud compute tpus tpu-vm ssh tpunode4 --project raden-tpu --zone us-central2-b --command="echo ok" 2>&1 | tail -5
+ssh -o ControlMaster=auto -o ControlPersist=4h -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -o StrictHostKeyChecking=accept-new -i ~/.ssh/google_compute_engine -fN muaz@35.186.33.7
+ssh -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.33.7 "echo connected"
 
 # rsync 
 rsync -avz \

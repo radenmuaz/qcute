@@ -519,3 +519,18 @@ def warmup_const_schedule(peak_lr: float, warmup_steps: int):
     def schedule(step):
         return jnp.minimum(1.0, (step + 1) / max(warmup_steps, 1)) * peak_lr
     return schedule
+
+
+def make_lr_schedule(kind: str, peak_lr: float, warmup_steps: int, total_steps: int = None):
+    """chat 2026-09-13 -- kind="const" (default): warmup_const_schedule above, unchanged.
+    kind="cosine": linear warmup then cosine decay to 0 over total_steps (this phase's own
+    epoch_count*steps_per_epoch -- decay resets fresh each phase, same as the const schedule's
+    own re-warmup each phase)."""
+    if kind == "const":
+        return warmup_const_schedule(peak_lr, warmup_steps)
+    assert kind == "cosine", f"unknown lr_schedule {kind!r}"
+    assert total_steps is not None and total_steps > warmup_steps, \
+        "cosine schedule needs total_steps > warmup_steps (this phase's epoch_count*steps_per_epoch)"
+    return optax.warmup_cosine_decay_schedule(
+        init_value=0.0, peak_value=peak_lr, warmup_steps=warmup_steps,
+        decay_steps=total_steps - warmup_steps, end_value=0.0)

@@ -8,7 +8,6 @@ everywhere (baseline, no true MTP -- mtp_horizon=1).
 uv run python3 -m image_lagcodec.run_lagcodec_zorder --config image_lagcodec/configs/cifar10_full_zorder_linears.py
 """
 
-run_name = "cifar10_full_zorder_linears"
 
 # --- model ---
 img_size = 32
