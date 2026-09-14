@@ -1,4 +1,4 @@
-"""uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/wa_discrete_1.py"""
+"""uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/overfit1k_ema.py"""
 
 
 # --- model ---
@@ -23,6 +23,7 @@ gumbel_at_inference = False
 cascade_rollout_prob = 0.8
 init_scheme = "llama"
 use_xsa = True
+pq_dim = (128, 64, 64, 64)
 
 byte_group = 3
 token_head_type = "linears"
@@ -33,28 +34,27 @@ mtp_mode = "parallel"
 traversal = "zorder"
 
 # --- training ---
-batch_size = 128
+batch_size = 64
 val_batch_size = 16
-epochs_per_phase = (400, 400, 400, )
-warmup_steps = 100
+epochs_per_phase = (2000, 2000, 2000, )
+warmup_steps = 10
 grad_clip = 10.0
 seed = 0
-train_subset_n = None
+train_subset_n = 1000
 
 lr = 5e-4
 lr_schedule = "cosine"
-weight_decay = 1e-5
+weight_decay = 1e-2
 optimizer = "adamw"
 optimizer_kwargs = {}
 
-# --- weight averaging ---
-wa_mode = "discrete"
-wa_every = 1000
-wa_stack_size = 5
-wa_discrete_weights = (5.0, 4.0, 3.0, 2.0, 1.0)
+wa_mode = "ema"
+wa_every = 10
+wa_ema_decay = 0.999
 
 # --- logging ---
 log_every = 100
-gen_eval_every = 1000
-ckpt_every = 1000
-qual_gen_n = 8
+gen_eval_every = 100
+ckpt_every = 10
+ckpt_keep = 1
+qual_gen_n = 16

@@ -1,4 +1,4 @@
-"""uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/wa_ema_1.py"""
+"""uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/linears_1_wma.py"""
 
 
 # --- model ---
@@ -48,12 +48,14 @@ optimizer = "adamw"
 optimizer_kwargs = {}
 
 # --- weight averaging ---
-wa_mode = "ema"
+wa_mode = "wma"
 wa_every = 1000
-wa_ema_decay = 0.999
+wa_stack_size = 5
+wa_wma_weights = (5.0, 4.0, 3.0, 2.0, 1.0)
 
 # --- logging ---
 log_every = 100
-gen_eval_every = 1000
-ckpt_every = 1000
-qual_gen_n = 8
+gen_eval_every = 10
+ckpt_every = 10
+ckpt_keep = 1
+qual_gen_n = 16

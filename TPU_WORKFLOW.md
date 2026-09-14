@@ -1,3 +1,92 @@
+# socket refresh
+gcloud compute tpus tpu-vm ssh tpunode1 --project raden-tpu --zone us-central2-b --command="echo ok"
+ssh -o ControlMaster=auto -o ControlPersist=4h -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -o StrictHostKeyChecking=accept-new -i ~/.ssh/google_compute_engine -fN muaz@35.186.98.243
+
+gcloud compute tpus tpu-vm ssh tpunode2 --project raden-tpu --zone us-central2-b --command="echo ok"
+ssh -o ControlMaster=auto -o ControlPersist=4h -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -o StrictHostKeyChecking=accept-new -i ~/.ssh/google_compute_engine -fN muaz@35.186.15.67
+
+gcloud compute tpus tpu-vm ssh tpunode3 --project raden-tpu --zone us-central2-b --command="echo ok"
+ssh -o ControlMaster=auto -o ControlPersist=4h -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -o StrictHostKeyChecking=accept-new -i ~/.ssh/google_compute_engine -fN muaz@107.167.160.20
+
+gcloud compute tpus tpu-vm ssh tpunode4 --project raden-tpu --zone us-central2-b --command="echo ok"
+ssh -o ControlMaster=auto -o ControlPersist=4h -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -o StrictHostKeyChecking=accept-new -i ~/.ssh/google_compute_engine -fN muaz@35.186.33.7
+
+# ssh
+ssh -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.98.243
+ssh -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.15.67
+ssh -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@107.167.160.20
+ssh -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.33.7
+
+# attach
+tmux attach -t overfit1k_baseline
+tmux attach -t overfit1k_mse1
+tmux attach -t overfit1k_qdrop05
+tmux attach -t overfit1k_ema
+
+# pull lagcodec
+rsync -avz --exclude="checkpoints/" \
+  -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  muaz@35.186.98.243:~/qcute/image_lagcodec/logs/<run_name>/ \
+  image_lagcodec/logs/<run_name>/
+
+rsync -avz --exclude="checkpoints/" \
+  -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  muaz@35.186.15.67:~/qcute/image_lagcodec/logs/<run_name>/ \
+  image_lagcodec/logs/<run_name>/
+
+rsync -avz --exclude="checkpoints/" \
+  -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  muaz@107.167.160.20:~/qcute/image_lagcodec/logs/<run_name>/ \
+  image_lagcodec/logs/<run_name>/
+
+rsync -avz --exclude="checkpoints/" \
+  -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  muaz@35.186.33.7:~/qcute/image_lagcodec/logs/<run_name>/ \
+  image_lagcodec/logs/<run_name>/
+
+# push lagcodec
+rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  --filter=':- ../.gitignore' --exclude=".git/" \
+  /Users/muaz/code/qcute/image_lagcodec/ muaz@35.186.98.243:~/qcute/image_lagcodec/
+
+rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  --filter=':- ../.gitignore' --exclude=".git/" \
+  /Users/muaz/code/qcute/image_lagcodec/ muaz@35.186.15.67:~/qcute/image_lagcodec/
+
+rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  --filter=':- ../.gitignore' --exclude=".git/" \
+  /Users/muaz/code/qcute/image_lagcodec/ muaz@107.167.160.20:~/qcute/image_lagcodec/
+
+rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  --filter=':- ../.gitignore' --exclude=".git/" \
+  /Users/muaz/code/qcute/image_lagcodec/ muaz@35.186.33.7:~/qcute/image_lagcodec/
+
+# push reset all
+rsync -avz --delete \
+  -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  --filter=':- .gitignore' --exclude=".git/" \
+  /Users/muaz/code/qcute/ muaz@35.186.98.243:~/qcute/
+
+rsync -avz --delete \
+  -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  --filter=':- .gitignore' --exclude=".git/" \
+  /Users/muaz/code/qcute/ muaz@35.186.15.67:~/qcute/
+
+rsync -avz --delete \
+  -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  --filter=':- .gitignore' --exclude=".git/" \
+  /Users/muaz/code/qcute/ muaz@107.167.160.20:~/qcute/
+
+rsync -avz --delete \
+  -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -i ~/.ssh/google_compute_engine" \
+  --filter=':- .gitignore' --exclude=".git/" \
+  /Users/muaz/code/qcute/ muaz@35.186.33.7:~/qcute/
+
+
+
+
+
+## older
 # pull sample
 gcloud compute tpus queued-resources scp muaz@tpu1:/home/muaz/qcute/image_lagcodec/logs/cifar10_stack_lag0/samples_epoch20_reconstruct_val.png . --project raden-tpu --zone us-central2-b
 

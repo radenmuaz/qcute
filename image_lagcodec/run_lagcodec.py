@@ -64,7 +64,7 @@ pmap-parallel across all local devices.
        phase -- EMA does NOT carry smoothing across a phase boundary (the trainable-param SET
        itself can grow between phases under curriculum_mode, so restarting is the simplest
        correct behavior; document, don't silently carry stale/mismatched structure).
-     - "discrete": a FIFO stack of up to --wa_stack_size raw parameter snapshots, one pushed every
+     - "wma": a FIFO stack of up to --wa_stack_size raw parameter snapshots, one pushed every
        --wa_every steps (oldest evicted once full). Once the stack is full (reaches
        wa_stack_size), a plain elementwise mean over every snapshot currently in it is computed
        and saved -- this fires again on every subsequent push, so it's a ROLLING average over the
@@ -88,6 +88,7 @@ import argparse
 import json
 import math
 import pickle
+import shutil
 import sys
 import tarfile
 import time
@@ -172,6 +173,12 @@ class Config:
     # own dec_head param count per level (audited 2026-09-12: a single global value badly under/
     # over-parameterizes different levels' alphabets).
     token_n_heads: tuple = 4        # per level (renamed from mtp_n_heads), bare-scalar default
+    pq_dim: tuple = None   # chat 2026-09-14 -- per-level embedding width for code_embed_proj
+    # (own_input_embed/ctx_embed/dec_target_embed -- the level's own PQ/byte codebook embedding,
+    # concat-then-linear-map scheme). None (default) -> that level's own d_model. Set a per-level
+    # tuple or a bare int (broadcasts uniformly) to use a narrower per-chunk width, e.g. 64 for a
+    # byte level's 3 RGB chunks, 32 for a PQ level's 4 chunks -- cheaper than full d_model per
+    # chunk since the down-projection still restores width D regardless.
     token_mask_prob: float = 0.15   # "diffusion" token head masking probability (KIV, unused by
     # the current sanity-check version which hardcodes always-mask -- see _token_teacher_forced_
     # diffusion's docstring; renamed from mask_prob)
@@ -202,6 +209,13 @@ class Config:
     traversal: str = "raster"    # "raster" (default, row-major) or "zorder" (Morton curve over
     # pixels, RGB stays contiguous per pixel regardless of byte_group -- see module docstring).
 
+    mse_weight: float = 0.0   # chat 2026-09-14 -- level0's byte-decode logits, straight-through
+    # quantized (softmax + argmax one-hot, ST gradient -- forward matches the exact byte value
+    # that would be generated), dotted with arange(256) to get a differentiable pixel-value
+    # estimate, then MSE'd against the real byte value and normalized by /255 (squared) so it's
+    # on a comparable [0,1] scale to the CE loss -- otherwise (confirmed 2026-09-14) raw 0-255
+    # pixel MSE totally dominates at mse_weight=1.0 (loss~9658 vs ~11.75 without it). Default 0.0.
+
     def __post_init__(self):
         n = len(self.strides)
 
@@ -222,12 +236,17 @@ class Config:
         bcast("token_n_heads", int)
         bcast("mtp_horizon", int)
         bcast("mtp_mode", str)
+        if self.pq_dim is None:
+            self.pq_dim = self.d_model
+        else:
+            bcast("pq_dim", int)
 
         assert len(self.d_model) == n and len(self.n_layers) == n and len(self.n_heads) == n \
             and len(self.n_kv_heads) == n and len(self.code_vocab) == n and len(self.pq_chunks) == n
         assert len(self.mlp_mult) == n and len(self.rope_base) == n and len(self.decoder_ncodes) == n
         assert len(self.weight_sharing) == n and len(self.gumbel_temperature) == n
         assert len(self.token_head_type) == n
+        assert len(self.pq_dim) == n
         assert all(t in ("linears", "ar", "diffusion") for t in self.token_head_type)
         assert len(self.mtp_horizon) == n and len(self.mtp_mode) == n
         assert all(m in ("parallel", "ar") for m in self.mtp_mode)
@@ -322,8 +341,13 @@ def load_cifar10(data_root: Path) -> tuple:
     tar_path = data_root / "cifar-10-python.tar.gz"
     if not tar_path.exists():
         import urllib.request
+        tmp_path = tar_path.with_suffix(".tar.gz.tmp")
         print(f"downloading {CIFAR10_URL} -> {tar_path}")
-        urllib.request.urlretrieve(CIFAR10_URL, tar_path)
+        urllib.request.urlretrieve(CIFAR10_URL, tmp_path)   # download to temp first -- an
+        tmp_path.rename(tar_path)   # interrupted/truncated download must never land at tar_path,
+        # or it silently poisons every future run on this node (confirmed 2026-09-14: a truncated
+        # tar.gz from an earlier interrupted download made tarfile/gzip EOFError on every relaunch
+        # since `if not tar_path.exists()` skipped re-downloading the corrupt file).
     extract_dir = data_root / "cifar-10-batches-py"
     if not extract_dir.exists():
         with tarfile.open(tar_path) as tf:
@@ -394,8 +418,8 @@ class BatchIterator:
 # Quantization (identical convention to run_lagcodec_sampler.py)
 # ---------------------------------------------------------------------------
 
-def quantize_hard(logits: jnp.ndarray, rng=None, quantize_drop: float = 0.0) -> tuple:
-    soft = jax.nn.softmax(logits, axis=-1)
+def quantize_hard(logits: jnp.ndarray, rng=None, quantize_drop: float = 0.0, tau: float = 1.0) -> tuple:
+    soft = jax.nn.softmax(logits / tau, axis=-1)
     idx = jnp.argmax(soft, axis=-1)
     hard = jax.nn.one_hot(idx, logits.shape[-1], dtype=soft.dtype)
     st = soft + jax.lax.stop_gradient(hard - soft)
@@ -407,11 +431,11 @@ def quantize_hard(logits: jnp.ndarray, rng=None, quantize_drop: float = 0.0) -> 
     return code_soft, idx
 
 
-def quantize_gumbel(logits: jnp.ndarray, rng, temperature: float = 1.0, quantize_drop: float = 0.0) -> tuple:
+def quantize_gumbel(logits: jnp.ndarray, rng, tau: float = 1.0, quantize_drop: float = 0.0) -> tuple:
     rng, drop_rng = jax.random.split(rng)
     u = jax.random.uniform(rng, logits.shape, minval=1e-8, maxval=1.0 - 1e-8)
     gumbel_noise = -jnp.log(-jnp.log(u))
-    noisy_logits = (logits + gumbel_noise) / temperature
+    noisy_logits = (logits + gumbel_noise) / tau
     soft = jax.nn.softmax(noisy_logits, axis=-1)
     idx = jnp.argmax(soft, axis=-1)
     hard = jax.nn.one_hot(idx, logits.shape[-1], dtype=soft.dtype)
@@ -436,9 +460,52 @@ def codebook_utilization(idx: jnp.ndarray, vocab: int) -> jnp.ndarray:
 
 
 def code_embed(code: jnp.ndarray, table: jnp.ndarray) -> jnp.ndarray:
-    if jnp.issubdtype(code.dtype, jnp.integer):
-        return table[code].sum(-2)
-    return (code @ table).sum(-2)
+    """table: (vocab, D). code: (...,C) int indices or (...,C,vocab) soft, C=chunks (byte_group
+    or pq_chunks -- this function is agnostic, used identically for both).
+
+    CONCATENATIVE (chat 2026-09-14): each of the C chunk positions gets its OWN disjoint slice of
+    the D-dim embedding (D split as evenly as possible across C slices) instead of all C chunks
+    sharing the full D-dim row and being summed -- preserves per-chunk identity (e.g. byte_group=3
+    R/G/B no longer alias through a shared sum, since summing let e.g. R=200,G=50,B=10 collide
+    with other combinations that happen to sum close to the same vector). Reuses the SAME (vocab,
+    D) table as before (no new params) -- just slices it differently per chunk index.
+    """
+    # --- additive (original) path, commented for easy revert ---
+    # if jnp.issubdtype(code.dtype, jnp.integer):
+    #     return table[code].sum(-2)
+    # return (code @ table).sum(-2)
+    D = table.shape[-1]
+    is_int = jnp.issubdtype(code.dtype, jnp.integer)
+    C = code.shape[-1] if is_int else code.shape[-2]
+    bounds = [round(i * D / C) for i in range(C + 1)]
+    parts = []
+    for i in range(C):
+        lo, hi = bounds[i], bounds[i + 1]
+        if is_int:
+            parts.append(table[code[..., i], lo:hi])
+        else:
+            parts.append(code[..., i, :] @ table[:, lo:hi])
+    return jnp.concatenate(parts, axis=-1)
+
+
+def code_embed_proj(code: jnp.ndarray, table: jnp.ndarray, proj: jnp.ndarray) -> jnp.ndarray:
+    """chat 2026-09-14: concat-then-linear-map upgrade over code_embed's disjoint-slice concat --
+    used for own_input_embed/ctx_embed/dec_target_embed (the level's own PQ/byte codebook
+    embedding), NOT token_member_embed (still plain code_embed, unaffected).
+
+    table: (vocab, pq_dim) -- each of the C chunks gets the FULL pq_dim width (no slicing).
+    proj: (C*pq_dim, D). Mathematically decomposes as sum_c(embed_c(code_c) @ proj_c), proj_c
+    being the c-th (pq_dim,D) block of proj -- a strict superset of both plain additive (proj_c=I
+    padded) and disjoint-slice concat (proj_c a 0/1 selection matrix): the network can LEARN
+    whichever combination is best, at the cost of C*pq_dim*D extra params vs a free gather+slice.
+    Still no genuine cross-chunk interaction (this is still linear/additive across chunks)."""
+    is_int = jnp.issubdtype(code.dtype, jnp.integer)
+    C = code.shape[-1] if is_int else code.shape[-2]
+    if is_int:
+        parts = [table[code[..., i]] for i in range(C)]
+    else:
+        parts = [code[..., i, :] @ table for i in range(C)]
+    return jnp.concatenate(parts, axis=-1) @ proj
 
 
 def reshape_pq(logits: jnp.ndarray, pq_chunks: int, code_vocab: int) -> jnp.ndarray:
@@ -556,13 +623,16 @@ class EncDecLevel(eqx.Module):
     blocks: list
     ln_f: RMSNorm
     own_input_embed: jnp.ndarray
+    own_input_proj: jnp.ndarray
     ntp_head: jnp.ndarray
     code_head: jnp.ndarray
     bos_embed: jnp.ndarray
     ctx_embed: jnp.ndarray
+    ctx_proj: jnp.ndarray
     dec_blocks: list
     dec_ln_f: RMSNorm
     dec_target_embed: jnp.ndarray
+    dec_target_proj: jnp.ndarray
     dec_head: jnp.ndarray
     # token_head_type in ("ar","diffusion") params (None unless has_decoder and token_head_type
     # needs them) -- self-attention + residual + UNTIED linear head only (no mlp, no weight
@@ -612,6 +682,7 @@ class EncDecLevel(eqx.Module):
     mtp_mode: str = eqx.field(static=True)
     mtp_weight: float = eqx.field(static=True)
     remat: bool = eqx.field(static=True)
+    pq_dim: int = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config, level: int, has_decoder: bool, weight_sharing: bool):
         D = cfg.d_model[level]
@@ -635,12 +706,14 @@ class EncDecLevel(eqx.Module):
         self.mtp_horizon = cfg.mtp_horizon[level]
         self.mtp_mode = cfg.mtp_mode[level]
         self.mtp_weight = cfg.mtp_weight
+        self.pq_dim = cfg.pq_dim[level]
         own_vocab = 256 if is_byte_level else self.in_code_vocab
         ntp_out = self.in_pq_chunks * self.in_code_vocab
-        keys = jax.random.split(key, 20)
+        keys = jax.random.split(key, 23)
 
         scheme, use_xsa, use_qknorm = cfg.init_scheme, cfg.use_xsa, cfg.use_qknorm
-        self.own_input_embed = init_matrix(keys[0], (own_vocab, D), scheme)
+        self.own_input_embed = init_matrix(keys[0], (own_vocab, self.pq_dim), scheme)
+        self.own_input_proj = init_matrix(keys[20], (self.in_pq_chunks * self.pq_dim, D), scheme)
         n_layers = cfg.n_layers[level]
         block_keys = jax.random.split(keys[1], n_layers)
         self.blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
@@ -649,7 +722,8 @@ class EncDecLevel(eqx.Module):
         self.code_head = init_matrix(keys[2], (D, self.pq_chunks * self.code_vocab), scheme)
         self.ntp_head = init_matrix(keys[3], (D, ntp_out), scheme)
         self.bos_embed = init_vector(keys[4], D, scheme)
-        self.ctx_embed = init_matrix(keys[5], (self.code_vocab, D), scheme)
+        self.ctx_embed = init_matrix(keys[5], (self.code_vocab, self.pq_dim), scheme)
+        self.ctx_proj = init_matrix(keys[21], (self.pq_chunks * self.pq_dim, D), scheme)
 
         if has_decoder and not weight_sharing:
             dec_block_keys = jax.random.split(keys[6], n_layers)
@@ -657,10 +731,11 @@ class EncDecLevel(eqx.Module):
                                      n_layers=n_layers, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
                                for k in dec_block_keys]
             self.dec_ln_f = RMSNorm(D)
-            self.dec_target_embed = init_matrix(keys[7], (own_vocab, D), scheme)
+            self.dec_target_embed = init_matrix(keys[7], (own_vocab, self.pq_dim), scheme)
+            self.dec_target_proj = init_matrix(keys[22], (self.in_pq_chunks * self.pq_dim, D), scheme)
             self.dec_head = init_matrix(keys[8], (D, ntp_out), scheme)
         else:
-            self.dec_blocks, self.dec_ln_f, self.dec_target_embed, self.dec_head = None, None, None, None
+            self.dec_blocks, self.dec_ln_f, self.dec_target_embed, self.dec_target_proj, self.dec_head = None, None, None, None, None
 
         if has_decoder and self.token_head_type in ("ar", "diffusion"):
             tdim, theads = cfg.token_dim[level], cfg.token_n_heads[level]
@@ -732,7 +807,7 @@ class EncDecLevel(eqx.Module):
         if rng is not None and self.quantize_mode == "gumbel":
             code_soft, code_idx = quantize_gumbel(logits, rng, self.gumbel_temperature, self.quantize_drop)
         else:
-            code_soft, code_idx = quantize_hard(logits, rng, self.quantize_drop)
+            code_soft, code_idx = quantize_hard(logits, rng, self.quantize_drop, self.gumbel_temperature)
 
         # IBQ-style (arXiv:2412.02692) entropy bonus: negative entropy of the batch-averaged soft
         # code distribution (differentiable, unlike codebook_utilization's hard-idx entropy used
@@ -764,7 +839,8 @@ class EncDecLevel(eqx.Module):
         (group-to-group) causal decoder -- unaffected by token_head_type, which only governs HOW
         a group's own members get predicted, not how a whole group is fed back in."""
         table = self.own_input_embed if self.weight_sharing else self.dec_target_embed
-        return code_embed(idx, table)
+        proj = self.own_input_proj if self.weight_sharing else self.dec_target_proj
+        return code_embed_proj(idx, table, proj)
 
     def _dec_head_w(self) -> jnp.ndarray:
         return self.ntp_head if self.weight_sharing else self.dec_head
@@ -927,7 +1003,7 @@ class EncDecLevel(eqx.Module):
         pad_blocks = (-n_blocks) % G
         n_blocks_p = n_blocks + pad_blocks
         n_groups = n_blocks_p // G
-        ctx_tok = code_embed(ctx_code_soft, self.ctx_embed)
+        ctx_tok = code_embed_proj(ctx_code_soft, self.ctx_embed, self.ctx_proj)
         if pad_blocks > 0:
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
             te = jnp.pad(te, ((0, 0), (0, pad_blocks * self.K), (0, 0)))
@@ -972,7 +1048,7 @@ class EncDecLevel(eqx.Module):
         n_groups = n_blocks_p // G
         per_group_len = G + 1 + G * self.K
         L_total = n_groups * per_group_len
-        ctx_tok = code_embed(ctx_idx, self.ctx_embed)
+        ctx_tok = code_embed_proj(ctx_idx, self.ctx_embed, self.ctx_proj)
         if pad_blocks > 0:
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
         ctx_tok_g = jnp.swapaxes(ctx_tok.reshape(B, n_groups, G, D), 0, 1)
@@ -1062,7 +1138,7 @@ class EncDecLevel(eqx.Module):
         n_groups = n_blocks_p // G
         per_group_len = G + 1 + G * self.K
         L_total = n_groups * per_group_len
-        ctx_tok = code_embed(ctx_idx, self.ctx_embed)
+        ctx_tok = code_embed_proj(ctx_idx, self.ctx_embed, self.ctx_proj)
         if pad_blocks > 0:
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
         ctx_tok_g = jnp.swapaxes(ctx_tok.reshape(B, n_groups, G, D), 0, 1)
@@ -1183,7 +1259,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     """Same cascade rollout sampler design as run_lagcodec_sampler.py -- see that file's module
     docstring. flat_bytes is always (B, n_positions, byte_group)."""
     levels = model.levels
-    x = code_embed(flat_bytes, levels[0].own_input_embed)
+    x = code_embed_proj(flat_bytes, levels[0].own_input_embed, levels[0].own_input_proj)
     target = flat_bytes
     codes, codes_soft = [], []
     enc_losses, enc_accs, utils, entropy_losses = [], [], [], []
@@ -1199,7 +1275,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
         utils.append(out["util"])
         entropy_losses.append(out["entropy_loss"])
         if i < phase - 1:
-            x = code_embed(out["code_soft"], levels[i + 1].own_input_embed)
+            x = code_embed_proj(out["code_soft"], levels[i + 1].own_input_embed, levels[i + 1].own_input_proj)
             target = out["code_idx"]
 
     dec_losses, dec_accs = [], []
@@ -1218,7 +1294,21 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
             # level0's own logits predict real byte VALUES (0-255) -- pixel-space MSE only makes
             # sense here, not at levels>0 (those predict PQ codebook indices, not pixel values).
             pred_bytes = jnp.argmax(logits, axis=-1).astype(jnp.float32)
-            byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)
+            byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)   # logging only, non-diff
+            if model.cfg.mse_weight > 0:
+                # straight-through quantize (forward = exact argmax byte, ST gradient through the
+                # softmax) then dot with arange(256) -- a differentiable pixel-value estimate whose
+                # FORWARD value matches the byte that would actually be generated.
+                byte_probs = jax.nn.softmax(logits, axis=-1)
+                byte_idx = jnp.argmax(byte_probs, axis=-1)
+                byte_hard = jax.nn.one_hot(byte_idx, byte_probs.shape[-1], dtype=byte_probs.dtype)
+                byte_st = byte_probs + jax.lax.stop_gradient(byte_hard - byte_probs)
+                byte_values = jnp.arange(byte_probs.shape[-1], dtype=byte_st.dtype)
+                pred_pixel = jnp.sum(byte_st * byte_values, axis=-1)
+                max_val = byte_probs.shape[-1] - 1   # 255 for a byte -- normalizes MSE to [0,1]
+                mse_loss = jnp.mean(((pred_pixel - target_i.astype(jnp.float32)) / max_val) ** 2)
+            else:
+                mse_loss = 0.0
         if i > 0:
             real_ctx = codes_soft[i - 1]
             if use_cascade is None:
@@ -1231,7 +1321,8 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     byte_acc = dec_accs[-1]
     ntp_loss_total = jnp.mean(jnp.stack(enc_losses))
     entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
-    loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total
+    loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
+        + model.cfg.mse_weight * mse_loss
     bpb = dec_loss_total / jnp.log(2.0)
     return loss, (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
                   jnp.mean(jnp.stack(utils)), byte_mse)
@@ -1314,6 +1405,27 @@ def find_latest_checkpoint(run_dir: Path):
     return candidates[-1][2]
 
 
+def prune_checkpoints(run_dir: Path, keep: int) -> None:
+    """Deletes all but the keep most recent (phase, phase_step) checkpoints under
+    run_dir/checkpoints (wa/ untouched). keep=None disables pruning entirely."""
+    if keep is None:
+        return
+    ckpt_root = run_dir / "checkpoints"
+    if not ckpt_root.exists():
+        return
+    candidates = []
+    for d in ckpt_root.iterdir():
+        if d.name == "wa":
+            continue
+        meta_path = d / "meta.json"
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            candidates.append((meta["phase"], meta["phase_step"], d))
+    candidates.sort(key=lambda t: (t[0], t[1]))
+    for _, _, d in candidates[:-keep] if keep > 0 else candidates:
+        shutil.rmtree(d)
+
+
 # ---------------------------------------------------------------------------
 # Weight averaging (chat 2026-09-14) -- see module docstring point 5. Both operate on diff_model
 # (trainable params only) as plain pytrees; caller is responsible for combining with static_model
@@ -1334,7 +1446,7 @@ def stack_average(stack: list, weights=None):
     if weights is None:
         w = [1.0 / n] * n
     else:
-        assert len(weights) == n, f"wa_discrete_weights has {len(weights)} entries, need {n} (wa_stack_size)"
+        assert len(weights) == n, f"wa_wma_weights has {len(weights)} entries, need {n} (wa_stack_size)"
         exp = [math.exp(x) for x in weights]
         total = sum(exp)
         w = [e / total for e in exp]
@@ -1441,8 +1553,8 @@ CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "st
                   "weight_sharing", "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
                   "gumbel_temperature", "gumbel_at_inference", "cascade_rollout_prob", "init_scheme", "use_xsa",
                   "use_qknorm", "remat",
-                  "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob",
-                  "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "traversal")
+                  "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
+                  "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "mse_weight", "traversal")
 
 
 def main():
@@ -1478,17 +1590,21 @@ def main():
     p.add_argument("--ckpt_every", type=int, default=10,
                     help="save a full resumable checkpoint (model+optim+rng+dataloader state) "
                          "every N EPOCHS, in addition to always at phase end -- auto-converted to steps")
+    p.add_argument("--ckpt_keep", type=lambda x: None if x.lower() == "none" else int(x), default=None,
+                    help="keep only the N most recent checkpoints under checkpoints/ (wa/ "
+                         "untouched), deleting older ones after each save. 'none' (default) "
+                         "disables pruning -- keep every checkpoint")
     p.add_argument("--resume", type=lambda x: x.lower() != "false", default=False,
                     help="resume from the latest checkpoint under this run's log dir, if any")
-    p.add_argument("--wa_mode", type=str, default="none", choices=["none", "ema", "discrete"],
-                    help="weight averaging: 'ema' (Polyak shadow copy) or 'discrete' (rolling "
+    p.add_argument("--wa_mode", type=str, default="none", choices=["none", "ema", "wma"],
+                    help="weight averaging: 'ema' (Polyak shadow copy) or 'wma' (rolling "
                          "mean over a FIFO stack of raw snapshots). 'none' (default) disables "
                          "both -- see module docstring point 5")
     p.add_argument("--wa_every", type=int, default=10, help="WA update cadence, in EPOCHS -- auto-converted to steps")
     p.add_argument("--wa_ema_decay", type=float, default=0.999, help="ema mode only")
-    p.add_argument("--wa_stack_size", type=int, default=3, help="discrete mode only")
-    p.add_argument("--wa_discrete_weights", type=_float_tuple_arg, default=None,
-                    help="discrete mode only: one raw score per stack slot (oldest first), "
+    p.add_argument("--wa_stack_size", type=int, default=3, help="wma mode only")
+    p.add_argument("--wa_wma_weights", type=_float_tuple_arg, default=None,
+                    help="wma mode only: one raw score per stack slot (oldest first), "
                          "softmax-normalized to sum to 1 -- length must equal wa_stack_size. "
                          "Default None: uniform (1/wa_stack_size each)")
     p.add_argument("--train_subset_n", type=int, default=100)
@@ -1534,11 +1650,13 @@ def main():
     p.add_argument("--token_head_type", type=str, default=Config.token_head_type)
     p.add_argument("--token_dim", type=_tuple_arg, default=Config.token_dim)
     p.add_argument("--token_n_heads", type=_tuple_arg, default=Config.token_n_heads)
+    p.add_argument("--pq_dim", type=_tuple_arg, default=Config.pq_dim)
     p.add_argument("--token_mask_prob", type=float, default=Config.token_mask_prob)
     p.add_argument("--mtp_horizon", type=_tuple_arg, default=Config.mtp_horizon)
     p.add_argument("--mtp_mode", type=str, default=Config.mtp_mode)   # see --token_head_type's note
     p.add_argument("--mtp_weight", type=float, default=Config.mtp_weight)
     p.add_argument("--entropy_weight", type=float, default=Config.entropy_weight)
+    p.add_argument("--mse_weight", type=float, default=Config.mse_weight)
     p.add_argument("--traversal", type=str, default=Config.traversal, choices=["raster", "zorder"])
     pre_args, _ = p.parse_known_args()
     config_vars = load_config_module(pre_args.config)
@@ -1613,7 +1731,7 @@ def main():
 
     def run_gen_eval(eval_model, top: int, tag: str, include_reconstruct: bool = False) -> tuple:
         m = cast_pytree(eval_model, compute_dtype)
-        x = code_embed(flat_prompt, m.levels[0].own_input_embed)
+        x = code_embed_proj(flat_prompt, m.levels[0].own_input_embed, m.levels[0].own_input_proj)
         target = flat_prompt
         codes, codes_soft = [], []
         eval_rngs = ([None] * (top + 1) if not cfg.gumbel_at_inference
@@ -1623,7 +1741,7 @@ def main():
             codes.append(out["code_idx"])
             codes_soft.append(out["code_soft"])
             if i < top:
-                x = code_embed(out["code_soft"], m.levels[i + 1].own_input_embed)
+                x = code_embed_proj(out["code_soft"], m.levels[i + 1].own_input_embed, m.levels[i + 1].own_input_proj)
                 target = out["code_idx"]
 
         recon_acc = recon_mse = None
@@ -1652,9 +1770,9 @@ def main():
         logger(msg, **rec)
         return recon_acc, cascade_acc
 
-    if args.wa_mode == "discrete" and args.wa_discrete_weights is not None:
-        assert len(args.wa_discrete_weights) == args.wa_stack_size, \
-            f"wa_discrete_weights has {len(args.wa_discrete_weights)} entries, need " \
+    if args.wa_mode == "wma" and args.wa_wma_weights is not None:
+        assert len(args.wa_wma_weights) == args.wa_stack_size, \
+            f"wa_wma_weights has {len(args.wa_wma_weights)} entries, need " \
             f"wa_stack_size={args.wa_stack_size}"
 
     step = resume_meta["step"] if resume_meta else 0
@@ -1797,6 +1915,7 @@ def main():
                     ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_step{step}"
                     save_checkpoint(ckpt_dir, ckpt_model, ckpt_opt_state, to_host(p_rng), train_iter,
                                      phase=phase, phase_step=phase_step, step=step, seed=args.seed)
+                    prune_checkpoints(run_dir, args.ckpt_keep)
                     logger(f"checkpoint saved: {ckpt_dir}")
 
                 if args.wa_mode != "none" and step % wa_every_steps == 0:
@@ -1810,9 +1929,9 @@ def main():
                     else:
                         wa_stack.append(cur_diff_model)
                         if len(wa_stack) == args.wa_stack_size:
-                            avg = stack_average(list(wa_stack), weights=args.wa_discrete_weights)
-                            eqx.tree_serialise_leaves(wa_dir / f"discrete_phase{phase}_step{step}.eqx", avg)
-                            logger(f"wa (discrete, n={len(wa_stack)}) average saved at step {step}")
+                            avg = stack_average(list(wa_stack), weights=args.wa_wma_weights)
+                            eqx.tree_serialise_leaves(wa_dir / f"wma_phase{phase}_step{step}.eqx", avg)
+                            logger(f"wa (wma, n={len(wa_stack)}) average saved at step {step}")
 
         diff_model = to_host(unreplicate(p_diff_model))
         model = eqx.combine(diff_model, static_model)
@@ -1821,6 +1940,7 @@ def main():
         ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_step{step}"
         save_checkpoint(ckpt_dir, model, to_host(unreplicate(p_opt_state)), to_host(p_rng), train_iter,
                          phase=phase, phase_step=phase_steps, step=step, seed=args.seed)
+        prune_checkpoints(run_dir, args.ckpt_keep)
         run_gen_eval(model, top=phase - 1, tag=f"phase{phase}_final", include_reconstruct=True)
 
     logger("=== all phases done, running final top-down cascade eval ===")
