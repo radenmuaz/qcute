@@ -79,6 +79,8 @@ class Config:
     mse_weight: float = 0.0
     mse_softmax_tau: float = 0.1
 
+    label_reg_weight: float = 0.0
+
     def __post_init__(self):
         n = len(self.strides)
 
@@ -291,6 +293,58 @@ def positions_to_image(positions: np.ndarray, cfg: Config, pixel_order: np.ndarr
     raster = np.zeros_like(pix_traversal)
     raster[:, pixel_order, :] = pix_traversal
     return raster.reshape(B, cfg.img_size, cfg.img_size, 3).astype(np.uint8)
+
+
+def byte_to_pq_idx_jax(byte_vals: jnp.ndarray, pq_chunks: int, code_vocab: int) -> jnp.ndarray:
+    bits_per_chunk = max(1, round(math.log2(code_vocab)))
+    total_bits = pq_chunks * bits_per_chunk
+    shifted = byte_vals >> (8 - total_bits) if total_bits <= 8 else byte_vals << (total_bits - 8)
+    chunks = [(shifted >> ((pq_chunks - 1 - c) * bits_per_chunk)) & (code_vocab - 1) for c in range(pq_chunks)]
+    return jnp.stack(chunks, axis=-1)
+
+
+def default_label_fn_jax(flat_bytes: jnp.ndarray, cfg: Config, pixel_order: np.ndarray, n_blocks: int,
+                          pq_chunks: int, code_vocab: int, method: str = "bilinear") -> jnp.ndarray:
+    M = flat_bytes.shape[0]
+    pix_traversal = flat_bytes.reshape(M, cfg.img_size * cfg.img_size, 3).astype(jnp.float32)
+    raster = jnp.zeros_like(pix_traversal).at[:, pixel_order, :].set(pix_traversal)
+    img = raster.reshape(M, cfg.img_size, cfg.img_size, 3)
+    side = max(1, round(math.sqrt(n_blocks)))
+    small = jax.image.resize(img, (M, side, side, 3), method=method)
+    gray = jnp.mean(small, axis=-1)
+    low_order = zorder_pixel_order(side) if cfg.traversal == "zorder" else np.arange(side * side)
+    flat_gray = gray.reshape(M, side * side)[:, low_order]
+    if side * side > n_blocks:
+        flat_gray = flat_gray[:, :n_blocks]
+    elif side * side < n_blocks:
+        flat_gray = jnp.pad(flat_gray, ((0, 0), (0, n_blocks - side * side)))
+    byte_vals = jnp.round(jnp.clip(flat_gray, 0, 255)).astype(jnp.int32)
+    return byte_to_pq_idx_jax(byte_vals, pq_chunks, code_vocab)
+
+
+def default_label_fn_pil(images: np.ndarray, cfg: Config, pixel_order: np.ndarray, n_blocks: int,
+                          pq_chunks: int, code_vocab: int) -> np.ndarray:
+    from PIL import Image
+    side = max(1, round(math.sqrt(n_blocks)))
+    out = np.zeros((images.shape[0], side, side), dtype=np.float32)
+    for b in range(images.shape[0]):
+        pil = Image.fromarray(images[b])
+        while min(pil.size) >= 2 * side:
+            pil = pil.resize(tuple(x // 2 for x in pil.size), resample=Image.BOX)
+        pil = pil.resize((side, side), resample=Image.BICUBIC)
+        out[b] = np.asarray(pil.convert("RGB"), dtype=np.float32).mean(axis=-1)
+    low_order = zorder_pixel_order(side) if cfg.traversal == "zorder" else np.arange(side * side)
+    flat_gray = out.reshape(images.shape[0], side * side)[:, low_order]
+    if side * side > n_blocks:
+        flat_gray = flat_gray[:, :n_blocks]
+    elif side * side < n_blocks:
+        flat_gray = np.pad(flat_gray, ((0, 0), (0, n_blocks - side * side)))
+    byte_vals = np.round(np.clip(flat_gray, 0, 255)).astype(np.int64)
+    bits_per_chunk = max(1, round(math.log2(code_vocab)))
+    total_bits = pq_chunks * bits_per_chunk
+    shifted = byte_vals >> (8 - total_bits) if total_bits <= 8 else byte_vals << (total_bits - 8)
+    chunks = [(shifted >> ((pq_chunks - 1 - c) * bits_per_chunk)) & (code_vocab - 1) for c in range(pq_chunks)]
+    return np.stack(chunks, axis=-1)
 
 
 class BatchIterator:
@@ -797,7 +851,7 @@ class EncDecLevel(eqx.Module):
         ntp_acc = jnp.mean(jnp.argmax(ntp_logits, -1) == tgt)
         util = codebook_utilization(code_idx, self.code_vocab)
         return dict(code_soft=code_soft, code_idx=code_idx, ntp_loss=ntp_loss, ntp_acc=ntp_acc, util=util,
-                    entropy_loss=entropy_loss)
+                    entropy_loss=entropy_loss, logits=logits)
 
 
     def _dec_blocks(self):
@@ -1344,12 +1398,13 @@ class HierEncDec(eqx.Module):
 
 
 def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=None,
-                   use_cascade=None, gumbel_temperature: float = 1.0, layer_drop_prob=None) -> tuple:
+                   use_cascade=None, gumbel_temperature: float = 1.0, layer_drop_prob=None,
+                   label_reg_weight: float = 0.0, label_fn=None, pixel_order=None) -> tuple:
     levels = model.levels
     x = code_embed_proj(flat_bytes, levels[0].own_input_embed, levels[0].own_input_proj)
     target = flat_bytes
     codes, codes_soft = [], []
-    enc_losses, enc_accs, utils, entropy_losses = [], [], [], []
+    enc_losses, enc_accs, utils, entropy_losses, label_losses = [], [], [], [], []
     level_rngs = [None] * (2 * phase) if rng is None else list(jax.random.split(rng, 2 * phase))
     for i in range(phase):
         out = levels[i].encode(x, target, rng=level_rngs[2 * i], gumbel_temperature=gumbel_temperature,
@@ -1360,6 +1415,13 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
         enc_accs.append(out["ntp_acc"])
         utils.append(out["util"])
         entropy_losses.append(out["entropy_loss"])
+        if label_reg_weight > 0:
+            enc_logits = out["logits"]
+            n_blocks_i = enc_logits.shape[1]
+            label_tgt = label_fn(flat_bytes, model.cfg, pixel_order, n_blocks_i,
+                                  model.cfg.pq_chunks[i], model.cfg.code_vocab[i])
+            logp_i = jax.nn.log_softmax(enc_logits, axis=-1)
+            label_losses.append(-jnp.mean(jnp.take_along_axis(logp_i, label_tgt[..., None], axis=-1)))
         if i < phase - 1:
             x = code_embed_proj(out["code_soft"], levels[i + 1].own_input_embed, levels[i + 1].own_input_proj)
             target = out["code_idx"]
@@ -1399,8 +1461,9 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     byte_acc = dec_accs[-1]
     ntp_loss_total = jnp.mean(jnp.stack(enc_losses))
     entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
+    label_loss_total = jnp.mean(jnp.stack(label_losses)) if label_losses else 0.0
     loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
-        + model.cfg.mse_weight * mse_loss
+        + model.cfg.mse_weight * mse_loss + label_reg_weight * label_loss_total
     bpb = dec_loss_total / jnp.log(2.0)
     return loss, (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
                   jnp.mean(jnp.stack(utils)), byte_mse)
@@ -1600,7 +1663,7 @@ CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "st
                   "use_qknorm", "remat", "attn_window", "use_attn_sink",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "mse_weight",
-                  "mse_softmax_tau", "traversal")
+                  "mse_softmax_tau", "traversal", "label_reg_weight")
 
 
 def main():
@@ -1749,9 +1812,19 @@ def main():
     p.add_argument("--entropy_weight", type=float, default=Config.entropy_weight)
     p.add_argument("--mse_weight", type=float, default=Config.mse_weight)
     p.add_argument("--mse_softmax_tau", type=float, default=Config.mse_softmax_tau)
+    p.add_argument("--label_reg_weight", type=float, default=Config.label_reg_weight,
+                    help="auxiliary regularization: cross-entropy each level's own code_head "
+                         "logits against a pseudo-label built by downsampling the real image to "
+                         "that level's own block-grid resolution and bit-packing the resulting "
+                         "byte value into that level's (pq_chunks, code_vocab) shape (default "
+                         "label generator: default_label_fn_jax, pure-JAX/on-device; a slower "
+                         "PIL-based alternative, default_label_fn_pil, is also provided -- set "
+                         "'label_fn' in a config.py to swap it, not CLI-representable). Default "
+                         "0.0 (off)")
     p.add_argument("--traversal", type=str, default=Config.traversal, choices=["raster", "zorder"])
     pre_args, _ = p.parse_known_args()
     config_vars = load_config_module(pre_args.config)
+    label_fn = config_vars.pop("label_fn", default_label_fn_jax)
     known = {a.dest for a in p._actions}
     unknown = set(config_vars) - known
     if unknown:
@@ -1881,7 +1954,8 @@ def main():
     def run_val_eval(eval_model, phase: int, tag: str) -> tuple:
         val_t0 = time.monotonic()
         m = cast_pytree(eval_model, compute_dtype)
-        loss, aux = phase_forward(m, flat_prompt, phase, rng=None, gumbel_temperature=args.gumbel_temperature[phase - 1])
+        loss, aux = phase_forward(m, flat_prompt, phase, rng=None, gumbel_temperature=args.gumbel_temperature[phase - 1],
+                                   label_reg_weight=cfg.label_reg_weight, label_fn=label_fn, pixel_order=pixel_order)
         bpb, acc, ntp_bpb, ntp_acc, util, val_mse = [float(a) for a in aux]
         loss = float(loss)
         val_time_s = time.monotonic() - val_t0
@@ -1941,7 +2015,9 @@ def main():
             m = cast_pytree(m, compute_dtype)
             return phase_forward(m, flat_bytes, phase, rng=rng, use_cascade=use_cascade,
                                   gumbel_temperature=gumbel_temperature_phase,
-                                  layer_drop_prob=layer_drop_prob_phase)
+                                  layer_drop_prob=layer_drop_prob_phase,
+                                  label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
+                                  pixel_order=pixel_order)
 
         steps_per_epoch_lr = len(train_iter)
         phase_total_steps = _phase_total_steps(phase - 1, steps_per_epoch_lr)
