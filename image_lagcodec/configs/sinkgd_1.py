@@ -16,7 +16,7 @@ decoder_ncodes = 4
 weight_sharing = False
 curriculum_mode = "no_freeze"
 quantize_mode = "argmax"
-cascade_rollout_prob = 0.5
+cascade_rollout_drop = 0.5
 init_scheme = "llama"
 use_xsa = True
 
@@ -30,7 +30,7 @@ traversal = "zorder"
 
 # --- training ---
 batch_size = 128
-epochs_per_phase = (200, 200, 200, )
+phase_epochs = (200, 200, 200, )
 warmup_steps = 100
 grad_clip = 10.0
 seed = 0
@@ -44,5 +44,5 @@ optimizer_kwargs = {"sinkhorn_iters": 2, "weight_decay": 0}
 
 # --- logging ---
 log_every = 100
-gen_eval_every = 10
+gen_eval_every_epoch = 10
 qual_gen_n = 8

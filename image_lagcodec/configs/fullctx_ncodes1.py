@@ -46,7 +46,7 @@ curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
 gumbel_temperature = 0.1
 gumbel_at_inference = False
-cascade_rollout_prob = 0.5
+cascade_rollout_drop = 0.5
 quantize_drop = 0.5
 init_scheme = "llama"
 use_xsa = True
@@ -70,7 +70,7 @@ batch_size = 4   # chat 2026-09-15: -2 (fullctx) fixes CTX SEMANTICS vs -1 (no m
 # OOM driver is decoder_ncodes=1 -> n_groups=256 -> B2=batch_size*n_devices*n_groups=16384 dense
 # attention rows -- inherent to this naive/dense approach at small G, unrelated to -1 vs -2.
 val_batch_size = 16
-epochs_per_phase = (100, 100, 100, )
+phase_epochs = (100, 100, 100, )
 warmup_steps = 1000
 grad_clip = 10.0
 seed = 0
@@ -90,7 +90,7 @@ wa_mode = "none"
 
 # --- logging ---
 log_every = 100
-gen_eval_every = 10
-ckpt_every = 10
+gen_eval_every_epoch = 10
+ckpt_every_epoch = 10
 ckpt_keep = 1
 qual_gen_n = 16

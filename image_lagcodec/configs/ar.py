@@ -59,7 +59,7 @@ decoder_ncodes = 4
 weight_sharing = False
 curriculum_mode = "no_freeze"
 quantize_mode = "argmax"
-cascade_rollout_prob = 0.5
+cascade_rollout_drop = 0.5
 init_scheme = "zero"
 # init_scheme = "llama"
 use_xsa = True
@@ -75,8 +75,8 @@ traversal = "zorder"
 
 # --- training ---
 batch_size = 256
-# epochs_per_phase = (20, 20, 100, )
-epochs_per_phase = (200, 200, 200, )
+# phase_epochs = (20, 20, 100, )
+phase_epochs = (200, 200, 200, )
 warmup_steps = 100
 grad_clip = 10.0
 seed = 0

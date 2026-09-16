@@ -1,115 +1,3 @@
-"""Fork of run_lagcodec_sampler.py (chat 2026-09-12) -- same cascade rollout sampler mechanism,
-curriculum, everything else unchanged. Extensions layered on top since:
-
-1. BYTE-GROUP GENERALIZATION: level0's own input/target alphabet is Config.byte_group members
-   of a 256-vocab (byte_group=1: one byte per position, old is_byte_level behavior; byte_group=3:
-   one PIXEL (R,G,B) per position, predicted/embedded as ONE group, same convention every other
-   level already uses for its own PQ code). flat_bytes is always (B, n_positions, byte_group).
-
-2. TOKEN HEAD (chat 2026-09-12, renamed from "group head"/"mtp" -- this predicts a position's
-   OWN in_pq_chunks/byte_group MEMBERS, e.g. one pixel's R,G,B -- NOT future timesteps, so it
-   isn't really "multi-token-prediction"; that name is reserved for extension 4 below).
-   Config.token_head_type is a per-level tuple, one of:
-     - "linears" (default): every member predicted independently in parallel off one shared
-       linear projection (reshape_pq) -- cheapest, matches every level's existing code_head/
-       ntp_head convention.
-     - "ar": tiny causal chain (ported from run_ar_clockwork.py's SequentialRGBHead) -- member m
-       conditions on a shared ctx projection AND the real (teacher-forced) values of members
-       0..m-1 via a shared embedding table, one tiny self-attention + residual + UNTIED linear
-       head (no mlp, no weight tying between input embedding and output head).
-     - "diffusion" (KIV, kept not deleted): masked bidirectional single-shot (ported from
-       run_ar_clockwork.py's DiffusionRGBHead) -- flaky, near-zero generation even after fixing
-       a real splash-attention-padding bug (dense_self_attention) and widening its masking
-       schedule; left in place at the user's request rather than removed, but not a working
-       option today (mask is hardcoded to always-True as an unresolved sanity check).
-   Config.token_dim/token_n_heads are PER-LEVEL (renamed from mtp_dim/mtp_n_heads).
-
-3. Z-ORDER (MORTON) TRAVERSAL: Config.traversal="raster" (default) or "zorder" -- pixels visited
-   in Morton-curve order instead of row-major; each pixel's R,G,B stays contiguous regardless of
-   byte_group. Fixed permutation table, applied in BatchIterator / inverted in sample-saving.
-
-4. TRUE MTP -- TIMESTEP-WISE multi-token prediction (chat 2026-09-12, Medusa/DeepSeek-MTP
-   style): from the SAME decoder hidden state h_t, predict K FUTURE positions t+1..t+K directly
-   (no recurrence needed for the prediction itself). Config.mtp_horizon (K, per level, must be
-   <=that level's own stride or __post_init__ raises) and Config.mtp_mode (per level,
-   "parallel"|"ar" -- how the K future steps relate to each other) are new, ORTHOGONAL to
-   token_head_type (which governs how ONE position's own in_pq_chunks members relate). Two
-   combos implemented: (linears,parallel) -- K independent linear heads off h_t, pure Medusa, no
-   chaining anywhere; (ar,ar), chat 2026-09-12 -- "two nested ar transformers": an OUTER causal
-   mini-transformer chains the K future TIMESTEPS (teacher-forced real future groups during
-   training, summed via the INNER token-ar chain's own token_member_embed table), each outer
-   step's output projected back to D and fed into the SAME INNER _token_teacher_forced_ar to
-   predict that timestep's own in_pq_chunks members. Both are trained via an AUXILIARY loss
-   (Config.mtp_weight, see _mtp_loss) against the real future groups -- confirmed 2026-09-12 that
-   without this the mtp params never receive gradient at all (decode_logits_and_target never
-   touched them before this fix; only the inference-time no-verify decode did, forever-random).
-   Both combos have a "no-verify" decode consumer (mtp_predict_no_verify_standalone -- takes the
-   K drafted positions directly, no check against the real sequential decode; "ar" mode chains
-   its own sampled groups at generation time since there's no real future to teacher-force with).
-   NOT YET implemented: (linears,ar) and (ar,parallel) combos, and the verified self-speculative
-   decode mode (draft via MTP heads, verify against the real one-step causal decode, accept
-   longest matching prefix). mtp_horizon=1 (default) disables all of this -- decode_generate
-   behaves exactly as before.
-
-pmap-parallel across all local devices.
-
-5. WEIGHT AVERAGING (chat 2026-09-14) -- fork of run_lagcodec_zorder.py. Two independent schemes,
-   Config-orthogonal (--wa_mode, default "none"): both operate on the trainable diff_model params
-   only (static_model, e.g. norm scales that aren't eqx arrays, is untouched) and are saved as a
-   SEPARATE checkpoint file under run_dir/checkpoints/wa/, alongside (not replacing) the regular
-   per-step model checkpoint.
-     - "ema": one shadow copy, updated every --wa_every steps as
-       ema = wa_ema_decay*ema + (1-wa_ema_decay)*current_params (Polyak/exponential averaging).
-       Shadow is (re)initialized from the phase's starting params at the first update of each
-       phase -- EMA does NOT carry smoothing across a phase boundary (the trainable-param SET
-       itself can grow between phases under curriculum_mode, so restarting is the simplest
-       correct behavior; document, don't silently carry stale/mismatched structure).
-     - "wma": a FIFO stack of up to --wa_stack_size raw parameter snapshots, one pushed every
-       --wa_every steps (oldest evicted once full). Once the stack is full (reaches
-       wa_stack_size), a plain elementwise mean over every snapshot currently in it is computed
-       and saved -- this fires again on every subsequent push, so it's a ROLLING average over the
-       last wa_stack_size snapshots, not a one-shot.
-
-6. STEP-BASED TRAINING LOOP (chat 2026-09-14) -- the nested epoch/step double loop is replaced by
-   a single loop driven by GLOBAL step count. --epochs_per_phase is still given in epochs (user-
-   facing unit) but is immediately converted to steps (epochs * steps_per_epoch) once
-   steps_per_epoch is known; --gen_eval_every/--ckpt_every/--wa_every are ALL given directly in
-   steps (not epochs) in this fork. The dataloader (BatchIterator) still cycles in full epochs
-   internally -- each pass through it is one shuffled epoch -- but the outer loop, tqdm bar,
-   logger, and every periodic trigger (gen-eval/checkpoint/WA) count against the flat global step,
-   so a phase can end mid-epoch with no special-casing. Checkpoint resume tracks phase_step
-   (steps completed within the CURRENT phase) instead of epoch for the same reason.
-
-7. PARALLEL DECODE (chat 2026-09-15) -- encode is fast because it's a prefill (parallel over the
-   whole sequence); decode is currently autoregressive group-by-group (decode_generate's outer
-   jax.lax.scan sequentially threads the KV cache ACROSS every decoder_ncodes-sized group, so
-   group N always attends to every earlier group's already-decoded content -- unbounded causal,
-   fully sequential across groups). FIRST CHANGE (implemented this fork): decode_generate_pardec
-   makes every decoder_ncodes-sized group of codes fully INDEPENDENT of every other group -- no
-   cross-group causal dependency at all -- by folding the group axis into the batch axis (B,
-   n_groups, ...) -> (B*n_groups, ...) and giving each group its OWN per_group_len-sized KV cache
-   (instead of one L_total-sized cache shared/accumulated across all groups). All groups then
-   decode in one parallel batched pass instead of a sequential lax.scan over groups. Within a
-   group, decode is still autoregressive over that group's own G*K member positions (unchanged --
-   only the CROSS-group dependency is removed, not the within-group one). Kept as a SEPARATE
-   method (decode_generate_pardec) alongside the original decode_generate (still present,
-   unused by run_gen_eval/main() in this fork). WIRED IN (chat 2026-09-15): every decode_generate
-   call inside run_gen_eval (mid-phase/phase-end/final eval, both the cascade path and the
-   currently-commented-out reconstruct path) now calls decode_generate_pardec instead -- verified
-   correct first (teacher-forced dense reference vs incremental KV-cache, including the
-   decoder_ncodes_overlap lookback/prune logic, see scripts/pardec_consistency_check.py) before
-   wiring in.
-
-   TODO (not implemented) -- WINDOWING between groups: decoder_ncodes stays the finest granularity
-   (fully independent/parallel, as above), but a GROUP OF groups (e.g. 2 consecutive
-   decoder_ncodes-chunks) could instead be made dependent -- the second sub-chunk waits for the
-   first sub-chunk in its window to finish decoding before proceeding, trading some parallelism
-   for more context. Open question, not resolved: given e.g. a window of 2 decoder_ncodes-chunks,
-   should CONSECUTIVE windows be disjoint or overlap (and by how much) so a window's decode can
-   see recently-decoded content from the previous window? Left open.
-
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/<name>.py
-"""
 from __future__ import annotations
 
 import argparse
@@ -138,15 +26,9 @@ from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, apply_rope, ap
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
-# chat 2026-09-15: was a hardcoded 32*32*3 (CIFAR-only) module constant -- now a function of
-# cfg.img_size so non-CIFAR datasets (e.g. imagenet64, img_size=64) compute the right byte count.
 def total_bytes_of(cfg) -> int:
     return cfg.img_size * cfg.img_size * 3
 
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Config:
@@ -158,144 +40,44 @@ class Config:
     strides: tuple = (3, 16, 16, -1)
     code_vocab: tuple = (4, 4, 4, 4)
     pq_chunks: tuple = (5, 5, 5, 5)
-    mlp_mult: tuple = 2          # chat 2026-09-12 -- now PER-LEVEL (was a single global int);
-    # a bare int (the default, or any config's override) broadcasts to a uniform tuple sized to
-    # however many levels THIS config actually has -- see bcast() in __post_init__. A fixed-
-    # length tuple default would silently break any config with a different level count.
-    rope_base: tuple = 10000.0    # chat 2026-09-12 -- now PER-LEVEL, bare-scalar default
-    ntp_weight: float = 1.0     # stays global -- a loss-mixing coefficient, not a capacity knob
-    decoder_ncodes: tuple = 1   # chat 2026-09-13 -- renamed from lag=0 (an offset) to a direct
-    # count of codes the decoder conditions on (1 = current position only, no lookback), avoiding
-    # the G=lag+1 off-by-one. Per-level, bare-scalar default.
-    ncodes_window: tuple = 0   # chat 2026-09-15 -- v2 of the old decoder_ncodes_overlap (renamed;
-    # old scheme kept, unchanged, in run_lagcodec_pardec_v1.py). Units are WHOLE PREVIOUS GROUPS,
-    # not ctx blocks: 0 = disjoint (current default, independent non-overlapping groups). N>=1 =
-    # a group may also attend to N neighboring groups' CTX CODES as extra read-only context (never
-    # their already-decoded TARGET values -- unlike v1, there is no target lookback/redecode/prune
-    # at all: every group's decode span is always exactly its own G*K positions, so no compute is
-    # ever thrown away). -1 = ALL -- a group attends to every OTHER group's ctx (naive
-    # implementation: pad/mask to the full n_groups*G width for every group, inferred from n_blocks
-    # at trace time). WHICH other groups (only earlier ones vs every one) and whether padding/
-    # masking is needed at all is controlled by the separate `streaming` axis below -- see its
-    # docstring for the truth table. Every group also gets TRUE GLOBAL RoPE positions now (v1
-    # restarted every group's positions at 0, unaware of true position -- see decode_generate_
-    # pardec's docstring). Per-level, bare-scalar default 0. Valid values: -1 (all), or any int >=
-    # 0 (no upper bound tied to decoder_ncodes anymore, since this counts groups, not blocks).
-    streaming: tuple = True   # chat 2026-09-15 -- orthogonal axis to ncodes_window, replacing the
-    # old ncodes_window=-2 sentinel ("janky", per user). True (default, current/existing behavior)
-    # = CAUSAL growing-prefix: group g may only see groups <g (or the N immediately-preceding ones,
-    # under bounded ncodes_window), matching a real streaming-decode scenario where later groups'
-    # codes genuinely don't exist yet. Early groups short on real history get a zero-padded prefix,
-    # explicitly masked out of attention. False = NON-causal: nothing is "streaming in" -- the
-    # entire ctx sequence is already known upfront, so a group may see neighboring groups on EITHER
-    # side. streaming=False + ncodes_window=-1 = TRUE FULLCTX (the old -2): every group sees the
-    # SAME full real ctx directly, no padding, no masking, cheapest possible. streaming=False +
-    # bounded ncodes_window (symmetric/bidirectional local window, e.g. sees N groups before AND
-    # after) is a currently-UNIMPLEMENTED combo -- raises NotImplementedError (no config needs it
-    # yet; the masking machinery only supports a one-sided min_valid_pos threshold today). Per-
-    # level, bare-scalar default True.
-    #
-    # Truth table (ncodes_window x streaming):
-    #   window=0,  streaming=True/False  -> disjoint groups, streaming is moot (no lookback either way)
-    #   window=N>0, streaming=True        -> causal bounded: sees N previous groups (existing, tested)
-    #   window=N>0, streaming=False       -> symmetric bounded window -- NOT IMPLEMENTED
-    #   window=-1, streaming=True         -> causal unbounded/streaming (existing, tested)
-    #   window=-1, streaming=False        -> true fullctx (existing, tested; was ncodes_window=-2)
-    weight_sharing: tuple = True   # chat 2026-09-12 -- now PER-LEVEL, bare-scalar default
-    precision: str = "bf16"           # stays global -- whole-model compute dtype
-    curriculum_mode: str = "freeze"   # stays global -- training-loop control
-    quantize_mode: str = "argmax"     # stays global -- training-time quantization strategy
-    quantize_drop: float = 0.0   # chat 2026-09-14 -- probability of skipping the straight-through
-    # hard commit for a given position, using the raw soft distribution instead (softmax alone
-    # under argmax mode, or the gumbel-noised softmax at gumbel_temperature under gumbel mode).
-    # Stays global. Default 0.0 -- always hard-commit, existing behavior unchanged.
-    gumbel_temperature: tuple = 1.0   # chat 2026-09-12 -- now PER-LEVEL, bare-scalar default
+    mlp_mult: tuple = 2
+    rope_base: tuple = 10000.0
+    ntp_weight: float = 1.0
+    decoder_ncodes: tuple = 1
+    ncodes_window: tuple = 0
+    streaming: tuple = True
+    weight_sharing: tuple = True
+    precision: str = "bf16"
+    curriculum_mode: str = "freeze"
+    quantize_mode: str = "argmax"
+    quantize_drop: float = 0.0
     gumbel_at_inference: bool = False
-    cascade_rollout_prob: float = 0.5
-    init_scheme: str = "llama"   # chat 2026-09-13 -- weight init: "llama" (N(0,0.02^2), residual-
-    # output projections scaled by 1/sqrt(2*n_layers), see eqx_common.init_matrix) or "zero"
-    # (Zhao et al. 2021 arXiv:2110.12661 ZerO init -- deterministic identity/Hadamard, residual-
-    # output projections forced to literal zero). Stays global, not per-level.
-    use_xsa: bool = False   # chat 2026-09-13 -- Exclusive Self-Attention (arXiv:2603.09078):
-    # removes the attention output's projection onto the query's own value vector, applied right
-    # after every attention call (see eqx_common.apply_xsa). Stays global; default off, enable
-    # with True.
-    use_qknorm: bool = True   # chat 2026-09-13 -- per-head RMSNorm on q/k before RoPE+scores.
-    # Stays global; disable with False.
+    init_scheme: str = "llama"
+    use_xsa: bool = False
+    use_qknorm: bool = True
 
-    attn_window: tuple = -1   # chat 2026-09-15 -- ENCODER-side (self.blocks, level.encode()) self-
-    # attention window, per-level tuple, bare-scalar default. -1 = unbounded ("flash", the current
-    # splash_attention CausalMask behavior, unchanged). int>0 = causal sliding window of that many
-    # positions back, via splash_attention's native LocalMask (genuinely block-sparse -- real O(T*
-    # window) savings, not a dense-then-masked matmul). For scaling to large images (e.g. 256x256
-    # -> level0's own self-attention sequence is 65536 positions, vs 1024 at 32x32) where O(T^2)
-    # unbounded attention becomes prohibitive. Decoder blocks (dec_blocks) are NOT affected -- this
-    # only threads into the encoder's own block stack.
-    use_attn_sink: bool = False   # chat 2026-09-15 -- learned per-head attention-sink logit
-    # (splash_attention's native `sinks` kernel arg -- a softmax bias, NOT an extra K/V token),
-    # ENCODER-side only (same scope as attn_window), stays global like use_xsa/use_qknorm. Useful
-    # alongside attn_window so a sliding-window layer always has somewhere to route excess
-    # attention mass (gpt-oss/StreamingLLM attention-sink literature). Default off.
+    attn_window: tuple = -1
+    use_attn_sink: bool = False
 
-    remat: bool = False   # chat 2026-09-14 -- gradient rematerialization (jax.checkpoint) applied
-    # per-block, every level's encoder AND decoder block stack -- trades recompute for activation
-    # memory. Stays global (uniform on/off), default off.
+    remat: bool = False
 
-    byte_group: int = 1          # level0's own group size, in {1, 3}. 1 = one byte per position
-    # (old is_byte_level behavior, default). 3 = one pixel (R,G,B) per position.
-    token_head_type: tuple = "linears"   # per level, bare-scalar default, one of "linears"/"ar"/
-    # "diffusion" -- see module docstring point 2 (renamed from group_head_type). "diffusion" is
-    # KIV (kept, not deleted, chat 2026-09-12) -- it was flaky (near-zero generation even after
-    # fixing a real splash-attention-padding bug and widening its masking schedule) but the user
-    # asked to leave it in place rather than remove it.
-    token_dim: tuple = 64       # per level (renamed from mtp_dim), bare-scalar default, only used
-    # by levels with token_head_type in ("ar","diffusion") -- size to roughly match "linears"'
-    # own dec_head param count per level (audited 2026-09-12: a single global value badly under/
-    # over-parameterizes different levels' alphabets).
-    token_n_heads: tuple = 4        # per level (renamed from mtp_n_heads), bare-scalar default
-    pq_dim: tuple = None   # chat 2026-09-14 -- per-level embedding width for code_embed_proj
-    # (own_input_embed/ctx_embed/dec_target_embed -- the level's own PQ/byte codebook embedding,
-    # concat-then-linear-map scheme). None (default) -> that level's own d_model. Set a per-level
-    # tuple or a bare int (broadcasts uniformly) to use a narrower per-chunk width, e.g. 64 for a
-    # byte level's 3 RGB chunks, 32 for a PQ level's 4 chunks -- cheaper than full d_model per
-    # chunk since the down-projection still restores width D regardless.
-    token_mask_prob: float = 0.15   # "diffusion" token head masking probability (KIV, unused by
-    # the current sanity-check version which hardcodes always-mask -- see _token_teacher_forced_
-    # diffusion's docstring; renamed from mask_prob)
+    byte_group: int = 1
+    token_head_type: tuple = "linears"
+    token_dim: tuple = 64
+    token_n_heads: tuple = 4
+    pq_dim: tuple = None
+    token_mask_prob: float = 0.15
 
-    mtp_horizon: tuple = 1         # chat 2026-09-12 -- NEW, true timestep-wise MTP (see module
-    # docstring point 4). Per level, bare-scalar default, K future positions predicted from one
-    # hidden state. 1 = disabled (today's plain one-step decode). Must be <=that level's own
-    # stride. Trained via an AUXILIARY loss (Config.mtp_weight) against the real future groups --
-    # see _mtp_loss; without this the mtp head/chain would never receive gradient at all (only
-    # decode_generate_mtp_no_verify would ever read it, at inference, forever-random).
-    mtp_mode: tuple = "parallel"   # chat 2026-09-12 -- NEW, per level, bare-scalar default,
-    # per level, "parallel" (K independent linear heads off h_t, no chaining -- requires
-    # token_head_type="linears") or "ar" (chat 2026-09-12: nested causal chain -- requires
-    # token_head_type="ar"; OUTER causal mini-transformer chains the K future TIMESTEPS
-    # (teacher-forced real future groups, summed via the token head's own member-embed table),
-    # each outer step's output projected back to D and fed into the SAME INNER token-ar chain
-    # to predict that timestep's own in_pq_chunks members -- "two nested ar transformers"). Only
-    # (linears,parallel) and (ar,ar) combos are implemented; anything else with mtp_horizon>1
-    # raises NotImplementedError in __post_init__.
-    mtp_weight: float = 0.1   # chat 2026-09-12 -- stays global (loss-mixing coefficient, like
-    # ntp_weight), scales the auxiliary MTP loss added on top of the main per-position loss.
+    mtp_horizon: tuple = 1
+    mtp_mode: tuple = "parallel"
+    mtp_weight: float = 0.1
 
-    entropy_weight: float = 0.0   # chat 2026-09-13 -- IBQ-style (arXiv:2412.02692) entropy bonus
-    # on the encoder's per-position code distribution, pushing codebook usage toward uniform
-    # (combats index collapse -- see codebook_utilization, computed but otherwise unused). Default
-    # 0.0 (off) -- opt-in, existing configs unaffected. Stays global, like ntp_weight/mtp_weight.
+    entropy_weight: float = 0.0
 
-    traversal: str = "raster"    # "raster" (default, row-major) or "zorder" (Morton curve over
-    # pixels, RGB stays contiguous per pixel regardless of byte_group -- see module docstring).
+    traversal: str = "raster"
 
-    mse_weight: float = 0.0   # chat 2026-09-14 -- level0's byte-decode logits, softmax'd (soft,
-    # no straight-through -- chat 2026-09-15) then dotted with arange(256) to get a differentiable
-    # pixel-value estimate, then MSE'd against the real byte value and normalized by /255 (squared)
-    # so it's on a comparable [0,1] scale to the CE loss -- otherwise (confirmed 2026-09-14) raw
-    # 0-255 pixel MSE totally dominates at mse_weight=1.0 (loss~9658 vs ~11.75 without it). Default 0.0.
-    mse_softmax_tau: float = 0.1   # chat 2026-09-15 -- temperature on the soft byte distribution
-    # used for mse_weight's pixel-value expectation (lower = sharper/closer to one-hot).
+    mse_weight: float = 0.0
+    mse_softmax_tau: float = 0.1
 
     def __post_init__(self):
         n = len(self.strides)
@@ -305,15 +87,12 @@ class Config:
             if isinstance(val, types):
                 setattr(self, name, (val,) * n)
 
-        # chat 2026-09-12: a bare scalar broadcasts to a same-length tuple -- convenience so a
-        # config doesn't have to spell out e.g. "(4,)*5" for a value uniform across every level.
         bcast("mlp_mult", int)
         bcast("rope_base", (int, float))
         bcast("decoder_ncodes", int)
         bcast("ncodes_window", int)
         bcast("streaming", bool)
         bcast("weight_sharing", bool)
-        bcast("gumbel_temperature", (int, float))
         bcast("token_head_type", str)
         bcast("token_dim", int)
         bcast("token_n_heads", int)
@@ -343,19 +122,12 @@ class Config:
             assert self.attn_window[i] == -1 or self.attn_window[i] >= 1, \
                 f"level {i}: attn_window={self.attn_window[i]} must be -1 (unbounded/flash) or >=1 (splash LocalMask)"
 
-        # chat 2026-09-15 -- (decoder_ncodes, ncodes_window) recommend/assert guards. Fusion note:
-        # G=n_blocks (one single group) is mathematically IDENTICAL to the original non-pardec
-        # decode (verified: same RoPE position formula, same causal dependency, ncodes_window
-        # moot with nothing to look back at) -- decode_generate_pardec/decode_logits_and_target_
-        # pardec detect this and fall back to the fast original implementation automatically (no
-        # padding/masking overhead for that regime). These guards steer AWAY from configurations
-        # that are valid but wasteful or redundant, not just outright invalid ones.
         code_count = total_bytes_of(self) // self.byte_group
         for i in range(n):
             K_i = self.strides[i] if self.strides[i] != -1 else 1
             code_count = code_count // K_i
             if i == n - 1:
-                break   # top level has no decoder
+                break
             n_blocks_i, G_i, N_i, S_i = code_count, self.decoder_ncodes[i], self.ncodes_window[i], self.streaming[i]
             assert G_i >= 1, f"level {i}: decoder_ncodes={G_i} must be >=1"
             if G_i > n_blocks_i:
@@ -364,7 +136,7 @@ class Config:
                     f"own code count) -- clamps to one single group, same as decoder_ncodes="
                     f"{n_blocks_i} (the fully-sequential 'original' degenerate case); recommend "
                     f"setting decoder_ncodes={n_blocks_i} explicitly for clarity")
-            n_groups_i = -(-n_blocks_i // G_i)   # ceil div, matches the runtime pad_blocks logic
+            n_groups_i = -(-n_blocks_i // G_i)
             if G_i >= n_blocks_i and N_i not in (0, -1):
                 warnings.warn(
                     f"level {i}: decoder_ncodes={G_i}>=n_blocks={n_blocks_i} (single group, falls "
@@ -383,7 +155,7 @@ class Config:
                     f"compute/memory scales as O(n_groups*n_blocks); recommend a larger "
                     f"decoder_ncodes or a bounded ncodes_window instead")
 
-        assert len(self.weight_sharing) == n and len(self.gumbel_temperature) == n
+        assert len(self.weight_sharing) == n
         assert len(self.token_head_type) == n
         assert len(self.pq_dim) == n
         assert all(t in ("linears", "ar", "diffusion") for t in self.token_head_type)
@@ -423,7 +195,6 @@ class Config:
         assert self.curriculum_mode == "no_freeze", \
             "run_lagcodec_zorder requires curriculum_mode='no_freeze' -- a level conditioned on " \
             "cascade-simulated ctx must stay trainable to adapt to it (see module docstring)"
-        assert 0.0 <= self.cascade_rollout_prob <= 1.0
         assert self.quantize_mode in ("argmax", "gumbel")
         assert self.init_scheme in ("llama", "zero")
         resolved_kv = []
@@ -439,14 +210,7 @@ def n_positions_of(cfg: Config) -> int:
     return total_bytes_of(cfg) // cfg.byte_group
 
 
-# ---------------------------------------------------------------------------
-# Z-order (Morton) traversal -- pure function of img_size, no data dependence
-# ---------------------------------------------------------------------------
-
 def zorder_pixel_order(img_size: int) -> np.ndarray:
-    """Returns a (img_size**2,) permutation: order[t] = raster pixel-index (row*img_size+col)
-    visited at traversal-step t. Built by interleaving the bits of (x, y) into a Morton code and
-    stable-sorting raster indices by it -- works for any img_size, not just powers of 2."""
     def part1by1(v: np.ndarray) -> np.ndarray:
         v = v.astype(np.uint32) & 0x0000ffff
         v = (v | (v << 8)) & 0x00FF00FF
@@ -468,10 +232,6 @@ def pixel_order_for(cfg: Config) -> np.ndarray:
     return zorder_pixel_order(cfg.img_size)
 
 
-# ---------------------------------------------------------------------------
-# CIFAR-10 data
-# ---------------------------------------------------------------------------
-
 CIFAR10_URL = "https://cave.cs.toronto.edu/kriz/cifar-10-python.tar.gz"
 
 
@@ -482,11 +242,8 @@ def load_cifar10(data_root: Path) -> tuple:
         import urllib.request
         tmp_path = tar_path.with_name(tar_path.name + ".tmp")
         print(f"downloading {CIFAR10_URL} -> {tar_path}")
-        urllib.request.urlretrieve(CIFAR10_URL, tmp_path)   # download to temp first -- an
-        tmp_path.rename(tar_path)   # interrupted/truncated download must never land at tar_path,
-        # or it silently poisons every future run on this node (confirmed 2026-09-14: a truncated
-        # tar.gz from an earlier interrupted download made tarfile/gzip EOFError on every relaunch
-        # since `if not tar_path.exists()` skipped re-downloading the corrupt file).
+        urllib.request.urlretrieve(CIFAR10_URL, tmp_path)
+        tmp_path.rename(tar_path)
     extract_dir = data_root / "cifar-10-batches-py"
     if not extract_dir.exists():
         with tarfile.open(tar_path) as tf:
@@ -507,18 +264,12 @@ def load_cifar10(data_root: Path) -> tuple:
 
 
 def load_imagenet64(data_root: Path, resolution: int = 64) -> tuple:
-    """chat 2026-09-15 -- loads shards produced by image_gen_jax_1/scripts/download_imagenet64.py
-    (np.lib.format memmap .npy files, flat raster-order uint8 RGB bytes,
-    imagenet64_{split}_{shard:05d}.npy naming). Does NOT download -- that script must be run
-    first (see its own docstring); this only reads whatever shards already exist under data_root.
-    No real labels in this shard format -- returns zero placeholders (matching load_cifar10's
-    (images, labels) shape convention; labels are unused downstream, see BatchIterator)."""
     def load_split(split: str) -> np.ndarray:
         shards = sorted(data_root.glob(f"imagenet64_{split}_*.npy"))
         assert shards, f"no imagenet64_{split}_*.npy shards found under {data_root} -- run " \
             f"image_gen_jax_1/scripts/download_imagenet64.py --split {split} --out_dir {data_root} first"
         parts = [np.load(s, mmap_mode="r") for s in shards]
-        flat = np.concatenate(parts, axis=0)   # (N, resolution*resolution*3)
+        flat = np.concatenate(parts, axis=0)
         return flat.reshape(-1, resolution, resolution, 3)
 
     train = load_split("train")
@@ -527,10 +278,6 @@ def load_imagenet64(data_root: Path, resolution: int = 64) -> tuple:
 
 
 def images_to_positions(images: np.ndarray, cfg: Config, pixel_order: np.ndarray) -> np.ndarray:
-    """images: (N,img_size,img_size,3) uint8/int -> (N, n_positions, byte_group) int32, pixels
-    visited in `pixel_order` (traversal), each pixel's R,G,B kept contiguous regardless of
-    byte_group (byte_group=3: one pixel per position; byte_group=1: 3 consecutive positions per
-    pixel, in R,G,B order -- "every pixel goes through its RGB first")."""
     n = images.shape[0]
     pix = images.reshape(n, cfg.img_size * cfg.img_size, 3)[:, pixel_order, :]
     if cfg.byte_group == 3:
@@ -539,8 +286,6 @@ def images_to_positions(images: np.ndarray, cfg: Config, pixel_order: np.ndarray
 
 
 def positions_to_image(positions: np.ndarray, cfg: Config, pixel_order: np.ndarray) -> np.ndarray:
-    """Inverse of images_to_positions: (B, n_positions, byte_group) in TRAVERSAL order ->
-    (B, img_size, img_size, 3) raster image (uint8)."""
     B = positions.shape[0]
     pix_traversal = positions.reshape(B, cfg.img_size * cfg.img_size, 3)
     raster = np.zeros_like(pix_traversal)
@@ -572,10 +317,6 @@ class BatchIterator:
             positions = images_to_positions(img, self.cfg, self.pixel_order)
             yield positions.reshape(self.n_devices, self.batch_size, self.n_positions, self.cfg.byte_group)
 
-
-# ---------------------------------------------------------------------------
-# Quantization (identical convention to run_lagcodec_sampler.py)
-# ---------------------------------------------------------------------------
 
 def quantize_hard(logits: jnp.ndarray, rng=None, quantize_drop: float = 0.0, tau: float = 1.0) -> tuple:
     soft = jax.nn.softmax(logits / tau, axis=-1)
@@ -619,20 +360,6 @@ def codebook_utilization(idx: jnp.ndarray, vocab: int) -> jnp.ndarray:
 
 
 def code_embed(code: jnp.ndarray, table: jnp.ndarray) -> jnp.ndarray:
-    """table: (vocab, D). code: (...,C) int indices or (...,C,vocab) soft, C=chunks (byte_group
-    or pq_chunks -- this function is agnostic, used identically for both).
-
-    CONCATENATIVE (chat 2026-09-14): each of the C chunk positions gets its OWN disjoint slice of
-    the D-dim embedding (D split as evenly as possible across C slices) instead of all C chunks
-    sharing the full D-dim row and being summed -- preserves per-chunk identity (e.g. byte_group=3
-    R/G/B no longer alias through a shared sum, since summing let e.g. R=200,G=50,B=10 collide
-    with other combinations that happen to sum close to the same vector). Reuses the SAME (vocab,
-    D) table as before (no new params) -- just slices it differently per chunk index.
-    """
-    # --- additive (original) path, commented for easy revert ---
-    # if jnp.issubdtype(code.dtype, jnp.integer):
-    #     return table[code].sum(-2)
-    # return (code @ table).sum(-2)
     D = table.shape[-1]
     is_int = jnp.issubdtype(code.dtype, jnp.integer)
     C = code.shape[-1] if is_int else code.shape[-2]
@@ -648,16 +375,6 @@ def code_embed(code: jnp.ndarray, table: jnp.ndarray) -> jnp.ndarray:
 
 
 def code_embed_proj(code: jnp.ndarray, table: jnp.ndarray, proj: jnp.ndarray) -> jnp.ndarray:
-    """chat 2026-09-14: concat-then-linear-map upgrade over code_embed's disjoint-slice concat --
-    used for own_input_embed/ctx_embed/dec_target_embed (the level's own PQ/byte codebook
-    embedding), NOT token_member_embed (still plain code_embed, unaffected).
-
-    table: (vocab, pq_dim) -- each of the C chunks gets the FULL pq_dim width (no slicing).
-    proj: (C*pq_dim, D). Mathematically decomposes as sum_c(embed_c(code_c) @ proj_c), proj_c
-    being the c-th (pq_dim,D) block of proj -- a strict superset of both plain additive (proj_c=I
-    padded) and disjoint-slice concat (proj_c a 0/1 selection matrix): the network can LEARN
-    whichever combination is best, at the cost of C*pq_dim*D extra params vs a free gather+slice.
-    Still no genuine cross-chunk interaction (this is still linear/additive across chunks)."""
     is_int = jnp.issubdtype(code.dtype, jnp.integer)
     C = code.shape[-1] if is_int else code.shape[-2]
     if is_int:
@@ -678,35 +395,15 @@ def sample_idx(logits: jnp.ndarray, rng, greedy: bool, temperature: float) -> tu
     return jax.random.categorical(k_, logits / temperature, axis=-1), rng
 
 
-def run_block(blk: Block, x: jnp.ndarray, remat: bool) -> jnp.ndarray:
-    """chat 2026-09-14: optional per-block gradient rematerialization (jax.checkpoint) -- only
-    the block's OUTPUT is kept for backward, its internal activations (qkv, attention scores,
-    mlp hidden) are recomputed instead of stored. Applied uniformly to every level's encoder and
-    decoder block stacks when Config.remat=True (default off)."""
-    return jax.checkpoint(blk)(x) if remat else blk(x)
+def run_block(blk: Block, x: jnp.ndarray, remat: bool, rng=None, drop_prob: float = 0.0) -> jnp.ndarray:
+    out = jax.checkpoint(blk)(x) if remat else blk(x)
+    if rng is not None and drop_prob > 0.0:
+        keep = jax.random.bernoulli(rng, p=1.0 - drop_prob)
+        out = jnp.where(keep, out, x)
+    return out
 
 
 def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False) -> jnp.ndarray:
-    """Plain (non-Pallas) dense self-attention -- the ATTENTION BRANCH ONLY (no residual, no
-    norm, no mlp). Originally built for the "diffusion" token head's non-causal case (KIV, kept
-    not deleted -- diffusion itself is flaky/near-zero generation): Attention.__call__(causal=
-    False) routes through splash_attention, which pads T up to 128 (_SPLASH_BLOCK);
-    splash_attention_mask.FullMask's own docstring says it "allows all tokens to attend to all
-    other tokens" -- no real-length truncation, unlike CausalMask, so every real diffusion-head
-    query would attend over ~124 garbage zero-padded key positions, corrupting the computation.
-
-    chat 2026-09-12: causal=True now ALSO uses this dense path, for a DIFFERENT reason --
-    splash_attention's 128-padding is correctness-safe under causal masking (padded kv sits past
-    any real causal query, never attended to), but NOT memory-safe: the Pallas kernel still
-    allocates/computes at the padded size (128) regardless of the real length. Every "ar" token-
-    head / mtp-chain call here has a tiny real sequence (chunks or mtp_horizon, typically <=8),
-    so routing it through splash_attention wastes ~16-42x the compute/memory it needs -- and the
-    (ar,ar) nested MTP design makes 5 such padded calls per position (1 outer + mtp_horizon
-    inner), compounding into the OOM confirmed 2026-09-12 (33-50G required vs 30.75G available).
-    Dense attention computes at the REAL length, no padding, for either case.
-
-    This function replicates Attention.__call__'s exact math (qkv proj, per-head RMSNorm, RoPE,
-    GQA repeat, out proj) but with a manual dense softmax instead of splash_attention."""
     B, T, D = x.shape
     hd = D // attn.n_heads
     qkv = x @ attn.qkv
@@ -726,30 +423,15 @@ def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False) 
         mask = jnp.tril(jnp.ones((T, T), dtype=bool))
         scores = jnp.where(mask[None, None, :, :], scores, -jnp.inf)
     weights = jax.nn.softmax(scores, axis=-1)
-    y = jnp.einsum("bhts,bhsd->bhtd", weights, v)  # (B,H,T,hd)
+    y = jnp.einsum("bhts,bhsd->bhtd", weights, v)
     if attn.use_xsa:
         y = apply_xsa(y, v)
     y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
     return y @ attn.out
 
 
-# ---------------------------------------------------------------------------
-# ncodes_window primitives (chat 2026-09-15) -- decouple the PHYSICAL cache/buffer position
-# (still a plain scalar, same dynamic_update_slice convention as Attention.step/chunk_step in
-# eqx_common.py -- can't vary per batch row) from the SEMANTIC RoPE position (now per-ROW, so
-# independent parallel groups can carry their TRUE global position instead of v1's "every group
-# restarts at 0"). Also adds a per-row min_valid_pos mask (hides the zero-padded lookback prefix
-# from attention outright, instead of v1's "hope the network ignores zero vectors" fiction).
-# Written as free functions here (not added to eqx_common.py's Attention/Block) to keep this
-# fork's blast radius contained -- mirrors dense_self_attention's existing
-# reimplement-the-math-standalone pattern above.
-# ---------------------------------------------------------------------------
-
 def pardec_step(attn: Attention, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray,
                  cache_pos, rope_pos: jnp.ndarray, min_valid_pos: jnp.ndarray, T_max: int) -> tuple:
-    """Single-step KV-cached form, like Attention.step, but rope_pos (Bc,) is the per-row TRUE
-    semantic position (independent of cache_pos, the shared scalar physical write offset), and
-    min_valid_pos (Bc,) masks out physical cache slots below it (per-row fake/padding prefix)."""
     Bc, D = x_new.shape
     hd = D // attn.n_heads
     qkv = x_new @ attn.qkv
@@ -757,7 +439,7 @@ def pardec_step(attn: Attention, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache
     q, k, v = q.reshape(Bc, attn.n_heads, hd), k.reshape(Bc, attn.n_kv_heads, hd), v.reshape(Bc, attn.n_kv_heads, hd)
     if attn.use_qknorm:
         q, k = rmsnorm(q, attn.q_norm), rmsnorm(k, attn.k_norm)
-    cos, sin = rope_cos_sin_pos(rope_pos, hd, attn.rope_base)   # rope_pos (Bc,) -> cos/sin (Bc,hd)
+    cos, sin = rope_cos_sin_pos(rope_pos, hd, attn.rope_base)
     q = (q * cos[:, None, :] + rotate_half(q) * sin[:, None, :]).astype(q.dtype)
     k = (k * cos[:, None, :] + rotate_half(k) * sin[:, None, :]).astype(k.dtype)
     cache_k = jax.lax.dynamic_update_slice(cache_k, k[:, :, None, :].astype(cache_k.dtype), (0, 0, cache_pos, 0))
@@ -782,9 +464,6 @@ def pardec_step(attn: Attention, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache
 def pardec_chunk_step(attn: Attention, x_chunk: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray,
                        cache_pos_start, rope_pos_ids: jnp.ndarray, min_valid_pos: jnp.ndarray,
                        T_max: int) -> tuple:
-    """Parallel-prefill form, like Attention.chunk_step, but rope_pos_ids (Bc,T) gives each token
-    its own TRUE semantic position (per row), decoupled from cache_pos_start (still a shared
-    scalar physical write offset); min_valid_pos (Bc,) masks the fake/padding prefix per row."""
     Bc, T, D = x_chunk.shape
     hd = D // attn.n_heads
     qkv = x_chunk @ attn.qkv
@@ -794,8 +473,8 @@ def pardec_chunk_step(attn: Attention, x_chunk: jnp.ndarray, cache_k: jnp.ndarra
     v = v.reshape(Bc, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
     if attn.use_qknorm:
         q, k = rmsnorm(q, attn.q_norm), rmsnorm(k, attn.k_norm)
-    cos, sin = rope_cos_sin_pos(rope_pos_ids, hd, attn.rope_base)   # (Bc,T) -> (Bc,T,hd)
-    cos_b, sin_b = cos[:, None, :, :], sin[:, None, :, :]   # broadcast over heads
+    cos, sin = rope_cos_sin_pos(rope_pos_ids, hd, attn.rope_base)
+    cos_b, sin_b = cos[:, None, :, :], sin[:, None, :, :]
     q = (q * cos_b + rotate_half(q) * sin_b).astype(q.dtype)
     k = (k * cos_b + rotate_half(k) * sin_b).astype(k.dtype)
     cache_k = jax.lax.dynamic_update_slice(cache_k, k.astype(cache_k.dtype), (0, 0, cache_pos_start, 0))
@@ -805,12 +484,12 @@ def pardec_chunk_step(attn: Attention, x_chunk: jnp.ndarray, cache_k: jnp.ndarra
     v_full = jnp.repeat(cache_v, n_rep, axis=1) if n_rep > 1 else cache_v
     scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
     logits = jnp.einsum("bhtd,bhsd->bhts", q, k_full) * scale
-    pos_ids_abs = cache_pos_start + jnp.arange(T)   # physical query positions (shared across rows)
+    pos_ids_abs = cache_pos_start + jnp.arange(T)
     idx = jnp.arange(T_max)
-    causal = idx[None, :] <= pos_ids_abs[:, None]              # (T,T_max)
-    validmin = idx[None, None, :] >= min_valid_pos[:, None, None]   # (Bc,1,T_max)
-    valid = causal[None] & validmin   # (1,T,T_max) & (Bc,1,T_max) -> (Bc,T,T_max)
-    logits = jnp.where(valid[:, None], logits, -1e9)   # add head axis -> (Bc,1,T,T_max)
+    causal = idx[None, :] <= pos_ids_abs[:, None]
+    validmin = idx[None, None, :] >= min_valid_pos[:, None, None]
+    valid = causal[None] & validmin
+    logits = jnp.where(valid[:, None], logits, -1e9)
     attn_w = jax.nn.softmax(logits, axis=-1)
     y = jnp.einsum("bhts,bhsd->bhtd", attn_w, v_full)
     if attn.use_xsa:
@@ -839,9 +518,6 @@ def pardec_block_chunk_step(blk: Block, x_chunk, cache_k, cache_v, cache_pos_sta
 
 def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: jnp.ndarray,
                                  min_valid_pos: jnp.ndarray) -> jnp.ndarray:
-    """Dense (training-path) counterpart to pardec_chunk_step: x (Bc,T,D) is ONE group's full
-    window (ctx lookback + bos + own target), rope_pos_ids (Bc,T) gives true global positions per
-    row, min_valid_pos (Bc,) masks each row's fake/padding prefix (causal + validity combined)."""
     Bc, T, D = x.shape
     hd = D // attn.n_heads
     qkv = x @ attn.qkv
@@ -851,7 +527,7 @@ def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: j
     v = v.reshape(Bc, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
     if attn.use_qknorm:
         q, k = rmsnorm(q, attn.q_norm), rmsnorm(k, attn.k_norm)
-    cos, sin = rope_cos_sin_pos(rope_pos_ids, hd, attn.rope_base)   # (Bc,T,hd)
+    cos, sin = rope_cos_sin_pos(rope_pos_ids, hd, attn.rope_base)
     cos_b, sin_b = cos[:, None], sin[:, None]
     q = (q * cos_b + rotate_half(q) * sin_b).astype(q.dtype)
     k = (k * cos_b + rotate_half(k) * sin_b).astype(k.dtype)
@@ -861,17 +537,10 @@ def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: j
     scale = 1.0 / math.sqrt(hd)
     scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale
     idx = jnp.arange(T)
-    causal = idx[None, :] <= idx[:, None]                 # (T,T)
-    validmin = idx[None, :] >= min_valid_pos[:, None]      # (Bc,T)
-    mask = causal[None] & validmin[:, None, :]   # (1,T,T) & (Bc,1,T) -> (Bc,T,T)
-    # -1e9 (finite), NOT -jnp.inf: a fake QUERY position can end up with ZERO valid keys (its own
-    # causal<=self range never overlaps the real/non-fake key range) -- softmax(-inf,...,-inf) is
-    # 0/0=NaN, which then leaks into REAL positions in later layers via 0(weight)*NaN(value)=NaN
-    # in the weighted sum, even though that weight is mathematically exactly 0 (confirmed
-    # 2026-09-15: mean_abs_diff was NaN while max_abs_diff stayed small -- NaN doesn't always win
-    # a max-reduction comparison, so max() alone silently missed this). -1e9 keeps a fully-masked
-    # row's softmax well-defined (uniform, finite, meaningless but harmless) instead.
-    scores = jnp.where(mask[:, None], scores, -1e9)   # add head axis
+    causal = idx[None, :] <= idx[:, None]
+    validmin = idx[None, :] >= min_valid_pos[:, None]
+    mask = causal[None] & validmin[:, None, :]
+    scores = jnp.where(mask[:, None], scores, -1e9)
     weights = jax.nn.softmax(scores, axis=-1)
     y = jnp.einsum("bhts,bhsd->bhtd", weights, v)
     if attn.use_xsa:
@@ -891,11 +560,6 @@ def run_block_pardec(blk: Block, x: jnp.ndarray, rope_pos_ids: jnp.ndarray, min_
 
 def token_ar_teacher_forced(in_proj, member_embed, norm1, attn, ln_f, out_head, dim, in_code_vocab,
                              h: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
-    """Free-function form of the token-ar chain (chat 2026-09-12, refactored out of EncDecLevel
-    so both a level's OWN token head and a "duplicate ar heads" MTP bank -- K independent copies
-    of this exact mechanism, mtp_mode="parallel" x token_head_type="ar" -- can share it). h:
-    (...,D) one context vector per group. target: (...,chunks) real member values. Returns
-    logits (...,chunks,vocab): member m predicted from ctx + real members[0..m-1]."""
     lead = h.shape[:-1]
     D = h.shape[-1]
     chunks = target.shape[-1]
@@ -930,10 +594,6 @@ def token_ar_generate(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks
     return idx, rng
 
 
-# ---------------------------------------------------------------------------
-# EncDecLevel -- one module per level, optionally shared between encoder/decoder roles
-# ---------------------------------------------------------------------------
-
 class EncDecLevel(eqx.Module):
     blocks: list
     ln_f: RMSNorm
@@ -949,9 +609,6 @@ class EncDecLevel(eqx.Module):
     dec_target_embed: jnp.ndarray
     dec_target_proj: jnp.ndarray
     dec_head: jnp.ndarray
-    # token_head_type in ("ar","diffusion") params (None unless has_decoder and token_head_type
-    # needs them) -- self-attention + residual + UNTIED linear head only (no mlp, no weight
-    # tying -- chat 2026-09-12). token_mask_embed/token_channel_embed are "diffusion"-only (KIV).
     token_in_proj: jnp.ndarray
     token_member_embed: jnp.ndarray
     token_mask_embed: jnp.ndarray
@@ -960,12 +617,6 @@ class EncDecLevel(eqx.Module):
     token_attn: Attention
     token_ln_f: RMSNorm
     token_out_head: jnp.ndarray
-    # true MTP params (chat 2026-09-12, None unless has_decoder and mtp_horizon>1):
-    # (linears,parallel) -- mtp_out_head only, K independent linear heads packed into one
-    # (D, K*ntp_out) matrix. (ar,ar) -- the OUTER causal chain's own params (reuses the INNER
-    # token-ar chain's token_attn/token_member_embed/token_out_head unchanged, "nested").
-    # (ar,parallel) -- mtp_heads_* lists, K FULLY INDEPENDENT copies of the token-ar mechanism
-    # ("duplicate ar heads"), each applied to the SAME h_t, no chaining across timesteps.
     mtp_out_head: jnp.ndarray
     mtp_in_proj: jnp.ndarray
     mtp_attn: Attention
@@ -989,7 +640,6 @@ class EncDecLevel(eqx.Module):
     n_kv_heads: int = eqx.field(static=True)
     quantize_mode: str = eqx.field(static=True)
     quantize_drop: float = eqx.field(static=True)
-    gumbel_temperature: float = eqx.field(static=True)
     token_head_type: str = eqx.field(static=True)
     token_dim: int = eqx.field(static=True)
     token_mask_prob: float = eqx.field(static=True)
@@ -1010,11 +660,8 @@ class EncDecLevel(eqx.Module):
         self.remat = cfg.remat
         self.ncodes_window = cfg.ncodes_window[level]
         self.streaming = cfg.streaming[level]
-        self.gumbel_temperature = cfg.gumbel_temperature[level]
         is_byte_level = (level == 0)
         self.pq_chunks, self.code_vocab = cfg.pq_chunks[level], cfg.code_vocab[level]
-        # level0's own in-stream is (byte_group, 256) instead of a special is_byte_level case --
-        # numerically identical to the old behavior when byte_group=1.
         self.in_pq_chunks = cfg.byte_group if is_byte_level else cfg.pq_chunks[level - 1]
         self.in_code_vocab = 256 if is_byte_level else cfg.code_vocab[level - 1]
         self.has_decoder = has_decoder
@@ -1083,8 +730,6 @@ class EncDecLevel(eqx.Module):
             self.mtp_out_head = init_matrix(keys[13], (D, self.mtp_horizon * ntp_out), scheme)
             (self.mtp_in_proj, self.mtp_attn, self.mtp_norm1, self.mtp_ln_f, self.mtp_out_proj) = (None,) * 5
         elif has_decoder and self.mtp_horizon > 1 and self.mtp_mode == "parallel" and self.token_head_type == "ar":
-            # "duplicate ar heads" (chat 2026-09-12): K FULLY INDEPENDENT copies of the token-ar
-            # mechanism, one per future timestep, all applied to the SAME h_t -- no chaining.
             tdim, theads = cfg.token_dim[level], cfg.token_n_heads[level]
             head_keys = jax.random.split(keys[19], self.mtp_horizon * 3)
             self.mtp_heads_in_proj = [init_matrix(head_keys[3 * k], (D, tdim), scheme)
@@ -1113,27 +758,34 @@ class EncDecLevel(eqx.Module):
             (self.mtp_out_head, self.mtp_in_proj, self.mtp_attn, self.mtp_norm1, self.mtp_ln_f,
              self.mtp_out_proj) = (None,) * 6
 
-    # --- encoder role (mirrors HierEncoder.EncoderLevel.forward) ---
 
-    def encode(self, x: jnp.ndarray, target_idx: jnp.ndarray, rng=None) -> dict:
+    def encode(self, x: jnp.ndarray, target_idx: jnp.ndarray, rng=None, gumbel_temperature: float = 1.0,
+               layer_drop_prob=None) -> dict:
         h = x
-        for blk in self.blocks:
-            h = run_block(blk, h, self.remat)
+        n_blk = len(self.blocks)
+        if rng is not None:
+            layer_rngs = list(jax.random.split(rng, n_blk + 1))
+            quant_rng = layer_rngs[-1]
+        else:
+            layer_rngs = [None] * n_blk
+            quant_rng = None
+        if layer_drop_prob is None:
+            layer_drop_prob = (0.0,) * n_blk
+        elif isinstance(layer_drop_prob, (int, float)):
+            layer_drop_prob = (layer_drop_prob,) * n_blk
+        for i, blk in enumerate(self.blocks):
+            h = run_block(blk, h, self.remat, rng=layer_rngs[i], drop_prob=layer_drop_prob[i])
         h = self.ln_f(h)
         M, L, D = h.shape
         n_blocks = L // self.K
         h_blocks = h[:, :n_blocks * self.K, :].reshape(M, n_blocks, self.K, D)
         pooled = h_blocks[:, :, self.K - 1, :]
         logits = reshape_pq(pooled @ self.code_head, self.pq_chunks, self.code_vocab)
-        if rng is not None and self.quantize_mode == "gumbel":
-            code_soft, code_idx = quantize_gumbel(logits, rng, self.gumbel_temperature, self.quantize_drop)
+        if quant_rng is not None and self.quantize_mode == "gumbel":
+            code_soft, code_idx = quantize_gumbel(logits, quant_rng, gumbel_temperature, self.quantize_drop)
         else:
-            code_soft, code_idx = quantize_hard(logits, rng, self.quantize_drop, self.gumbel_temperature)
+            code_soft, code_idx = quantize_hard(logits, quant_rng, self.quantize_drop, gumbel_temperature)
 
-        # IBQ-style (arXiv:2412.02692) entropy bonus: negative entropy of the batch-averaged soft
-        # code distribution (differentiable, unlike codebook_utilization's hard-idx entropy used
-        # only for logging) -- minimizing this maximizes codebook usage entropy, combating index
-        # collapse. Config.entropy_weight (default 0.0) scales this in phase_forward.
         probs = jax.nn.softmax(logits, axis=-1)
         p_avg = jnp.mean(probs, axis=(0, 1))
         entropy_loss = jnp.mean(jnp.sum(p_avg * jnp.log(jnp.maximum(p_avg, 1e-9)), axis=-1))
@@ -1147,7 +799,6 @@ class EncDecLevel(eqx.Module):
         return dict(code_soft=code_soft, code_idx=code_idx, ntp_loss=ntp_loss, ntp_acc=ntp_acc, util=util,
                     entropy_loss=entropy_loss)
 
-    # --- decoder role (mirrors StageLagDecoder.forward/reconstruct_kv_cache) ---
 
     def _dec_blocks(self):
         return self.blocks if self.weight_sharing else self.dec_blocks
@@ -1156,9 +807,6 @@ class EncDecLevel(eqx.Module):
         return self.ln_f if self.weight_sharing else self.dec_ln_f
 
     def _dec_embed_target(self, idx: jnp.ndarray) -> jnp.ndarray:
-        """Embeds THIS level's own previous target group as ONE summed token for the OUTER
-        (group-to-group) causal decoder -- unaffected by token_head_type, which only governs HOW
-        a group's own members get predicted, not how a whole group is fed back in."""
         table = self.own_input_embed if self.weight_sharing else self.dec_target_embed
         proj = self.own_input_proj if self.weight_sharing else self.dec_target_proj
         return code_embed_proj(idx, table, proj)
@@ -1166,19 +814,12 @@ class EncDecLevel(eqx.Module):
     def _dec_head_w(self) -> jnp.ndarray:
         return self.ntp_head if self.weight_sharing else self.dec_head
 
-    # --- token head dispatch: "linears" (parallel, existing), "ar" (causal chain, ported from
-    # run_ar_clockwork.py's SequentialRGBHead) -- predicts a position's OWN in_pq_chunks members ---
 
     def _token_logits_linears(self, h: jnp.ndarray) -> jnp.ndarray:
         logits = h @ self._dec_head_w()
         return reshape_pq(logits, self.in_pq_chunks, self.in_code_vocab)
 
     def _token_teacher_forced_ar(self, h: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
-        """h: (...,D) one context vector per group. target: (...,chunks) real member values.
-        Returns logits (...,chunks,vocab): member m predicted from ctx + real members[0..m-1].
-        causal=True uses real splash_attention directly (padding-safe -- unlike non-causal/
-        bidirectional attention, padded kv sits past any real causal query and is never
-        attended to, confirmed 2026-09-12 during the (now-removed) diffusion head's audit)."""
         return token_ar_teacher_forced(self.token_in_proj, self.token_member_embed, self.token_norm1,
                                         self.token_attn, self.token_ln_f, self.token_out_head,
                                         self.token_dim, self.in_code_vocab, h, target)
@@ -1189,22 +830,13 @@ class EncDecLevel(eqx.Module):
                                   self.in_pq_chunks, h, rng, greedy, temperature)
 
     def _token_teacher_forced_diffusion(self, h: jnp.ndarray, target: jnp.ndarray, rng) -> tuple:
-        """KIV (kept, not deleted, chat 2026-09-12) -- flaky, near-zero generation even after
-        fixing a real splash-attention-padding bug (see dense_self_attention's docstring) and
-        widening its masking schedule. Returns (logits (...,chunks,vocab), mask (...,chunks)
-        bool -- True where masked). mask is currently hardcoded to always-True (sanity check --
-        exactly matches inference's always-fully-masked input, no train/inference mismatch at
-        all); Uniform(0.05,1.0) token_mask_prob sampling is commented out below, not deleted."""
         lead = h.shape[:-1]
         D = h.shape[-1]
         chunks = self.in_pq_chunks
         N = int(np.prod(lead)) if lead else 1
         ctx = (h.reshape(N, D) @ self.token_in_proj)
         tgt_flat = target.reshape(N, chunks)
-        # prob_rng, mask_rng = jax.random.split(rng)
-        # mask_prob = jax.random.uniform(prob_rng, (), minval=0.05, maxval=1.0)
-        # mask = jax.random.bernoulli(mask_rng, mask_prob, (N, chunks))
-        mask = jnp.ones((N, chunks), dtype=bool)   # sanity check: always mask (matches inference exactly)
+        mask = jnp.ones((N, chunks), dtype=bool)
         real = self.token_member_embed[tgt_flat]
         tok = jnp.where(mask[..., None], self.token_mask_embed, real) \
             + self.token_channel_embed[None, :, :] + ctx[:, None, :]
@@ -1225,11 +857,6 @@ class EncDecLevel(eqx.Module):
         idx, rng = sample_idx(logits, rng, greedy, temperature)
         return idx.reshape(*lead, chunks), rng
 
-    # --- true MTP auxiliary training loss (chat 2026-09-12) -- predicts REAL future groups
-    # t+1..t+K from h_t, so the mtp params actually receive gradient (without this the mtp head/
-    # chain is never touched by the main per-position loss and stays at random init forever --
-    # only decode_generate_mtp_no_verify would ever read it, at inference). Only positions with
-    # a full K-window of real future groups still inside the decoded sequence contribute. ---
 
     def _mtp_loss_parallel(self, h_t: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
         B, T, D = h_t.shape
@@ -1244,8 +871,6 @@ class EncDecLevel(eqx.Module):
         return jnp.mean(nll)
 
     def _mtp_loss_ar_parallel(self, h_t: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
-        """"Duplicate ar heads" (chat 2026-09-12): K fully independent copies of the token-ar
-        mechanism, each applied to the SAME h_t (no chaining across timesteps, unlike (ar,ar))."""
         B, T, D = h_t.shape
         K = self.mtp_horizon
         valid_T = T - K
@@ -1264,10 +889,6 @@ class EncDecLevel(eqx.Module):
         return jnp.mean(jnp.stack(losses))
 
     def _mtp_loss_ar_ar(self, h_t: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
-        """Nested: OUTER causal chain over the K future timesteps (real future groups
-        teacher-forced, summed into one token each via the INNER token-ar chain's own
-        token_member_embed table), each outer output projected back to D and fed into the SAME
-        INNER _token_teacher_forced_ar to predict that timestep's own in_pq_chunks members."""
         B, T, D = h_t.shape
         K, chunks = self.mtp_horizon, self.in_pq_chunks
         valid_T = T - K
@@ -1311,10 +932,6 @@ class EncDecLevel(eqx.Module):
 
     def decode_logits_and_target(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray, decoder_ncodes: int,
                                   rng=None) -> tuple:
-        """Returns (logits, target, mask). mask is None except for "diffusion" (KIV -- only
-        masked positions count toward loss/acc, standard MLM convention). target_seq/
-        ctx_code_soft same shapes/semantics as run_lagcodec_sampler.py's decode_logits -- see
-        that file's docstring."""
         blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
         B = target_seq.shape[0]
         D = self.bos_embed.shape[-1]
@@ -1353,34 +970,6 @@ class EncDecLevel(eqx.Module):
 
     def decode_logits_and_target_pardec(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
                                          decoder_ncodes: int, rng=None) -> tuple:
-        """chat 2026-09-15 (v2, ncodes_window) -- TRAINING-side counterpart to decode_generate_
-        pardec. Every group is still fully INDEPENDENT (folded into the batch axis, own cache) --
-        but unlike v1 (run_lagcodec_pardec_v1.py), a group's TARGET decode span is ALWAYS just its
-        own G*K positions (no lookback/redecode/prune -- nothing is ever thrown away). What
-        self.ncodes_window controls is how many PREVIOUS groups' CTX CODES a group may additionally
-        attend to as pure read-only context (never their already-decoded target values). Every
-        token also gets its TRUE GLOBAL RoPE position (v1 restarted every group at position 0);
-        the zero-padded lookback prefix (for early groups that don't have ncodes_window real
-        previous groups yet) is excluded from attention via an explicit per-row mask, not v1's
-        "hope the network ignores zero vectors" reliance.
-
-        FALLBACK (chat 2026-09-15): decoder_ncodes>=n_blocks (one single group) is mathematically
-        IDENTICAL to the original non-pardec decode_logits_and_target (verified: same RoPE
-        position formula, same causal dependency, ncodes_window moot with nothing to look back
-        at) -- falls back to it directly rather than paying pardec's windowing/masking machinery
-        for zero benefit.
-
-        self.streaming (chat 2026-09-15, replacing the old ncodes_window=-2 sentinel): orthogonal
-        axis controlling whether the lookback is CAUSAL (True, default -- group g only sees groups
-        <g, needs a zero-padded fake prefix for early groups) or NON-causal (False -- nothing is
-        streaming in, the entire ctx sequence is already known upfront). streaming=False with
-        ncodes_window=-1 is TRUE FULLCTX: every group sees the SAME full real ctx directly -- no
-        causal restriction on the ctx axis, no padding, no masking needed at all. Cheaper than
-        streaming=True's -1 for small decoder_ncodes, not just differently-scoped: streaming causal
-        -1 at decoder_ncodes=1 pads group 0 to (n_groups-1)*G fake blocks for just 1 real one
-        (confirmed OOM'ing at batch_size=16 on a v4-8); non-streaming fullctx has zero padding
-        overhead regardless of decoder_ncodes. streaming=False with bounded ncodes_window
-        (symmetric window) is not implemented -- see Config.streaming's docstring."""
         n_blocks_check = ctx_code_soft.shape[1]
         if decoder_ncodes >= n_blocks_check:
             return self.decode_logits_and_target(target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
@@ -1393,8 +982,8 @@ class EncDecLevel(eqx.Module):
         n_blocks_p = n_blocks + pad_blocks
         n_groups = n_blocks_p // G
         fullctx = (not self.streaming) and (self.ncodes_window == -1)
-        N = self.ncodes_window if self.ncodes_window >= 0 else (n_groups - 1)   # naive unbounded (-1 only)
-        Wg = n_blocks_p if fullctx else (N + 1) * G   # ctx window width in blocks
+        N = self.ncodes_window if self.ncodes_window >= 0 else (n_groups - 1)
+        Wg = n_blocks_p if fullctx else (N + 1) * G
         per_group_len = Wg + 1 + G * self.K
 
         ctx_tok = code_embed_proj(ctx_code_soft, self.ctx_embed, self.ctx_proj)
@@ -1403,20 +992,16 @@ class EncDecLevel(eqx.Module):
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
             target_p = jnp.pad(target_p, ((0, 0), (0, pad_blocks * self.K), (0, 0)))
         if not fullctx and N > 0:
-            ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * G, 0), (0, 0)))   # front zero-pad, ctx ONLY
+            ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * G, 0), (0, 0)))
 
         B2 = B * n_groups
         if fullctx:
-            # every group sees the IDENTICAL full ctx_tok -- no per-group slicing/padding at all.
             ctx_flat = jnp.broadcast_to(ctx_tok[:, None, :, :], (B, n_groups, Wg, D)).reshape(B2, Wg, D)
-            min_valid_pos = jnp.zeros((B2,), dtype=jnp.int32)   # nothing fake -- always fully valid
+            min_valid_pos = jnp.zeros((B2,), dtype=jnp.int32)
             rope_ctx_g = jnp.broadcast_to(jnp.arange(Wg)[None, :], (n_groups, Wg))
         else:
-            # unrolled-Python-loop windowing (n_groups is a static int, known at trace time).
             ctx_windows = jnp.stack([ctx_tok[:, g * G:g * G + Wg, :] for g in range(n_groups)], axis=1)
             ctx_flat = ctx_windows.reshape(B2, Wg, D)
-            # fake/padding prefix length per group (local window index) -- only the first
-            # max(0,N-g) REAL groups are missing for group g, so that many *G blocks are fake.
             fake_counts = jnp.array([max(0, N - g) * G for g in range(n_groups)])
             min_valid_pos = jnp.broadcast_to(fake_counts[None, :], (B, n_groups)).reshape(B2)
             rope_ctx_g = jnp.stack([jnp.clip(jnp.arange(Wg) - N * G + g * G, 0, None) for g in range(n_groups)], axis=0)
@@ -1426,14 +1011,11 @@ class EncDecLevel(eqx.Module):
         target_flat = target_windows.reshape(B2, G * self.K, *target_seq.shape[2:])
         te_flat = self._dec_embed_target(target_flat)
         bos = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
-        xe = jnp.concatenate([ctx_flat, bos, te_flat], axis=1)   # (B2, per_group_len, D)
+        xe = jnp.concatenate([ctx_flat, bos, te_flat], axis=1)
 
-        # true global RoPE positions: real ctx block b -> b; this group's bos -> (g+1)*G; this
-        # group's target member m -> (g+1)*G + 1 + m. Fake ctx entries (non-fullctx only) get
-        # clipped to 0 (masked out by min_valid_pos, so their position value never matters).
         rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])[:, None]
         rope_target = jnp.stack([(g + 1) * G + 1 + jnp.arange(G * self.K) for g in range(n_groups)], axis=0)
-        rope_pos_ids_g = jnp.concatenate([rope_ctx_g, rope_bos, rope_target], axis=1)   # (n_groups, per_group_len)
+        rope_pos_ids_g = jnp.concatenate([rope_ctx_g, rope_bos, rope_target], axis=1)
         rope_pos_ids = jnp.broadcast_to(rope_pos_ids_g[None], (B, n_groups, per_group_len)).reshape(B2, per_group_len)
 
         x = xe
@@ -1441,7 +1023,7 @@ class EncDecLevel(eqx.Module):
             x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, self.remat)
         h = ln_f(x)
         pred_pos = Wg + jnp.arange(G * self.K)
-        h_t = h[:, pred_pos, :]   # (B2, G*K, D)
+        h_t = h[:, pred_pos, :]
         h_t = h_t.reshape(B, n_groups * G * self.K, D)
         target_out = target_windows.reshape(B, n_groups * G * self.K, *target_seq.shape[2:])
         valid_len = n_blocks * self.K
@@ -1545,31 +1127,6 @@ class EncDecLevel(eqx.Module):
 
     def decode_generate_pardec(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
                                 temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
-        """chat 2026-09-15 (v2, ncodes_window) -- decode_generate with every decoder_ncodes-sized
-        group made fully INDEPENDENT of every other group (no cross-group causal dependency,
-        cache, or shared state): folds the group axis into the batch axis and gives each group
-        its OWN per_group_len-sized KV cache. All groups decode in ONE parallel batched pass;
-        within a group, decode is still autoregressive over that group's own G*K member positions.
-
-        self.ncodes_window (N, default 0): each group may additionally attend to the N
-        immediately-preceding groups' CTX CODES (Wg=(N+1)*G ctx window width) as pure read-only
-        context -- their already-decoded TARGET values are NEVER re-read/re-decoded (unlike v1's
-        overlap scheme, nothing is ever thrown away: a group's decode span is always exactly its
-        own G*K positions). N=-1 means unbounded (every earlier group's ctx, naive: Wg grows to
-        the full n_groups*G, inferred from n_blocks). Groups short on real history (early groups
-        under bounded N, or ANY group under -1 beyond its own) get a zero-padded ctx prefix,
-        explicitly MASKED out of attention (not v1's zero-vector reliance). Every token also
-        carries its TRUE GLOBAL RoPE position (v1 restarted every group at 0) -- see
-        pardec_step/pardec_chunk_step's docstrings for how position is decoupled from the shared
-        physical cache-write offset to make this possible per-row. See module docstring section 7.
-
-        FALLBACK (chat 2026-09-15): decoder_ncodes>=n_blocks (one single group) is mathematically
-        IDENTICAL to the original non-pardec decode_generate -- falls back to it directly rather
-        than paying pardec's windowing/masking machinery for zero benefit.
-
-        self.streaming=False with ncodes_window=-1: TRUE FULLCTX (replaces the old ncodes_window=-2
-        sentinel) -- see decode_logits_and_target_pardec's docstring for why this is distinct from
-        (and cheaper than) streaming causal -1."""
         n_blocks_check = ctx_idx.shape[1]
         if decoder_ncodes >= n_blocks_check:
             return self.decode_generate(ctx_idx, decoder_ncodes, greedy, temperature, seed)
@@ -1646,7 +1203,7 @@ class EncDecLevel(eqx.Module):
             chunk_rope = jnp.concatenate([rope_ctx_flat, rope_bos_flat[:, None]], axis=1)
             h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, jnp.array(0), chunk_rope)
             pos = Wg + 1
-            rope_pos_row = rope_bos_flat + 1   # position for the SECOND target member (first came from bos)
+            rope_pos_row = rope_bos_flat + 1
             h = h_chunk[:, -1, :]
             val, rng = token_predict(h, rng)
             vals = [val]
@@ -1661,19 +1218,12 @@ class EncDecLevel(eqx.Module):
             _, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
             return jnp.stack(vals, axis=1)
 
-        vals_all = run_pardec(ctx_tok_flat, cache_k, cache_v, rng)   # (B2, G*K, *out_extra)
+        vals_all = run_pardec(ctx_tok_flat, cache_k, cache_v, rng)
         out = vals_all.reshape(B, n_groups * G * self.K, *out_extra).astype(jnp.int32)
         return out[:, :n_blocks * self.K]
 
     def decode_generate_mtp_no_verify(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
                                        temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
-        """chat 2026-09-12: true-MTP "no-verify" decode -- draws mtp_horizon positions per KV-
-        cache step instead of one, directly accepting the draft with no check against the real
-        sequential decode (see mtp_predict_no_verify's docstring). Only valid when
-        self.mtp_horizon>1; falls back to plain decode_generate() otherwise. Structurally
-        identical to decode_generate() except group_step advances mtp_horizon positions per
-        outer step using the SAME cached hidden state (the K draws share one h -- genuinely
-        parallel, not autoregressive)."""
         if self.mtp_horizon <= 1:
             return self.decode_generate(ctx_idx, decoder_ncodes, greedy, temperature, seed)
         K = self.mtp_horizon
@@ -1718,9 +1268,8 @@ class EncDecLevel(eqx.Module):
             h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, pos)
             pos = pos + (G + 1)
             h = h_chunk[:, -1, :]
-            draft, rng = mtp_predict_no_verify_standalone(self, h, rng, greedy, temperature)  # (B,K,chunks)
+            draft, rng = mtp_predict_no_verify_standalone(self, h, rng, greedy, temperature)
             vals = [draft[:, k, :] for k in range(K)]
-            # advance the real KV cache by feeding the DRAFTED values (no-verify -- accepted as-is)
             for k in range(K):
                 x_input = self._dec_embed_target(vals[k])
                 _, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
@@ -1749,12 +1298,6 @@ class EncDecLevel(eqx.Module):
 
 
 def mtp_predict_no_verify_standalone(level: EncDecLevel, h_pos, rng, greedy, temperature):
-    """Drafts K future groups directly off ONE hidden state, NO check against what the real
-    sequential decode would have produced ("no-verify" -- a verified self-speculative mode
-    isn't implemented yet). mtp_mode="parallel": K independent packed linear heads. "ar":
-    OUTER causal chain -- but at GENERATION time there's no real future to teacher-force with,
-    so each outer step feeds back its OWN sampled group (embedded via token_member_embed),
-    chained causally, same nesting as training just without ground truth."""
     K, chunks, vocab = level.mtp_horizon, level.in_pq_chunks, level.in_code_vocab
     if level.mtp_mode == "parallel":
         logits = (h_pos @ level.mtp_out_head).reshape(*h_pos.shape[:-1], K, chunks, vocab)
@@ -1788,10 +1331,6 @@ def token_predict_standalone(level: EncDecLevel, h_pos, rng, greedy, temperature
         return level._token_generate_diffusion(h_pos, rng, greedy, temperature)
 
 
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
 class HierEncDec(eqx.Module):
     levels: list
     cfg: Config = eqx.field(static=True)
@@ -1805,19 +1344,16 @@ class HierEncDec(eqx.Module):
 
 
 def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=None,
-                   use_cascade=None) -> tuple:
-    """Same cascade rollout sampler design as run_lagcodec_sampler.py -- see that file's module
-    docstring. flat_bytes is always (B, n_positions, byte_group)."""
+                   use_cascade=None, gumbel_temperature: float = 1.0, layer_drop_prob=None) -> tuple:
     levels = model.levels
     x = code_embed_proj(flat_bytes, levels[0].own_input_embed, levels[0].own_input_proj)
     target = flat_bytes
     codes, codes_soft = [], []
     enc_losses, enc_accs, utils, entropy_losses = [], [], [], []
-    # per-level: one rng for encode()'s optional gumbel noise, one for decode()'s optional
-    # diffusion token-head masking (KIV -- see _token_teacher_forced_diffusion).
     level_rngs = [None] * (2 * phase) if rng is None else list(jax.random.split(rng, 2 * phase))
     for i in range(phase):
-        out = levels[i].encode(x, target, rng=level_rngs[2 * i])
+        out = levels[i].encode(x, target, rng=level_rngs[2 * i], gumbel_temperature=gumbel_temperature,
+                                layer_drop_prob=layer_drop_prob)
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
         enc_losses.append(out["ntp_loss"])
@@ -1841,19 +1377,13 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
         dec_losses.append(loss_i)
         dec_accs.append(acc_i)
         if i == 0:
-            # level0's own logits predict real byte VALUES (0-255) -- pixel-space MSE only makes
-            # sense here, not at levels>0 (those predict PQ codebook indices, not pixel values).
             pred_bytes = jnp.argmax(logits, axis=-1).astype(jnp.float32)
-            byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)   # logging only, non-diff
+            byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)
             if model.cfg.mse_weight > 0:
-                # soft (non-ST) pixel-value expectation (chat 2026-09-15): softmax(logits/tau)
-                # dotted with arange(256), no straight-through hard commit -- the FORWARD value is
-                # the distribution's mean pixel value, not the argmax byte. mse_softmax_tau sharpens
-                # (<1) or flattens (>1) the distribution before taking the expectation.
                 byte_probs = jax.nn.softmax(logits / model.cfg.mse_softmax_tau, axis=-1)
                 byte_values = jnp.arange(byte_probs.shape[-1], dtype=byte_probs.dtype)
                 pred_pixel = jnp.sum(byte_probs * byte_values, axis=-1)
-                max_val = byte_probs.shape[-1] - 1   # 255 for a byte -- normalizes MSE to [0,1]
+                max_val = byte_probs.shape[-1] - 1
                 mse_loss = jnp.mean(((pred_pixel - target_i.astype(jnp.float32)) / max_val) ** 2)
             else:
                 mse_loss = 0.0
@@ -1912,19 +1442,8 @@ def to_single_device(tree, device=None):
     return jax.tree_util.tree_map(lambda x: jax.device_put(x, device) if eqx.is_array(x) else x, tree)
 
 
-# ---------------------------------------------------------------------------
-# Full resumability (chat 2026-09-14): model + optimizer state + live RNG + dataloader shuffle
-# state + phase/epoch/step position, so a killed run resumes bit-for-bit (same n_devices) rather
-# than just reloading final weights. p_rng is the REPLICATED (n_devices,2) array saved as-is (not
-# unreplicated) -- each device's row diverges after splits inside train_step, so only the full
-# array reproduces every device's exact stream; opt_state/model ARE unreplicated first by the
-# caller since pmean keeps every device's copy identical, so device 0 is fully representative.
-# ---------------------------------------------------------------------------
-
 def save_checkpoint(ckpt_dir: Path, model, opt_state, p_rng, train_iter: "BatchIterator",
                      phase: int, phase_step: int, step: int, seed: int) -> None:
-    """chat 2026-09-14: epoch -> phase_step (steps completed within the CURRENT phase) -- this
-    fork's training loop is step-driven, not epoch-driven (see module docstring point 6)."""
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     eqx.tree_serialise_leaves(ckpt_dir / "model.eqx", model)
     eqx.tree_serialise_leaves(ckpt_dir / "opt_state.eqx", opt_state)
@@ -1934,8 +1453,6 @@ def save_checkpoint(ckpt_dir: Path, model, opt_state, p_rng, train_iter: "BatchI
 
 
 def find_latest_checkpoint(run_dir: Path):
-    """Highest (phase, phase_step) checkpoint under run_dir/checkpoints, or None if there isn't
-    one. Skips the wa/ subdirectory (weight-averaged snapshots, not resumable training state)."""
     ckpt_root = run_dir / "checkpoints"
     if not ckpt_root.exists():
         return None
@@ -1954,8 +1471,6 @@ def find_latest_checkpoint(run_dir: Path):
 
 
 def prune_checkpoints(run_dir: Path, keep: int) -> None:
-    """Deletes all but the keep most recent (phase, phase_step) checkpoints under
-    run_dir/checkpoints (wa/ untouched). keep=None disables pruning entirely."""
     if keep is None:
         return
     ckpt_root = run_dir / "checkpoints"
@@ -1974,22 +1489,12 @@ def prune_checkpoints(run_dir: Path, keep: int) -> None:
         shutil.rmtree(d)
 
 
-# ---------------------------------------------------------------------------
-# Weight averaging (chat 2026-09-14) -- see module docstring point 5. Both operate on diff_model
-# (trainable params only) as plain pytrees; caller is responsible for combining with static_model
-# and unreplicating/host-transferring before calling these.
-# ---------------------------------------------------------------------------
-
 def ema_update(ema_tree, new_tree, decay: float):
     return jax.tree_util.tree_map(
         lambda e, p: decay * e + (1 - decay) * p if eqx.is_array(e) else e, ema_tree, new_tree)
 
 
 def stack_average(stack: list, weights=None):
-    """Weighted elementwise mean over every snapshot currently in the FIFO stack (oldest first).
-    weights=None (default): uniform (1/n each). A tuple of raw scores, one per stack slot, is
-    softmax-normalized to sum to 1 -- so only relative magnitude matters, not absolute scale
-    (e.g. a rising score sequence weights more-recent/more-converged snapshots higher)."""
     n = len(stack)
     if weights is None:
         w = [1.0 / n] * n
@@ -2003,9 +1508,6 @@ def stack_average(stack: list, weights=None):
 
 
 def pixel_mse(gen: np.ndarray, gt: np.ndarray) -> float:
-    """Mean squared pixel error, in float64 to avoid uint8 overflow -- averaged over EVERY
-    element (n*h*w*c), not summed. Verified (chat 2026-09-14): mean(per_image_mse) == this,
-    confirming no aggregation blow-up."""
     return float(np.mean((gen.astype(np.float64) - gt.astype(np.float64)) ** 2))
 
 
@@ -2032,9 +1534,6 @@ class Logger:
         h, rem = divmod(elapsed_s, 3600)
         m, s = divmod(rem, 60)
         line = f"[{h:02d}:{m:02d}:{s:02d}] {msg}"
-        # tqdm.write(line)   # chat 2026-09-13: defaults to stdout, block-buffered when piped
-        # through tee -- lags behind the bar (stderr, unbuffered), then dumps in a burst. Revert
-        # to this line to undo.
         tqdm.write(line, file=sys.stderr)
         self.text_f.write(line + "\n")
         self.text_f.flush()
@@ -2049,9 +1548,6 @@ def _fmt_lr(lr: float) -> str:
 
 
 def _round_floats(obj, ndigits: int = 4):
-    """Recursively truncates every float to ndigits decimal places (dict/list/tuple-aware) --
-    chat 2026-09-14, the raw config/resolved_config dumps had long float repr noise (bf16/float32
-    roundtrip artifacts like 0.10000000149011612) that made the log hard to read."""
     if isinstance(obj, float):
         return round(obj, ndigits)
     if isinstance(obj, dict):
@@ -2100,7 +1596,7 @@ CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "st
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "decoder_ncodes",
                   "ncodes_window", "streaming",
                   "weight_sharing", "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
-                  "gumbel_temperature", "gumbel_at_inference", "cascade_rollout_prob", "init_scheme", "use_xsa",
+                  "gumbel_at_inference", "init_scheme", "use_xsa",
                   "use_qknorm", "remat", "attn_window", "use_attn_sink",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "mse_weight",
@@ -2122,25 +1618,40 @@ def main():
                     help="training batch size -- a bare int applies uniformly to every phase; a "
                          "tuple gives one value per phase (length must equal n_phases)")
     p.add_argument("--n_devices", type=int, default=None)
-    p.add_argument("--epochs_per_phase", type=_tuple_arg, default=(1000,),
+    p.add_argument("--phase_steps", type=_tuple_arg, default=None,
+                    help="steps per phase -- a bare int applies uniformly to every phase; a "
+                         "tuple gives one value per phase. At most one of --phase_steps/"
+                         "--phase_epochs may be set")
+    p.add_argument("--phase_epochs", type=_tuple_arg, default=None,
                     help="epochs per phase -- a bare int applies uniformly to every phase; a "
-                         "tuple gives one value per phase (length must equal n_phases)")
+                         "tuple gives one value per phase. At most one of --phase_steps/"
+                         "--phase_epochs may be set. Default (both unset): 1000 epochs")
     p.add_argument("--no_curriculum", type=lambda x: x.lower() != "false", default=False,
-                    help="chat 2026-09-12 -- skip the phase-by-phase curriculum entirely: train "
-                         "ALL levels jointly from step 1 (curriculum_mode='no_freeze' still "
-                         "required). Reuses the same phase loop with phase fixed at n_phases for "
-                         "its only iteration; epochs_per_phase's single/last entry is used.")
+                    help="skip the phase-by-phase curriculum entirely: train ALL levels jointly "
+                         "from step 1 (curriculum_mode='no_freeze' still required). Reuses the "
+                         "same phase loop with phase fixed at n_phases for its only iteration; "
+                         "phase_steps/phase_epochs's single/last entry is used.")
     p.add_argument("--lr", type=float, default=1e-2)
-    p.add_argument("--warmup_steps", type=int, default=100)
+    p.add_argument("--warmup_steps", type=int, default=None,
+                    help="warmup length, in steps. At most one of --warmup_steps/--warmup_epochs "
+                         "may be set. Default (both unset): 100 steps")
+    p.add_argument("--warmup_epochs", type=float, default=None,
+                    help="warmup length, in epochs (converted using this phase's own "
+                         "steps_per_epoch). Default (both unset): 100 steps")
     p.add_argument("--lr_schedule", type=str, default="const", choices=["const", "cosine"],
                     help="const: warmup then flat forever (default). cosine: warmup then cosine "
                          "decay to 0 over this phase's own epoch_count*steps_per_epoch")
     p.add_argument("--lr_min", type=float, default=0.0,
                     help="cosine only: lr floor the decay reaches (default 0)")
+    p.add_argument("--lr_min_step", type=int, default=None,
+                    help="cosine only: step (within this phase) at which lr_min is reached; lr "
+                         "holds flat at lr_min for the rest of the phase. At most one of "
+                         "--lr_min_step/--lr_min_epoch may be set")
     p.add_argument("--lr_min_epoch", type=float, default=None,
                     help="cosine only: epoch (within this phase) at which lr_min is reached; lr "
-                         "holds flat at lr_min for the rest of the phase. Default: reach lr_min "
-                         "exactly at phase end (old behavior)")
+                         "holds flat at lr_min for the rest of the phase. At most one of "
+                         "--lr_min_step/--lr_min_epoch may be set. Default (both unset): reach "
+                         "lr_min exactly at phase end (old behavior)")
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--optimizer", type=str, default="sinkgd", choices=["adamw", "sinkgd"])
     p.add_argument("--optimizer_kwargs", type=json.loads, default={"sinkhorn_iters": 1, "weight_decay": 0})
@@ -2148,10 +1659,18 @@ def main():
                     help="global-norm gradient clip threshold, applied before the optimizer "
                          "update; 'none' disables it")
     p.add_argument("--log_every", type=int, default=10, help="in steps")
-    p.add_argument("--gen_eval_every", type=int, default=10, help="mid-phase gen-eval cadence in EPOCHS -- auto-converted to steps via batch_size")
-    p.add_argument("--ckpt_every", type=int, default=10,
+    p.add_argument("--gen_eval_every_step", type=int, default=None, help="mid-phase gen-eval cadence, in steps")
+    p.add_argument("--gen_eval_every_epoch", type=float, default=None,
+                    help="mid-phase gen-eval cadence, in epochs (auto-converted to steps via "
+                         "this phase's own steps_per_epoch). At most one of --gen_eval_every_step/"
+                         "--gen_eval_every_epoch may be set. Default (both unset): 10 epochs")
+    p.add_argument("--ckpt_every_step", type=int, default=None,
                     help="save a full resumable checkpoint (model+optim+rng+dataloader state) "
-                         "every N EPOCHS, in addition to always at phase end -- auto-converted to steps")
+                         "every N steps, in addition to always at phase end")
+    p.add_argument("--ckpt_every_epoch", type=float, default=None,
+                    help="checkpoint cadence, in epochs (auto-converted to steps). At most one "
+                         "of --ckpt_every_step/--ckpt_every_epoch may be set. Default (both "
+                         "unset): 10 epochs")
     p.add_argument("--ckpt_keep", type=lambda x: None if x.lower() == "none" else int(x), default=None,
                     help="keep only the N most recent checkpoints under checkpoints/ (wa/ "
                          "untouched), deleting older ones after each save. 'none' (default) "
@@ -2162,7 +1681,11 @@ def main():
                     help="weight averaging: 'ema' (Polyak shadow copy) or 'wma' (rolling "
                          "mean over a FIFO stack of raw snapshots). 'none' (default) disables "
                          "both -- see module docstring point 5")
-    p.add_argument("--wa_every", type=int, default=10, help="WA update cadence, in EPOCHS -- auto-converted to steps")
+    p.add_argument("--wa_every_step", type=int, default=None, help="WA update cadence, in steps")
+    p.add_argument("--wa_every_epoch", type=float, default=None,
+                    help="WA update cadence, in epochs (auto-converted to steps). At most one "
+                         "of --wa_every_step/--wa_every_epoch may be set. Default (both unset): "
+                         "10 epochs")
     p.add_argument("--wa_ema_decay", type=float, default=0.999, help="ema mode only")
     p.add_argument("--wa_stack_size", type=int, default=3, help="wma mode only")
     p.add_argument("--wa_wma_weights", type=_float_tuple_arg, default=None,
@@ -2196,9 +1719,18 @@ def main():
     p.add_argument("--curriculum_mode", type=str, default=Config.curriculum_mode, choices=["freeze", "no_freeze"])
     p.add_argument("--quantize_mode", type=str, default=Config.quantize_mode, choices=["argmax", "gumbel"])
     p.add_argument("--quantize_drop", type=float, default=Config.quantize_drop)
-    p.add_argument("--gumbel_temperature", type=_float_tuple_arg, default=Config.gumbel_temperature)
+    p.add_argument("--gumbel_temperature", type=_float_tuple_arg, default=(1.0,),
+                    help="gumbel-softmax temperature -- global (not per-level), per-phase tuple. "
+                         "A bare scalar broadcasts to every phase")
     p.add_argument("--gumbel_at_inference", type=lambda x: x.lower() != "false", default=Config.gumbel_at_inference)
-    p.add_argument("--cascade_rollout_prob", type=float, default=Config.cascade_rollout_prob)
+    p.add_argument("--cascade_rollout_drop", type=_float_tuple_arg, default=(0.5,),
+                    help="probability of NOT using cascade-simulated rollout during training "
+                         "(1 - old cascade_rollout_prob) -- per-phase tuple, bare scalar broadcasts")
+    p.add_argument("--layer_drop_prob", type=_float_tuple_arg, default=(0.0,),
+                    help="stochastic-depth drop probability per transformer layer -- bare scalar "
+                         "broadcasts to every phase uniformly; a flat tuple (length n_phases) "
+                         "gives one value per phase; a nested tuple-of-tuples (config.py only, "
+                         "not expressible on the CLI) gives one value per phase per layer")
     p.add_argument("--init_scheme", type=str, default=Config.init_scheme, choices=["llama", "zero"])
     p.add_argument("--use_xsa", type=lambda x: x.lower() != "false", default=Config.use_xsa)
     p.add_argument("--use_qknorm", type=lambda x: x.lower() != "false", default=Config.use_qknorm)
@@ -2206,20 +1738,13 @@ def main():
     p.add_argument("--attn_window", type=_tuple_arg, default=Config.attn_window)
     p.add_argument("--use_attn_sink", type=lambda x: x.lower() != "false", default=Config.use_attn_sink)
     p.add_argument("--byte_group", type=int, default=Config.byte_group)
-    # type=str (NOT _str_tuple_arg): argparse auto-applies `type=` to ANY string-valued default
-    # (even one set via set_defaults from a config file) -- with _str_tuple_arg that silently
-    # comma-splits a bare broadcast string like "linears" into a 1-tuple BEFORE Config ever sees
-    # it, breaking Config's own bcast() (confirmed 2026-09-12). type=str is a no-op on a plain
-    # string, so a config file's bare-string broadcast value survives untouched; a genuine CLI
-    # multi-value string ("--token_head_type linears,ar") is NOT supported this way -- set a real
-    # per-level tuple in a config file instead (tuples are never touched by this argparse quirk).
     p.add_argument("--token_head_type", type=str, default=Config.token_head_type)
     p.add_argument("--token_dim", type=_tuple_arg, default=Config.token_dim)
     p.add_argument("--token_n_heads", type=_tuple_arg, default=Config.token_n_heads)
     p.add_argument("--pq_dim", type=_tuple_arg, default=Config.pq_dim)
     p.add_argument("--token_mask_prob", type=float, default=Config.token_mask_prob)
     p.add_argument("--mtp_horizon", type=_tuple_arg, default=Config.mtp_horizon)
-    p.add_argument("--mtp_mode", type=str, default=Config.mtp_mode)   # see --token_head_type's note
+    p.add_argument("--mtp_mode", type=str, default=Config.mtp_mode)
     p.add_argument("--mtp_weight", type=float, default=Config.mtp_weight)
     p.add_argument("--entropy_weight", type=float, default=Config.entropy_weight)
     p.add_argument("--mse_weight", type=float, default=Config.mse_weight)
@@ -2236,6 +1761,28 @@ def main():
     if args.run_name is None:
         args.run_name = pre_args.config.stem
 
+    def _resolve_pair(step_name, epoch_name, default_step=None):
+        s, e = getattr(args, step_name), getattr(args, epoch_name)
+        assert s is None or e is None, \
+            f"at most one of --{step_name}/--{epoch_name} may be set (got {step_name}={s}, {epoch_name}={e})"
+        if s is None and e is None and default_step is not None:
+            setattr(args, step_name, default_step)
+
+    _resolve_pair("phase_steps", "phase_epochs", default_step=None)
+    if args.phase_steps is None and args.phase_epochs is None:
+        args.phase_epochs = (1000,)
+    _resolve_pair("warmup_steps", "warmup_epochs", default_step=100)
+    _resolve_pair("lr_min_step", "lr_min_epoch")
+    _resolve_pair("gen_eval_every_step", "gen_eval_every_epoch")
+    if args.gen_eval_every_step is None and args.gen_eval_every_epoch is None:
+        args.gen_eval_every_epoch = 10
+    _resolve_pair("ckpt_every_step", "ckpt_every_epoch")
+    if args.ckpt_every_step is None and args.ckpt_every_epoch is None:
+        args.ckpt_every_epoch = 10
+    _resolve_pair("wa_every_step", "wa_every_epoch")
+    if args.wa_every_step is None and args.wa_every_epoch is None:
+        args.wa_every_epoch = 10
+
     n_devices = args.n_devices or jax.local_device_count()
     print(f"jax devices ({n_devices} used of {jax.local_device_count()} local): {jax.devices()}")
     cfg = Config(**{k: getattr(args, k) for k in CONFIG_FIELDS})
@@ -2244,21 +1791,24 @@ def main():
     n_positions = n_positions_of(cfg)
     pixel_order = pixel_order_for(cfg)
 
-    # chat 2026-09-12/14: epochs_per_phase/batch_size/val_batch_size are per-PHASE -- a bare int,
-    # or a length-1 tuple (Config-file-literal path where it wasn't parsed through _tuple_arg's
-    # CLI string form) broadcasts uniformly; otherwise its length must match n_phases exactly.
     def _bcast_per_phase(name):
         val = getattr(args, name)
-        if isinstance(val, int):
+        if val is None:
+            return
+        if isinstance(val, (int, float)):
             val = (val,) * n_phases
         elif len(val) == 1:
             val = val * n_phases
         assert len(val) == n_phases, f"{name} has {len(val)} entries, need {n_phases} (one per phase)"
         setattr(args, name, val)
 
-    _bcast_per_phase("epochs_per_phase")
+    _bcast_per_phase("phase_steps")
+    _bcast_per_phase("phase_epochs")
     _bcast_per_phase("batch_size")
     _bcast_per_phase("val_batch_size")
+    _bcast_per_phase("gumbel_temperature")
+    _bcast_per_phase("cascade_rollout_drop")
+    _bcast_per_phase("layer_drop_prob")
 
     if args.dataset == "imagenet64":
         (train_np, train_labels), (val_np, val_labels) = load_imagenet64(Path(args.data_root))
@@ -2266,8 +1816,6 @@ def main():
         (train_np, train_labels), (val_np, val_labels) = load_cifar10(Path(args.data_root))
     if args.train_subset_n:
         train_np = train_np[:args.train_subset_n]
-    # train_iter is rebuilt fresh each phase (see phase loop below) since batch_size is now
-    # per-phase -- no single shared BatchIterator here anymore.
 
     rng = jax.random.PRNGKey(args.seed)
     model = HierEncDec(rng, cfg)
@@ -2294,9 +1842,6 @@ def main():
             logger("--resume set but no checkpoint found under this run_dir -- starting fresh")
 
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
-    # recon_prompt/flat_prompt/gt_img are rebuilt fresh each phase (see phase loop below) since
-    # val_batch_size is now per-phase -- run_gen_eval() (defined once, below) closes over these
-    # as free variables and picks up whatever they're reassigned to at call time.
     recon_prompt = flat_prompt = gt_img = None
 
     def run_gen_eval(eval_model, top: int, tag: str, include_reconstruct: bool = False) -> tuple:
@@ -2308,7 +1853,7 @@ def main():
         eval_rngs = ([None] * (top + 1) if not cfg.gumbel_at_inference
                      else list(jax.random.split(jax.random.fold_in(jax.random.PRNGKey(0), hash(tag) % (2**31)), top + 1)))
         for i in range(top + 1):
-            out = m.levels[i].encode(x, target, rng=eval_rngs[i])
+            out = m.levels[i].encode(x, target, rng=eval_rngs[i], gumbel_temperature=args.gumbel_temperature[phase - 1])
             codes.append(out["code_idx"])
             codes_soft.append(out["code_soft"])
             if i < top:
@@ -2316,12 +1861,6 @@ def main():
                 target = out["code_idx"]
 
         recon_acc = recon_mse = None
-        # if include_reconstruct:
-        #     recon = m.levels[0].decode_generate_pardec(codes[0], cfg.decoder_ncodes[0], greedy=True, seed=0)
-        #     recon_acc = float(jnp.mean(recon == flat_prompt))
-        #     recon_img = positions_to_image(np.asarray(recon), cfg, pixel_order)
-        #     recon_mse = pixel_mse(recon_img, gt_img)
-        #     save_compare_grid(recon_img, gt_img, run_dir / f"samples_{tag}_reconstruct.png")
 
         cur_code = codes[top]
         for i in range(top, 0, -1):
@@ -2335,26 +1874,16 @@ def main():
         gen_time_s = time.monotonic() - gen_t0
         msg = f"[{tag}] top={top} CASCADE gen_byte_acc={cascade_acc:.4f} gen_cascade_mse={cascade_mse:.2f}"
         rec = dict(tag=tag, gen_cascade_acc=cascade_acc, gen_cascade_mse=cascade_mse, gen_time_s=gen_time_s)
-        # if include_reconstruct:
-        #     msg += f" reconstruct gen_byte_acc={recon_acc:.4f} gen_recon_mse={recon_mse:.2f}"
-        #     rec["gen_recon_acc"] = recon_acc
-        #     rec["gen_recon_mse"] = recon_mse
         msg += f" gen_time={gen_time_s:.1f}s"
         logger(msg, **rec)
         return recon_acc, cascade_acc
 
     def run_val_eval(eval_model, phase: int, tag: str) -> tuple:
-        """chat 2026-09-15 -- teacher-forced VALIDATION loss/acc: a plain FORWARD PASS only (no
-        grad), same phase_forward used by train_step's loss_fn, but on flat_prompt (the held-out
-        val batch already prepared for run_gen_eval) instead of a train batch. use_cascade left
-        at its default (None -> always real ctx, never the cascade-rollout substitution) for a
-        clean, deterministic signal -- NOT directly comparable to train's own logged loss/acc,
-        which uses a stochastic use_cascade draw per cfg.cascade_rollout_prob."""
         val_t0 = time.monotonic()
         m = cast_pytree(eval_model, compute_dtype)
-        loss, aux = phase_forward(m, flat_prompt, phase, rng=None)
+        loss, aux = phase_forward(m, flat_prompt, phase, rng=None, gumbel_temperature=args.gumbel_temperature[phase - 1])
         bpb, acc, ntp_bpb, ntp_acc, util, val_mse = [float(a) for a in aux]
-        loss = float(loss)   # forces device sync -- val_time_s below includes the full forward pass
+        loss = float(loss)
         val_time_s = time.monotonic() - val_t0
         logger(f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_ntp_acc={ntp_acc:.2f} "
                f"val_time={val_time_s:.1f}s",
@@ -2368,49 +1897,61 @@ def main():
             f"wa_wma_weights has {len(args.wa_wma_weights)} entries, need " \
             f"wa_stack_size={args.wa_stack_size}"
 
+    def _phase_total_steps(idx, steps_per_epoch):
+        if args.phase_steps is not None:
+            return args.phase_steps[idx]
+        return round(args.phase_epochs[idx] * steps_per_epoch)
+
+    def _every_steps(step_val, epoch_val, steps_per_epoch):
+        return step_val if step_val is not None else round(epoch_val * steps_per_epoch)
+
     step = resume_meta["step"] if resume_meta else 0
     all_phases = [n_phases] if args.no_curriculum else list(range(1, n_phases + 1))
     total_all_steps = sum(
-        args.epochs_per_phase[p - 1] * (len(train_np) // (args.batch_size[p - 1] * n_devices))
+        _phase_total_steps(p - 1, len(train_np) // (args.batch_size[p - 1] * n_devices))
         for p in all_phases)
     global_pbar = tqdm(total=total_all_steps, initial=step, desc="total", dynamic_ncols=True, position=1, leave=True)
     last_global_step = step
     phase_iter = [n_phases] if args.no_curriculum else list(range(1, n_phases + 1))
     if resume_meta is not None:
         resume_phase = resume_meta["phase"]
-        # cheap throwaway BatchIterator just to learn that phase's steps_per_epoch (no data copy,
-        # just wraps the numpy arrays) -- needed to tell whether the checkpointed phase_step means
-        # "phase complete" (next phase starts fresh) or "mid-phase" (resume within resume_phase).
         steps_per_epoch_resume = len(BatchIterator(
             train_np, train_labels[:len(train_np)], args.batch_size[resume_phase - 1], n_devices,
             shuffle=True, seed=args.seed, cfg=cfg))
-        phase_steps_resume = args.epochs_per_phase[resume_phase - 1] * steps_per_epoch_resume
+        phase_steps_resume = _phase_total_steps(resume_phase - 1, steps_per_epoch_resume)
         phase_complete = resume_meta["phase_step"] >= phase_steps_resume
         phase_iter = [p for p in phase_iter if p > resume_phase] if phase_complete \
             else [p for p in phase_iter if p >= resume_phase]
     for phase in phase_iter:
         train_iter = BatchIterator(train_np, train_labels[:len(train_np)], args.batch_size[phase - 1],
                                     n_devices, shuffle=True, seed=args.seed, cfg=cfg)
-        recon_prompt = val_np[:args.val_batch_size[phase - 1]]   # held-out, not train_np -- see
-        # chat 2026-09-14: run_gen_eval's gen_recon_mse/gen_cascade_mse are genuine validation
-        # metrics now, not train-set metrics.
+        recon_prompt = val_np[:args.val_batch_size[phase - 1]]
         flat_prompt = jnp.array(images_to_positions(recon_prompt, cfg, pixel_order))
         gt_img = recon_prompt.astype(np.uint8)
 
         filter_spec = phase_trainable_filter(model, phase)
         diff_model, static_model = eqx.partition(model, filter_spec)
 
+        gumbel_temperature_phase = args.gumbel_temperature[phase - 1]
+        cascade_rollout_drop_phase = args.cascade_rollout_drop[phase - 1]
+        layer_drop_prob_phase = args.layer_drop_prob[phase - 1]
+
         def loss_fn(diff_model, static_model, flat_bytes, rng, use_cascade, phase=phase):
             m = eqx.combine(diff_model, static_model)
             m = cast_pytree(m, compute_dtype)
-            return phase_forward(m, flat_bytes, phase, rng=rng, use_cascade=use_cascade)
+            return phase_forward(m, flat_bytes, phase, rng=rng, use_cascade=use_cascade,
+                                  gumbel_temperature=gumbel_temperature_phase,
+                                  layer_drop_prob=layer_drop_prob_phase)
 
-        phase_epochs = args.epochs_per_phase[phase - 1]
         steps_per_epoch_lr = len(train_iter)
-        total_steps = phase_epochs * steps_per_epoch_lr
-        min_epoch = args.lr_min_epoch if args.lr_min_epoch is not None else phase_epochs
-        lr_decay_steps = max(1, round(min_epoch * steps_per_epoch_lr) - args.warmup_steps)
-        lr_schedule = make_lr_schedule(args.lr_schedule, args.lr, args.warmup_steps, total_steps,
+        phase_total_steps = _phase_total_steps(phase - 1, steps_per_epoch_lr)
+        total_steps = phase_total_steps
+        warmup_steps_resolved = _every_steps(args.warmup_steps, args.warmup_epochs, steps_per_epoch_lr)
+        min_step = (args.lr_min_step if args.lr_min_step is not None
+                    else round(args.lr_min_epoch * steps_per_epoch_lr) if args.lr_min_epoch is not None
+                    else phase_total_steps)
+        lr_decay_steps = max(1, min_step - warmup_steps_resolved)
+        lr_schedule = make_lr_schedule(args.lr_schedule, args.lr, warmup_steps_resolved, total_steps,
                                         end_value=args.lr_min, decay_steps=lr_decay_steps)
         if args.optimizer == "sinkgd":
             optimizer = sinkgd(lr_schedule, **args.optimizer_kwargs)
@@ -2422,13 +1963,13 @@ def main():
 
         def train_step(diff_model, opt_state, rng, flat_bytes, static_model=static_model):
             rng, level_rng, cascade_rng = jax.random.split(rng, 3)
-            use_cascade = jax.random.bernoulli(cascade_rng, p=cfg.cascade_rollout_prob)
+            use_cascade = jax.random.bernoulli(cascade_rng, p=1.0 - cascade_rollout_drop_phase)
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
                 diff_model, static_model, flat_bytes, level_rng, use_cascade)
             grads = jax.lax.pmean(grads, axis_name="d")
             loss = jax.lax.pmean(loss, axis_name="d")
             aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
-            grad_norm = optax.global_norm(grads)   # before clip -- shows when/how hard grad_clip fires
+            grad_norm = optax.global_norm(grads)
             aux = aux + (grad_norm,)
             updates, opt_state = optimizer.update(grads, opt_state, diff_model)
             diff_model = eqx.apply_updates(diff_model, updates)
@@ -2439,12 +1980,8 @@ def main():
         p_opt_state = replicate(opt_state, n_devices)
         p_rng = jax.random.split(jax.random.fold_in(jax.random.PRNGKey(args.seed), phase), n_devices)
 
-        phase_steps = phase_epochs * len(train_iter)   # user gave epochs -- converted to steps once
         start_phase_step = 0
         if resume_meta is not None and phase == resume_meta["phase"]:
-            # diff_model/p_diff_model already reflect the resumed weights (model was
-            # deserialised from checkpoint before the phase loop) -- only optimizer state, RNG,
-            # and the dataloader's shuffle stream need restoring here.
             p_opt_state = replicate(
                 eqx.tree_deserialise_leaves(resume_ckpt_dir / "opt_state.eqx", opt_state), n_devices)
             p_rng = eqx.tree_deserialise_leaves(resume_ckpt_dir / "p_rng.eqx", p_rng)
@@ -2456,31 +1993,29 @@ def main():
 
         trained_desc = f"levels0-{phase - 1}" if cfg.curriculum_mode == "no_freeze" else f"level{phase - 1}"
         active_desc = f"phase{phase}[{trained_desc}]"
-        logger(f"=== starting {active_desc} for {phase_epochs} epochs ({phase_steps} steps) ===")
+        logger(f"=== starting {active_desc} for {phase_total_steps / steps_per_epoch_lr:.3g} "
+               f"epochs ({phase_total_steps} steps) ===")
 
         steps_per_epoch = len(train_iter)
-        gen_eval_every_steps = args.gen_eval_every * steps_per_epoch
-        ckpt_every_steps = args.ckpt_every * steps_per_epoch
-        wa_every_steps = args.wa_every * steps_per_epoch
+        gen_eval_every_steps = _every_steps(args.gen_eval_every_step, args.gen_eval_every_epoch, steps_per_epoch)
+        ckpt_every_steps = _every_steps(args.ckpt_every_step, args.ckpt_every_epoch, steps_per_epoch)
+        wa_every_steps = _every_steps(args.wa_every_step, args.wa_every_epoch, steps_per_epoch)
 
         wa_ema = None
         wa_stack = deque(maxlen=args.wa_stack_size)
         wa_dir = run_dir / "checkpoints" / "wa"
 
-        pbar = tqdm(total=phase_steps, initial=start_phase_step, desc=active_desc, dynamic_ncols=True, position=0)
+        pbar = tqdm(total=phase_total_steps, initial=start_phase_step, desc=active_desc, dynamic_ncols=True, position=0)
         jit_timed = False
         phase_step = start_phase_step
         epoch_num = start_phase_step // steps_per_epoch
-        while phase_step < phase_steps:
-            # one full pass through train_iter = one shuffled epoch (BatchIterator.__iter__
-            # reshuffles via its own persistent rng each call) -- the dataloader still cycles in
-            # full epochs; only the OUTER bookkeeping (pbar/logger/triggers) is step-based.
+        while phase_step < phase_total_steps:
             epoch_num += 1
             logger(f"{active_desc}: epoch {epoch_num} (step {step})")
             global_pbar.update(step - last_global_step)
             last_global_step = step
             for flat in train_iter:
-                if phase_step >= phase_steps:
+                if phase_step >= phase_total_steps:
                     break
                 flat = jnp.array(flat)
                 if not jit_timed:
@@ -2489,7 +2024,7 @@ def main():
                 step += 1
                 phase_step += 1
                 pbar.update(1)
-                loss0 = float(loss[0])   # forces device sync -- first call includes jit compile
+                loss0 = float(loss[0])
                 if not jit_timed:
                     logger(f"{active_desc}: first train_step (incl. jit compile) took "
                            f"{time.monotonic() - jit_t0:.1f}s")
@@ -2499,7 +2034,6 @@ def main():
                 lr_str = _fmt_lr(lr)
                 pbar.set_postfix(step=step, loss=f"{loss0:.2f}",
                                   acc=f"{acc:.2f}",
-                                #   ntp_acc=f"{ntp_acc:.2f}",
                                   lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
                     logger(f"\n"
@@ -2545,7 +2079,7 @@ def main():
         logger(f"=== {active_desc} done, {freeze_msg} ===")
         ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_step{step}"
         save_checkpoint(ckpt_dir, model, to_host(unreplicate(p_opt_state)), to_host(p_rng), train_iter,
-                         phase=phase, phase_step=phase_steps, step=step, seed=args.seed)
+                         phase=phase, phase_step=phase_total_steps, step=step, seed=args.seed)
         prune_checkpoints(run_dir, args.ckpt_keep)
         run_val_eval(model, phase, tag=f"phase{phase}_final")
         run_gen_eval(model, top=phase - 1, tag=f"phase{phase}_final", include_reconstruct=True)

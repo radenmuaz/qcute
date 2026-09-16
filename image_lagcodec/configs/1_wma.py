@@ -20,7 +20,7 @@ curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
 gumbel_temperature = 0.1
 gumbel_at_inference = False
-cascade_rollout_prob = 0.8
+cascade_rollout_drop = 0.2
 init_scheme = "llama"
 use_xsa = False
 pq_dim = (128, 64, 64, 64)
@@ -36,7 +36,7 @@ traversal = "zorder"
 # --- training ---
 batch_size = 64
 val_batch_size = 16
-epochs_per_phase = (200, 200, 200, )
+phase_epochs = (200, 200, 200, )
 warmup_steps = 1000
 grad_clip = 10.0
 seed = 0
@@ -52,13 +52,13 @@ optimizer_kwargs = {}
 
 wa_mode = "wma"
 quantize_drop = 0.8
-wa_every = 5
+wa_every_epoch = 5
 wa_stack_size = 5
 wa_wma_weights = (5.0, 4.0, 3.0, 2.0, 1.0)
 
 # --- logging ---
 log_every = 100
-gen_eval_every = 100
-ckpt_every = 10
+gen_eval_every_epoch = 100
+ckpt_every_epoch = 10
 ckpt_keep = 1
 qual_gen_n = 16
