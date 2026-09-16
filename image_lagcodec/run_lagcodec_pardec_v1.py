@@ -53,7 +53,62 @@ curriculum, everything else unchanged. Extensions layered on top since:
 
 pmap-parallel across all local devices.
 
-uv run python3 -m image_lagcodec.run_lagcodec_zorder --config image_lagcodec/configs/<name>.py
+5. WEIGHT AVERAGING (chat 2026-09-14) -- fork of run_lagcodec_zorder.py. Two independent schemes,
+   Config-orthogonal (--wa_mode, default "none"): both operate on the trainable diff_model params
+   only (static_model, e.g. norm scales that aren't eqx arrays, is untouched) and are saved as a
+   SEPARATE checkpoint file under run_dir/checkpoints/wa/, alongside (not replacing) the regular
+   per-step model checkpoint.
+     - "ema": one shadow copy, updated every --wa_every steps as
+       ema = wa_ema_decay*ema + (1-wa_ema_decay)*current_params (Polyak/exponential averaging).
+       Shadow is (re)initialized from the phase's starting params at the first update of each
+       phase -- EMA does NOT carry smoothing across a phase boundary (the trainable-param SET
+       itself can grow between phases under curriculum_mode, so restarting is the simplest
+       correct behavior; document, don't silently carry stale/mismatched structure).
+     - "wma": a FIFO stack of up to --wa_stack_size raw parameter snapshots, one pushed every
+       --wa_every steps (oldest evicted once full). Once the stack is full (reaches
+       wa_stack_size), a plain elementwise mean over every snapshot currently in it is computed
+       and saved -- this fires again on every subsequent push, so it's a ROLLING average over the
+       last wa_stack_size snapshots, not a one-shot.
+
+6. STEP-BASED TRAINING LOOP (chat 2026-09-14) -- the nested epoch/step double loop is replaced by
+   a single loop driven by GLOBAL step count. --epochs_per_phase is still given in epochs (user-
+   facing unit) but is immediately converted to steps (epochs * steps_per_epoch) once
+   steps_per_epoch is known; --gen_eval_every/--ckpt_every/--wa_every are ALL given directly in
+   steps (not epochs) in this fork. The dataloader (BatchIterator) still cycles in full epochs
+   internally -- each pass through it is one shuffled epoch -- but the outer loop, tqdm bar,
+   logger, and every periodic trigger (gen-eval/checkpoint/WA) count against the flat global step,
+   so a phase can end mid-epoch with no special-casing. Checkpoint resume tracks phase_step
+   (steps completed within the CURRENT phase) instead of epoch for the same reason.
+
+7. PARALLEL DECODE (chat 2026-09-15) -- encode is fast because it's a prefill (parallel over the
+   whole sequence); decode is currently autoregressive group-by-group (decode_generate's outer
+   jax.lax.scan sequentially threads the KV cache ACROSS every decoder_ncodes-sized group, so
+   group N always attends to every earlier group's already-decoded content -- unbounded causal,
+   fully sequential across groups). FIRST CHANGE (implemented this fork): decode_generate_pardec
+   makes every decoder_ncodes-sized group of codes fully INDEPENDENT of every other group -- no
+   cross-group causal dependency at all -- by folding the group axis into the batch axis (B,
+   n_groups, ...) -> (B*n_groups, ...) and giving each group its OWN per_group_len-sized KV cache
+   (instead of one L_total-sized cache shared/accumulated across all groups). All groups then
+   decode in one parallel batched pass instead of a sequential lax.scan over groups. Within a
+   group, decode is still autoregressive over that group's own G*K member positions (unchanged --
+   only the CROSS-group dependency is removed, not the within-group one). Kept as a SEPARATE
+   method (decode_generate_pardec) alongside the original decode_generate (still present,
+   unused by run_gen_eval/main() in this fork). WIRED IN (chat 2026-09-15): every decode_generate
+   call inside run_gen_eval (mid-phase/phase-end/final eval, both the cascade path and the
+   currently-commented-out reconstruct path) now calls decode_generate_pardec instead -- verified
+   correct first (teacher-forced dense reference vs incremental KV-cache, including the
+   decoder_ncodes_overlap lookback/prune logic, see scripts/pardec_consistency_check.py) before
+   wiring in.
+
+   TODO (not implemented) -- WINDOWING between groups: decoder_ncodes stays the finest granularity
+   (fully independent/parallel, as above), but a GROUP OF groups (e.g. 2 consecutive
+   decoder_ncodes-chunks) could instead be made dependent -- the second sub-chunk waits for the
+   first sub-chunk in its window to finish decoding before proceeding, trading some parallelism
+   for more context. Open question, not resolved: given e.g. a window of 2 decoder_ncodes-chunks,
+   should CONSECUTIVE windows be disjoint or overlap (and by how much) so a window's decode can
+   see recently-decoded content from the previous window? Left open.
+
+uv run python3 -m image_lagcodec.run_lagcodec_pardec --config image_lagcodec/configs/<name>.py
 """
 from __future__ import annotations
 
@@ -61,9 +116,11 @@ import argparse
 import json
 import math
 import pickle
+import shutil
 import sys
 import tarfile
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -106,10 +163,25 @@ class Config:
     decoder_ncodes: tuple = 1   # chat 2026-09-13 -- renamed from lag=0 (an offset) to a direct
     # count of codes the decoder conditions on (1 = current position only, no lookback), avoiding
     # the G=lag+1 off-by-one. Per-level, bare-scalar default.
+    decoder_ncodes_overlap: tuple = 0   # chat 2026-09-15 -- decode_generate_pardec only (see
+    # module docstring section 7). Each independent group's ctx window is extended BACKWARD by
+    # this many extra ctx blocks from the previous group (pure read-only lookback context,
+    # recomputed independently -- group g never depends on group g-1's actual decode output, so
+    # the "every group independent" invariant is preserved). Group 0 has no real previous-group
+    # ctx to look back into, so it gets `decoder_ncodes_overlap` ZERO ctx blocks prepended instead
+    # (special-cased). The extra lookback positions get DECODED too (needed for the self-attn
+    # causal chain to be well-formed) but PRUNED from the final output before reassembly -- only
+    # each group's own primary (non-overlap) G-block window is kept. Per-level, bare-scalar
+    # default 0 (disabled, decode_generate_pardec behaves exactly as before). If >0, must be
+    # <=decoder_ncodes[i] (can't look back more than one whole adjacent group).
     weight_sharing: tuple = True   # chat 2026-09-12 -- now PER-LEVEL, bare-scalar default
     precision: str = "bf16"           # stays global -- whole-model compute dtype
     curriculum_mode: str = "freeze"   # stays global -- training-loop control
     quantize_mode: str = "argmax"     # stays global -- training-time quantization strategy
+    quantize_drop: float = 0.0   # chat 2026-09-14 -- probability of skipping the straight-through
+    # hard commit for a given position, using the raw soft distribution instead (softmax alone
+    # under argmax mode, or the gumbel-noised softmax at gumbel_temperature under gumbel mode).
+    # Stays global. Default 0.0 -- always hard-commit, existing behavior unchanged.
     gumbel_temperature: tuple = 1.0   # chat 2026-09-12 -- now PER-LEVEL, bare-scalar default
     gumbel_at_inference: bool = False
     cascade_rollout_prob: float = 0.5
@@ -140,6 +212,12 @@ class Config:
     # own dec_head param count per level (audited 2026-09-12: a single global value badly under/
     # over-parameterizes different levels' alphabets).
     token_n_heads: tuple = 4        # per level (renamed from mtp_n_heads), bare-scalar default
+    pq_dim: tuple = None   # chat 2026-09-14 -- per-level embedding width for code_embed_proj
+    # (own_input_embed/ctx_embed/dec_target_embed -- the level's own PQ/byte codebook embedding,
+    # concat-then-linear-map scheme). None (default) -> that level's own d_model. Set a per-level
+    # tuple or a bare int (broadcasts uniformly) to use a narrower per-chunk width, e.g. 64 for a
+    # byte level's 3 RGB chunks, 32 for a PQ level's 4 chunks -- cheaper than full d_model per
+    # chunk since the down-projection still restores width D regardless.
     token_mask_prob: float = 0.15   # "diffusion" token head masking probability (KIV, unused by
     # the current sanity-check version which hardcodes always-mask -- see _token_teacher_forced_
     # diffusion's docstring; renamed from mask_prob)
@@ -170,6 +248,14 @@ class Config:
     traversal: str = "raster"    # "raster" (default, row-major) or "zorder" (Morton curve over
     # pixels, RGB stays contiguous per pixel regardless of byte_group -- see module docstring).
 
+    mse_weight: float = 0.0   # chat 2026-09-14 -- level0's byte-decode logits, softmax'd (soft,
+    # no straight-through -- chat 2026-09-15) then dotted with arange(256) to get a differentiable
+    # pixel-value estimate, then MSE'd against the real byte value and normalized by /255 (squared)
+    # so it's on a comparable [0,1] scale to the CE loss -- otherwise (confirmed 2026-09-14) raw
+    # 0-255 pixel MSE totally dominates at mse_weight=1.0 (loss~9658 vs ~11.75 without it). Default 0.0.
+    mse_softmax_tau: float = 0.1   # chat 2026-09-15 -- temperature on the soft byte distribution
+    # used for mse_weight's pixel-value expectation (lower = sharper/closer to one-hot).
+
     def __post_init__(self):
         n = len(self.strides)
 
@@ -183,6 +269,7 @@ class Config:
         bcast("mlp_mult", int)
         bcast("rope_base", (int, float))
         bcast("decoder_ncodes", int)
+        bcast("decoder_ncodes_overlap", int)
         bcast("weight_sharing", bool)
         bcast("gumbel_temperature", (int, float))
         bcast("token_head_type", str)
@@ -190,12 +277,22 @@ class Config:
         bcast("token_n_heads", int)
         bcast("mtp_horizon", int)
         bcast("mtp_mode", str)
+        if self.pq_dim is None:
+            self.pq_dim = self.d_model
+        else:
+            bcast("pq_dim", int)
 
         assert len(self.d_model) == n and len(self.n_layers) == n and len(self.n_heads) == n \
             and len(self.n_kv_heads) == n and len(self.code_vocab) == n and len(self.pq_chunks) == n
         assert len(self.mlp_mult) == n and len(self.rope_base) == n and len(self.decoder_ncodes) == n
+        assert len(self.decoder_ncodes_overlap) == n
+        for i in range(n):
+            assert 0 <= self.decoder_ncodes_overlap[i] <= self.decoder_ncodes[i], \
+                f"level {i}: decoder_ncodes_overlap={self.decoder_ncodes_overlap[i]} must be in " \
+                f"[0, decoder_ncodes={self.decoder_ncodes[i]}]"
         assert len(self.weight_sharing) == n and len(self.gumbel_temperature) == n
         assert len(self.token_head_type) == n
+        assert len(self.pq_dim) == n
         assert all(t in ("linears", "ar", "diffusion") for t in self.token_head_type)
         assert len(self.mtp_horizon) == n and len(self.mtp_mode) == n
         assert all(m in ("parallel", "ar") for m in self.mtp_mode)
@@ -290,8 +387,13 @@ def load_cifar10(data_root: Path) -> tuple:
     tar_path = data_root / "cifar-10-python.tar.gz"
     if not tar_path.exists():
         import urllib.request
+        tmp_path = tar_path.with_name(tar_path.name + ".tmp")
         print(f"downloading {CIFAR10_URL} -> {tar_path}")
-        urllib.request.urlretrieve(CIFAR10_URL, tar_path)
+        urllib.request.urlretrieve(CIFAR10_URL, tmp_path)   # download to temp first -- an
+        tmp_path.rename(tar_path)   # interrupted/truncated download must never land at tar_path,
+        # or it silently poisons every future run on this node (confirmed 2026-09-14: a truncated
+        # tar.gz from an earlier interrupted download made tarfile/gzip EOFError on every relaunch
+        # since `if not tar_path.exists()` skipped re-downloading the corrupt file).
     extract_dir = data_root / "cifar-10-batches-py"
     if not extract_dir.exists():
         with tarfile.open(tar_path) as tf:
@@ -362,22 +464,33 @@ class BatchIterator:
 # Quantization (identical convention to run_lagcodec_sampler.py)
 # ---------------------------------------------------------------------------
 
-def quantize_hard(logits: jnp.ndarray) -> tuple:
-    soft = jax.nn.softmax(logits, axis=-1)
+def quantize_hard(logits: jnp.ndarray, rng=None, quantize_drop: float = 0.0, tau: float = 1.0) -> tuple:
+    soft = jax.nn.softmax(logits / tau, axis=-1)
     idx = jnp.argmax(soft, axis=-1)
     hard = jax.nn.one_hot(idx, logits.shape[-1], dtype=soft.dtype)
-    code_soft = soft + jax.lax.stop_gradient(hard - soft)
+    st = soft + jax.lax.stop_gradient(hard - soft)
+    if quantize_drop > 0 and rng is not None:
+        drop = jax.random.bernoulli(rng, p=quantize_drop, shape=soft.shape[:-1])[..., None]
+        code_soft = jnp.where(drop, soft, st)
+    else:
+        code_soft = st
     return code_soft, idx
 
 
-def quantize_gumbel(logits: jnp.ndarray, rng, temperature: float = 1.0) -> tuple:
+def quantize_gumbel(logits: jnp.ndarray, rng, tau: float = 1.0, quantize_drop: float = 0.0) -> tuple:
+    rng, drop_rng = jax.random.split(rng)
     u = jax.random.uniform(rng, logits.shape, minval=1e-8, maxval=1.0 - 1e-8)
     gumbel_noise = -jnp.log(-jnp.log(u))
-    noisy_logits = (logits + gumbel_noise) / temperature
+    noisy_logits = (logits + gumbel_noise) / tau
     soft = jax.nn.softmax(noisy_logits, axis=-1)
     idx = jnp.argmax(soft, axis=-1)
     hard = jax.nn.one_hot(idx, logits.shape[-1], dtype=soft.dtype)
-    code_soft = soft + jax.lax.stop_gradient(hard - soft)
+    st = soft + jax.lax.stop_gradient(hard - soft)
+    if quantize_drop > 0:
+        drop = jax.random.bernoulli(drop_rng, p=quantize_drop, shape=soft.shape[:-1])[..., None]
+        code_soft = jnp.where(drop, soft, st)
+    else:
+        code_soft = st
     return code_soft, idx
 
 
@@ -393,9 +506,52 @@ def codebook_utilization(idx: jnp.ndarray, vocab: int) -> jnp.ndarray:
 
 
 def code_embed(code: jnp.ndarray, table: jnp.ndarray) -> jnp.ndarray:
-    if jnp.issubdtype(code.dtype, jnp.integer):
-        return table[code].sum(-2)
-    return (code @ table).sum(-2)
+    """table: (vocab, D). code: (...,C) int indices or (...,C,vocab) soft, C=chunks (byte_group
+    or pq_chunks -- this function is agnostic, used identically for both).
+
+    CONCATENATIVE (chat 2026-09-14): each of the C chunk positions gets its OWN disjoint slice of
+    the D-dim embedding (D split as evenly as possible across C slices) instead of all C chunks
+    sharing the full D-dim row and being summed -- preserves per-chunk identity (e.g. byte_group=3
+    R/G/B no longer alias through a shared sum, since summing let e.g. R=200,G=50,B=10 collide
+    with other combinations that happen to sum close to the same vector). Reuses the SAME (vocab,
+    D) table as before (no new params) -- just slices it differently per chunk index.
+    """
+    # --- additive (original) path, commented for easy revert ---
+    # if jnp.issubdtype(code.dtype, jnp.integer):
+    #     return table[code].sum(-2)
+    # return (code @ table).sum(-2)
+    D = table.shape[-1]
+    is_int = jnp.issubdtype(code.dtype, jnp.integer)
+    C = code.shape[-1] if is_int else code.shape[-2]
+    bounds = [round(i * D / C) for i in range(C + 1)]
+    parts = []
+    for i in range(C):
+        lo, hi = bounds[i], bounds[i + 1]
+        if is_int:
+            parts.append(table[code[..., i], lo:hi])
+        else:
+            parts.append(code[..., i, :] @ table[:, lo:hi])
+    return jnp.concatenate(parts, axis=-1)
+
+
+def code_embed_proj(code: jnp.ndarray, table: jnp.ndarray, proj: jnp.ndarray) -> jnp.ndarray:
+    """chat 2026-09-14: concat-then-linear-map upgrade over code_embed's disjoint-slice concat --
+    used for own_input_embed/ctx_embed/dec_target_embed (the level's own PQ/byte codebook
+    embedding), NOT token_member_embed (still plain code_embed, unaffected).
+
+    table: (vocab, pq_dim) -- each of the C chunks gets the FULL pq_dim width (no slicing).
+    proj: (C*pq_dim, D). Mathematically decomposes as sum_c(embed_c(code_c) @ proj_c), proj_c
+    being the c-th (pq_dim,D) block of proj -- a strict superset of both plain additive (proj_c=I
+    padded) and disjoint-slice concat (proj_c a 0/1 selection matrix): the network can LEARN
+    whichever combination is best, at the cost of C*pq_dim*D extra params vs a free gather+slice.
+    Still no genuine cross-chunk interaction (this is still linear/additive across chunks)."""
+    is_int = jnp.issubdtype(code.dtype, jnp.integer)
+    C = code.shape[-1] if is_int else code.shape[-2]
+    if is_int:
+        parts = [table[code[..., i]] for i in range(C)]
+    else:
+        parts = [code[..., i, :] @ table for i in range(C)]
+    return jnp.concatenate(parts, axis=-1) @ proj
 
 
 def reshape_pq(logits: jnp.ndarray, pq_chunks: int, code_vocab: int) -> jnp.ndarray:
@@ -513,13 +669,16 @@ class EncDecLevel(eqx.Module):
     blocks: list
     ln_f: RMSNorm
     own_input_embed: jnp.ndarray
+    own_input_proj: jnp.ndarray
     ntp_head: jnp.ndarray
     code_head: jnp.ndarray
     bos_embed: jnp.ndarray
     ctx_embed: jnp.ndarray
+    ctx_proj: jnp.ndarray
     dec_blocks: list
     dec_ln_f: RMSNorm
     dec_target_embed: jnp.ndarray
+    dec_target_proj: jnp.ndarray
     dec_head: jnp.ndarray
     # token_head_type in ("ar","diffusion") params (None unless has_decoder and token_head_type
     # needs them) -- self-attention + residual + UNTIED linear head only (no mlp, no weight
@@ -560,6 +719,7 @@ class EncDecLevel(eqx.Module):
     n_heads: int = eqx.field(static=True)
     n_kv_heads: int = eqx.field(static=True)
     quantize_mode: str = eqx.field(static=True)
+    quantize_drop: float = eqx.field(static=True)
     gumbel_temperature: float = eqx.field(static=True)
     token_head_type: str = eqx.field(static=True)
     token_dim: int = eqx.field(static=True)
@@ -568,13 +728,17 @@ class EncDecLevel(eqx.Module):
     mtp_mode: str = eqx.field(static=True)
     mtp_weight: float = eqx.field(static=True)
     remat: bool = eqx.field(static=True)
+    pq_dim: int = eqx.field(static=True)
+    decoder_ncodes_overlap: int = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config, level: int, has_decoder: bool, weight_sharing: bool):
         D = cfg.d_model[level]
         self.K = cfg.strides[level] if cfg.strides[level] != -1 else 1
         self.n_heads, self.n_kv_heads = cfg.n_heads[level], cfg.n_kv_heads[level]
         self.quantize_mode = cfg.quantize_mode
+        self.quantize_drop = cfg.quantize_drop
         self.remat = cfg.remat
+        self.decoder_ncodes_overlap = cfg.decoder_ncodes_overlap[level]
         self.gumbel_temperature = cfg.gumbel_temperature[level]
         is_byte_level = (level == 0)
         self.pq_chunks, self.code_vocab = cfg.pq_chunks[level], cfg.code_vocab[level]
@@ -590,12 +754,14 @@ class EncDecLevel(eqx.Module):
         self.mtp_horizon = cfg.mtp_horizon[level]
         self.mtp_mode = cfg.mtp_mode[level]
         self.mtp_weight = cfg.mtp_weight
+        self.pq_dim = cfg.pq_dim[level]
         own_vocab = 256 if is_byte_level else self.in_code_vocab
         ntp_out = self.in_pq_chunks * self.in_code_vocab
-        keys = jax.random.split(key, 20)
+        keys = jax.random.split(key, 23)
 
         scheme, use_xsa, use_qknorm = cfg.init_scheme, cfg.use_xsa, cfg.use_qknorm
-        self.own_input_embed = init_matrix(keys[0], (own_vocab, D), scheme)
+        self.own_input_embed = init_matrix(keys[0], (own_vocab, self.pq_dim), scheme)
+        self.own_input_proj = init_matrix(keys[20], (self.in_pq_chunks * self.pq_dim, D), scheme)
         n_layers = cfg.n_layers[level]
         block_keys = jax.random.split(keys[1], n_layers)
         self.blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
@@ -604,7 +770,8 @@ class EncDecLevel(eqx.Module):
         self.code_head = init_matrix(keys[2], (D, self.pq_chunks * self.code_vocab), scheme)
         self.ntp_head = init_matrix(keys[3], (D, ntp_out), scheme)
         self.bos_embed = init_vector(keys[4], D, scheme)
-        self.ctx_embed = init_matrix(keys[5], (self.code_vocab, D), scheme)
+        self.ctx_embed = init_matrix(keys[5], (self.code_vocab, self.pq_dim), scheme)
+        self.ctx_proj = init_matrix(keys[21], (self.pq_chunks * self.pq_dim, D), scheme)
 
         if has_decoder and not weight_sharing:
             dec_block_keys = jax.random.split(keys[6], n_layers)
@@ -612,10 +779,11 @@ class EncDecLevel(eqx.Module):
                                      n_layers=n_layers, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
                                for k in dec_block_keys]
             self.dec_ln_f = RMSNorm(D)
-            self.dec_target_embed = init_matrix(keys[7], (own_vocab, D), scheme)
+            self.dec_target_embed = init_matrix(keys[7], (own_vocab, self.pq_dim), scheme)
+            self.dec_target_proj = init_matrix(keys[22], (self.in_pq_chunks * self.pq_dim, D), scheme)
             self.dec_head = init_matrix(keys[8], (D, ntp_out), scheme)
         else:
-            self.dec_blocks, self.dec_ln_f, self.dec_target_embed, self.dec_head = None, None, None, None
+            self.dec_blocks, self.dec_ln_f, self.dec_target_embed, self.dec_target_proj, self.dec_head = None, None, None, None, None
 
         if has_decoder and self.token_head_type in ("ar", "diffusion"):
             tdim, theads = cfg.token_dim[level], cfg.token_n_heads[level]
@@ -685,9 +853,9 @@ class EncDecLevel(eqx.Module):
         pooled = h_blocks[:, :, self.K - 1, :]
         logits = reshape_pq(pooled @ self.code_head, self.pq_chunks, self.code_vocab)
         if rng is not None and self.quantize_mode == "gumbel":
-            code_soft, code_idx = quantize_gumbel(logits, rng, self.gumbel_temperature)
+            code_soft, code_idx = quantize_gumbel(logits, rng, self.gumbel_temperature, self.quantize_drop)
         else:
-            code_soft, code_idx = quantize_hard(logits)
+            code_soft, code_idx = quantize_hard(logits, rng, self.quantize_drop, self.gumbel_temperature)
 
         # IBQ-style (arXiv:2412.02692) entropy bonus: negative entropy of the batch-averaged soft
         # code distribution (differentiable, unlike codebook_utilization's hard-idx entropy used
@@ -719,7 +887,8 @@ class EncDecLevel(eqx.Module):
         (group-to-group) causal decoder -- unaffected by token_head_type, which only governs HOW
         a group's own members get predicted, not how a whole group is fed back in."""
         table = self.own_input_embed if self.weight_sharing else self.dec_target_embed
-        return code_embed(idx, table)
+        proj = self.own_input_proj if self.weight_sharing else self.dec_target_proj
+        return code_embed_proj(idx, table, proj)
 
     def _dec_head_w(self) -> jnp.ndarray:
         return self.ntp_head if self.weight_sharing else self.dec_head
@@ -882,7 +1051,7 @@ class EncDecLevel(eqx.Module):
         pad_blocks = (-n_blocks) % G
         n_blocks_p = n_blocks + pad_blocks
         n_groups = n_blocks_p // G
-        ctx_tok = code_embed(ctx_code_soft, self.ctx_embed)
+        ctx_tok = code_embed_proj(ctx_code_soft, self.ctx_embed, self.ctx_proj)
         if pad_blocks > 0:
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
             te = jnp.pad(te, ((0, 0), (0, pad_blocks * self.K), (0, 0)))
@@ -909,6 +1078,81 @@ class EncDecLevel(eqx.Module):
         mtp_loss = self._mtp_loss(h_t, target)
         return logits, target, mask, mtp_loss
 
+    def decode_logits_and_target_pardec(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
+                                         decoder_ncodes: int, rng=None) -> tuple:
+        """chat 2026-09-15 -- TRAINING-side counterpart to decode_generate_pardec. decode_logits_
+        and_target above concatenates ALL groups into ONE continuous causal sequence (group g
+        attends to every earlier group) -- consistent with the ORIGINAL decode_generate's
+        sequential-across-groups KV cache, but INCONSISTENT with decode_generate_pardec, which
+        makes every group fully INDEPENDENT (separate cache, no cross-group attention at all).
+        Training under decode_logits_and_target while generating with decode_generate_pardec is a
+        real train/inference mismatch -- this method fixes it by training under the SAME
+        independent-group structure: folds the group axis into the batch axis (like decode_
+        generate_pardec) instead of concatenating groups into one sequence, and applies the same
+        Wg=G+O windowing/zero-lookback-pad/prune-before-the-token-head logic when
+        decoder_ncodes_overlap (O) > 0. At O=0 this reduces to the same independent, non-
+        overlapping groups decode_generate_pardec uses at O=0 (mathematically equivalent to the
+        original decode_logits_and_target ONLY if that used independent groups too, which it does
+        not -- so even at O=0 this is a materially different, weaker-dependency model than the
+        original; use whichever of decode_logits_and_target/decode_logits_and_target_pardec
+        matches the decode_generate variant you actually train-serve with)."""
+        blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
+        B = target_seq.shape[0]
+        D = self.bos_embed.shape[-1]
+        G = decoder_ncodes
+        O = self.decoder_ncodes_overlap
+        Wg = G + O
+        n_blocks = ctx_code_soft.shape[1]
+        pad_blocks = (-n_blocks) % G
+        n_blocks_p = n_blocks + pad_blocks
+        n_groups = n_blocks_p // G
+
+        ctx_tok = code_embed_proj(ctx_code_soft, self.ctx_embed, self.ctx_proj)
+        target_p = target_seq
+        if pad_blocks > 0:
+            ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
+            target_p = jnp.pad(target_p, ((0, 0), (0, pad_blocks * self.K), (0, 0)))
+        if O > 0:
+            ctx_tok = jnp.pad(ctx_tok, ((0, 0), (O, 0), (0, 0)))
+            target_p = jnp.pad(target_p, ((0, 0), (O * self.K, 0), (0, 0)))   # group 0 lookback: zero index
+
+        # sliding windows of width Wg, stride G -- same unrolled-Python-loop pattern as
+        # decode_generate_pardec (n_groups is a static Python int, known at trace time).
+        ctx_windows = jnp.stack([ctx_tok[:, g * G:g * G + Wg, :] for g in range(n_groups)], axis=1)
+        target_windows = jnp.stack(
+            [target_p[:, g * G * self.K:g * G * self.K + Wg * self.K] for g in range(n_groups)], axis=1)
+        B2 = B * n_groups
+        ctx_flat = ctx_windows.reshape(B2, Wg, D)
+        target_flat = target_windows.reshape(B2, Wg * self.K, *target_seq.shape[2:])
+        te_flat = self._dec_embed_target(target_flat)
+        bos = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
+        xe = jnp.concatenate([ctx_flat, bos, te_flat], axis=1)
+        x = xe
+        for blk in blocks:
+            x = run_block(blk, x, self.remat)
+        h = ln_f(x)
+        pred_pos = Wg + jnp.arange(Wg * self.K)
+        h_t = h[:, pred_pos, :]   # (B2, Wg*K, D)
+
+        # prune the O*K lookback positions from BOTH h_t and target BEFORE the token head (cheaper
+        # than pruning post-head, and teacher-forcing must only see the kept target values) --
+        # mirrors decode_generate_pardec's compute-full-window-then-prune convention exactly.
+        h_t = h_t.reshape(B, n_groups, Wg * self.K, D)[:, :, O * self.K:, :].reshape(B, n_groups * G * self.K, D)
+        target_pruned = target_windows[:, :, O * self.K:, ...].reshape(B, n_groups * G * self.K, *target_seq.shape[2:])
+        valid_len = n_blocks * self.K
+        h_t = h_t[:, :valid_len, :]
+        target_pruned = target_pruned[:, :valid_len]
+
+        if self.token_head_type == "linears":
+            logits, mask = self._token_logits_linears(h_t), None
+        elif self.token_head_type == "ar":
+            logits, mask = self._token_teacher_forced_ar(h_t, target_pruned), None
+        else:
+            assert rng is not None, "diffusion token head needs an rng even at eval (masking is inherent)"
+            logits, mask = self._token_teacher_forced_diffusion(h_t, target_pruned, rng)
+        mtp_loss = self._mtp_loss(h_t, target_pruned)
+        return logits, target_pruned, mask, mtp_loss
+
     def decode(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray, decoder_ncodes: int, rng=None) -> tuple:
         logits, target, mask, mtp_loss = self.decode_logits_and_target(target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
         loss, acc = self._dec_loss_acc(logits, target, mask)
@@ -927,7 +1171,7 @@ class EncDecLevel(eqx.Module):
         n_groups = n_blocks_p // G
         per_group_len = G + 1 + G * self.K
         L_total = n_groups * per_group_len
-        ctx_tok = code_embed(ctx_idx, self.ctx_embed)
+        ctx_tok = code_embed_proj(ctx_idx, self.ctx_embed, self.ctx_proj)
         if pad_blocks > 0:
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
         ctx_tok_g = jnp.swapaxes(ctx_tok.reshape(B, n_groups, G, D), 0, 1)
@@ -994,6 +1238,106 @@ class EncDecLevel(eqx.Module):
         out = vals_all.reshape(B, n_groups * G * self.K, *out_extra).astype(jnp.int32)
         return out[:, :n_blocks * self.K]
 
+    def decode_generate_pardec(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
+                                temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
+        """chat 2026-09-15 -- decode_generate with every decoder_ncodes-sized group made fully
+        INDEPENDENT of every other group (no cross-group causal dependency): folds the group axis
+        into the batch axis (B*n_groups) and gives each group its OWN per_group_len-sized KV
+        cache, instead of decode_generate's single L_total cache accumulated sequentially across
+        groups via lax.scan. All groups decode in ONE parallel batched pass; within a group,
+        decode is still autoregressive over that group's own G*K member positions (unchanged --
+        only the cross-group dependency is removed). See module docstring section 7.
+
+        self.decoder_ncodes_overlap (O, default 0): each group's ctx window is extended BACKWARD
+        by O extra ctx blocks from the previous group (Wg = G+O total window width) -- pure
+        read-only lookback, recomputed independently by this group (group g never reads group
+        g-1's actual decode output, so "every group independent" still holds). Group 0 has no
+        real previous group, so O ZERO ctx blocks are prepended for it (special-cased via padding
+        at the very front, before the per-group windowing). Each group then decodes its FULL
+        Wg*K positions (the lookback ones are needed for the self-attn causal chain to be
+        well-formed), but only the LAST G*K (the group's own primary, non-overlap window) are
+        kept -- the first O*K (lookback duplicates, already owned by the previous group) are
+        pruned before reassembling the final output."""
+        blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
+        B, n_blocks, _ = ctx_idx.shape
+        D = self.bos_embed.shape[-1]
+        hd = D // self.n_heads
+        out_extra = (self.in_pq_chunks,)
+        G = decoder_ncodes
+        O = self.decoder_ncodes_overlap
+        Wg = G + O   # each group's own full ctx window width (G primary + O lookback)
+        pad_blocks = (-n_blocks) % G
+        n_blocks_p = n_blocks + pad_blocks
+        n_groups = n_blocks_p // G
+        per_group_len = Wg + 1 + Wg * self.K   # each group's OWN independent cache length
+        ctx_tok = code_embed_proj(ctx_idx, self.ctx_embed, self.ctx_proj)
+        if pad_blocks > 0:
+            ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
+        if O > 0:
+            ctx_tok = jnp.pad(ctx_tok, ((0, 0), (O, 0), (0, 0)))   # group 0's lookback: O zero blocks
+        B2 = B * n_groups
+        # sliding windows of width Wg, stride G (O>0 => adjacent windows overlap by O blocks) --
+        # n_groups is a static Python int (known from n_blocks_p//G at trace time), so this
+        # unrolled Python loop is fine (same pattern as code_embed_proj's per-chunk loop).
+        windows = jnp.stack([ctx_tok[:, g * G:g * G + Wg, :] for g in range(n_groups)], axis=1)
+        ctx_tok_flat = windows.reshape(B2, Wg, D)   # group axis folded into batch -- no cross-group state
+
+        def self_step(x_new, ck, cv, pos):
+            new_ck, new_cv = [], []
+            x = x_new
+            for i, blk in enumerate(blocks):
+                x, ck_i, cv_i = blk.step(x, ck[i], cv[i], pos, per_group_len)
+                new_ck.append(ck_i)
+                new_cv.append(cv_i)
+            return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+
+        def self_chunk_step(x_chunk, ck, cv, pos_start):
+            new_ck, new_cv = [], []
+            x = x_chunk
+            for i, blk in enumerate(blocks):
+                x, ck_i, cv_i = blk.chunk_step(x, ck[i], cv[i], pos_start, per_group_len)
+                new_ck.append(ck_i)
+                new_cv.append(cv_i)
+            return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+
+        def token_predict(h_pos, rng):
+            if self.token_head_type == "linears":
+                logits = self._token_logits_linears(h_pos)
+                return sample_idx(logits, rng, greedy, temperature)
+            elif self.token_head_type == "ar":
+                return self._token_generate_ar(h_pos, rng, greedy, temperature)
+            else:
+                return self._token_generate_diffusion(h_pos, rng, greedy, temperature)
+
+        cache_k = jnp.zeros((len(blocks), B2, self.n_kv_heads, per_group_len, hd))
+        cache_v = jnp.zeros_like(cache_k)
+        rng = jax.random.PRNGKey(seed)
+
+        @jax.jit
+        def run_pardec(ctx_tok_flat, cache_k, cache_v, rng):
+            bos_in = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
+            chunk = jnp.concatenate([ctx_tok_flat, bos_in], axis=1)
+            h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, jnp.array(0))
+            pos = Wg + 1
+            h = h_chunk[:, -1, :]
+            val, rng = token_predict(h, rng)
+            vals = [val]
+            x_input = self._dec_embed_target(val)
+            for _ in range(Wg * self.K - 1):
+                h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
+                pos = pos + 1
+                val, rng = token_predict(h, rng)
+                vals.append(val)
+                x_input = self._dec_embed_target(val)
+            _, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
+            return jnp.stack(vals, axis=1)
+
+        vals_all = run_pardec(ctx_tok_flat, cache_k, cache_v, rng)   # (B2, Wg*K, *out_extra)
+        vals_all = vals_all.reshape(B, n_groups, Wg * self.K, *out_extra)
+        primary = vals_all[:, :, O * self.K:, ...]   # prune the first O*K lookback (overlap) positions
+        out = primary.reshape(B, n_groups * G * self.K, *out_extra).astype(jnp.int32)
+        return out[:, :n_blocks * self.K]
+
     def decode_generate_mtp_no_verify(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
                                        temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
         """chat 2026-09-12: true-MTP "no-verify" decode -- draws mtp_horizon positions per KV-
@@ -1017,7 +1361,7 @@ class EncDecLevel(eqx.Module):
         n_groups = n_blocks_p // G
         per_group_len = G + 1 + G * self.K
         L_total = n_groups * per_group_len
-        ctx_tok = code_embed(ctx_idx, self.ctx_embed)
+        ctx_tok = code_embed_proj(ctx_idx, self.ctx_embed, self.ctx_proj)
         if pad_blocks > 0:
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
         ctx_tok_g = jnp.swapaxes(ctx_tok.reshape(B, n_groups, G, D), 0, 1)
@@ -1138,7 +1482,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     """Same cascade rollout sampler design as run_lagcodec_sampler.py -- see that file's module
     docstring. flat_bytes is always (B, n_positions, byte_group)."""
     levels = model.levels
-    x = code_embed(flat_bytes, levels[0].own_input_embed)
+    x = code_embed_proj(flat_bytes, levels[0].own_input_embed, levels[0].own_input_proj)
     target = flat_bytes
     codes, codes_soft = [], []
     enc_losses, enc_accs, utils, entropy_losses = [], [], [], []
@@ -1154,7 +1498,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
         utils.append(out["util"])
         entropy_losses.append(out["entropy_loss"])
         if i < phase - 1:
-            x = code_embed(out["code_soft"], levels[i + 1].own_input_embed)
+            x = code_embed_proj(out["code_soft"], levels[i + 1].own_input_embed, levels[i + 1].own_input_proj)
             target = out["code_idx"]
 
     dec_losses, dec_accs = [], []
@@ -1163,7 +1507,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     for i in range(phase - 1, -1, -1):
         dec_target = flat_bytes if i == 0 else codes[i - 1]
         dec_rng = level_rngs[2 * i + 1]
-        logits, target_i, mask_i, mtp_loss_i = levels[i].decode_logits_and_target(
+        logits, target_i, mask_i, mtp_loss_i = levels[i].decode_logits_and_target_pardec(
             dec_target, ctx, model.cfg.decoder_ncodes[i], rng=dec_rng)
         loss_i, acc_i = levels[i]._dec_loss_acc(logits, target_i, mask_i)
         loss_i = loss_i + levels[i].mtp_weight * mtp_loss_i
@@ -1173,7 +1517,19 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
             # level0's own logits predict real byte VALUES (0-255) -- pixel-space MSE only makes
             # sense here, not at levels>0 (those predict PQ codebook indices, not pixel values).
             pred_bytes = jnp.argmax(logits, axis=-1).astype(jnp.float32)
-            byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)
+            byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)   # logging only, non-diff
+            if model.cfg.mse_weight > 0:
+                # soft (non-ST) pixel-value expectation (chat 2026-09-15): softmax(logits/tau)
+                # dotted with arange(256), no straight-through hard commit -- the FORWARD value is
+                # the distribution's mean pixel value, not the argmax byte. mse_softmax_tau sharpens
+                # (<1) or flattens (>1) the distribution before taking the expectation.
+                byte_probs = jax.nn.softmax(logits / model.cfg.mse_softmax_tau, axis=-1)
+                byte_values = jnp.arange(byte_probs.shape[-1], dtype=byte_probs.dtype)
+                pred_pixel = jnp.sum(byte_probs * byte_values, axis=-1)
+                max_val = byte_probs.shape[-1] - 1   # 255 for a byte -- normalizes MSE to [0,1]
+                mse_loss = jnp.mean(((pred_pixel - target_i.astype(jnp.float32)) / max_val) ** 2)
+            else:
+                mse_loss = 0.0
         if i > 0:
             real_ctx = codes_soft[i - 1]
             if use_cascade is None:
@@ -1186,7 +1542,8 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     byte_acc = dec_accs[-1]
     ntp_loss_total = jnp.mean(jnp.stack(enc_losses))
     entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
-    loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total
+    loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
+        + model.cfg.mse_weight * mse_loss
     bpb = dec_loss_total / jnp.log(2.0)
     return loss, (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
                   jnp.mean(jnp.stack(utils)), byte_mse)
@@ -1238,30 +1595,84 @@ def to_single_device(tree, device=None):
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(ckpt_dir: Path, model, opt_state, p_rng, train_iter: "BatchIterator",
-                     phase: int, epoch: int, step: int, seed: int) -> None:
+                     phase: int, phase_step: int, step: int, seed: int) -> None:
+    """chat 2026-09-14: epoch -> phase_step (steps completed within the CURRENT phase) -- this
+    fork's training loop is step-driven, not epoch-driven (see module docstring point 6)."""
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     eqx.tree_serialise_leaves(ckpt_dir / "model.eqx", model)
     eqx.tree_serialise_leaves(ckpt_dir / "opt_state.eqx", opt_state)
     eqx.tree_serialise_leaves(ckpt_dir / "p_rng.eqx", p_rng)
     (ckpt_dir / "dataloader_state.json").write_text(json.dumps(train_iter.rng.bit_generator.state))
-    (ckpt_dir / "meta.json").write_text(json.dumps(dict(phase=phase, epoch=epoch, step=step, seed=seed)))
+    (ckpt_dir / "meta.json").write_text(json.dumps(dict(phase=phase, phase_step=phase_step, step=step, seed=seed)))
 
 
 def find_latest_checkpoint(run_dir: Path):
-    """Highest (phase, epoch) checkpoint under run_dir/checkpoints, or None if there isn't one."""
+    """Highest (phase, phase_step) checkpoint under run_dir/checkpoints, or None if there isn't
+    one. Skips the wa/ subdirectory (weight-averaged snapshots, not resumable training state)."""
     ckpt_root = run_dir / "checkpoints"
     if not ckpt_root.exists():
         return None
     candidates = []
     for d in ckpt_root.iterdir():
+        if d.name == "wa":
+            continue
         meta_path = d / "meta.json"
         if meta_path.exists():
             meta = json.loads(meta_path.read_text())
-            candidates.append((meta["phase"], meta["epoch"], d))
+            candidates.append((meta["phase"], meta["phase_step"], d))
     if not candidates:
         return None
     candidates.sort(key=lambda t: (t[0], t[1]))
     return candidates[-1][2]
+
+
+def prune_checkpoints(run_dir: Path, keep: int) -> None:
+    """Deletes all but the keep most recent (phase, phase_step) checkpoints under
+    run_dir/checkpoints (wa/ untouched). keep=None disables pruning entirely."""
+    if keep is None:
+        return
+    ckpt_root = run_dir / "checkpoints"
+    if not ckpt_root.exists():
+        return
+    candidates = []
+    for d in ckpt_root.iterdir():
+        if d.name == "wa":
+            continue
+        meta_path = d / "meta.json"
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            candidates.append((meta["phase"], meta["phase_step"], d))
+    candidates.sort(key=lambda t: (t[0], t[1]))
+    for _, _, d in candidates[:-keep] if keep > 0 else candidates:
+        shutil.rmtree(d)
+
+
+# ---------------------------------------------------------------------------
+# Weight averaging (chat 2026-09-14) -- see module docstring point 5. Both operate on diff_model
+# (trainable params only) as plain pytrees; caller is responsible for combining with static_model
+# and unreplicating/host-transferring before calling these.
+# ---------------------------------------------------------------------------
+
+def ema_update(ema_tree, new_tree, decay: float):
+    return jax.tree_util.tree_map(
+        lambda e, p: decay * e + (1 - decay) * p if eqx.is_array(e) else e, ema_tree, new_tree)
+
+
+def stack_average(stack: list, weights=None):
+    """Weighted elementwise mean over every snapshot currently in the FIFO stack (oldest first).
+    weights=None (default): uniform (1/n each). A tuple of raw scores, one per stack slot, is
+    softmax-normalized to sum to 1 -- so only relative magnitude matters, not absolute scale
+    (e.g. a rising score sequence weights more-recent/more-converged snapshots higher)."""
+    n = len(stack)
+    if weights is None:
+        w = [1.0 / n] * n
+    else:
+        assert len(weights) == n, f"wa_wma_weights has {len(weights)} entries, need {n} (wa_stack_size)"
+        exp = [math.exp(x) for x in weights]
+        total = sum(exp)
+        w = [e / total for e in exp]
+    return jax.tree_util.tree_map(
+        lambda *xs: sum(wi * x for wi, x in zip(w, xs)) if eqx.is_array(xs[0]) else xs[0], *stack)
 
 
 def pixel_mse(gen: np.ndarray, gt: np.ndarray) -> float:
@@ -1323,6 +1734,12 @@ def _round_floats(obj, ndigits: int = 4):
     return obj
 
 
+def _pretty_dict(d: dict, per_line: int = 4) -> str:
+    items = [f"{k}={v}" for k, v in d.items()]
+    lines = ["\t".join(items[i:i + per_line]) for i in range(0, len(items), per_line)]
+    return "\n" + "\n".join(lines)
+
+
 def _tuple_arg(s: str) -> tuple:
     return tuple(None if x.strip().lower() == "none" else int(x) for x in s.split(","))
 
@@ -1354,11 +1771,13 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
 
 CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "decoder_ncodes",
-                  "weight_sharing", "precision", "curriculum_mode", "quantize_mode",
+                  "decoder_ncodes_overlap",
+                  "weight_sharing", "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
                   "gumbel_temperature", "gumbel_at_inference", "cascade_rollout_prob", "init_scheme", "use_xsa",
                   "use_qknorm", "remat",
-                  "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob",
-                  "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "traversal")
+                  "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
+                  "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "mse_weight",
+                  "mse_softmax_tau", "traversal")
 
 
 def main():
@@ -1383,19 +1802,40 @@ def main():
     p.add_argument("--lr_schedule", type=str, default="const", choices=["const", "cosine"],
                     help="const: warmup then flat forever (default). cosine: warmup then cosine "
                          "decay to 0 over this phase's own epoch_count*steps_per_epoch")
+    p.add_argument("--lr_min", type=float, default=0.0,
+                    help="cosine only: lr floor the decay reaches (default 0)")
+    p.add_argument("--lr_min_epoch", type=float, default=None,
+                    help="cosine only: epoch (within this phase) at which lr_min is reached; lr "
+                         "holds flat at lr_min for the rest of the phase. Default: reach lr_min "
+                         "exactly at phase end (old behavior)")
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--optimizer", type=str, default="sinkgd", choices=["adamw", "sinkgd"])
     p.add_argument("--optimizer_kwargs", type=json.loads, default={"sinkhorn_iters": 1, "weight_decay": 0})
     p.add_argument("--grad_clip", type=lambda x: None if x.lower() == "none" else float(x), default=1.0,
                     help="global-norm gradient clip threshold, applied before the optimizer "
                          "update; 'none' disables it")
-    p.add_argument("--log_every", type=int, default=10)
-    p.add_argument("--gen_eval_every", type=int, default=10, help="mid-phase gen-eval cadence in epochs")
+    p.add_argument("--log_every", type=int, default=10, help="in steps")
+    p.add_argument("--gen_eval_every", type=int, default=10, help="mid-phase gen-eval cadence in EPOCHS -- auto-converted to steps via batch_size")
     p.add_argument("--ckpt_every", type=int, default=10,
                     help="save a full resumable checkpoint (model+optim+rng+dataloader state) "
-                         "every N epochs, in addition to always at phase end")
+                         "every N EPOCHS, in addition to always at phase end -- auto-converted to steps")
+    p.add_argument("--ckpt_keep", type=lambda x: None if x.lower() == "none" else int(x), default=None,
+                    help="keep only the N most recent checkpoints under checkpoints/ (wa/ "
+                         "untouched), deleting older ones after each save. 'none' (default) "
+                         "disables pruning -- keep every checkpoint")
     p.add_argument("--resume", type=lambda x: x.lower() != "false", default=False,
                     help="resume from the latest checkpoint under this run's log dir, if any")
+    p.add_argument("--wa_mode", type=str, default="none", choices=["none", "ema", "wma"],
+                    help="weight averaging: 'ema' (Polyak shadow copy) or 'wma' (rolling "
+                         "mean over a FIFO stack of raw snapshots). 'none' (default) disables "
+                         "both -- see module docstring point 5")
+    p.add_argument("--wa_every", type=int, default=10, help="WA update cadence, in EPOCHS -- auto-converted to steps")
+    p.add_argument("--wa_ema_decay", type=float, default=0.999, help="ema mode only")
+    p.add_argument("--wa_stack_size", type=int, default=3, help="wma mode only")
+    p.add_argument("--wa_wma_weights", type=_float_tuple_arg, default=None,
+                    help="wma mode only: one raw score per stack slot (oldest first), "
+                         "softmax-normalized to sum to 1 -- length must equal wa_stack_size. "
+                         "Default None: uniform (1/wa_stack_size each)")
     p.add_argument("--train_subset_n", type=int, default=100)
     p.add_argument("--qual_gen_n", type=int, default=8)
     p.add_argument("--val_batch_size", type=_tuple_arg, default=(2,),
@@ -1416,10 +1856,12 @@ def main():
     p.add_argument("--rope_base", type=_float_tuple_arg, default=Config.rope_base)
     p.add_argument("--ntp_weight", type=float, default=Config.ntp_weight)
     p.add_argument("--decoder_ncodes", type=_tuple_arg, default=Config.decoder_ncodes)
+    p.add_argument("--decoder_ncodes_overlap", type=_tuple_arg, default=Config.decoder_ncodes_overlap)
     p.add_argument("--weight_sharing", type=_bool_tuple_arg, default=Config.weight_sharing)
     p.add_argument("--precision", type=str, default=Config.precision, choices=["bf16", "fp32"])
     p.add_argument("--curriculum_mode", type=str, default=Config.curriculum_mode, choices=["freeze", "no_freeze"])
     p.add_argument("--quantize_mode", type=str, default=Config.quantize_mode, choices=["argmax", "gumbel"])
+    p.add_argument("--quantize_drop", type=float, default=Config.quantize_drop)
     p.add_argument("--gumbel_temperature", type=_float_tuple_arg, default=Config.gumbel_temperature)
     p.add_argument("--gumbel_at_inference", type=lambda x: x.lower() != "false", default=Config.gumbel_at_inference)
     p.add_argument("--cascade_rollout_prob", type=float, default=Config.cascade_rollout_prob)
@@ -1438,11 +1880,14 @@ def main():
     p.add_argument("--token_head_type", type=str, default=Config.token_head_type)
     p.add_argument("--token_dim", type=_tuple_arg, default=Config.token_dim)
     p.add_argument("--token_n_heads", type=_tuple_arg, default=Config.token_n_heads)
+    p.add_argument("--pq_dim", type=_tuple_arg, default=Config.pq_dim)
     p.add_argument("--token_mask_prob", type=float, default=Config.token_mask_prob)
     p.add_argument("--mtp_horizon", type=_tuple_arg, default=Config.mtp_horizon)
     p.add_argument("--mtp_mode", type=str, default=Config.mtp_mode)   # see --token_head_type's note
     p.add_argument("--mtp_weight", type=float, default=Config.mtp_weight)
     p.add_argument("--entropy_weight", type=float, default=Config.entropy_weight)
+    p.add_argument("--mse_weight", type=float, default=Config.mse_weight)
+    p.add_argument("--mse_softmax_tau", type=float, default=Config.mse_softmax_tau)
     p.add_argument("--traversal", type=str, default=Config.traversal, choices=["raster", "zorder"])
     pre_args, _ = p.parse_known_args()
     config_vars = load_config_module(pre_args.config)
@@ -1493,11 +1938,10 @@ def main():
     logger = Logger(run_dir)
     write_resolved_config(run_dir, args)
     (run_dir / f"config_{args.config.name}").write_text(args.config.read_text())
-    logger(f"config: {_round_floats(asdict(cfg))}")
     logger(f"n_levels={n_levels} n_phases={n_phases} n_positions={n_positions} "
            f"params={n_params / 1e6:.2f}M")
     resolved = {k: v for k, v in sorted(vars(args).items()) if k != "config"}
-    logger(f"resolved_config: {_round_floats(resolved)}")
+    logger(f"resolved_config:{_pretty_dict(_round_floats(resolved))}")
 
     resume_meta, resume_ckpt_dir = None, None
     if args.resume:
@@ -1506,7 +1950,7 @@ def main():
             resume_meta = json.loads((resume_ckpt_dir / "meta.json").read_text())
             model = eqx.tree_deserialise_leaves(resume_ckpt_dir / "model.eqx", model)
             logger(f"resuming from {resume_ckpt_dir}: phase={resume_meta['phase']} "
-                   f"epoch={resume_meta['epoch']} step={resume_meta['step']}")
+                   f"phase_step={resume_meta['phase_step']} step={resume_meta['step']}")
         else:
             logger("--resume set but no checkpoint found under this run_dir -- starting fresh")
 
@@ -1517,8 +1961,9 @@ def main():
     recon_prompt = flat_prompt = gt_img = None
 
     def run_gen_eval(eval_model, top: int, tag: str, include_reconstruct: bool = False) -> tuple:
+        gen_t0 = time.monotonic()
         m = cast_pytree(eval_model, compute_dtype)
-        x = code_embed(flat_prompt, m.levels[0].own_input_embed)
+        x = code_embed_proj(flat_prompt, m.levels[0].own_input_embed, m.levels[0].own_input_proj)
         target = flat_prompt
         codes, codes_soft = [], []
         eval_rngs = ([None] * (top + 1) if not cfg.gumbel_at_inference
@@ -1528,40 +1973,80 @@ def main():
             codes.append(out["code_idx"])
             codes_soft.append(out["code_soft"])
             if i < top:
-                x = code_embed(out["code_soft"], m.levels[i + 1].own_input_embed)
+                x = code_embed_proj(out["code_soft"], m.levels[i + 1].own_input_embed, m.levels[i + 1].own_input_proj)
                 target = out["code_idx"]
 
         recon_acc = recon_mse = None
-        if include_reconstruct:
-            recon = m.levels[0].decode_generate(codes[0], cfg.decoder_ncodes[0], greedy=True, seed=0)
-            recon_acc = float(jnp.mean(recon == flat_prompt))
-            recon_img = positions_to_image(np.asarray(recon), cfg, pixel_order)
-            recon_mse = pixel_mse(recon_img, gt_img)
-            save_compare_grid(recon_img, gt_img, run_dir / f"samples_{tag}_reconstruct.png")
+        # if include_reconstruct:
+        #     recon = m.levels[0].decode_generate_pardec(codes[0], cfg.decoder_ncodes[0], greedy=True, seed=0)
+        #     recon_acc = float(jnp.mean(recon == flat_prompt))
+        #     recon_img = positions_to_image(np.asarray(recon), cfg, pixel_order)
+        #     recon_mse = pixel_mse(recon_img, gt_img)
+        #     save_compare_grid(recon_img, gt_img, run_dir / f"samples_{tag}_reconstruct.png")
 
         cur_code = codes[top]
         for i in range(top, 0, -1):
-            cur_code = m.levels[i].decode_generate(cur_code, cfg.decoder_ncodes[i], greedy=True, seed=0)
-        cascade_recon = m.levels[0].decode_generate(cur_code, cfg.decoder_ncodes[0], greedy=True, seed=0)
+            cur_code = m.levels[i].decode_generate_pardec(cur_code, cfg.decoder_ncodes[i], greedy=True, seed=0)
+        cascade_recon = m.levels[0].decode_generate_pardec(cur_code, cfg.decoder_ncodes[0], greedy=True, seed=0)
         cascade_acc = float(jnp.mean(cascade_recon == flat_prompt))
         cascade_img = positions_to_image(np.asarray(cascade_recon), cfg, pixel_order)
         cascade_mse = pixel_mse(cascade_img, gt_img)
         save_compare_grid(cascade_img, gt_img, run_dir / f"samples_{tag}_cascade.png")
 
+        gen_time_s = time.monotonic() - gen_t0
         msg = f"[{tag}] top={top} CASCADE gen_byte_acc={cascade_acc:.4f} gen_cascade_mse={cascade_mse:.2f}"
-        rec = dict(tag=tag, gen_cascade_acc=cascade_acc, gen_cascade_mse=cascade_mse)
-        if include_reconstruct:
-            msg += f" reconstruct gen_byte_acc={recon_acc:.4f} gen_recon_mse={recon_mse:.2f}"
-            rec["gen_recon_acc"] = recon_acc
-            rec["gen_recon_mse"] = recon_mse
+        rec = dict(tag=tag, gen_cascade_acc=cascade_acc, gen_cascade_mse=cascade_mse, gen_time_s=gen_time_s)
+        # if include_reconstruct:
+        #     msg += f" reconstruct gen_byte_acc={recon_acc:.4f} gen_recon_mse={recon_mse:.2f}"
+        #     rec["gen_recon_acc"] = recon_acc
+        #     rec["gen_recon_mse"] = recon_mse
+        msg += f" gen_time={gen_time_s:.1f}s"
         logger(msg, **rec)
         return recon_acc, cascade_acc
 
+    def run_val_eval(eval_model, phase: int, tag: str) -> tuple:
+        """chat 2026-09-15 -- teacher-forced VALIDATION loss/acc: a plain FORWARD PASS only (no
+        grad), same phase_forward used by train_step's loss_fn, but on flat_prompt (the held-out
+        val batch already prepared for run_gen_eval) instead of a train batch. use_cascade left
+        at its default (None -> always real ctx, never the cascade-rollout substitution) for a
+        clean, deterministic signal -- NOT directly comparable to train's own logged loss/acc,
+        which uses a stochastic use_cascade draw per cfg.cascade_rollout_prob."""
+        val_t0 = time.monotonic()
+        m = cast_pytree(eval_model, compute_dtype)
+        loss, aux = phase_forward(m, flat_prompt, phase, rng=None)
+        bpb, acc, ntp_bpb, ntp_acc, util, val_mse = [float(a) for a in aux]
+        loss = float(loss)   # forces device sync -- val_time_s below includes the full forward pass
+        val_time_s = time.monotonic() - val_t0
+        logger(f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_ntp_acc={ntp_acc:.2f} "
+               f"val_time={val_time_s:.1f}s",
+               tag=tag, val_loss=loss, val_dec_acc=acc, val_dec_bpb=bpb,
+               val_ntp_acc=ntp_acc, val_ntp_bpb=ntp_bpb, val_util=util, val_mse=val_mse,
+               val_time_s=val_time_s)
+        return loss, acc
+
+    if args.wa_mode == "wma" and args.wa_wma_weights is not None:
+        assert len(args.wa_wma_weights) == args.wa_stack_size, \
+            f"wa_wma_weights has {len(args.wa_wma_weights)} entries, need " \
+            f"wa_stack_size={args.wa_stack_size}"
+
     step = resume_meta["step"] if resume_meta else 0
+    all_phases = [n_phases] if args.no_curriculum else list(range(1, n_phases + 1))
+    total_all_steps = sum(
+        args.epochs_per_phase[p - 1] * (len(train_np) // (args.batch_size[p - 1] * n_devices))
+        for p in all_phases)
+    global_pbar = tqdm(total=total_all_steps, initial=step, desc="total", dynamic_ncols=True, position=1, leave=True)
+    last_global_step = step
     phase_iter = [n_phases] if args.no_curriculum else list(range(1, n_phases + 1))
     if resume_meta is not None:
         resume_phase = resume_meta["phase"]
-        phase_complete = resume_meta["epoch"] >= args.epochs_per_phase[resume_phase - 1]
+        # cheap throwaway BatchIterator just to learn that phase's steps_per_epoch (no data copy,
+        # just wraps the numpy arrays) -- needed to tell whether the checkpointed phase_step means
+        # "phase complete" (next phase starts fresh) or "mid-phase" (resume within resume_phase).
+        steps_per_epoch_resume = len(BatchIterator(
+            train_np, train_labels[:len(train_np)], args.batch_size[resume_phase - 1], n_devices,
+            shuffle=True, seed=args.seed, cfg=cfg))
+        phase_steps_resume = args.epochs_per_phase[resume_phase - 1] * steps_per_epoch_resume
+        phase_complete = resume_meta["phase_step"] >= phase_steps_resume
         phase_iter = [p for p in phase_iter if p > resume_phase] if phase_complete \
             else [p for p in phase_iter if p >= resume_phase]
     for phase in phase_iter:
@@ -1582,8 +2067,12 @@ def main():
             return phase_forward(m, flat_bytes, phase, rng=rng, use_cascade=use_cascade)
 
         phase_epochs = args.epochs_per_phase[phase - 1]
-        total_steps = phase_epochs * len(train_iter)
-        lr_schedule = make_lr_schedule(args.lr_schedule, args.lr, args.warmup_steps, total_steps)
+        steps_per_epoch_lr = len(train_iter)
+        total_steps = phase_epochs * steps_per_epoch_lr
+        min_epoch = args.lr_min_epoch if args.lr_min_epoch is not None else phase_epochs
+        lr_decay_steps = max(1, round(min_epoch * steps_per_epoch_lr) - args.warmup_steps)
+        lr_schedule = make_lr_schedule(args.lr_schedule, args.lr, args.warmup_steps, total_steps,
+                                        end_value=args.lr_min, decay_steps=lr_decay_steps)
         if args.optimizer == "sinkgd":
             optimizer = sinkgd(lr_schedule, **args.optimizer_kwargs)
         else:
@@ -1611,7 +2100,8 @@ def main():
         p_opt_state = replicate(opt_state, n_devices)
         p_rng = jax.random.split(jax.random.fold_in(jax.random.PRNGKey(args.seed), phase), n_devices)
 
-        start_epoch = 1
+        phase_steps = phase_epochs * len(train_iter)   # user gave epochs -- converted to steps once
+        start_phase_step = 0
         if resume_meta is not None and phase == resume_meta["phase"]:
             # diff_model/p_diff_model already reflect the resumed weights (model was
             # deserialised from checkpoint before the phase loop) -- only optimizer state, RNG,
@@ -1621,71 +2111,110 @@ def main():
             p_rng = eqx.tree_deserialise_leaves(resume_ckpt_dir / "p_rng.eqx", p_rng)
             train_iter.rng.bit_generator.state = json.loads(
                 (resume_ckpt_dir / "dataloader_state.json").read_text())
-            start_epoch = resume_meta["epoch"] + 1
+            start_phase_step = resume_meta["phase_step"]
             logger(f"resumed phase {phase}: optimizer/rng/dataloader state restored, "
-                   f"continuing from epoch {start_epoch}")
+                   f"continuing from phase_step {start_phase_step}")
 
         trained_desc = f"levels0-{phase - 1}" if cfg.curriculum_mode == "no_freeze" else f"level{phase - 1}"
         active_desc = f"phase{phase}[{trained_desc}]"
-        logger(f"=== starting {active_desc} for {phase_epochs} epochs ===")
-        pbar = tqdm(range(start_epoch, phase_epochs + 1), desc=active_desc, dynamic_ncols=True)
+        logger(f"=== starting {active_desc} for {phase_epochs} epochs ({phase_steps} steps) ===")
+
+        steps_per_epoch = len(train_iter)
+        gen_eval_every_steps = args.gen_eval_every * steps_per_epoch
+        ckpt_every_steps = args.ckpt_every * steps_per_epoch
+        wa_every_steps = args.wa_every * steps_per_epoch
+
+        wa_ema = None
+        wa_stack = deque(maxlen=args.wa_stack_size)
+        wa_dir = run_dir / "checkpoints" / "wa"
+
+        pbar = tqdm(total=phase_steps, initial=start_phase_step, desc=active_desc, dynamic_ncols=True, position=0)
         jit_timed = False
-        for epoch in pbar:
-            epoch_losses = []
-            step_pbar = tqdm(train_iter, total=len(train_iter), desc=f"epoch{epoch}", leave=False, dynamic_ncols=True)
-            for flat in step_pbar:
+        phase_step = start_phase_step
+        epoch_num = start_phase_step // steps_per_epoch
+        while phase_step < phase_steps:
+            # one full pass through train_iter = one shuffled epoch (BatchIterator.__iter__
+            # reshuffles via its own persistent rng each call) -- the dataloader still cycles in
+            # full epochs; only the OUTER bookkeeping (pbar/logger/triggers) is step-based.
+            epoch_num += 1
+            logger(f"{active_desc}: epoch {epoch_num} (step {step})")
+            global_pbar.update(step - last_global_step)
+            last_global_step = step
+            for flat in train_iter:
+                if phase_step >= phase_steps:
+                    break
                 flat = jnp.array(flat)
                 if not jit_timed:
                     jit_t0 = time.monotonic()
                 p_diff_model, p_opt_state, p_rng, loss, aux = train_step(p_diff_model, p_opt_state, p_rng, flat)
                 step += 1
+                phase_step += 1
+                pbar.update(1)
                 loss0 = float(loss[0])   # forces device sync -- first call includes jit compile
                 if not jit_timed:
                     logger(f"{active_desc}: first train_step (incl. jit compile) took "
                            f"{time.monotonic() - jit_t0:.1f}s")
                     jit_timed = True
-                epoch_losses.append(loss0)
                 bpb, acc, ntp_bpb, ntp_acc, util, train_mse, grad_norm = [float(a[0]) for a in aux]
                 lr = float(lr_schedule(step - 1))
                 lr_str = _fmt_lr(lr)
-                step_pbar.set_postfix(step=step, loss=f"{loss0:.2f}",
-                                    #    bpb=f"{bpb:.2f}",
-                                       acc=f"{acc:.2f}",
-                                    #    ntp_bpb=f"{ntp_bpb:.2f}",
-                                    #    ntp_acc=f"{ntp_acc:.2f}", 
-                                    #    train_mse=f"{train_mse:.1f}",
-                                       lr=lr_str, gnorm=f"{grad_norm:.2f}")
+                pbar.set_postfix(step=step, loss=f"{loss0:.2f}",
+                                  acc=f"{acc:.2f}",
+                                #   ntp_acc=f"{ntp_acc:.2f}",
+                                  lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
                     logger(f"\n"
-                           f"[p={phase} e={epoch} s={step}] loss={loss0:.2f} dec_acc={acc:.2f} "
+                           f"[p={phase} s={step}] loss={loss0:.2f} dec_acc={acc:.2f} "
                            f"ntp_acc={ntp_acc:.2f} util={util:.2f} train_mse={train_mse:.1f} "
                            f"lr={lr_str} grad_norm={grad_norm:.2f}",
-                           phase=phase, epoch=epoch, step=step, loss=loss0, dec_bpb=bpb,
+                           phase=phase, step=step, loss=loss0, dec_bpb=bpb,
                            dec_acc=acc, ntp_bpb=ntp_bpb, ntp_acc=ntp_acc, util=util,
                            train_mse=train_mse, lr=lr, grad_norm=grad_norm)
 
-            if epoch % args.gen_eval_every == 0:
-                snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
-                run_gen_eval(snapshot, top=phase - 1, tag=f"phase{phase}_epoch{epoch}", include_reconstruct=True)
+                if step % gen_eval_every_steps == 0:
+                    snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
+                    run_val_eval(snapshot, phase, tag=f"phase{phase}_step{step}")
+                    run_gen_eval(snapshot, top=phase - 1, tag=f"phase{phase}_step{step}", include_reconstruct=True)
 
-            if epoch % args.ckpt_every == 0:
-                ckpt_model = eqx.combine(to_host(unreplicate(p_diff_model)), static_model)
-                ckpt_opt_state = to_host(unreplicate(p_opt_state))
-                ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_epoch{epoch}"
-                save_checkpoint(ckpt_dir, ckpt_model, ckpt_opt_state, to_host(p_rng), train_iter,
-                                 phase=phase, epoch=epoch, step=step, seed=args.seed)
-                logger(f"checkpoint saved: {ckpt_dir}")
+                if step % ckpt_every_steps == 0:
+                    ckpt_model = eqx.combine(to_host(unreplicate(p_diff_model)), static_model)
+                    ckpt_opt_state = to_host(unreplicate(p_opt_state))
+                    ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_step{step}"
+                    save_checkpoint(ckpt_dir, ckpt_model, ckpt_opt_state, to_host(p_rng), train_iter,
+                                     phase=phase, phase_step=phase_step, step=step, seed=args.seed)
+                    prune_checkpoints(run_dir, args.ckpt_keep)
+                    logger(f"checkpoint saved: {ckpt_dir}")
+
+                if args.wa_mode != "none" and step % wa_every_steps == 0:
+                    cur_diff_model = to_host(unreplicate(p_diff_model))
+                    wa_dir.mkdir(parents=True, exist_ok=True)
+                    if args.wa_mode == "ema":
+                        wa_ema = cur_diff_model if wa_ema is None else \
+                            ema_update(wa_ema, cur_diff_model, args.wa_ema_decay)
+                        eqx.tree_serialise_leaves(wa_dir / f"ema_phase{phase}_step{step}.eqx", wa_ema)
+                        logger(f"wa (ema) snapshot saved at step {step}")
+                    else:
+                        wa_stack.append(cur_diff_model)
+                        if len(wa_stack) == args.wa_stack_size:
+                            avg = stack_average(list(wa_stack), weights=args.wa_wma_weights)
+                            eqx.tree_serialise_leaves(wa_dir / f"wma_phase{phase}_step{step}.eqx", avg)
+                            logger(f"wa (wma, n={len(wa_stack)}) average saved at step {step}")
 
         diff_model = to_host(unreplicate(p_diff_model))
         model = eqx.combine(diff_model, static_model)
         freeze_msg = "no freeze (no_freeze mode)" if cfg.curriculum_mode == "no_freeze" else f"freezing level {phase - 1}"
         logger(f"=== {active_desc} done, {freeze_msg} ===")
-        ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_epoch{phase_epochs}"
+        ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_step{step}"
         save_checkpoint(ckpt_dir, model, to_host(unreplicate(p_opt_state)), to_host(p_rng), train_iter,
-                         phase=phase, epoch=phase_epochs, step=step, seed=args.seed)
+                         phase=phase, phase_step=phase_steps, step=step, seed=args.seed)
+        prune_checkpoints(run_dir, args.ckpt_keep)
+        run_val_eval(model, phase, tag=f"phase{phase}_final")
         run_gen_eval(model, top=phase - 1, tag=f"phase{phase}_final", include_reconstruct=True)
 
+    global_pbar.update(step - last_global_step)
+    global_pbar.close()
     logger("=== all phases done, running final top-down cascade eval ===")
+    run_val_eval(model, n_levels - 1, tag="final")
     run_gen_eval(model, top=n_levels - 2, tag="final", include_reconstruct=True)
     logger("training done")
 

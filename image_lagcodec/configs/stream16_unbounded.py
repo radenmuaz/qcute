@@ -1,0 +1,90 @@
+"""
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/stream16_unbounded.py
+
+STREAMING preset (chat 2026-09-15, renamed from "pardec_fullctx_16" -- that name was wrong, this
+is NOT fullctx): decoder_ncodes=16 (fixed chunk size, as if new encoder codes keep arriving 16 at
+a time) with ncodes_window=-1 (each new 16-chunk gets unbounded lookback into everything decoded
+so far), uniformly across every level. 16 is level2's (the deepest DECODED level's) own max
+n_blocks, so level2 degenerates to ONE single group there (falls back to the fast original
+sequential decode automatically, see decode_generate_pardec's fallback docstring); levels 0
+(n_blocks=256) and 1 (n_blocks=64) stay genuinely streaming-parallel at chunk=16 with full
+unbounded lookback. True FULLCTX (no streaming, entire sequence known upfront) is a DIFFERENT
+point in the same (decoder_ncodes, ncodes_window) space -- see pardec_fullctx_parallel.py
+(decoder_ncodes=1, ncodes_window=-1, "one seed one token") and the fast-fallback case
+(decoder_ncodes=n_blocks, single group, "one long slow AR"). No new flag needed -- both scenarios
+were always expressible with the existing two params; the earlier confusion was a naming/config
+mistake, not a parameterization gap. See pardec_1_unbounded.py for the decoder_ncodes-vs-n_groups
+table.
+"""
+
+
+# --- model ---
+img_size = 32
+d_model = (256, 256, 256, 256, )
+# n_layers = (2, 2, 2, 2,)
+n_layers = (4, 4, 4, 4,)
+n_heads = (2, 2, 2, 2,)
+n_kv_heads = (None, None, None, None,)
+strides = (4, 4, 4, -1)
+code_vocab = (256, 256, 256, 256,)
+pq_chunks = (3, 3, 3, 3,)
+mlp_mult = 2
+rope_base = 10000.0
+
+ntp_weight = 1.0
+mtp_weight = 0.1
+mse_weight = 1.0
+entropy_weight = 0.01
+
+decoder_ncodes = 16
+ncodes_window = -1   # streaming: fixed 16-code chunks, unbounded lookback into past chunks
+weight_sharing = False
+# weight_sharing = True
+curriculum_mode = "no_freeze"
+quantize_mode = "gumbel"
+gumbel_temperature = 0.1
+gumbel_at_inference = False
+cascade_rollout_prob = 0.5
+quantize_drop = 0.5
+init_scheme = "llama"
+use_xsa = True
+pq_dim = (128, 128, 128, 128)
+# pq_dim = (64, 64, 64, 64,)
+
+byte_group = 3
+token_head_type = "ar"
+token_dim = (128, 128, 128, 128)
+# token_dim = (64, 64, 64, 64,)
+token_n_heads = 2
+mtp_horizon = 1
+# mtp_mode = "ar"
+mtp_mode = "parallel"
+traversal = "zorder"
+
+# --- training ---
+batch_size = 16
+val_batch_size = 16
+epochs_per_phase = (100, 100, 100, )
+warmup_steps = 1000
+grad_clip = 10.0
+seed = 0
+# warmup_steps = 2
+train_subset_n = None
+
+lr = 1e-3
+lr_schedule = "cosine"
+lr_min = 1e-5
+lr_min_epoch = 80
+# lr_min_epoch = 400
+weight_decay = 1e-4
+optimizer = "adamw"
+optimizer_kwargs = {}
+
+wa_mode = "none"
+
+# --- logging ---
+log_every = 100
+gen_eval_every = 100
+ckpt_every = 100
+ckpt_keep = 1
+qual_gen_n = 16

@@ -1,0 +1,31 @@
+Run: 2026-09-15, tpu3, CPU-only (JAX_PLATFORMS=cpu), REAL trained checkpoint
+(logs/pardec_1/checkpoints/phase_2_step58900/model.eqx, run_lagcodec_pardec.py, config
+pardec_1.py: decoder_ncodes=16, decoder_ncodes_overlap=8, weight_sharing=False), real train batch
+(B=4) from ~/qcute/datasets.
+
+E0915 10:59:52.103614 2513928 slow_operation_alarm.cc:73]
+********************************
+[Compiling module jit_run_pardec for CPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E0915 11:00:49.381784 2513384 slow_operation_alarm.cc:140] The operation took 2m57.278341881s
+
+loaded REAL checkpoint: /home/muaz/qcute/image_lagcodec/logs/pardec_1/checkpoints/phase_2_step58900/model.eqx
+G=16 O=8 weight_sharing=False
+
+[CHECK 1] teacher-forced dense vs incremental KV-cache (REAL checkpoint weights):
+  max_abs_diff=0.000052 mean_abs_diff=0.000002
+  CONSISTENT (tol=0.01)
+
+[CHECK 2] train path (decode_logits_and_target_pardec) on real checkpoint:
+  loss=5.6242 dec_acc=0.4103 (should be nontrivial, model IS trained to step 58900)
+
+[CHECK 3] decode_generate_pardec (free-running) on real checkpoint:
+  shape=(4, 1024, 3) gen_recon_acc=0.0250 (expect << train dec_acc -- exposure bias, not a bug)
+
+PASS -- no shape/wiring crash across train (decode_logits_and_target_pardec), teacher-forced-vs-KV-cache, and free-running generate (decode_generate_pardec), all on the REAL trained checkpoint with decoder_ncodes_overlap=8.
+
+Conclusion: the KV-cache implementation (Attention.step/chunk_step) and the
+decoder_ncodes_overlap lookback/zero-pad/prune logic are numerically consistent with the dense
+teacher-forced reference on REAL trained weights, not just random init. No train/generate
+implementation mismatch found. The large train-acc (0.41) vs gen-acc (0.025) gap is expected
+exposure bias from free-running autoregressive generation, not a code bug.

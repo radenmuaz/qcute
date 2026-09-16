@@ -1,0 +1,18 @@
+Run: 2026-09-14, tpu1, CPU-only (JAX_PLATFORMS=cpu), random-init weights (no checkpoint), real
+train batch (B=4) from overfit1k_baseline.py's config/architecture. splash_attention patched to a
+plain jnp causal-softmax fallback for the dense path only (Pallas TPU kernel has no CPU interpret
+mode wired up); KV-cache .step/.chunk_step path already uses plain einsum, unaffected.
+
+n_groups=64 G=4 K=4 valid_len=1024
+dense-vs-kv-cache: max_abs_diff=0.000007 mean_abs_diff=0.000001
+dense-vs-kv-cache: CONSISTENT (all positions within tol=0.001)
+
+Conclusion: teacher-forced dense decode and incremental KV-cache decode are numerically
+consistent given identical ground-truth prefixes (diff is float32 noise). No implementation bug
+in decode_generate's KV-cache path (Attention.step/chunk_step bookkeeping, group/padding
+construction). Full-recompute control variant was not triggered since nothing diverged.
+
+Implication: the observed train-acc-good/gen-acc-bad gap is not caused by a broken generation
+code path -- likely exposure bias / compounding sampling error during autoregressive generation,
+or an issue in the cross-level cascade rollout (cascade_rollout_prob, pseudo_ctx), not this
+per-level decode mechanism.

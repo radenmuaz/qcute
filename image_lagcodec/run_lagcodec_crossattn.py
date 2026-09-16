@@ -80,35 +80,52 @@ pmap-parallel across all local devices.
    so a phase can end mid-epoch with no special-casing. Checkpoint resume tracks phase_step
    (steps completed within the CURRENT phase) instead of epoch for the same reason.
 
-7. PARALLEL DECODE (chat 2026-09-15) -- encode is fast because it's a prefill (parallel over the
-   whole sequence); decode is currently autoregressive group-by-group (decode_generate's outer
-   jax.lax.scan sequentially threads the KV cache ACROSS every decoder_ncodes-sized group, so
-   group N always attends to every earlier group's already-decoded content -- unbounded causal,
-   fully sequential across groups). FIRST CHANGE (implemented this fork): decode_generate_pardec
-   makes every decoder_ncodes-sized group of codes fully INDEPENDENT of every other group -- no
-   cross-group causal dependency at all -- by folding the group axis into the batch axis (B,
-   n_groups, ...) -> (B*n_groups, ...) and giving each group its OWN per_group_len-sized KV cache
-   (instead of one L_total-sized cache shared/accumulated across all groups). All groups then
-   decode in one parallel batched pass instead of a sequential lax.scan over groups. Within a
-   group, decode is still autoregressive over that group's own G*K member positions (unchanged --
-   only the CROSS-group dependency is removed, not the within-group one). Kept as a SEPARATE
-   method (decode_generate_pardec) alongside the original decode_generate (still present,
-   unused by run_gen_eval/main() in this fork). WIRED IN (chat 2026-09-15): every decode_generate
-   call inside run_gen_eval (mid-phase/phase-end/final eval, both the cascade path and the
-   currently-commented-out reconstruct path) now calls decode_generate_pardec instead -- verified
-   correct first (teacher-forced dense reference vs incremental KV-cache, including the
-   decoder_ncodes_overlap lookback/prune logic, see scripts/pardec_consistency_check.py) before
-   wiring in.
+7. CROSS-ATTENTION DECODER PORT (chat 2026-09-15, STUB ONLY -- fork point, no new code yet).
+   Idea: currently EncDecLevel's decoder self-attends over ONE combined per-group sequence
+   [ctx codes, bos, target member embeds] (decode_logits_and_target/decode_generate), re-
+   prepending ctx codes and a fresh bos INTO the self-attn stream every decoder_ncodes-sized
+   group. run_lagcodec_stack.py already implements an alternative for its own (simpler, less
+   general) reference-port architecture: self-attn over the REAL target token stream ONLY (one
+   bos prepended ONCE at position 0, standard shifted NTP) + a SEPARATE shared-weight cross-
+   attention sublayer per layer (Level1Layer: self_attn_and_save -> cross_attn_own_code -> mlp,
+   wq/wk/wv/out SHARED between the self and cross calls) attending to that level's own code
+   sequence, masked by a lag-shifted LagCrossMask (splash_cross_attention, eqx_common.py).
 
-   TODO (not implemented) -- WINDOWING between groups: decoder_ncodes stays the finest granularity
-   (fully independent/parallel, as above), but a GROUP OF groups (e.g. 2 consecutive
-   decoder_ncodes-chunks) could instead be made dependent -- the second sub-chunk waits for the
-   first sub-chunk in its window to finish decoding before proceeding, trading some parallelism
-   for more context. Open question, not resolved: given e.g. a window of 2 decoder_ncodes-chunks,
-   should CONSECUTIVE windows be disjoint or overlap (and by how much) so a window's decode can
-   see recently-decoded content from the previous window? Left open.
+   Audit -- how invasive to port that idea into THIS file, end-to-end train-to-generate (asked
+   2026-09-15, not yet started):
+   - Not a small patch -- decode_logits_and_target/decode/decode_generate/
+     decode_generate_mtp_no_verify (~150-250 lines) get REPLACED, not extended. decoder_ncodes
+     currently exists only to chunk the ctx-prepend scheme for KV-cache prefill efficiency; under
+     cross-attn it's no longer needed for that purpose.
+   - New sublayer needed: eqx_common.py's Block/Attention have no cross-attn variant today. A
+     Level1Layer-style shared-wq/wk/wv self+cross block would need adding (mechanically portable
+     from run_lagcodec_stack.py, already working there).
+   - New incremental-generation algorithm: current KV-cache is ONE unified self-attn cache over
+     the combined ctx+bos+target sequence. Cross-attn splits this into a self-attn KV cache over
+     target tokens only, PLUS a small cross-attn recomputed fresh every step (code_kv is cheap,
+     no cache needed per stack.py's own cross_attn_own_code_single) -- a different incremental
+     design, not a drop-in swap.
+   - h_t extraction changes for EVERY token_head_type (linears/ar/diffusion) and every true-MTP
+     mode -- all currently key off group-boundary positions from the prepend scheme; position
+     semantics change under cross-attn and each consumer needs re-deriving/re-verifying.
+   - LagCrossMask generalization: run_lagcodec_stack.py's mask is built for its own raster/byte-
+     lag scheduling. This file has since generalized to Z-order traversal + arbitrary byte_group/
+     pq_chunks -- the lag-mask math needs re-deriving for that generalization, not copy-paste.
+   - Orthogonal/low-risk, should port through untouched: curriculum phases, cascade rollout,
+     quantize_drop, WA/EMA, remat -- none touch decode's internal sequence layout.
+   - Rough estimate: full-day-plus effort, risk concentrated in the incremental-generation
+     rewrite and the multi-token-head-type h_t re-derivation, not the cross-attn mechanism itself
+     (already proven working in run_lagcodec_stack.py).
 
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/<name>.py
+   TODO (not started): make the decoder side a genuine enc-dec seq2seq, with the ENCODER made
+   CAUSAL-STREAMING (not full-bidirectional) -- so it reaches feature parity with the CURRENT
+   decoder-only self-attention decoder (which is causal/streaming-compatible end-to-end, matching
+   autoregressive generation exactly step-by-step). A non-causal/bidirectional encoder side would
+   NOT have that property (encoder would need the full sequence upfront, breaking incremental
+   single-token generation) -- causal-streaming encoder is the requirement for this to be a
+   like-for-like replacement rather than a regression in generation capability.
+
+uv run python3 -m image_lagcodec.run_lagcodec_crossattn --config image_lagcodec/configs/<name>.py
 """
 from __future__ import annotations
 
@@ -120,7 +137,6 @@ import shutil
 import sys
 import tarfile
 import time
-import warnings
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -133,15 +149,12 @@ import optax
 from tqdm import tqdm
 
 from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, apply_rope, apply_xsa, init_matrix,
-                                        init_vector, make_lr_schedule, rmsnorm, rope_cos_sin,
-                                        rope_cos_sin_pos, rotate_half, sinkgd, warmup_const_schedule)
+                                        init_vector, make_lr_schedule, rmsnorm, rope_cos_sin, sinkgd,
+                                        warmup_const_schedule)
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
-# chat 2026-09-15: was a hardcoded 32*32*3 (CIFAR-only) module constant -- now a function of
-# cfg.img_size so non-CIFAR datasets (e.g. imagenet64, img_size=64) compute the right byte count.
-def total_bytes_of(cfg) -> int:
-    return cfg.img_size * cfg.img_size * 3
+TOTAL_BYTES = 32 * 32 * 3   # raw byte count per image, fixed regardless of byte_group/traversal
 
 
 # ---------------------------------------------------------------------------
@@ -167,40 +180,6 @@ class Config:
     decoder_ncodes: tuple = 1   # chat 2026-09-13 -- renamed from lag=0 (an offset) to a direct
     # count of codes the decoder conditions on (1 = current position only, no lookback), avoiding
     # the G=lag+1 off-by-one. Per-level, bare-scalar default.
-    ncodes_window: tuple = 0   # chat 2026-09-15 -- v2 of the old decoder_ncodes_overlap (renamed;
-    # old scheme kept, unchanged, in run_lagcodec_pardec_v1.py). Units are WHOLE PREVIOUS GROUPS,
-    # not ctx blocks: 0 = disjoint (current default, independent non-overlapping groups). N>=1 =
-    # a group may also attend to N neighboring groups' CTX CODES as extra read-only context (never
-    # their already-decoded TARGET values -- unlike v1, there is no target lookback/redecode/prune
-    # at all: every group's decode span is always exactly its own G*K positions, so no compute is
-    # ever thrown away). -1 = ALL -- a group attends to every OTHER group's ctx (naive
-    # implementation: pad/mask to the full n_groups*G width for every group, inferred from n_blocks
-    # at trace time). WHICH other groups (only earlier ones vs every one) and whether padding/
-    # masking is needed at all is controlled by the separate `streaming` axis below -- see its
-    # docstring for the truth table. Every group also gets TRUE GLOBAL RoPE positions now (v1
-    # restarted every group's positions at 0, unaware of true position -- see decode_generate_
-    # pardec's docstring). Per-level, bare-scalar default 0. Valid values: -1 (all), or any int >=
-    # 0 (no upper bound tied to decoder_ncodes anymore, since this counts groups, not blocks).
-    streaming: tuple = True   # chat 2026-09-15 -- orthogonal axis to ncodes_window, replacing the
-    # old ncodes_window=-2 sentinel ("janky", per user). True (default, current/existing behavior)
-    # = CAUSAL growing-prefix: group g may only see groups <g (or the N immediately-preceding ones,
-    # under bounded ncodes_window), matching a real streaming-decode scenario where later groups'
-    # codes genuinely don't exist yet. Early groups short on real history get a zero-padded prefix,
-    # explicitly masked out of attention. False = NON-causal: nothing is "streaming in" -- the
-    # entire ctx sequence is already known upfront, so a group may see neighboring groups on EITHER
-    # side. streaming=False + ncodes_window=-1 = TRUE FULLCTX (the old -2): every group sees the
-    # SAME full real ctx directly, no padding, no masking, cheapest possible. streaming=False +
-    # bounded ncodes_window (symmetric/bidirectional local window, e.g. sees N groups before AND
-    # after) is a currently-UNIMPLEMENTED combo -- raises NotImplementedError (no config needs it
-    # yet; the masking machinery only supports a one-sided min_valid_pos threshold today). Per-
-    # level, bare-scalar default True.
-    #
-    # Truth table (ncodes_window x streaming):
-    #   window=0,  streaming=True/False  -> disjoint groups, streaming is moot (no lookback either way)
-    #   window=N>0, streaming=True        -> causal bounded: sees N previous groups (existing, tested)
-    #   window=N>0, streaming=False       -> symmetric bounded window -- NOT IMPLEMENTED
-    #   window=-1, streaming=True         -> causal unbounded/streaming (existing, tested)
-    #   window=-1, streaming=False        -> true fullctx (existing, tested; was ncodes_window=-2)
     weight_sharing: tuple = True   # chat 2026-09-12 -- now PER-LEVEL, bare-scalar default
     precision: str = "bf16"           # stays global -- whole-model compute dtype
     curriculum_mode: str = "freeze"   # stays global -- training-loop control
@@ -222,20 +201,6 @@ class Config:
     # with True.
     use_qknorm: bool = True   # chat 2026-09-13 -- per-head RMSNorm on q/k before RoPE+scores.
     # Stays global; disable with False.
-
-    attn_window: tuple = -1   # chat 2026-09-15 -- ENCODER-side (self.blocks, level.encode()) self-
-    # attention window, per-level tuple, bare-scalar default. -1 = unbounded ("flash", the current
-    # splash_attention CausalMask behavior, unchanged). int>0 = causal sliding window of that many
-    # positions back, via splash_attention's native LocalMask (genuinely block-sparse -- real O(T*
-    # window) savings, not a dense-then-masked matmul). For scaling to large images (e.g. 256x256
-    # -> level0's own self-attention sequence is 65536 positions, vs 1024 at 32x32) where O(T^2)
-    # unbounded attention becomes prohibitive. Decoder blocks (dec_blocks) are NOT affected -- this
-    # only threads into the encoder's own block stack.
-    use_attn_sink: bool = False   # chat 2026-09-15 -- learned per-head attention-sink logit
-    # (splash_attention's native `sinks` kernel arg -- a softmax bias, NOT an extra K/V token),
-    # ENCODER-side only (same scope as attn_window), stays global like use_xsa/use_qknorm. Useful
-    # alongside attn_window so a sliding-window layer always has somewhere to route excess
-    # attention mass (gpt-oss/StreamingLLM attention-sink literature). Default off.
 
     remat: bool = False   # chat 2026-09-14 -- gradient rematerialization (jax.checkpoint) applied
     # per-block, every level's encoder AND decoder block stack -- trades recompute for activation
@@ -310,8 +275,6 @@ class Config:
         bcast("mlp_mult", int)
         bcast("rope_base", (int, float))
         bcast("decoder_ncodes", int)
-        bcast("ncodes_window", int)
-        bcast("streaming", bool)
         bcast("weight_sharing", bool)
         bcast("gumbel_temperature", (int, float))
         bcast("token_head_type", str)
@@ -319,7 +282,6 @@ class Config:
         bcast("token_n_heads", int)
         bcast("mtp_horizon", int)
         bcast("mtp_mode", str)
-        bcast("attn_window", int)
         if self.pq_dim is None:
             self.pq_dim = self.d_model
         else:
@@ -328,61 +290,6 @@ class Config:
         assert len(self.d_model) == n and len(self.n_layers) == n and len(self.n_heads) == n \
             and len(self.n_kv_heads) == n and len(self.code_vocab) == n and len(self.pq_chunks) == n
         assert len(self.mlp_mult) == n and len(self.rope_base) == n and len(self.decoder_ncodes) == n
-        assert len(self.ncodes_window) == n and len(self.streaming) == n
-        for i in range(n):
-            assert self.ncodes_window[i] >= -1, \
-                f"level {i}: ncodes_window={self.ncodes_window[i]} must be -1 (all) or >=0 " \
-                f"(disjoint at 0, bounded lookback above)"
-            if not self.streaming[i] and self.ncodes_window[i] > 0:
-                raise NotImplementedError(
-                    f"level {i}: streaming=False with bounded ncodes_window={self.ncodes_window[i]} "
-                    f"(symmetric/bidirectional local window) is not implemented -- only ncodes_window="
-                    f"-1 (true fullctx) or 0 (disjoint, streaming moot) are supported under streaming=False")
-        assert len(self.attn_window) == n
-        for i in range(n):
-            assert self.attn_window[i] == -1 or self.attn_window[i] >= 1, \
-                f"level {i}: attn_window={self.attn_window[i]} must be -1 (unbounded/flash) or >=1 (splash LocalMask)"
-
-        # chat 2026-09-15 -- (decoder_ncodes, ncodes_window) recommend/assert guards. Fusion note:
-        # G=n_blocks (one single group) is mathematically IDENTICAL to the original non-pardec
-        # decode (verified: same RoPE position formula, same causal dependency, ncodes_window
-        # moot with nothing to look back at) -- decode_generate_pardec/decode_logits_and_target_
-        # pardec detect this and fall back to the fast original implementation automatically (no
-        # padding/masking overhead for that regime). These guards steer AWAY from configurations
-        # that are valid but wasteful or redundant, not just outright invalid ones.
-        code_count = total_bytes_of(self) // self.byte_group
-        for i in range(n):
-            K_i = self.strides[i] if self.strides[i] != -1 else 1
-            code_count = code_count // K_i
-            if i == n - 1:
-                break   # top level has no decoder
-            n_blocks_i, G_i, N_i, S_i = code_count, self.decoder_ncodes[i], self.ncodes_window[i], self.streaming[i]
-            assert G_i >= 1, f"level {i}: decoder_ncodes={G_i} must be >=1"
-            if G_i > n_blocks_i:
-                warnings.warn(
-                    f"level {i}: decoder_ncodes={G_i} exceeds n_blocks={n_blocks_i} (this level's "
-                    f"own code count) -- clamps to one single group, same as decoder_ncodes="
-                    f"{n_blocks_i} (the fully-sequential 'original' degenerate case); recommend "
-                    f"setting decoder_ncodes={n_blocks_i} explicitly for clarity")
-            n_groups_i = -(-n_blocks_i // G_i)   # ceil div, matches the runtime pad_blocks logic
-            if G_i >= n_blocks_i and N_i not in (0, -1):
-                warnings.warn(
-                    f"level {i}: decoder_ncodes={G_i}>=n_blocks={n_blocks_i} (single group, falls "
-                    f"back to the fast original decode) -- ncodes_window={N_i} has NO EFFECT here; "
-                    f"recommend setting it to 0 for clarity (it's ignored either way)")
-            elif N_i != -1 and N_i >= n_groups_i:
-                warnings.warn(
-                    f"level {i}: ncodes_window={N_i} >= n_groups={n_groups_i} -- every group "
-                    f"already sees ALL earlier groups at this setting; recommend -1 (unbounded) "
-                    f"instead for the same effect with clearer intent")
-            elif N_i == -1 and S_i and G_i < max(1, n_blocks_i // 8):
-                warnings.warn(
-                    f"level {i}: ncodes_window=-1 streaming=True (causal unbounded) with a small "
-                    f"decoder_ncodes={G_i} relative to n_blocks={n_blocks_i} (n_groups={n_groups_i}) "
-                    f"-- the naive causal window pads EVERY group to the FULL n_blocks width, so "
-                    f"compute/memory scales as O(n_groups*n_blocks); recommend a larger "
-                    f"decoder_ncodes or a bounded ncodes_window instead")
-
         assert len(self.weight_sharing) == n and len(self.gumbel_temperature) == n
         assert len(self.token_head_type) == n
         assert len(self.pq_dim) == n
@@ -412,11 +319,11 @@ class Config:
                     f"{self.decoder_ncodes[i]}*{stride_i}={max_horizon} -- can't predict further " \
                     "ahead than one decode block's own group of target codes"
         assert self.byte_group in (1, 3), "byte_group must be 1 (per-byte) or 3 (per-pixel RGB)"
-        assert total_bytes_of(self) % self.byte_group == 0
+        assert TOTAL_BYTES % self.byte_group == 0
         assert self.traversal in ("raster", "zorder")
         assert self.strides[-1] == -1, "top level's stride is unused -- use -1 as the don't-care convention"
         assert all(s >= 1 for s in self.strides[:-1])
-        n_positions = total_bytes_of(self) // self.byte_group
+        n_positions = TOTAL_BYTES // self.byte_group
         assert n_positions % math.prod(self.strides[:-1]) == 0
         assert self.precision in ("bf16", "fp32")
         assert self.curriculum_mode in ("freeze", "no_freeze")
@@ -436,7 +343,7 @@ class Config:
 
 
 def n_positions_of(cfg: Config) -> int:
-    return total_bytes_of(cfg) // cfg.byte_group
+    return TOTAL_BYTES // cfg.byte_group
 
 
 # ---------------------------------------------------------------------------
@@ -504,26 +411,6 @@ def load_cifar10(data_root: Path) -> tuple:
     train_labels = np.concatenate([b[1] for b in train_batches], axis=0)
     test, test_labels = load_batch("test_batch")
     return (train, train_labels), (test, test_labels)
-
-
-def load_imagenet64(data_root: Path, resolution: int = 64) -> tuple:
-    """chat 2026-09-15 -- loads shards produced by image_gen_jax_1/scripts/download_imagenet64.py
-    (np.lib.format memmap .npy files, flat raster-order uint8 RGB bytes,
-    imagenet64_{split}_{shard:05d}.npy naming). Does NOT download -- that script must be run
-    first (see its own docstring); this only reads whatever shards already exist under data_root.
-    No real labels in this shard format -- returns zero placeholders (matching load_cifar10's
-    (images, labels) shape convention; labels are unused downstream, see BatchIterator)."""
-    def load_split(split: str) -> np.ndarray:
-        shards = sorted(data_root.glob(f"imagenet64_{split}_*.npy"))
-        assert shards, f"no imagenet64_{split}_*.npy shards found under {data_root} -- run " \
-            f"image_gen_jax_1/scripts/download_imagenet64.py --split {split} --out_dir {data_root} first"
-        parts = [np.load(s, mmap_mode="r") for s in shards]
-        flat = np.concatenate(parts, axis=0)   # (N, resolution*resolution*3)
-        return flat.reshape(-1, resolution, resolution, 3)
-
-    train = load_split("train")
-    val = load_split("validation")
-    return (train, np.zeros(len(train), dtype=np.int32)), (val, np.zeros(len(val), dtype=np.int32))
 
 
 def images_to_positions(images: np.ndarray, cfg: Config, pixel_order: np.ndarray) -> np.ndarray:
@@ -733,162 +620,6 @@ def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False) 
     return y @ attn.out
 
 
-# ---------------------------------------------------------------------------
-# ncodes_window primitives (chat 2026-09-15) -- decouple the PHYSICAL cache/buffer position
-# (still a plain scalar, same dynamic_update_slice convention as Attention.step/chunk_step in
-# eqx_common.py -- can't vary per batch row) from the SEMANTIC RoPE position (now per-ROW, so
-# independent parallel groups can carry their TRUE global position instead of v1's "every group
-# restarts at 0"). Also adds a per-row min_valid_pos mask (hides the zero-padded lookback prefix
-# from attention outright, instead of v1's "hope the network ignores zero vectors" fiction).
-# Written as free functions here (not added to eqx_common.py's Attention/Block) to keep this
-# fork's blast radius contained -- mirrors dense_self_attention's existing
-# reimplement-the-math-standalone pattern above.
-# ---------------------------------------------------------------------------
-
-def pardec_step(attn: Attention, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray,
-                 cache_pos, rope_pos: jnp.ndarray, min_valid_pos: jnp.ndarray, T_max: int) -> tuple:
-    """Single-step KV-cached form, like Attention.step, but rope_pos (Bc,) is the per-row TRUE
-    semantic position (independent of cache_pos, the shared scalar physical write offset), and
-    min_valid_pos (Bc,) masks out physical cache slots below it (per-row fake/padding prefix)."""
-    Bc, D = x_new.shape
-    hd = D // attn.n_heads
-    qkv = x_new @ attn.qkv
-    q, k, v = jnp.split(qkv, [D, D + attn.n_kv_heads * hd], axis=-1)
-    q, k, v = q.reshape(Bc, attn.n_heads, hd), k.reshape(Bc, attn.n_kv_heads, hd), v.reshape(Bc, attn.n_kv_heads, hd)
-    if attn.use_qknorm:
-        q, k = rmsnorm(q, attn.q_norm), rmsnorm(k, attn.k_norm)
-    cos, sin = rope_cos_sin_pos(rope_pos, hd, attn.rope_base)   # rope_pos (Bc,) -> cos/sin (Bc,hd)
-    q = (q * cos[:, None, :] + rotate_half(q) * sin[:, None, :]).astype(q.dtype)
-    k = (k * cos[:, None, :] + rotate_half(k) * sin[:, None, :]).astype(k.dtype)
-    cache_k = jax.lax.dynamic_update_slice(cache_k, k[:, :, None, :].astype(cache_k.dtype), (0, 0, cache_pos, 0))
-    cache_v = jax.lax.dynamic_update_slice(cache_v, v[:, :, None, :].astype(cache_v.dtype), (0, 0, cache_pos, 0))
-    n_rep = attn.n_heads // attn.n_kv_heads
-    k_full = jnp.repeat(cache_k, n_rep, axis=1) if n_rep > 1 else cache_k
-    v_full = jnp.repeat(cache_v, n_rep, axis=1) if n_rep > 1 else cache_v
-    scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
-    logits = jnp.einsum("bhd,bhtd->bht", q, k_full) * scale
-    idx = jnp.arange(T_max)
-    valid = (idx[None, None, :] <= cache_pos) & (idx[None, None, :] >= min_valid_pos[:, None, None])
-    logits = jnp.where(valid, logits, -1e9)
-    attn_w = jax.nn.softmax(logits, axis=-1)
-    y = jnp.einsum("bht,bhtd->bhd", attn_w, v_full)
-    if attn.use_xsa:
-        v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
-        y = apply_xsa(y, v_self)
-    y = y.reshape(Bc, D)
-    return y @ attn.out, cache_k, cache_v
-
-
-def pardec_chunk_step(attn: Attention, x_chunk: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray,
-                       cache_pos_start, rope_pos_ids: jnp.ndarray, min_valid_pos: jnp.ndarray,
-                       T_max: int) -> tuple:
-    """Parallel-prefill form, like Attention.chunk_step, but rope_pos_ids (Bc,T) gives each token
-    its own TRUE semantic position (per row), decoupled from cache_pos_start (still a shared
-    scalar physical write offset); min_valid_pos (Bc,) masks the fake/padding prefix per row."""
-    Bc, T, D = x_chunk.shape
-    hd = D // attn.n_heads
-    qkv = x_chunk @ attn.qkv
-    q, k, v = jnp.split(qkv, [D, D + attn.n_kv_heads * hd], axis=-1)
-    q = q.reshape(Bc, T, attn.n_heads, hd).transpose(0, 2, 1, 3)
-    k = k.reshape(Bc, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
-    v = v.reshape(Bc, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
-    if attn.use_qknorm:
-        q, k = rmsnorm(q, attn.q_norm), rmsnorm(k, attn.k_norm)
-    cos, sin = rope_cos_sin_pos(rope_pos_ids, hd, attn.rope_base)   # (Bc,T) -> (Bc,T,hd)
-    cos_b, sin_b = cos[:, None, :, :], sin[:, None, :, :]   # broadcast over heads
-    q = (q * cos_b + rotate_half(q) * sin_b).astype(q.dtype)
-    k = (k * cos_b + rotate_half(k) * sin_b).astype(k.dtype)
-    cache_k = jax.lax.dynamic_update_slice(cache_k, k.astype(cache_k.dtype), (0, 0, cache_pos_start, 0))
-    cache_v = jax.lax.dynamic_update_slice(cache_v, v.astype(cache_v.dtype), (0, 0, cache_pos_start, 0))
-    n_rep = attn.n_heads // attn.n_kv_heads
-    k_full = jnp.repeat(cache_k, n_rep, axis=1) if n_rep > 1 else cache_k
-    v_full = jnp.repeat(cache_v, n_rep, axis=1) if n_rep > 1 else cache_v
-    scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
-    logits = jnp.einsum("bhtd,bhsd->bhts", q, k_full) * scale
-    pos_ids_abs = cache_pos_start + jnp.arange(T)   # physical query positions (shared across rows)
-    idx = jnp.arange(T_max)
-    causal = idx[None, :] <= pos_ids_abs[:, None]              # (T,T_max)
-    validmin = idx[None, None, :] >= min_valid_pos[:, None, None]   # (Bc,1,T_max)
-    valid = causal[None] & validmin   # (1,T,T_max) & (Bc,1,T_max) -> (Bc,T,T_max)
-    logits = jnp.where(valid[:, None], logits, -1e9)   # add head axis -> (Bc,1,T,T_max)
-    attn_w = jax.nn.softmax(logits, axis=-1)
-    y = jnp.einsum("bhts,bhsd->bhtd", attn_w, v_full)
-    if attn.use_xsa:
-        v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
-        y = apply_xsa(y, v_self)
-    y = y.transpose(0, 2, 1, 3).reshape(Bc, T, D)
-    return y @ attn.out, cache_k, cache_v
-
-
-def pardec_block_step(blk: Block, x_new, cache_k, cache_v, cache_pos, rope_pos, min_valid_pos, T_max):
-    attn_out, ck, cv = pardec_step(blk.attn, blk.norm1(x_new), cache_k, cache_v, cache_pos,
-                                    rope_pos, min_valid_pos, T_max)
-    x = x_new + attn_out
-    x = x + blk.mlp(blk.norm2(x))
-    return x, ck, cv
-
-
-def pardec_block_chunk_step(blk: Block, x_chunk, cache_k, cache_v, cache_pos_start, rope_pos_ids,
-                             min_valid_pos, T_max):
-    attn_out, ck, cv = pardec_chunk_step(blk.attn, blk.norm1(x_chunk), cache_k, cache_v,
-                                          cache_pos_start, rope_pos_ids, min_valid_pos, T_max)
-    x = x_chunk + attn_out
-    x = x + blk.mlp(blk.norm2(x))
-    return x, ck, cv
-
-
-def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: jnp.ndarray,
-                                 min_valid_pos: jnp.ndarray) -> jnp.ndarray:
-    """Dense (training-path) counterpart to pardec_chunk_step: x (Bc,T,D) is ONE group's full
-    window (ctx lookback + bos + own target), rope_pos_ids (Bc,T) gives true global positions per
-    row, min_valid_pos (Bc,) masks each row's fake/padding prefix (causal + validity combined)."""
-    Bc, T, D = x.shape
-    hd = D // attn.n_heads
-    qkv = x @ attn.qkv
-    q, k, v = jnp.split(qkv, [D, D + attn.n_kv_heads * hd], axis=-1)
-    q = q.reshape(Bc, T, attn.n_heads, hd).transpose(0, 2, 1, 3)
-    k = k.reshape(Bc, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
-    v = v.reshape(Bc, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
-    if attn.use_qknorm:
-        q, k = rmsnorm(q, attn.q_norm), rmsnorm(k, attn.k_norm)
-    cos, sin = rope_cos_sin_pos(rope_pos_ids, hd, attn.rope_base)   # (Bc,T,hd)
-    cos_b, sin_b = cos[:, None], sin[:, None]
-    q = (q * cos_b + rotate_half(q) * sin_b).astype(q.dtype)
-    k = (k * cos_b + rotate_half(k) * sin_b).astype(k.dtype)
-    rep = attn.n_heads // attn.n_kv_heads
-    if rep > 1:
-        k, v = jnp.repeat(k, rep, axis=1), jnp.repeat(v, rep, axis=1)
-    scale = 1.0 / math.sqrt(hd)
-    scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale
-    idx = jnp.arange(T)
-    causal = idx[None, :] <= idx[:, None]                 # (T,T)
-    validmin = idx[None, :] >= min_valid_pos[:, None]      # (Bc,T)
-    mask = causal[None] & validmin[:, None, :]   # (1,T,T) & (Bc,1,T) -> (Bc,T,T)
-    # -1e9 (finite), NOT -jnp.inf: a fake QUERY position can end up with ZERO valid keys (its own
-    # causal<=self range never overlaps the real/non-fake key range) -- softmax(-inf,...,-inf) is
-    # 0/0=NaN, which then leaks into REAL positions in later layers via 0(weight)*NaN(value)=NaN
-    # in the weighted sum, even though that weight is mathematically exactly 0 (confirmed
-    # 2026-09-15: mean_abs_diff was NaN while max_abs_diff stayed small -- NaN doesn't always win
-    # a max-reduction comparison, so max() alone silently missed this). -1e9 keeps a fully-masked
-    # row's softmax well-defined (uniform, finite, meaningless but harmless) instead.
-    scores = jnp.where(mask[:, None], scores, -1e9)   # add head axis
-    weights = jax.nn.softmax(scores, axis=-1)
-    y = jnp.einsum("bhts,bhsd->bhtd", weights, v)
-    if attn.use_xsa:
-        y = apply_xsa(y, v)
-    y = y.transpose(0, 2, 1, 3).reshape(Bc, T, D)
-    return y @ attn.out
-
-
-def run_block_pardec(blk: Block, x: jnp.ndarray, rope_pos_ids: jnp.ndarray, min_valid_pos: jnp.ndarray,
-                      remat: bool) -> jnp.ndarray:
-    def f(x):
-        x = x + dense_self_attention_pardec(blk.attn, blk.norm1(x), rope_pos_ids, min_valid_pos)
-        x = x + blk.mlp(blk.norm2(x))
-        return x
-    return jax.checkpoint(f)(x) if remat else f(x)
-
-
 def token_ar_teacher_forced(in_proj, member_embed, norm1, attn, ln_f, out_head, dim, in_code_vocab,
                              h: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
     """Free-function form of the token-ar chain (chat 2026-09-12, refactored out of EncDecLevel
@@ -998,8 +729,6 @@ class EncDecLevel(eqx.Module):
     mtp_weight: float = eqx.field(static=True)
     remat: bool = eqx.field(static=True)
     pq_dim: int = eqx.field(static=True)
-    ncodes_window: int = eqx.field(static=True)
-    streaming: bool = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config, level: int, has_decoder: bool, weight_sharing: bool):
         D = cfg.d_model[level]
@@ -1008,8 +737,6 @@ class EncDecLevel(eqx.Module):
         self.quantize_mode = cfg.quantize_mode
         self.quantize_drop = cfg.quantize_drop
         self.remat = cfg.remat
-        self.ncodes_window = cfg.ncodes_window[level]
-        self.streaming = cfg.streaming[level]
         self.gumbel_temperature = cfg.gumbel_temperature[level]
         is_byte_level = (level == 0)
         self.pq_chunks, self.code_vocab = cfg.pq_chunks[level], cfg.code_vocab[level]
@@ -1035,10 +762,8 @@ class EncDecLevel(eqx.Module):
         self.own_input_proj = init_matrix(keys[20], (self.in_pq_chunks * self.pq_dim, D), scheme)
         n_layers = cfg.n_layers[level]
         block_keys = jax.random.split(keys[1], n_layers)
-        enc_window = None if cfg.attn_window[level] == -1 else cfg.attn_window[level]
         self.blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
-                             n_layers=n_layers, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
-                             window=enc_window, use_sink=cfg.use_attn_sink) for k in block_keys]
+                             n_layers=n_layers, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm) for k in block_keys]
         self.ln_f = RMSNorm(D)
         self.code_head = init_matrix(keys[2], (D, self.pq_chunks * self.code_vocab), scheme)
         self.ntp_head = init_matrix(keys[3], (D, ntp_out), scheme)
@@ -1351,113 +1076,6 @@ class EncDecLevel(eqx.Module):
         mtp_loss = self._mtp_loss(h_t, target)
         return logits, target, mask, mtp_loss
 
-    def decode_logits_and_target_pardec(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
-                                         decoder_ncodes: int, rng=None) -> tuple:
-        """chat 2026-09-15 (v2, ncodes_window) -- TRAINING-side counterpart to decode_generate_
-        pardec. Every group is still fully INDEPENDENT (folded into the batch axis, own cache) --
-        but unlike v1 (run_lagcodec_pardec_v1.py), a group's TARGET decode span is ALWAYS just its
-        own G*K positions (no lookback/redecode/prune -- nothing is ever thrown away). What
-        self.ncodes_window controls is how many PREVIOUS groups' CTX CODES a group may additionally
-        attend to as pure read-only context (never their already-decoded target values). Every
-        token also gets its TRUE GLOBAL RoPE position (v1 restarted every group at position 0);
-        the zero-padded lookback prefix (for early groups that don't have ncodes_window real
-        previous groups yet) is excluded from attention via an explicit per-row mask, not v1's
-        "hope the network ignores zero vectors" reliance.
-
-        FALLBACK (chat 2026-09-15): decoder_ncodes>=n_blocks (one single group) is mathematically
-        IDENTICAL to the original non-pardec decode_logits_and_target (verified: same RoPE
-        position formula, same causal dependency, ncodes_window moot with nothing to look back
-        at) -- falls back to it directly rather than paying pardec's windowing/masking machinery
-        for zero benefit.
-
-        self.streaming (chat 2026-09-15, replacing the old ncodes_window=-2 sentinel): orthogonal
-        axis controlling whether the lookback is CAUSAL (True, default -- group g only sees groups
-        <g, needs a zero-padded fake prefix for early groups) or NON-causal (False -- nothing is
-        streaming in, the entire ctx sequence is already known upfront). streaming=False with
-        ncodes_window=-1 is TRUE FULLCTX: every group sees the SAME full real ctx directly -- no
-        causal restriction on the ctx axis, no padding, no masking needed at all. Cheaper than
-        streaming=True's -1 for small decoder_ncodes, not just differently-scoped: streaming causal
-        -1 at decoder_ncodes=1 pads group 0 to (n_groups-1)*G fake blocks for just 1 real one
-        (confirmed OOM'ing at batch_size=16 on a v4-8); non-streaming fullctx has zero padding
-        overhead regardless of decoder_ncodes. streaming=False with bounded ncodes_window
-        (symmetric window) is not implemented -- see Config.streaming's docstring."""
-        n_blocks_check = ctx_code_soft.shape[1]
-        if decoder_ncodes >= n_blocks_check:
-            return self.decode_logits_and_target(target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
-        blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
-        B = target_seq.shape[0]
-        D = self.bos_embed.shape[-1]
-        G = decoder_ncodes
-        n_blocks = ctx_code_soft.shape[1]
-        pad_blocks = (-n_blocks) % G
-        n_blocks_p = n_blocks + pad_blocks
-        n_groups = n_blocks_p // G
-        fullctx = (not self.streaming) and (self.ncodes_window == -1)
-        N = self.ncodes_window if self.ncodes_window >= 0 else (n_groups - 1)   # naive unbounded (-1 only)
-        Wg = n_blocks_p if fullctx else (N + 1) * G   # ctx window width in blocks
-        per_group_len = Wg + 1 + G * self.K
-
-        ctx_tok = code_embed_proj(ctx_code_soft, self.ctx_embed, self.ctx_proj)
-        target_p = target_seq
-        if pad_blocks > 0:
-            ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
-            target_p = jnp.pad(target_p, ((0, 0), (0, pad_blocks * self.K), (0, 0)))
-        if not fullctx and N > 0:
-            ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * G, 0), (0, 0)))   # front zero-pad, ctx ONLY
-
-        B2 = B * n_groups
-        if fullctx:
-            # every group sees the IDENTICAL full ctx_tok -- no per-group slicing/padding at all.
-            ctx_flat = jnp.broadcast_to(ctx_tok[:, None, :, :], (B, n_groups, Wg, D)).reshape(B2, Wg, D)
-            min_valid_pos = jnp.zeros((B2,), dtype=jnp.int32)   # nothing fake -- always fully valid
-            rope_ctx_g = jnp.broadcast_to(jnp.arange(Wg)[None, :], (n_groups, Wg))
-        else:
-            # unrolled-Python-loop windowing (n_groups is a static int, known at trace time).
-            ctx_windows = jnp.stack([ctx_tok[:, g * G:g * G + Wg, :] for g in range(n_groups)], axis=1)
-            ctx_flat = ctx_windows.reshape(B2, Wg, D)
-            # fake/padding prefix length per group (local window index) -- only the first
-            # max(0,N-g) REAL groups are missing for group g, so that many *G blocks are fake.
-            fake_counts = jnp.array([max(0, N - g) * G for g in range(n_groups)])
-            min_valid_pos = jnp.broadcast_to(fake_counts[None, :], (B, n_groups)).reshape(B2)
-            rope_ctx_g = jnp.stack([jnp.clip(jnp.arange(Wg) - N * G + g * G, 0, None) for g in range(n_groups)], axis=0)
-
-        target_windows = jnp.stack(
-            [target_p[:, g * G * self.K:(g + 1) * G * self.K] for g in range(n_groups)], axis=1)
-        target_flat = target_windows.reshape(B2, G * self.K, *target_seq.shape[2:])
-        te_flat = self._dec_embed_target(target_flat)
-        bos = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
-        xe = jnp.concatenate([ctx_flat, bos, te_flat], axis=1)   # (B2, per_group_len, D)
-
-        # true global RoPE positions: real ctx block b -> b; this group's bos -> (g+1)*G; this
-        # group's target member m -> (g+1)*G + 1 + m. Fake ctx entries (non-fullctx only) get
-        # clipped to 0 (masked out by min_valid_pos, so their position value never matters).
-        rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])[:, None]
-        rope_target = jnp.stack([(g + 1) * G + 1 + jnp.arange(G * self.K) for g in range(n_groups)], axis=0)
-        rope_pos_ids_g = jnp.concatenate([rope_ctx_g, rope_bos, rope_target], axis=1)   # (n_groups, per_group_len)
-        rope_pos_ids = jnp.broadcast_to(rope_pos_ids_g[None], (B, n_groups, per_group_len)).reshape(B2, per_group_len)
-
-        x = xe
-        for blk in blocks:
-            x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, self.remat)
-        h = ln_f(x)
-        pred_pos = Wg + jnp.arange(G * self.K)
-        h_t = h[:, pred_pos, :]   # (B2, G*K, D)
-        h_t = h_t.reshape(B, n_groups * G * self.K, D)
-        target_out = target_windows.reshape(B, n_groups * G * self.K, *target_seq.shape[2:])
-        valid_len = n_blocks * self.K
-        h_t = h_t[:, :valid_len, :]
-        target_out = target_out[:, :valid_len]
-
-        if self.token_head_type == "linears":
-            logits, mask = self._token_logits_linears(h_t), None
-        elif self.token_head_type == "ar":
-            logits, mask = self._token_teacher_forced_ar(h_t, target_out), None
-        else:
-            assert rng is not None, "diffusion token head needs an rng even at eval (masking is inherent)"
-            logits, mask = self._token_teacher_forced_diffusion(h_t, target_out, rng)
-        mtp_loss = self._mtp_loss(h_t, target_out)
-        return logits, target_out, mask, mtp_loss
-
     def decode(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray, decoder_ncodes: int, rng=None) -> tuple:
         logits, target, mask, mtp_loss = self.decode_logits_and_target(target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
         loss, acc = self._dec_loss_acc(logits, target, mask)
@@ -1540,128 +1158,6 @@ class EncDecLevel(eqx.Module):
 
         _, vals_all = run_scan(init_carry, ctx_tok_g)
         vals_all = jnp.moveaxis(vals_all, 0, 1)
-        out = vals_all.reshape(B, n_groups * G * self.K, *out_extra).astype(jnp.int32)
-        return out[:, :n_blocks * self.K]
-
-    def decode_generate_pardec(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
-                                temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
-        """chat 2026-09-15 (v2, ncodes_window) -- decode_generate with every decoder_ncodes-sized
-        group made fully INDEPENDENT of every other group (no cross-group causal dependency,
-        cache, or shared state): folds the group axis into the batch axis and gives each group
-        its OWN per_group_len-sized KV cache. All groups decode in ONE parallel batched pass;
-        within a group, decode is still autoregressive over that group's own G*K member positions.
-
-        self.ncodes_window (N, default 0): each group may additionally attend to the N
-        immediately-preceding groups' CTX CODES (Wg=(N+1)*G ctx window width) as pure read-only
-        context -- their already-decoded TARGET values are NEVER re-read/re-decoded (unlike v1's
-        overlap scheme, nothing is ever thrown away: a group's decode span is always exactly its
-        own G*K positions). N=-1 means unbounded (every earlier group's ctx, naive: Wg grows to
-        the full n_groups*G, inferred from n_blocks). Groups short on real history (early groups
-        under bounded N, or ANY group under -1 beyond its own) get a zero-padded ctx prefix,
-        explicitly MASKED out of attention (not v1's zero-vector reliance). Every token also
-        carries its TRUE GLOBAL RoPE position (v1 restarted every group at 0) -- see
-        pardec_step/pardec_chunk_step's docstrings for how position is decoupled from the shared
-        physical cache-write offset to make this possible per-row. See module docstring section 7.
-
-        FALLBACK (chat 2026-09-15): decoder_ncodes>=n_blocks (one single group) is mathematically
-        IDENTICAL to the original non-pardec decode_generate -- falls back to it directly rather
-        than paying pardec's windowing/masking machinery for zero benefit.
-
-        self.streaming=False with ncodes_window=-1: TRUE FULLCTX (replaces the old ncodes_window=-2
-        sentinel) -- see decode_logits_and_target_pardec's docstring for why this is distinct from
-        (and cheaper than) streaming causal -1."""
-        n_blocks_check = ctx_idx.shape[1]
-        if decoder_ncodes >= n_blocks_check:
-            return self.decode_generate(ctx_idx, decoder_ncodes, greedy, temperature, seed)
-        blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
-        B, n_blocks, _ = ctx_idx.shape
-        D = self.bos_embed.shape[-1]
-        hd = D // self.n_heads
-        out_extra = (self.in_pq_chunks,)
-        G = decoder_ncodes
-        pad_blocks = (-n_blocks) % G
-        n_blocks_p = n_blocks + pad_blocks
-        n_groups = n_blocks_p // G
-        fullctx = (not self.streaming) and (self.ncodes_window == -1)
-        N = self.ncodes_window if self.ncodes_window >= 0 else (n_groups - 1)
-        Wg = n_blocks_p if fullctx else (N + 1) * G
-        per_group_len = Wg + 1 + G * self.K
-
-        ctx_tok = code_embed_proj(ctx_idx, self.ctx_embed, self.ctx_proj)
-        if pad_blocks > 0:
-            ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
-        if not fullctx and N > 0:
-            ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * G, 0), (0, 0)))
-        B2 = B * n_groups
-        if fullctx:
-            ctx_tok_flat = jnp.broadcast_to(ctx_tok[:, None, :, :], (B, n_groups, Wg, D)).reshape(B2, Wg, D)
-            min_valid_pos = jnp.zeros((B2,), dtype=jnp.int32)
-            rope_ctx_flat = jnp.broadcast_to(jnp.arange(Wg)[None, :], (B2, Wg))
-        else:
-            ctx_windows = jnp.stack([ctx_tok[:, g * G:g * G + Wg, :] for g in range(n_groups)], axis=1)
-            ctx_tok_flat = ctx_windows.reshape(B2, Wg, D)
-            fake_counts = jnp.array([max(0, N - g) * G for g in range(n_groups)])
-            min_valid_pos = jnp.broadcast_to(fake_counts[None, :], (B, n_groups)).reshape(B2)
-            rope_ctx = jnp.stack([jnp.clip(jnp.arange(Wg) - N * G + g * G, 0, None) for g in range(n_groups)], axis=0)
-            rope_ctx_flat = jnp.broadcast_to(rope_ctx[None], (B, n_groups, Wg)).reshape(B2, Wg)
-        rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])
-        rope_bos_flat = jnp.broadcast_to(rope_bos[None, :], (B, n_groups)).reshape(B2)
-
-        def self_step(x_new, ck, cv, pos, rope_pos_row):
-            new_ck, new_cv = [], []
-            x = x_new
-            for i, blk in enumerate(blocks):
-                x, ck_i, cv_i = pardec_block_step(blk, x, ck[i], cv[i], pos, rope_pos_row, min_valid_pos, per_group_len)
-                new_ck.append(ck_i)
-                new_cv.append(cv_i)
-            return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
-
-        def self_chunk_step(x_chunk, ck, cv, pos_start, rope_pos_ids_chunk):
-            new_ck, new_cv = [], []
-            x = x_chunk
-            for i, blk in enumerate(blocks):
-                x, ck_i, cv_i = pardec_block_chunk_step(blk, x, ck[i], cv[i], pos_start,
-                                                          rope_pos_ids_chunk, min_valid_pos, per_group_len)
-                new_ck.append(ck_i)
-                new_cv.append(cv_i)
-            return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
-
-        def token_predict(h_pos, rng):
-            if self.token_head_type == "linears":
-                logits = self._token_logits_linears(h_pos)
-                return sample_idx(logits, rng, greedy, temperature)
-            elif self.token_head_type == "ar":
-                return self._token_generate_ar(h_pos, rng, greedy, temperature)
-            else:
-                return self._token_generate_diffusion(h_pos, rng, greedy, temperature)
-
-        cache_k = jnp.zeros((len(blocks), B2, self.n_kv_heads, per_group_len, hd))
-        cache_v = jnp.zeros_like(cache_k)
-        rng = jax.random.PRNGKey(seed)
-
-        @jax.jit
-        def run_pardec(ctx_tok_flat, cache_k, cache_v, rng):
-            bos_in = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
-            chunk = jnp.concatenate([ctx_tok_flat, bos_in], axis=1)
-            chunk_rope = jnp.concatenate([rope_ctx_flat, rope_bos_flat[:, None]], axis=1)
-            h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, jnp.array(0), chunk_rope)
-            pos = Wg + 1
-            rope_pos_row = rope_bos_flat + 1   # position for the SECOND target member (first came from bos)
-            h = h_chunk[:, -1, :]
-            val, rng = token_predict(h, rng)
-            vals = [val]
-            x_input = self._dec_embed_target(val)
-            for _ in range(G * self.K - 1):
-                h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
-                pos = pos + 1
-                rope_pos_row = rope_pos_row + 1
-                val, rng = token_predict(h, rng)
-                vals.append(val)
-                x_input = self._dec_embed_target(val)
-            _, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
-            return jnp.stack(vals, axis=1)
-
-        vals_all = run_pardec(ctx_tok_flat, cache_k, cache_v, rng)   # (B2, G*K, *out_extra)
         out = vals_all.reshape(B, n_groups * G * self.K, *out_extra).astype(jnp.int32)
         return out[:, :n_blocks * self.K]
 
@@ -1834,7 +1330,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     for i in range(phase - 1, -1, -1):
         dec_target = flat_bytes if i == 0 else codes[i - 1]
         dec_rng = level_rngs[2 * i + 1]
-        logits, target_i, mask_i, mtp_loss_i = levels[i].decode_logits_and_target_pardec(
+        logits, target_i, mask_i, mtp_loss_i = levels[i].decode_logits_and_target(
             dec_target, ctx, model.cfg.decoder_ncodes[i], rng=dec_rng)
         loss_i, acc_i = levels[i]._dec_loss_acc(logits, target_i, mask_i)
         loss_i = loss_i + levels[i].mtp_weight * mtp_loss_i
@@ -2098,10 +1594,9 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
 
 CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "decoder_ncodes",
-                  "ncodes_window", "streaming",
                   "weight_sharing", "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
                   "gumbel_temperature", "gumbel_at_inference", "cascade_rollout_prob", "init_scheme", "use_xsa",
-                  "use_qknorm", "remat", "attn_window", "use_attn_sink",
+                  "use_qknorm", "remat",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "mse_weight",
                   "mse_softmax_tau", "traversal")
@@ -2110,12 +1605,6 @@ CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "st
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=Path, required=True)
-    p.add_argument("--dataset", type=str, default="cifar", choices=["cifar", "imagenet64"],
-                    help="cifar (default): downloads/caches under --data_root. imagenet64: reads "
-                         "pre-built shards from --data_root (produced by "
-                         "image_gen_jax_1/scripts/download_imagenet64.py -- does NOT download "
-                         "itself, run that script first). Config.img_size must match (32 for "
-                         "cifar, 64 for imagenet64).")
     p.add_argument("--data_root", type=str, default=str(REPO_ROOT / "datasets"))
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--batch_size", type=_tuple_arg, default=(16,),
@@ -2189,8 +1678,6 @@ def main():
     p.add_argument("--rope_base", type=_float_tuple_arg, default=Config.rope_base)
     p.add_argument("--ntp_weight", type=float, default=Config.ntp_weight)
     p.add_argument("--decoder_ncodes", type=_tuple_arg, default=Config.decoder_ncodes)
-    p.add_argument("--ncodes_window", type=_tuple_arg, default=Config.ncodes_window)
-    p.add_argument("--streaming", type=_bool_tuple_arg, default=Config.streaming)
     p.add_argument("--weight_sharing", type=_bool_tuple_arg, default=Config.weight_sharing)
     p.add_argument("--precision", type=str, default=Config.precision, choices=["bf16", "fp32"])
     p.add_argument("--curriculum_mode", type=str, default=Config.curriculum_mode, choices=["freeze", "no_freeze"])
@@ -2203,8 +1690,6 @@ def main():
     p.add_argument("--use_xsa", type=lambda x: x.lower() != "false", default=Config.use_xsa)
     p.add_argument("--use_qknorm", type=lambda x: x.lower() != "false", default=Config.use_qknorm)
     p.add_argument("--remat", type=lambda x: x.lower() != "false", default=Config.remat)
-    p.add_argument("--attn_window", type=_tuple_arg, default=Config.attn_window)
-    p.add_argument("--use_attn_sink", type=lambda x: x.lower() != "false", default=Config.use_attn_sink)
     p.add_argument("--byte_group", type=int, default=Config.byte_group)
     # type=str (NOT _str_tuple_arg): argparse auto-applies `type=` to ANY string-valued default
     # (even one set via set_defaults from a config file) -- with _str_tuple_arg that silently
@@ -2260,10 +1745,7 @@ def main():
     _bcast_per_phase("batch_size")
     _bcast_per_phase("val_batch_size")
 
-    if args.dataset == "imagenet64":
-        (train_np, train_labels), (val_np, val_labels) = load_imagenet64(Path(args.data_root))
-    else:
-        (train_np, train_labels), (val_np, val_labels) = load_cifar10(Path(args.data_root))
+    (train_np, train_labels), (val_np, val_labels) = load_cifar10(Path(args.data_root))
     if args.train_subset_n:
         train_np = train_np[:args.train_subset_n]
     # train_iter is rebuilt fresh each phase (see phase loop below) since batch_size is now
@@ -2317,7 +1799,7 @@ def main():
 
         recon_acc = recon_mse = None
         # if include_reconstruct:
-        #     recon = m.levels[0].decode_generate_pardec(codes[0], cfg.decoder_ncodes[0], greedy=True, seed=0)
+        #     recon = m.levels[0].decode_generate(codes[0], cfg.decoder_ncodes[0], greedy=True, seed=0)
         #     recon_acc = float(jnp.mean(recon == flat_prompt))
         #     recon_img = positions_to_image(np.asarray(recon), cfg, pixel_order)
         #     recon_mse = pixel_mse(recon_img, gt_img)
@@ -2325,8 +1807,8 @@ def main():
 
         cur_code = codes[top]
         for i in range(top, 0, -1):
-            cur_code = m.levels[i].decode_generate_pardec(cur_code, cfg.decoder_ncodes[i], greedy=True, seed=0)
-        cascade_recon = m.levels[0].decode_generate_pardec(cur_code, cfg.decoder_ncodes[0], greedy=True, seed=0)
+            cur_code = m.levels[i].decode_generate(cur_code, cfg.decoder_ncodes[i], greedy=True, seed=0)
+        cascade_recon = m.levels[0].decode_generate(cur_code, cfg.decoder_ncodes[0], greedy=True, seed=0)
         cascade_acc = float(jnp.mean(cascade_recon == flat_prompt))
         cascade_img = positions_to_image(np.asarray(cascade_recon), cfg, pixel_order)
         cascade_mse = pixel_mse(cascade_img, gt_img)
@@ -2342,26 +1824,6 @@ def main():
         msg += f" gen_time={gen_time_s:.1f}s"
         logger(msg, **rec)
         return recon_acc, cascade_acc
-
-    def run_val_eval(eval_model, phase: int, tag: str) -> tuple:
-        """chat 2026-09-15 -- teacher-forced VALIDATION loss/acc: a plain FORWARD PASS only (no
-        grad), same phase_forward used by train_step's loss_fn, but on flat_prompt (the held-out
-        val batch already prepared for run_gen_eval) instead of a train batch. use_cascade left
-        at its default (None -> always real ctx, never the cascade-rollout substitution) for a
-        clean, deterministic signal -- NOT directly comparable to train's own logged loss/acc,
-        which uses a stochastic use_cascade draw per cfg.cascade_rollout_prob."""
-        val_t0 = time.monotonic()
-        m = cast_pytree(eval_model, compute_dtype)
-        loss, aux = phase_forward(m, flat_prompt, phase, rng=None)
-        bpb, acc, ntp_bpb, ntp_acc, util, val_mse = [float(a) for a in aux]
-        loss = float(loss)   # forces device sync -- val_time_s below includes the full forward pass
-        val_time_s = time.monotonic() - val_t0
-        logger(f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_ntp_acc={ntp_acc:.2f} "
-               f"val_time={val_time_s:.1f}s",
-               tag=tag, val_loss=loss, val_dec_acc=acc, val_dec_bpb=bpb,
-               val_ntp_acc=ntp_acc, val_ntp_bpb=ntp_bpb, val_util=util, val_mse=val_mse,
-               val_time_s=val_time_s)
-        return loss, acc
 
     if args.wa_mode == "wma" and args.wa_wma_weights is not None:
         assert len(args.wa_wma_weights) == args.wa_stack_size, \
@@ -2512,7 +1974,6 @@ def main():
 
                 if step % gen_eval_every_steps == 0:
                     snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
-                    run_val_eval(snapshot, phase, tag=f"phase{phase}_step{step}")
                     run_gen_eval(snapshot, top=phase - 1, tag=f"phase{phase}_step{step}", include_reconstruct=True)
 
                 if step % ckpt_every_steps == 0:
@@ -2547,13 +2008,11 @@ def main():
         save_checkpoint(ckpt_dir, model, to_host(unreplicate(p_opt_state)), to_host(p_rng), train_iter,
                          phase=phase, phase_step=phase_steps, step=step, seed=args.seed)
         prune_checkpoints(run_dir, args.ckpt_keep)
-        run_val_eval(model, phase, tag=f"phase{phase}_final")
         run_gen_eval(model, top=phase - 1, tag=f"phase{phase}_final", include_reconstruct=True)
 
     global_pbar.update(step - last_global_step)
     global_pbar.close()
     logger("=== all phases done, running final top-down cascade eval ===")
-    run_val_eval(model, n_levels - 1, tag="final")
     run_gen_eval(model, top=n_levels - 2, tag="final", include_reconstruct=True)
     logger("training done")
 

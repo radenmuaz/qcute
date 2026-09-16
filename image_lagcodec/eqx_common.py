@@ -32,15 +32,29 @@ def _splash_pad(x: jnp.ndarray, block: int) -> jnp.ndarray:
     return x
 
 
-def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool):
+def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool, window: int = None):
     """Not cached: caching a SplashAttentionKernel (holds jnp.array-converted MaskInfo, created
     during whichever trace first calls this) across separate jax traces (train vs eval, or a
     retrace) leaks a tracer from the first, now-closed trace -- confirmed 2026-09-08, all 4 TPU
-    nodes crashed with UnexpectedTracerError from an lru_cache'd version of this function."""
-    mask_cls = splash_mask_lib.CausalMask if causal else splash_mask_lib.FullMask
-    mask = splash_mask_lib.MultiHeadMask(
-        [mask_cls((padded_T, padded_T)) for _ in range(n_heads)]
-    )
+    nodes crashed with UnexpectedTracerError from an lru_cache'd version of this function.
+
+    window (chat 2026-09-15): None -- unbounded (CausalMask/FullMask, "flash" attention -- same
+    Pallas kernel, just the standard dense-over-the-whole-sequence mask). int -- causal SLIDING
+    WINDOW of that many positions back (LocalMask, natively supported by JAX's splash_attention
+    library -- genuinely block-sparse, not a dense-then-masked matmul, so it's real O(T*window)
+    compute/memory savings). For scaling the ENCODER's own self-attention to large images (e.g.
+    256x256 -> 65536-position sequences at level0) where full O(T^2) unbounded attention becomes
+    prohibitive."""
+    if window is not None:
+        mask = splash_mask_lib.MultiHeadMask(
+            [splash_mask_lib.LocalMask((padded_T, padded_T), window_size=(window, 0), offset=0)
+             for _ in range(n_heads)]
+        )
+    else:
+        mask_cls = splash_mask_lib.CausalMask if causal else splash_mask_lib.FullMask
+        mask = splash_mask_lib.MultiHeadMask(
+            [mask_cls((padded_T, padded_T)) for _ in range(n_heads)]
+        )
     block = min(_SPLASH_BLOCK, padded_T)
     block_sizes = splash_kernel_lib.BlockSizes(
         block_q=block, block_kv=block, block_kv_compute=block,
@@ -50,13 +64,21 @@ def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool):
     return splash_kernel_lib.make_splash_mha_single_device(mask=mask, block_sizes=block_sizes)
 
 
-def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: bool, sm_scale: float) -> jnp.ndarray:
+def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: bool, sm_scale: float,
+                      window: int = None, sink: jnp.ndarray = None) -> jnp.ndarray:
     """q:(B,Hq,T,hd), k/v:(B,Hkv,T,hd), Hq%Hkv==0 (native GQA -- splash groups kv heads internally,
-    no repeat_kv needed unlike Pallas flash_attention). Returns (B,Hq,T,hd)."""
+    no repeat_kv needed unlike Pallas flash_attention). Returns (B,Hq,T,hd). window: see
+    _splash_attn_kernel's docstring -- None (default) is unchanged/unbounded behavior. sink
+    (chat 2026-09-15): optional (Hq,) per-head attention-sink logit, splash_attention's NATIVE
+    `sinks` kernel arg -- NOT batched (shared across B), so vmap must close over it rather than
+    map it like q/k/v."""
     B, Hq, T, hd = q.shape
     q_p, k_p, v_p = _splash_pad(q, _SPLASH_BLOCK), _splash_pad(k, _SPLASH_BLOCK), _splash_pad(v, _SPLASH_BLOCK)
-    kernel = _splash_attn_kernel(Hq, q_p.shape[-2], causal)
-    y = jax.vmap(kernel)(q_p * sm_scale, k_p, v_p)
+    kernel = _splash_attn_kernel(Hq, q_p.shape[-2], causal, window)
+    if sink is not None:
+        y = jax.vmap(lambda qq, kk, vv: kernel(qq, kk, vv, sinks=sink))(q_p * sm_scale, k_p, v_p)
+    else:
+        y = jax.vmap(kernel)(q_p * sm_scale, k_p, v_p)
     return y[:, :, :T, :]
 
 
@@ -271,14 +293,27 @@ class Attention(eqx.Module):
     rope_base: float = eqx.field(static=True)
     use_xsa: bool = eqx.field(static=True)
     use_qknorm: bool = eqx.field(static=True)
+    window: int = eqx.field(static=True)
+    sink: jnp.ndarray
 
     def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, rope_base: float, n_layers: int = None,
-                 init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True):
+                 init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True, window: int = None,
+                 use_sink: bool = False):
         """See SwiGLU.__init__ for the init_scheme rationale -- applies identically here, with
         `out` as the residual-output projection. use_xsa: see apply_xsa() above (arXiv:2603.09078)
         -- applied right after the attention call, before the out-projection; default off, opt-in.
         use_qknorm: per-head RMSNorm on q/k before RoPE+scores (stabilizes attention logit scale);
-        can be disabled."""
+        can be disabled. window (chat 2026-09-15): None (default) -- unbounded causal attention,
+        unchanged. int -- causal sliding window of that many positions back (splash_attention's
+        native LocalMask, genuinely block-sparse) -- see splash_attention()'s docstring. Only
+        __call__ (the dense/batched form) respects this; step/chunk_step (KV-cached decode) are
+        unaffected -- windowing is an ENCODER-side (self.blocks, full self-attention) concern,
+        not currently wired into the decoder's incremental generation path. use_sink (chat
+        2026-09-15): learned per-head attention-sink logit (one scalar per query head, init 0),
+        using splash_attention's NATIVE `sinks` kernel arg -- a bias folded directly into the
+        softmax max/sum, NOT an extra K/V token (cheaper: no extra sequence position, no extra
+        matmul work). See the gpt-oss/StreamingLLM attention-sink literature; useful alongside
+        `window` so a sliding-window layer always has somewhere to route unneeded attention mass."""
         hd = d_model // n_heads
         k1, k2 = jax.random.split(key, 2)
         if init_scheme == "zero":
@@ -298,6 +333,8 @@ class Attention(eqx.Module):
         self.n_heads, self.n_kv_heads, self.rope_base = n_heads, n_kv_heads, rope_base
         self.use_xsa = use_xsa
         self.use_qknorm = use_qknorm
+        self.window = window
+        self.sink = jnp.zeros((n_heads,)) if use_sink else None
 
     def __call__(self, x: jnp.ndarray, causal: bool = True) -> jnp.ndarray:
         """Batched training-time forward: x is (B,T,D). causal=False is full bidirectional
@@ -315,7 +352,7 @@ class Attention(eqx.Module):
         cos, sin = rope_cos_sin(T, hd, self.rope_base)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         scale = 1.0 / math.sqrt(hd)
-        y = splash_attention(q, k, v, causal=causal, sm_scale=scale)  # (B,H,T,hd)
+        y = splash_attention(q, k, v, causal=causal, sm_scale=scale, window=self.window, sink=self.sink)  # (B,H,T,hd)
         if self.use_xsa:
             n_rep = self.n_heads // self.n_kv_heads
             v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
@@ -397,11 +434,13 @@ class Block(eqx.Module):
     mlp: SwiGLU
 
     def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, mlp_mult: int, rope_base: float,
-                 n_layers: int = None, init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True):
+                 n_layers: int = None, init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True,
+                 window: int = None, use_sink: bool = False):
         k1, k2 = jax.random.split(key, 2)
         self.norm1 = RMSNorm(d_model)
         self.attn = Attention(k1, d_model, n_heads, n_kv_heads, rope_base, n_layers=n_layers,
-                               init_scheme=init_scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
+                               init_scheme=init_scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, window=window,
+                               use_sink=use_sink)
         self.norm2 = RMSNorm(d_model)
         self.mlp = SwiGLU(k2, d_model, mlp_mult, n_layers=n_layers, init_scheme=init_scheme)
 
@@ -521,16 +560,21 @@ def warmup_const_schedule(peak_lr: float, warmup_steps: int):
     return schedule
 
 
-def make_lr_schedule(kind: str, peak_lr: float, warmup_steps: int, total_steps: int = None):
+def make_lr_schedule(kind: str, peak_lr: float, warmup_steps: int, total_steps: int = None,
+                      end_value: float = 0.0, decay_steps: int = None):
     """chat 2026-09-13 -- kind="const" (default): warmup_const_schedule above, unchanged.
-    kind="cosine": linear warmup then cosine decay to 0 over total_steps (this phase's own
-    epoch_count*steps_per_epoch -- decay resets fresh each phase, same as the const schedule's
-    own re-warmup each phase)."""
+    kind="cosine": linear warmup then cosine decay to end_value (default 0) over decay_steps
+    (default total_steps - warmup_steps -- this phase's own epoch_count*steps_per_epoch, decay
+    resets fresh each phase). decay_steps lets the min lr be reached BEFORE phase end (e.g. by a
+    given epoch); optax clips its internal step count at decay_steps, so lr holds flat at
+    end_value for the remainder of the phase once reached (chat 2026-09-14)."""
     if kind == "const":
         return warmup_const_schedule(peak_lr, warmup_steps)
     assert kind == "cosine", f"unknown lr_schedule {kind!r}"
     assert total_steps is not None and total_steps > warmup_steps, \
-        "cosine schedule needs total_steps > warmup_steps (this phase's epoch_count*steps_per_epoch)"
+        f"cosine schedule needs total_steps > warmup_steps (this phase's epoch_count*steps_per_epoch) " \
+        f"-- got total_steps={total_steps}, warmup_steps={warmup_steps}"
+    ds = decay_steps if decay_steps is not None else (total_steps - warmup_steps)
     return optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=peak_lr, warmup_steps=warmup_steps,
-        decay_steps=total_steps - warmup_steps, end_value=0.0)
+        decay_steps=ds, end_value=end_value)
