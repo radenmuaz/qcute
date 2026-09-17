@@ -599,17 +599,32 @@ def pardec_block_chunk_step(blk: Block, x_chunk, cache_k, cache_v, cache_pos_sta
 
 
 def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: jnp.ndarray,
-                                 min_valid_pos: jnp.ndarray, lookahead: jnp.ndarray = None) -> jnp.ndarray:
-    """lookahead (chat 2026-09-16): optional (T,) per-QUERY-POSITION forward relaxation of the
-    causal mask -- query i may additionally see keys up to i+lookahead[i] (0 = plain causal,
-    unchanged). Needed for decode_future: plain causal masking makes appending extra future
-    target positions AFTER a group's real span completely inert (later-appended keys can never
-    affect an earlier query's output under strict causality) -- confirmed by a real bug this
-    session (decode_future changed nothing until this was added). Scoped to a real (T,) vector,
-    not a per-ROW scalar, because only the real target span's OWN queries should get the
-    relaxation -- ctx/bos/decode_past positions must stay strictly causal, or their hidden states
-    (attended to by the real span) would leak future information no generation-time draft could
-    ever have produced (train/inference mismatch)."""
+                                 min_valid_pos: jnp.ndarray, real_query: jnp.ndarray = None,
+                                 tail_pos: jnp.ndarray = None, own_chain_key: jnp.ndarray = None) -> jnp.ndarray:
+    """real_query/tail_pos/own_chain_key (chat 2026-09-17, fixes TWO real bugs found via actual
+    search-run data -- decode_future>0 runs hit dec_acc=1.0 with degenerate generation):
+
+    Bug 1 (single-layer leak): a naive per-query additive shift `key <= query+lookahead` also
+    relaxes visibility into later NOT-YET-PREDICTED positions within the SAME real Kspan block
+    (any key up to Pf ahead), not just the intended trailing Pf-tail extension.
+
+    Bug 2 (transitive 2-layer leak, survived fixing bug 1 alone): even with relaxation correctly
+    scoped to (real_query, tail_key) pairs only, the tail positions LEGITIMATELY see the real
+    Kspan's own late values via plain causality in layer 1 (the tail comes after Kspan in the raw
+    sequence) -- their layer-1 hidden state then encodes that value, and layer 2's relaxation lets
+    an EARLY real-Kspan query attend to that now-contaminated tail hidden state, transitively
+    recovering a later value it must not have seen. Confirmed by directly perturbing one real
+    target value and checking an earlier position's logits changed (they did, even after fixing
+    bug 1). Fix: the tail must be blocked from attending into this group's own draft/prediction
+    chain (decode_past + real Kspan) at ALL layers -- it may only see ctx/bos, mirroring true
+    generation-time semantics where an independent async group's decode_future draft would never
+    have been conditioned on THIS group's specific realized predictions in the first place.
+
+    allowed(q,k) = causal(q,k)
+                   AND NOT (tail_pos[q] AND own_chain_key[k])     -- tail can't see this group's own chain
+                   OR  (real_query[q] AND tail_pos[k])            -- real queries DO get to see the tail
+
+    All three params are (T,) booleans; None (default) = plain causal, unchanged."""
     Bc, T, D = x.shape
     hd = D // attn.n_heads
     qkv = x @ attn.qkv
@@ -629,10 +644,12 @@ def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: j
     scale = 1.0 / math.sqrt(hd)
     scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale
     idx = jnp.arange(T)
-    if lookahead is None:
-        causal = idx[None, :] <= idx[:, None]
-    else:
-        causal = idx[None, :] <= (idx[:, None] + lookahead[:, None])
+    causal = idx[None, :] <= idx[:, None]
+    if real_query is not None:
+        blocked = tail_pos[:, None] & own_chain_key[None, :]
+        causal = causal & ~blocked
+        extra = real_query[:, None] & tail_pos[None, :]
+        causal = causal | extra
     validmin = idx[None, :] >= min_valid_pos[:, None]
     mask = causal[None] & validmin[:, None, :]
     scores = jnp.where(mask[:, None], scores, -1e9)
@@ -645,9 +662,11 @@ def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: j
 
 
 def run_block_pardec(blk: Block, x: jnp.ndarray, rope_pos_ids: jnp.ndarray, min_valid_pos: jnp.ndarray,
-                      remat: bool, lookahead: jnp.ndarray = None) -> jnp.ndarray:
+                      remat: bool, real_query: jnp.ndarray = None, tail_pos: jnp.ndarray = None,
+                      own_chain_key: jnp.ndarray = None) -> jnp.ndarray:
     def f(x):
-        x = x + dense_self_attention_pardec(blk.attn, blk.norm1(x), rope_pos_ids, min_valid_pos, lookahead)
+        x = x + dense_self_attention_pardec(blk.attn, blk.norm1(x), rope_pos_ids, min_valid_pos,
+                                             real_query, tail_pos, own_chain_key)
         x = x + blk.mlp(blk.norm2(x))
         return x
     return jax.checkpoint(f)(x) if remat else f(x)
@@ -747,6 +766,7 @@ class EncDecLevel(eqx.Module):
     streaming: bool = eqx.field(static=True)
     decode_past: int = eqx.field(static=True)
     decode_future: int = eqx.field(static=True)
+    attn_lookahead: int = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config, level: int, has_decoder: bool, weight_sharing: bool):
         D = cfg.d_model[level]
@@ -759,6 +779,7 @@ class EncDecLevel(eqx.Module):
         self.streaming = cfg.streaming[level]
         self.decode_past = cfg.decode_past[level]
         self.decode_future = cfg.decode_future[level]
+        self.attn_lookahead = cfg.attn_lookahead[level]
         is_byte_level = (level == 0)
         self.pq_chunks, self.code_vocab = cfg.pq_chunks[level], cfg.code_vocab[level]
         self.in_pq_chunks = cfg.byte_group if is_byte_level else cfg.pq_chunks[level - 1]
@@ -890,11 +911,21 @@ class EncDecLevel(eqx.Module):
         p_avg = jnp.mean(probs, axis=(0, 1))
         entropy_loss = jnp.mean(jnp.sum(p_avg * jnp.log(jnp.maximum(p_avg, 1e-9)), axis=-1))
 
-        ntp_logits = reshape_pq(h[:, :-1, :] @ self.ntp_head, self.in_pq_chunks, self.in_code_vocab)
-        tgt = target_idx[:, 1:]
-        logp = jax.nn.log_softmax(ntp_logits, axis=-1)
-        ntp_loss = -jnp.mean(jnp.take_along_axis(logp, tgt[..., None], axis=-1))
-        ntp_acc = jnp.mean(jnp.argmax(ntp_logits, -1) == tgt)
+        # shift must EXCEED attn_lookahead: h[i] already attends up to key i+attn_lookahead (the
+        # encoder's own self-attention window), so predicting anything at or before that offset
+        # is trivially visible, not a real prediction task -- confirmed a real leak this session
+        # (ntp_acc trivially ~1.0, useless as training signal) for any attn_lookahead>=1 at the
+        # old fixed shift=1.
+        ntp_shift = 1 + self.attn_lookahead
+        if L > ntp_shift:
+            ntp_logits = reshape_pq(h[:, :-ntp_shift, :] @ self.ntp_head, self.in_pq_chunks, self.in_code_vocab)
+            tgt = target_idx[:, ntp_shift:]
+            logp = jax.nn.log_softmax(ntp_logits, axis=-1)
+            ntp_loss = -jnp.mean(jnp.take_along_axis(logp, tgt[..., None], axis=-1))
+            ntp_acc = jnp.mean(jnp.argmax(ntp_logits, -1) == tgt)
+        else:
+            ntp_loss = jnp.array(0.0, dtype=h.dtype)
+            ntp_acc = jnp.array(0.0, dtype=h.dtype)
         util = codebook_utilization(code_idx, self.code_vocab)
         return dict(code_soft=code_soft, code_idx=code_idx, ntp_loss=ntp_loss, ntp_acc=ntp_acc, util=util,
                     entropy_loss=entropy_loss, logits=logits)
@@ -1125,22 +1156,45 @@ class EncDecLevel(eqx.Module):
         per_group_len = per_group_len + Pp + Pf
 
         rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])[:, None]
-        rope_target = jnp.stack(
-            [(g + 1) * G + 1 - Pp + jnp.arange(widened_len) for g in range(n_groups)], axis=0)
-        rope_target = jnp.clip(rope_target, 0, None)
+        # rope_target split at the draft/real boundary (chat 2026-09-17, fixes a real rope
+        # collision): a single linear formula across the whole widened span makes the LAST draft
+        # position (j=Pp-1) land on EXACTLY bos's own rope value ((g+1)*G) whenever Pp>0 -- two
+        # physically different positions, Pp apart, sharing one rope value, confirmed live on a
+        # real run (search0.py, Pp=16). Fix: draft (j<Pp) gets its OWN formula ending one BEFORE
+        # bos_pos (never touching it); real+tail (j>=Pp) keeps the original, already-tested
+        # anchor `(g+1)*G+1+k` unchanged (so real target[0]'s own key position is untouched --
+        # still exactly bos_pos+1, same as the non-widened Pp=Pf=0 case always was).
+        rope_draft = jnp.stack([(g + 1) * G - Pp + jnp.arange(Pp) for g in range(n_groups)], axis=0)
+        rope_real_tail = jnp.stack(
+            [(g + 1) * G + 1 + jnp.arange(widened_len - Pp) for g in range(n_groups)], axis=0)
+        rope_target = jnp.clip(jnp.concatenate([rope_draft, rope_real_tail], axis=1), 0, None)
         rope_pos_ids_g = jnp.concatenate([rope_ctx_g, rope_bos, rope_target], axis=1)
         rope_pos_ids = jnp.broadcast_to(rope_pos_ids_g[None], (B, n_groups, per_group_len)).reshape(B2, per_group_len)
 
         if Pf > 0:
             pos_idx = jnp.arange(per_group_len)
-            kspan_start = Wg + Pp
-            lookahead_vec = jnp.where((pos_idx >= kspan_start) & (pos_idx < kspan_start + Kspan), Pf, 0)
+            kspan_start = Wg + Pp   # query-space: positions whose hidden state predicts a real target
+            kspan_end_q = kspan_start + Kspan   # one past the last such query
+            # key-space is offset by +1 from query-space: predicting te_flat[m] uses the hidden
+            # state at query position kspan_start+m, but te_flat[m] itself is EMBEDDED (as a key)
+            # one position later, at kspan_start+1+m -- so the real Kspan's own key positions are
+            # [kspan_start+1, kspan_start+1+Kspan), and the tail starts right after THAT, not
+            # right after kspan_end_q (using kspan_end_q here was the bug: it's one position too
+            # early, exactly the LAST real value's own key position, which every within-Kspan
+            # query could then trivially see -- confirmed via a real leak test 2026-09-17).
+            tail_start = kspan_start + 1 + Kspan
+            real_query = (pos_idx >= kspan_start) & (pos_idx < kspan_end_q)
+            tail_pos = (pos_idx >= tail_start) & (pos_idx < tail_start + Pf)
+            # own_chain_key: this group's own draft+real chain (decode_past + real Kspan), the
+            # tail must NEVER attend into it (see dense_self_attention_pardec's docstring, bug 2)
+            own_chain_key = (pos_idx >= Wg + 1) & (pos_idx < tail_start)
         else:
-            lookahead_vec = None
+            real_query = tail_pos = own_chain_key = None
 
         x = xe
         for blk in blocks:
-            x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, self.remat, lookahead_vec)
+            x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, self.remat,
+                                  real_query, tail_pos, own_chain_key)
         h = ln_f(x)
         pred_pos = Wg + Pp + jnp.arange(G * self.K)
         h_t = h[:, pred_pos, :]
@@ -1321,6 +1375,20 @@ class EncDecLevel(eqx.Module):
 
         total_steps = Pp + G * self.K
 
+        def widened_pos(t):
+            # matches training's PER-POSITION clip exactly (decode_logits_and_target_pardec's
+            # rope_target formula) -- must NOT be a running "+1 from an already-clipped value"
+            # (that silently drifts off training's positions for any boundary group where Pp
+            # reaches before real history exists: incrementing a clipped 0 gives 1, but the next
+            # widened index may ALSO still be in the pre-clip negative region and should stay 0
+            # too. Confirmed as a real train/inference mismatch for early groups 2026-09-17.)
+            # Also matches training's draft/real split (t is a static Python int, branch is free):
+            # draft (t<Pp) ends one BEFORE bos's own rope value, never colliding with it; real (t>=Pp)
+            # keeps the original bos_pos+1+k anchor untouched (see rope_draft/rope_real_tail above).
+            if t < Pp:
+                return jnp.clip(rope_bos_flat - Pp + t, 0, None)
+            return rope_bos_flat + 1 + (t - Pp)
+
         @jax.jit
         def run_pardec(ctx_tok_flat, cache_k, cache_v, rng):
             bos_in = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
@@ -1328,7 +1396,7 @@ class EncDecLevel(eqx.Module):
             chunk_rope = jnp.concatenate([rope_ctx_flat, rope_bos_flat[:, None]], axis=1)
             h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, jnp.array(0), chunk_rope)
             pos = Wg + 1
-            rope_pos_row = jnp.clip(rope_bos_flat + 1 - Pp, 0, None)
+            rope_pos_row = widened_pos(0)
             h = h_chunk[:, -1, :]
             val, rng = token_predict(h, rng)
             vals = [val] if Pp == 0 else []   # t=0's own output is a decode_past DRAFT, pruned, if Pp>0
@@ -1336,7 +1404,7 @@ class EncDecLevel(eqx.Module):
             for t in range(1, total_steps):
                 h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
                 pos = pos + 1
-                rope_pos_row = rope_pos_row + 1
+                rope_pos_row = widened_pos(t)
                 val, rng = token_predict(h, rng)
                 if t >= Pp:
                     vals.append(val)
@@ -1471,16 +1539,37 @@ class HierEncDec(eqx.Module):
 
 
 def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=None,
-                   cascade_rollout_drop=None, cascade_rng=None, gumbel_temperature: float = 1.0,
+                   level_drop=None, cascade_rng=None, gumbel_temperature: float = 1.0,
                    layer_drop_prob=None, label_reg_weight: float = 0.0, label_fn=None,
-                   pixel_order=None) -> tuple:
-    """cascade_rollout_drop/cascade_rng (chat 2026-09-17): None/None -- always real ctx (eval).
-    Otherwise, an INDEPENDENT bernoulli draw at every level transition i->i-1 (not one shared
-    draw for the whole step): p(real)=1-cascade_rollout_drop[i] (or the same scalar for every
-    transition). Genuinely per-level -- outcomes like real,rollout,real across a 3-level cascade
-    are possible, not just "real for a while then rollout for the rest." real_ctx is that level's
-    own differentiable encode() output (not an external label), so gradient flows end-to-end
-    through EITHER branch back into the encoder above -- using real ctx never detaches anything."""
+                   pixel_order=None, feedback_p=None, feedback_rng=None, feedback_detach: bool = True,
+                   _feedback_recursed: bool = False) -> tuple:
+    """level_drop/cascade_rng (chat 2026-09-17, reverted to the original cascade_rollout_prob
+    semantic -- value directly means "probability of rollout", not "probability of dropping it"):
+    None/None -- always real ctx (eval). Otherwise, an INDEPENDENT bernoulli draw at every level
+    transition i->i-1 (not one shared draw for the whole step): p(rollout)=level_drop[i] (or the
+    same scalar for every transition), p(real)=1-level_drop[i]. Genuinely per-level -- outcomes
+    like real,rollout,real across a 3-level cascade are possible, not just "real for a while then
+    rollout for the rest." real_ctx is that level's own differentiable encode() output (not an
+    external label), so gradient flows end-to-end through EITHER branch back into the encoder
+    above -- using real ctx never detaches anything.
+
+    feedback_p/feedback_rng (generalizes torch qcute_lagcodec's byte_consistency_p to any level,
+    additive like encoder_ste_p rather than in-place like level_drop): per level i, independent
+    bernoulli draw p=feedback_p[i] (or scalar for all levels). On fire, argmax level i's OWN decode
+    reconstruction and jax.lax.stop_gradient it (full stop, unlike level_drop's pseudo_ctx which
+    keeps a straight-through path back into level i's decoder on purpose) -- this pseudo
+    reconstruction is then treated as if it were real and re-decoded, and that second loss is added
+    UNWEIGHTED to the main loss. feedback_detach (default True) controls only the i>0 path: True
+    keeps the full stop_gradient described above; False leaves quantize_hard's own straight-through
+    path intact (gradient flows back into level i's decoder through the softmax, same shape as
+    torch's encoder_ste_p additive+STE mode) -- i==0's recursive pass is always fully detached
+    (argmax itself has no gradient; a differentiable version would need a soft-byte input path,
+    not implemented). i>0: pseudo codes[i-1] becomes ctx for a second decode cascade
+    through levels i-1..0 (reusing the real codes/codes_soft already computed below i), testing
+    "can the lower levels still recover ground truth if this level's own reconstruction is trusted
+    as context." i==0: pseudo bytes re-enter the WHOLE model as a fresh input via one guarded
+    recursive phase_forward call (_feedback_recursed=True to prevent runaway recursion), testing
+    full-pipeline idempotence -- torch's original byte_consistency_p is exactly this i==0 case."""
     levels = model.levels
     x = code_embed_proj(flat_bytes, levels[0].own_input_embed, levels[0].own_input_proj)
     target = flat_bytes
@@ -1508,9 +1597,11 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
             target = out["code_idx"]
 
     dec_losses, dec_accs = [], []
+    feedback_losses = []
     byte_mse = None
     ctx = codes_soft[phase - 1]
     cascade_rngs = [None] * phase if cascade_rng is None else list(jax.random.split(cascade_rng, phase))
+    feedback_rngs = [None] * phase if feedback_rng is None else list(jax.random.split(feedback_rng, phase))
     for i in range(phase - 1, -1, -1):
         dec_target = flat_bytes if i == 0 else codes[i - 1]
         dec_rng = level_rngs[2 * i + 1]
@@ -1531,14 +1622,45 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
                 mse_loss = jnp.mean(((pred_pixel - target_i.astype(jnp.float32)) / max_val) ** 2)
             else:
                 mse_loss = 0.0
+        if feedback_p is not None:
+            feedback_p_i = feedback_p if isinstance(feedback_p, (int, float)) else feedback_p[i]
+            if feedback_p_i > 0 and not (i == 0 and _feedback_recursed):
+                fire_i = jax.random.bernoulli(feedback_rngs[i], p=feedback_p_i)
+                zero = jnp.array(0.0, dtype=loss_i.dtype)
+                if i > 0:
+                    def _feedback_fire(i=i, logits=logits):
+                        pseudo_ctx = quantize_hard(logits)[0]
+                        if feedback_detach:
+                            pseudo_ctx = jax.lax.stop_gradient(pseudo_ctx)
+                        c, total = pseudo_ctx, 0.0
+                        for j in range(i - 1, -1, -1):
+                            dj = flat_bytes if j == 0 else codes[j - 1]
+                            lj, tj, mj, mtpj = levels[j].decode_logits_and_target_pardec(
+                                dj, c, model.cfg.decoder_ncodes[j])
+                            lossj, _ = levels[j]._dec_loss_acc(lj, tj, mj)
+                            total = total + lossj + levels[j].mtp_weight * mtpj
+                            if j > 0:
+                                c = codes_soft[j - 1]
+                        return total / i
+                else:
+                    def _feedback_fire(logits=logits):
+                        pseudo_bytes = jax.lax.stop_gradient(jnp.argmax(logits, axis=-1))
+                        l2, _ = phase_forward(
+                            model, pseudo_bytes, phase, rng=rng, level_drop=level_drop,
+                            cascade_rng=cascade_rng, gumbel_temperature=gumbel_temperature,
+                            layer_drop_prob=layer_drop_prob, label_reg_weight=0.0, label_fn=None,
+                            pixel_order=None, feedback_p=None, feedback_rng=None,
+                            _feedback_recursed=True)
+                        return l2
+                feedback_losses.append(jax.lax.cond(fire_i, _feedback_fire, lambda: zero))
         if i > 0:
             real_ctx = codes_soft[i - 1]
-            if cascade_rollout_drop is None:
+            if level_drop is None:
                 ctx = real_ctx
             else:
-                drop_i = cascade_rollout_drop if isinstance(cascade_rollout_drop, (int, float)) \
-                    else cascade_rollout_drop[i]
-                use_cascade_i = jax.random.bernoulli(cascade_rngs[i], p=1.0 - drop_i)
+                level_drop_i = level_drop if isinstance(level_drop, (int, float)) \
+                    else level_drop[i]
+                use_cascade_i = jax.random.bernoulli(cascade_rngs[i], p=level_drop_i)
                 pseudo_ctx, _ = quantize_hard(logits)
                 ctx = jnp.where(use_cascade_i, pseudo_ctx, real_ctx)
 
@@ -1547,8 +1669,9 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     ntp_loss_total = jnp.mean(jnp.stack(enc_losses))
     entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
     label_loss_total = jnp.mean(jnp.stack(label_losses)) if label_losses else 0.0
+    feedback_loss_total = jnp.mean(jnp.stack(feedback_losses)) if feedback_losses else 0.0
     loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
-        + model.cfg.mse_weight * mse_loss + label_reg_weight * label_loss_total
+        + model.cfg.mse_weight * mse_loss + label_reg_weight * label_loss_total + feedback_loss_total
     bpb = dec_loss_total / jnp.log(2.0)
     return loss, (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
                   jnp.mean(jnp.stack(utils)), byte_mse)
@@ -1829,6 +1952,9 @@ def main():
                     help="weight averaging: 'ema' (Polyak shadow copy) or 'wma' (rolling "
                          "mean over a FIFO stack of raw snapshots). 'none' (default) disables "
                          "both -- see module docstring point 5")
+    p.add_argument("--wa_verbose", type=lambda x: x.lower() != "false", default=True,
+                    help="log a line every time a wa (ema/wma) snapshot is saved. Default True; "
+                         "set False to suppress (the snapshot is still saved either way)")
     p.add_argument("--wa_every_step", type=int, default=None, help="WA update cadence, in steps")
     p.add_argument("--wa_every_epoch", type=float, default=None,
                     help="WA update cadence, in epochs (auto-converted to steps). At most one "
@@ -1841,7 +1967,10 @@ def main():
                          "softmax-normalized to sum to 1 -- length must equal wa_stack_size. "
                          "Default None: uniform (1/wa_stack_size each)")
     p.add_argument("--train_subset_n", type=int, default=100)
-    p.add_argument("--qual_gen_n", type=int, default=8)
+    p.add_argument("--eval_gen_train", type=lambda x: x.lower() != "false", default=True,
+                    help="also run gen-eval (cascade generation + sample grid) on a TRAIN-set "
+                         "prompt, in addition to the usual val-set one -- same count as "
+                         "val_batch_size, tagged '<tag>_train'. Default True")
     p.add_argument("--val_batch_size", type=_tuple_arg, default=(2,),
                     help="how many train-set images run_gen_eval reconstructs/generates from -- "
                          "kept small (default 2) since decode_generate is far more memory-heavy "
@@ -1881,14 +2010,32 @@ def main():
                     help="gumbel-softmax temperature -- global (not per-level), per-phase tuple. "
                          "A bare scalar broadcasts to every phase")
     p.add_argument("--gumbel_at_inference", type=lambda x: x.lower() != "false", default=Config.gumbel_at_inference)
-    p.add_argument("--cascade_rollout_drop", type=_float_tuple_arg, default=(0.5,),
-                    help="probability of NOT using cascade-simulated rollout during training "
-                         "(1 - old cascade_rollout_prob) -- per-phase tuple, bare scalar broadcasts")
+    p.add_argument("--level_drop", type=_float_tuple_arg, default=(0.5,),
+                    help="probability of using cascade-simulated rollout (dropping ground-truth "
+                         "ctx) at each level transition during training -- independent draw per "
+                         "level, not one shared draw for the whole step. Per-phase tuple (bare "
+                         "scalar broadcasts to every phase); each phase entry may itself be a "
+                         "scalar (same prob for every level transition) or a tuple (one prob per "
+                         "level, config.py only -- not expressible on the CLI)")
     p.add_argument("--layer_drop_prob", type=_float_tuple_arg, default=(0.0,),
                     help="stochastic-depth drop probability per transformer layer -- bare scalar "
                          "broadcasts to every phase uniformly; a flat tuple (length n_phases) "
                          "gives one value per phase; a nested tuple-of-tuples (config.py only, "
                          "not expressible on the CLI) gives one value per phase per layer")
+    p.add_argument("--feedback_p", type=_float_tuple_arg, default=(0.0,),
+                    help="probability per level of an additive self-feedback pass: stop-gradient "
+                         "argmax that level's own decode reconstruction and re-decode the levels "
+                         "below it (or, for level0, the whole model) on that pseudo input, adding "
+                         "the loss unweighted on top -- tests idempotence/robustness to its own "
+                         "predictions, gradient never reaches the level whose output was argmax'd. "
+                         "Per-phase tuple (bare scalar broadcasts to every phase); each phase entry "
+                         "may itself be a scalar or a per-level tuple (config.py only)")
+    p.add_argument("--feedback_detach", type=lambda x: x.lower() != "false", default=True,
+                    help="feedback_p's i>0 path: True (default) fully stop-gradients the pseudo "
+                         "ctx; False leaves quantize_hard's straight-through path intact so "
+                         "gradient reaches level i's decoder (torch encoder_ste_p additive+STE "
+                         "shape). i==0's recursive whole-model pass is always fully detached "
+                         "regardless (argmax has no gradient either way)")
     p.add_argument("--init_scheme", type=str, default=Config.init_scheme, choices=["llama", "zero"])
     p.add_argument("--use_xsa", type=lambda x: x.lower() != "false", default=Config.use_xsa)
     p.add_argument("--use_qknorm", type=lambda x: x.lower() != "false", default=Config.use_qknorm)
@@ -1980,8 +2127,9 @@ def main():
     _bcast_per_phase("batch_size")
     _bcast_per_phase("val_batch_size")
     _bcast_per_phase("gumbel_temperature")
-    _bcast_per_phase("cascade_rollout_drop")
+    _bcast_per_phase("level_drop")
     _bcast_per_phase("layer_drop_prob")
+    _bcast_per_phase("feedback_p")
 
     if args.dataset == "imagenet64":
         (train_np, train_labels), (val_np, val_labels) = load_imagenet64(Path(args.data_root))
@@ -2016,8 +2164,9 @@ def main():
 
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
     recon_prompt = flat_prompt = gt_img = None
+    train_recon_prompt = train_flat_prompt = train_gt_img = None
 
-    def run_gen_eval(eval_model, top: int, tag: str, include_reconstruct: bool = False) -> tuple:
+    def run_gen_eval(eval_model, top: int, tag: str, flat_prompt, gt_img) -> tuple:
         gen_t0 = time.monotonic()
         m = cast_pytree(eval_model, compute_dtype)
         x = code_embed_proj(flat_prompt, m.levels[0].own_input_embed, m.levels[0].own_input_proj)
@@ -2050,6 +2199,12 @@ def main():
         msg += f" gen_time={gen_time_s:.1f}s"
         logger(msg, **rec)
         return recon_acc, cascade_acc
+
+    def run_gen_eval_both(eval_model, top: int, tag: str) -> tuple:
+        result = run_gen_eval(eval_model, top, tag, flat_prompt, gt_img)
+        if args.eval_gen_train:
+            run_gen_eval(eval_model, top, f"{tag}_train", train_flat_prompt, train_gt_img)
+        return result
 
     def run_val_eval(eval_model, phase: int, tag: str) -> tuple:
         val_t0 = time.monotonic()
@@ -2102,23 +2257,30 @@ def main():
         recon_prompt = val_np[:args.val_batch_size[phase - 1]]
         flat_prompt = jnp.array(images_to_positions(recon_prompt, cfg, pixel_order))
         gt_img = recon_prompt.astype(np.uint8)
+        if args.eval_gen_train:
+            train_recon_prompt = train_np[:args.val_batch_size[phase - 1]]
+            train_flat_prompt = jnp.array(images_to_positions(train_recon_prompt, cfg, pixel_order))
+            train_gt_img = train_recon_prompt.astype(np.uint8)
 
         filter_spec = phase_trainable_filter(model, phase)
         diff_model, static_model = eqx.partition(model, filter_spec)
 
         gumbel_temperature_phase = args.gumbel_temperature[phase - 1]
-        cascade_rollout_drop_phase = args.cascade_rollout_drop[phase - 1]
+        level_drop_phase = args.level_drop[phase - 1]
         layer_drop_prob_phase = args.layer_drop_prob[phase - 1]
+        feedback_p_phase = args.feedback_p[phase - 1]
 
-        def loss_fn(diff_model, static_model, flat_bytes, rng, cascade_rng, phase=phase):
+        def loss_fn(diff_model, static_model, flat_bytes, rng, cascade_rng, feedback_rng, phase=phase):
             m = eqx.combine(diff_model, static_model)
             m = cast_pytree(m, compute_dtype)
             return phase_forward(m, flat_bytes, phase, rng=rng,
-                                  cascade_rollout_drop=cascade_rollout_drop_phase, cascade_rng=cascade_rng,
+                                  level_drop=level_drop_phase, cascade_rng=cascade_rng,
                                   gumbel_temperature=gumbel_temperature_phase,
                                   layer_drop_prob=layer_drop_prob_phase,
                                   label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
-                                  pixel_order=pixel_order)
+                                  pixel_order=pixel_order,
+                                  feedback_p=feedback_p_phase, feedback_rng=feedback_rng,
+                                  feedback_detach=args.feedback_detach)
 
         steps_per_epoch_lr = len(train_iter)
         phase_total_steps = _phase_total_steps(phase - 1, steps_per_epoch_lr)
@@ -2139,9 +2301,9 @@ def main():
         opt_state = optimizer.init(diff_model)
 
         def train_step(diff_model, opt_state, rng, flat_bytes, static_model=static_model):
-            rng, level_rng, cascade_rng = jax.random.split(rng, 3)
+            rng, level_rng, cascade_rng, feedback_rng = jax.random.split(rng, 4)
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-                diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+                diff_model, static_model, flat_bytes, level_rng, cascade_rng, feedback_rng)
             grads = jax.lax.pmean(grads, axis_name="d")
             loss = jax.lax.pmean(loss, axis_name="d")
             aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
@@ -2167,8 +2329,7 @@ def main():
             logger(f"resumed phase {phase}: optimizer/rng/dataloader state restored, "
                    f"continuing from phase_step {start_phase_step}")
 
-        trained_desc = f"levels0-{phase - 1}" if cfg.curriculum_mode == "no_freeze" else f"level{phase - 1}"
-        active_desc = f"phase{phase}[{trained_desc}]"
+        active_desc = f"level{phase - 1}"
         logger(f"=== starting {active_desc} for {phase_total_steps / steps_per_epoch_lr:.3g} "
                f"epochs ({phase_total_steps} steps) ===")
 
@@ -2212,18 +2373,17 @@ def main():
                                   acc=f"{acc:.2f}",
                                   lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
-                    logger(f"\n"
-                           f"[p={phase} s={step}] loss={loss0:.2f} dec_acc={acc:.2f} "
+                    logger(f"l={phase - 1} s={step} loss={loss0:.2f} dec_acc={acc:.2f} "
                            f"ntp_acc={ntp_acc:.2f} util={util:.2f} train_mse={train_mse:.1f} "
                            f"lr={lr_str} grad_norm={grad_norm:.2f}",
-                           phase=phase, step=step, loss=loss0, dec_bpb=bpb,
+                           level=phase - 1, step=step, loss=loss0, dec_bpb=bpb,
                            dec_acc=acc, ntp_bpb=ntp_bpb, ntp_acc=ntp_acc, util=util,
                            train_mse=train_mse, lr=lr, grad_norm=grad_norm)
 
                 if step % gen_eval_every_steps == 0:
                     snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
                     run_val_eval(snapshot, phase, tag=f"phase{phase}_step{step}")
-                    run_gen_eval(snapshot, top=phase - 1, tag=f"phase{phase}_step{step}", include_reconstruct=True)
+                    run_gen_eval_both(snapshot, top=phase - 1, tag=f"phase{phase}_step{step}")
 
                 if step % ckpt_every_steps == 0:
                     ckpt_model = eqx.combine(to_host(unreplicate(p_diff_model)), static_model)
@@ -2241,13 +2401,15 @@ def main():
                         wa_ema = cur_diff_model if wa_ema is None else \
                             ema_update(wa_ema, cur_diff_model, args.wa_ema_decay)
                         eqx.tree_serialise_leaves(wa_dir / f"ema_phase{phase}_step{step}.eqx", wa_ema)
-                        logger(f"wa (ema) snapshot saved at step {step}")
+                        if args.wa_verbose:
+                            logger(f"wa (ema) snapshot saved at step {step}")
                     else:
                         wa_stack.append(cur_diff_model)
                         if len(wa_stack) == args.wa_stack_size:
                             avg = stack_average(list(wa_stack), weights=args.wa_wma_weights)
                             eqx.tree_serialise_leaves(wa_dir / f"wma_phase{phase}_step{step}.eqx", avg)
-                            logger(f"wa (wma, n={len(wa_stack)}) average saved at step {step}")
+                            if args.wa_verbose:
+                                logger(f"wa (wma, n={len(wa_stack)}) average saved at step {step}")
 
         diff_model = to_host(unreplicate(p_diff_model))
         model = eqx.combine(diff_model, static_model)
@@ -2258,13 +2420,13 @@ def main():
                          phase=phase, phase_step=phase_total_steps, step=step, seed=args.seed)
         prune_checkpoints(run_dir, args.ckpt_keep)
         run_val_eval(model, phase, tag=f"phase{phase}_final")
-        run_gen_eval(model, top=phase - 1, tag=f"phase{phase}_final", include_reconstruct=True)
+        run_gen_eval_both(model, top=phase - 1, tag=f"phase{phase}_final")
 
     global_pbar.update(step - last_global_step)
     global_pbar.close()
     logger("=== all phases done, running final top-down cascade eval ===")
     run_val_eval(model, n_levels - 1, tag="final")
-    run_gen_eval(model, top=n_levels - 2, tag="final", include_reconstruct=True)
+    run_gen_eval_both(model, top=n_levels - 2, tag="final")
     logger("training done")
 
 

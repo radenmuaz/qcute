@@ -85,7 +85,6 @@ log_every = 100
 gen_eval_every_epoch = 10
 ckpt_every_epoch = 100
 ckpt_keep = 1
-qual_gen_n = 16
 
 attn_lookahead = (0, 0, 0, 0)
 decode_past = (2, 0, 0, 0)

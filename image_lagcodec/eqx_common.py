@@ -580,10 +580,14 @@ def make_lr_schedule(kind: str, peak_lr: float, warmup_steps: int, total_steps: 
     if kind == "const":
         return warmup_const_schedule(peak_lr, warmup_steps)
     assert kind == "cosine", f"unknown lr_schedule {kind!r}"
-    assert total_steps is not None and total_steps > warmup_steps, \
-        f"cosine schedule needs total_steps > warmup_steps (this phase's epoch_count*steps_per_epoch) " \
-        f"-- got total_steps={total_steps}, warmup_steps={warmup_steps}"
+    assert total_steps is not None, "cosine schedule needs total_steps"
     ds = decay_steps if decay_steps is not None else (total_steps - warmup_steps)
+    # total_steps <= warmup_steps is allowed (e.g. a short debug/smoke phase with a real config's
+    # warmup_steps) -- optax's OWN decay_steps arg is the TOTAL schedule length including warmup
+    # (it computes the cosine-only portion as decay_steps-warmup_steps internally), so ds must
+    # stay > warmup_steps or optax's own construction raises; clamp only kicks in for this
+    # otherwise-crashing case, doesn't touch the normal ds>warmup_steps path (chat 2026-09-17)
+    ds = max(ds, warmup_steps + 1)
     return optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=peak_lr, warmup_steps=warmup_steps,
         decay_steps=ds, end_value=end_value)

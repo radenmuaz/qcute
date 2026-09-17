@@ -22,7 +22,7 @@ mse_weight = 1.0
 entropy_weight = 0.1
 
 
-decoder_ncodes = (16, 16, 16, 4)   # level3 (top, new) only has 4 own codes -- avoid the clamp warning
+decoder_ncodes = (4, 4, 4, 4)   # level3 (top, new) only has 4 own codes -- avoid the clamp warning
 ncodes_window = -1   # streaming: fixed 16-code chunks, unbounded lookback into past chunks
 weight_sharing = False
 # weight_sharing = True
@@ -85,7 +85,6 @@ log_every = 100
 gen_eval_every_epoch = 10
 ckpt_every_epoch = 100
 ckpt_keep = 1
-qual_gen_n = 16
 
 attn_lookahead = (0, 0, 0, 0)
 decode_past = (0, 0, 0, 0)

@@ -1,13 +1,11 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/search8_all.py
-
-8-way random search off run_1.py (top_level_trainable base), chat 2026-09-17. Ablates attn_lookahead=2, decode_past=2, decode_future=2 on level0 (2^3 factorial across search1-8, this is run 8/8).
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/search0.py
 """
 
 # --- model ---
 img_size = 32
 d_model = (128, 128, 128, 128,)
-n_layers = (1, 1, 1, 1)
+n_layers = (2, 2, 2, 2)
 n_heads = (2, 2, 2, 2)
 n_kv_heads = (None, None, None, None,)
 strides = (4, 4, 4, 4)   # was (4,4,4,-1) -- real last stride opts into top_level_trainable
@@ -22,16 +20,19 @@ mse_weight = 1.0
 entropy_weight = 0.1
 
 
-decoder_ncodes = (16, 16, 16, 4)   # level3 (top, new) only has 4 own codes -- avoid the clamp warning
-ncodes_window = -1   # streaming: fixed 16-code chunks, unbounded lookback into past chunks
+decoder_ncodes = 4
+ncodes_window = -1   
+attn_lookahead = 16
+decode_past = 16
+decode_future = 16
 weight_sharing = False
 # weight_sharing = True
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
 gumbel_temperature = 1.0
 gumbel_at_inference = False
-cascade_rollout_drop = 0.1
-quantize_drop = 0.9
+level_drop = 0.8
+quantize_drop = 0.8
 # mse_softmax_tau = 1.0
 init_scheme = "llama"
 use_xsa = True
@@ -53,7 +54,7 @@ traversal = "zorder"
 # --- training ---
 batch_size = 16
 val_batch_size = 16
-phase_epochs = (5, 5, 100, 100)   # 4th entry added -- n_phases is now n_levels=4 (top level trained too)
+phase_epochs = (3, 3, 3, 100)   # 4th entry added -- n_phases is now n_levels=4 (top level trained too)
 warmup_steps = 1000
 grad_clip = 10.0
 seed = 0
@@ -72,7 +73,7 @@ optimizer_kwargs = {}
 # wa_mode = "none"
 
 wa_mode = "ema"
-wa_every_epoch = 1
+wa_every_step = 100
 wa_ema_decay = 0.9
 
 # wa_mode = "wma"
@@ -82,10 +83,10 @@ wa_ema_decay = 0.9
 
 # --- logging ---
 log_every = 100
-gen_eval_every_epoch = 10
+gen_eval_every_epoch = 3
 ckpt_every_epoch = 100
 ckpt_keep = 1
 
-attn_lookahead = (2, 0, 0, 0)
-decode_past = (2, 0, 0, 0)
-decode_future = (2, 0, 0, 0)
+attn_lookahead = (0, 0, 0, 0)
+decode_past = (0, 0, 0, 0)
+decode_future = (0, 0, 0, 0)
