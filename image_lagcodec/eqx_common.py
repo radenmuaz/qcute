@@ -32,7 +32,7 @@ def _splash_pad(x: jnp.ndarray, block: int) -> jnp.ndarray:
     return x
 
 
-def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool, window: int = None):
+def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool, window: int = None, lookahead: int = 0):
     """Not cached: caching a SplashAttentionKernel (holds jnp.array-converted MaskInfo, created
     during whichever trace first calls this) across separate jax traces (train vs eval, or a
     retrace) leaks a tracer from the first, now-closed trace -- confirmed 2026-09-08, all 4 TPU
@@ -44,10 +44,16 @@ def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool, window: int =
     library -- genuinely block-sparse, not a dense-then-masked matmul, so it's real O(T*window)
     compute/memory savings). For scaling the ENCODER's own self-attention to large images (e.g.
     256x256 -> 65536-position sequences at level0) where full O(T^2) unbounded attention becomes
-    prohibitive."""
-    if window is not None:
+    prohibitive.
+
+    lookahead (chat 2026-09-16): 0 (default) -- plain causal, unchanged. int>0 -- shifted
+    triangular mask: query i may additionally see keys up to i+lookahead (LocalMask's native
+    right-side window_size, window_size=(window, lookahead) -- same kernel, still genuinely
+    block-sparse). Only meaningful when causal=True; ignored when causal=False (already fully
+    unbounded both ways -- ordinary full attention, ordinary per-query output)."""
+    if window is not None or lookahead > 0:
         mask = splash_mask_lib.MultiHeadMask(
-            [splash_mask_lib.LocalMask((padded_T, padded_T), window_size=(window, 0), offset=0)
+            [splash_mask_lib.LocalMask((padded_T, padded_T), window_size=(window, lookahead), offset=0)
              for _ in range(n_heads)]
         )
     else:
@@ -65,16 +71,16 @@ def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool, window: int =
 
 
 def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: bool, sm_scale: float,
-                      window: int = None, sink: jnp.ndarray = None) -> jnp.ndarray:
+                      window: int = None, lookahead: int = 0, sink: jnp.ndarray = None) -> jnp.ndarray:
     """q:(B,Hq,T,hd), k/v:(B,Hkv,T,hd), Hq%Hkv==0 (native GQA -- splash groups kv heads internally,
-    no repeat_kv needed unlike Pallas flash_attention). Returns (B,Hq,T,hd). window: see
-    _splash_attn_kernel's docstring -- None (default) is unchanged/unbounded behavior. sink
-    (chat 2026-09-15): optional (Hq,) per-head attention-sink logit, splash_attention's NATIVE
-    `sinks` kernel arg -- NOT batched (shared across B), so vmap must close over it rather than
-    map it like q/k/v."""
+    no repeat_kv needed unlike Pallas flash_attention). Returns (B,Hq,T,hd). window/lookahead: see
+    _splash_attn_kernel's docstring -- None/0 (default) is unchanged/unbounded-causal behavior.
+    sink (chat 2026-09-15): optional (Hq,) per-head attention-sink logit, splash_attention's
+    NATIVE `sinks` kernel arg -- NOT batched (shared across B), so vmap must close over it rather
+    than map it like q/k/v."""
     B, Hq, T, hd = q.shape
     q_p, k_p, v_p = _splash_pad(q, _SPLASH_BLOCK), _splash_pad(k, _SPLASH_BLOCK), _splash_pad(v, _SPLASH_BLOCK)
-    kernel = _splash_attn_kernel(Hq, q_p.shape[-2], causal, window)
+    kernel = _splash_attn_kernel(Hq, q_p.shape[-2], causal, window, lookahead)
     if sink is not None:
         y = jax.vmap(lambda qq, kk, vv: kernel(qq, kk, vv, sinks=sink))(q_p * sm_scale, k_p, v_p)
     else:
@@ -294,11 +300,12 @@ class Attention(eqx.Module):
     use_xsa: bool = eqx.field(static=True)
     use_qknorm: bool = eqx.field(static=True)
     window: int = eqx.field(static=True)
+    lookahead: int = eqx.field(static=True)
     sink: jnp.ndarray
 
     def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, rope_base: float, n_layers: int = None,
                  init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True, window: int = None,
-                 use_sink: bool = False):
+                 lookahead: int = 0, use_sink: bool = False):
         """See SwiGLU.__init__ for the init_scheme rationale -- applies identically here, with
         `out` as the residual-output projection. use_xsa: see apply_xsa() above (arXiv:2603.09078)
         -- applied right after the attention call, before the out-projection; default off, opt-in.
@@ -334,6 +341,7 @@ class Attention(eqx.Module):
         self.use_xsa = use_xsa
         self.use_qknorm = use_qknorm
         self.window = window
+        self.lookahead = lookahead
         self.sink = jnp.zeros((n_heads,)) if use_sink else None
 
     def __call__(self, x: jnp.ndarray, causal: bool = True) -> jnp.ndarray:
@@ -352,7 +360,8 @@ class Attention(eqx.Module):
         cos, sin = rope_cos_sin(T, hd, self.rope_base)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         scale = 1.0 / math.sqrt(hd)
-        y = splash_attention(q, k, v, causal=causal, sm_scale=scale, window=self.window, sink=self.sink)  # (B,H,T,hd)
+        y = splash_attention(q, k, v, causal=causal, sm_scale=scale, window=self.window,
+                             lookahead=self.lookahead, sink=self.sink)  # (B,H,T,hd)
         if self.use_xsa:
             n_rep = self.n_heads // self.n_kv_heads
             v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
@@ -435,12 +444,12 @@ class Block(eqx.Module):
 
     def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, mlp_mult: int, rope_base: float,
                  n_layers: int = None, init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True,
-                 window: int = None, use_sink: bool = False):
+                 window: int = None, lookahead: int = 0, use_sink: bool = False):
         k1, k2 = jax.random.split(key, 2)
         self.norm1 = RMSNorm(d_model)
         self.attn = Attention(k1, d_model, n_heads, n_kv_heads, rope_base, n_layers=n_layers,
                                init_scheme=init_scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, window=window,
-                               use_sink=use_sink)
+                               lookahead=lookahead, use_sink=use_sink)
         self.norm2 = RMSNorm(d_model)
         self.mlp = SwiGLU(k2, d_model, mlp_mult, n_layers=n_layers, init_scheme=init_scheme)
 

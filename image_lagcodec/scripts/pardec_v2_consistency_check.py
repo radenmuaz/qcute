@@ -20,7 +20,7 @@ from image_lagcodec.run_lagcodec import (
 import image_lagcodec.eqx_common as eqx_common
 
 if jax.default_backend() == "cpu":
-    def _cpu_dense_attention(q, k, v, causal, sm_scale, window=None, sink=None):
+    def _cpu_dense_attention(q, k, v, causal, sm_scale, window=None, lookahead=0, sink=None):
         Bc, Hq, T, hd = q.shape
         Hkv = k.shape[1]
         n_rep = Hq // Hkv
@@ -29,9 +29,14 @@ if jax.default_backend() == "cpu":
             v = jnp.repeat(v, n_rep, axis=1)
         logits = jnp.einsum("bhtd,bhsd->bhts", q, k) * sm_scale
         if causal:
-            mask = jnp.tril(jnp.ones((T, T), dtype=bool))
-            if window is not None:
-                mask = mask & (jnp.arange(T)[None, :] > jnp.arange(T)[:, None] - window)
+            q_idx, kv_idx = jnp.arange(T)[:, None], jnp.arange(T)[None, :]
+            if window is None and lookahead <= 0:
+                mask = q_idx >= kv_idx
+            else:
+                mask = jnp.ones((T, T), dtype=bool)
+                if window is not None:
+                    mask = mask & (q_idx - window <= kv_idx)
+                mask = mask & (q_idx + max(0, lookahead) >= kv_idx)
             logits = jnp.where(mask[None, None], logits, -1e9)
         attn = jax.nn.softmax(logits, axis=-1)
         return jnp.einsum("bhts,bhsd->bhtd", attn, v)   # sink not modeled here (fullctx-path test only)

@@ -46,6 +46,9 @@ class Config:
     decoder_ncodes: tuple = 1
     ncodes_window: tuple = 0
     streaming: tuple = True
+    decode_past: tuple = 0
+    decode_future: tuple = 0
+    sync: tuple = False
     weight_sharing: tuple = True
     precision: str = "bf16"
     curriculum_mode: str = "freeze"
@@ -57,6 +60,7 @@ class Config:
     use_qknorm: bool = True
 
     attn_window: tuple = -1
+    attn_lookahead: tuple = 0
     use_attn_sink: bool = False
 
     remat: bool = False
@@ -94,6 +98,9 @@ class Config:
         bcast("decoder_ncodes", int)
         bcast("ncodes_window", int)
         bcast("streaming", bool)
+        bcast("decode_past", int)
+        bcast("decode_future", int)
+        bcast("sync", bool)
         bcast("weight_sharing", bool)
         bcast("token_head_type", str)
         bcast("token_dim", int)
@@ -101,6 +108,7 @@ class Config:
         bcast("mtp_horizon", int)
         bcast("mtp_mode", str)
         bcast("attn_window", int)
+        bcast("attn_lookahead", int)
         if self.pq_dim is None:
             self.pq_dim = self.d_model
         else:
@@ -110,6 +118,7 @@ class Config:
             and len(self.n_kv_heads) == n and len(self.code_vocab) == n and len(self.pq_chunks) == n
         assert len(self.mlp_mult) == n and len(self.rope_base) == n and len(self.decoder_ncodes) == n
         assert len(self.ncodes_window) == n and len(self.streaming) == n
+        assert len(self.decode_past) == n and len(self.decode_future) == n and len(self.sync) == n
         for i in range(n):
             assert self.ncodes_window[i] >= -1, \
                 f"level {i}: ncodes_window={self.ncodes_window[i]} must be -1 (all) or >=0 " \
@@ -119,16 +128,32 @@ class Config:
                     f"level {i}: streaming=False with bounded ncodes_window={self.ncodes_window[i]} "
                     f"(symmetric/bidirectional local window) is not implemented -- only ncodes_window="
                     f"-1 (true fullctx) or 0 (disjoint, streaming moot) are supported under streaming=False")
-        assert len(self.attn_window) == n
+            assert self.decode_past[i] >= 0 and self.decode_future[i] >= 0, \
+                f"level {i}: decode_past={self.decode_past[i]}/decode_future={self.decode_future[i]} must be >=0"
+            if self.sync[i]:
+                raise NotImplementedError(
+                    f"level {i}: sync=True is a stub (TODO) -- real cross-group pipelining "
+                    f"(sequential group scan with a shared/growing cache, so a later group can "
+                    f"read an earlier group's ACTUAL decode_future output instead of drafting its "
+                    f"own private guess) is not implemented yet. Async mode (sync=False, default) "
+                    f"already supports decode_past/decode_future at TRAINING time (both are real, "
+                    f"teacher-forced); at GENERATION time only decode_past is used (the group's own "
+                    f"private redecode of past content, discarded after conditioning) -- "
+                    f"decode_future is a training-only regularizer for now and is skipped entirely "
+                    f"during decode_generate_pardec, regardless of its value, until sync=True lands")
+        assert len(self.attn_window) == n and len(self.attn_lookahead) == n
         for i in range(n):
             assert self.attn_window[i] == -1 or self.attn_window[i] >= 1, \
                 f"level {i}: attn_window={self.attn_window[i]} must be -1 (unbounded/flash) or >=1 (splash LocalMask)"
+            assert self.attn_lookahead[i] >= 0, \
+                f"level {i}: attn_lookahead={self.attn_lookahead[i]} must be >=0 (0=plain causal)"
 
+        top_level_trainable = self.strides[-1] != -1
         code_count = total_bytes_of(self) // self.byte_group
         for i in range(n):
             K_i = self.strides[i] if self.strides[i] != -1 else 1
             code_count = code_count // K_i
-            if i == n - 1:
+            if i == n - 1 and not top_level_trainable:
                 break
             n_blocks_i, G_i, N_i, S_i = code_count, self.decoder_ncodes[i], self.ncodes_window[i], self.streaming[i]
             assert G_i >= 1, f"level {i}: decoder_ncodes={G_i} must be >=1"
@@ -188,7 +213,10 @@ class Config:
         assert self.byte_group in (1, 3), "byte_group must be 1 (per-byte) or 3 (per-pixel RGB)"
         assert total_bytes_of(self) % self.byte_group == 0
         assert self.traversal in ("raster", "zorder")
-        assert self.strides[-1] == -1, "top level's stride is unused -- use -1 as the don't-care convention"
+        assert self.strides[-1] == -1 or self.strides[-1] >= 1, \
+            "top level's stride is either -1 (don't-care, legacy: top level stays untrained/wasted " \
+            "-- see top_level_trainable) or a real stride >=1 (top level becomes fully trainable: " \
+            "its own encoder gets a phase, and it gets a real decoder too)"
         assert all(s >= 1 for s in self.strides[:-1])
         n_positions = total_bytes_of(self) // self.byte_group
         assert n_positions % math.prod(self.strides[:-1]) == 0
@@ -571,7 +599,17 @@ def pardec_block_chunk_step(blk: Block, x_chunk, cache_k, cache_v, cache_pos_sta
 
 
 def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: jnp.ndarray,
-                                 min_valid_pos: jnp.ndarray) -> jnp.ndarray:
+                                 min_valid_pos: jnp.ndarray, lookahead: jnp.ndarray = None) -> jnp.ndarray:
+    """lookahead (chat 2026-09-16): optional (T,) per-QUERY-POSITION forward relaxation of the
+    causal mask -- query i may additionally see keys up to i+lookahead[i] (0 = plain causal,
+    unchanged). Needed for decode_future: plain causal masking makes appending extra future
+    target positions AFTER a group's real span completely inert (later-appended keys can never
+    affect an earlier query's output under strict causality) -- confirmed by a real bug this
+    session (decode_future changed nothing until this was added). Scoped to a real (T,) vector,
+    not a per-ROW scalar, because only the real target span's OWN queries should get the
+    relaxation -- ctx/bos/decode_past positions must stay strictly causal, or their hidden states
+    (attended to by the real span) would leak future information no generation-time draft could
+    ever have produced (train/inference mismatch)."""
     Bc, T, D = x.shape
     hd = D // attn.n_heads
     qkv = x @ attn.qkv
@@ -591,7 +629,10 @@ def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: j
     scale = 1.0 / math.sqrt(hd)
     scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale
     idx = jnp.arange(T)
-    causal = idx[None, :] <= idx[:, None]
+    if lookahead is None:
+        causal = idx[None, :] <= idx[:, None]
+    else:
+        causal = idx[None, :] <= (idx[:, None] + lookahead[:, None])
     validmin = idx[None, :] >= min_valid_pos[:, None]
     mask = causal[None] & validmin[:, None, :]
     scores = jnp.where(mask[:, None], scores, -1e9)
@@ -604,9 +645,9 @@ def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: j
 
 
 def run_block_pardec(blk: Block, x: jnp.ndarray, rope_pos_ids: jnp.ndarray, min_valid_pos: jnp.ndarray,
-                      remat: bool) -> jnp.ndarray:
+                      remat: bool, lookahead: jnp.ndarray = None) -> jnp.ndarray:
     def f(x):
-        x = x + dense_self_attention_pardec(blk.attn, blk.norm1(x), rope_pos_ids, min_valid_pos)
+        x = x + dense_self_attention_pardec(blk.attn, blk.norm1(x), rope_pos_ids, min_valid_pos, lookahead)
         x = x + blk.mlp(blk.norm2(x))
         return x
     return jax.checkpoint(f)(x) if remat else f(x)
@@ -704,6 +745,8 @@ class EncDecLevel(eqx.Module):
     pq_dim: int = eqx.field(static=True)
     ncodes_window: int = eqx.field(static=True)
     streaming: bool = eqx.field(static=True)
+    decode_past: int = eqx.field(static=True)
+    decode_future: int = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config, level: int, has_decoder: bool, weight_sharing: bool):
         D = cfg.d_model[level]
@@ -714,6 +757,8 @@ class EncDecLevel(eqx.Module):
         self.remat = cfg.remat
         self.ncodes_window = cfg.ncodes_window[level]
         self.streaming = cfg.streaming[level]
+        self.decode_past = cfg.decode_past[level]
+        self.decode_future = cfg.decode_future[level]
         is_byte_level = (level == 0)
         self.pq_chunks, self.code_vocab = cfg.pq_chunks[level], cfg.code_vocab[level]
         self.in_pq_chunks = cfg.byte_group if is_byte_level else cfg.pq_chunks[level - 1]
@@ -737,9 +782,10 @@ class EncDecLevel(eqx.Module):
         n_layers = cfg.n_layers[level]
         block_keys = jax.random.split(keys[1], n_layers)
         enc_window = None if cfg.attn_window[level] == -1 else cfg.attn_window[level]
+        enc_lookahead = cfg.attn_lookahead[level]
         self.blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
                              n_layers=n_layers, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
-                             window=enc_window, use_sink=cfg.use_attn_sink) for k in block_keys]
+                             window=enc_window, lookahead=enc_lookahead, use_sink=cfg.use_attn_sink) for k in block_keys]
         self.ln_f = RMSNorm(D)
         self.code_head = init_matrix(keys[2], (D, self.pq_chunks * self.code_vocab), scheme)
         self.ntp_head = init_matrix(keys[3], (D, ntp_out), scheme)
@@ -1062,21 +1108,41 @@ class EncDecLevel(eqx.Module):
 
         target_windows = jnp.stack(
             [target_p[:, g * G * self.K:(g + 1) * G * self.K] for g in range(n_groups)], axis=1)
-        target_flat = target_windows.reshape(B2, G * self.K, *target_seq.shape[2:])
+
+        Pp, Pf = self.decode_past, self.decode_future
+        Kspan = G * self.K
+        widened_len = Pp + Kspan + Pf
+        if Pp > 0 or Pf > 0:
+            target_p_wide = jnp.pad(target_p, ((0, 0), (Pp, Pf), (0, 0)))
+            target_windows_wide = jnp.stack(
+                [target_p_wide[:, g * Kspan:g * Kspan + widened_len] for g in range(n_groups)], axis=1)
+        else:
+            target_windows_wide = target_windows
+        target_flat = target_windows_wide.reshape(B2, widened_len, *target_seq.shape[2:])
         te_flat = self._dec_embed_target(target_flat)
         bos = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
         xe = jnp.concatenate([ctx_flat, bos, te_flat], axis=1)
+        per_group_len = per_group_len + Pp + Pf
 
         rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])[:, None]
-        rope_target = jnp.stack([(g + 1) * G + 1 + jnp.arange(G * self.K) for g in range(n_groups)], axis=0)
+        rope_target = jnp.stack(
+            [(g + 1) * G + 1 - Pp + jnp.arange(widened_len) for g in range(n_groups)], axis=0)
+        rope_target = jnp.clip(rope_target, 0, None)
         rope_pos_ids_g = jnp.concatenate([rope_ctx_g, rope_bos, rope_target], axis=1)
         rope_pos_ids = jnp.broadcast_to(rope_pos_ids_g[None], (B, n_groups, per_group_len)).reshape(B2, per_group_len)
 
+        if Pf > 0:
+            pos_idx = jnp.arange(per_group_len)
+            kspan_start = Wg + Pp
+            lookahead_vec = jnp.where((pos_idx >= kspan_start) & (pos_idx < kspan_start + Kspan), Pf, 0)
+        else:
+            lookahead_vec = None
+
         x = xe
         for blk in blocks:
-            x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, self.remat)
+            x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, self.remat, lookahead_vec)
         h = ln_f(x)
-        pred_pos = Wg + jnp.arange(G * self.K)
+        pred_pos = Wg + Pp + jnp.arange(G * self.K)
         h_t = h[:, pred_pos, :]
         h_t = h_t.reshape(B, n_groups * G * self.K, D)
         target_out = target_windows.reshape(B, n_groups * G * self.K, *target_seq.shape[2:])
@@ -1196,7 +1262,10 @@ class EncDecLevel(eqx.Module):
         fullctx = (not self.streaming) and (self.ncodes_window == -1)
         N = self.ncodes_window if self.ncodes_window >= 0 else (n_groups - 1)
         Wg = n_blocks_p if fullctx else (N + 1) * G
-        per_group_len = Wg + 1 + G * self.K
+        Pp = self.decode_past   # decode_future is TRAIN-ONLY -- never used at generation, see
+        # Config.sync's docstring (sync=True, TODO, would let a later group read an earlier
+        # group's ACTUAL decode_future output; until then it's simply not decoded here at all)
+        per_group_len = Wg + 1 + Pp + G * self.K
 
         ctx_tok = code_embed_proj(ctx_idx, self.ctx_embed, self.ctx_proj)
         if pad_blocks > 0:
@@ -1250,6 +1319,8 @@ class EncDecLevel(eqx.Module):
         cache_v = jnp.zeros_like(cache_k)
         rng = jax.random.PRNGKey(seed)
 
+        total_steps = Pp + G * self.K
+
         @jax.jit
         def run_pardec(ctx_tok_flat, cache_k, cache_v, rng):
             bos_in = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
@@ -1257,17 +1328,18 @@ class EncDecLevel(eqx.Module):
             chunk_rope = jnp.concatenate([rope_ctx_flat, rope_bos_flat[:, None]], axis=1)
             h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, jnp.array(0), chunk_rope)
             pos = Wg + 1
-            rope_pos_row = rope_bos_flat + 1
+            rope_pos_row = jnp.clip(rope_bos_flat + 1 - Pp, 0, None)
             h = h_chunk[:, -1, :]
             val, rng = token_predict(h, rng)
-            vals = [val]
+            vals = [val] if Pp == 0 else []   # t=0's own output is a decode_past DRAFT, pruned, if Pp>0
             x_input = self._dec_embed_target(val)
-            for _ in range(G * self.K - 1):
+            for t in range(1, total_steps):
                 h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
                 pos = pos + 1
                 rope_pos_row = rope_pos_row + 1
                 val, rng = token_predict(h, rng)
-                vals.append(val)
+                if t >= Pp:
+                    vals.append(val)
                 x_input = self._dec_embed_target(val)
             _, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
             return jnp.stack(vals, axis=1)
@@ -1392,8 +1464,9 @@ class HierEncDec(eqx.Module):
     def __init__(self, key, cfg: Config):
         self.cfg = cfg
         n = len(cfg.strides)
+        top_level_trainable = cfg.strides[-1] != -1
         keys = jax.random.split(key, n)
-        self.levels = [EncDecLevel(keys[i], cfg, level=i, has_decoder=(i < n - 1),
+        self.levels = [EncDecLevel(keys[i], cfg, level=i, has_decoder=(i < n - 1) or top_level_trainable,
                                     weight_sharing=cfg.weight_sharing[i]) for i in range(n)]
 
 
@@ -1657,10 +1730,10 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
 
 CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "decoder_ncodes",
-                  "ncodes_window", "streaming",
+                  "ncodes_window", "streaming", "decode_past", "decode_future", "sync",
                   "weight_sharing", "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
                   "gumbel_at_inference", "init_scheme", "use_xsa",
-                  "use_qknorm", "remat", "attn_window", "use_attn_sink",
+                  "use_qknorm", "remat", "attn_window", "attn_lookahead", "use_attn_sink",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "mse_weight",
                   "mse_softmax_tau", "traversal", "label_reg_weight")
@@ -1777,6 +1850,16 @@ def main():
     p.add_argument("--decoder_ncodes", type=_tuple_arg, default=Config.decoder_ncodes)
     p.add_argument("--ncodes_window", type=_tuple_arg, default=Config.ncodes_window)
     p.add_argument("--streaming", type=_bool_tuple_arg, default=Config.streaming)
+    p.add_argument("--decode_past", type=_tuple_arg, default=Config.decode_past,
+                    help="redecode this many extra target positions before a group's own real "
+                         "span (teacher-forced at training; at generation, the group's own private "
+                         "redecode/draft, never shared) -- pruned from the final output either way")
+    p.add_argument("--decode_future", type=_tuple_arg, default=Config.decode_future,
+                    help="redecode this many extra target positions after a group's own real span "
+                         "-- TRAINING ONLY (teacher-forced); ignored at generation until sync=True "
+                         "lands (stub, not implemented) -- pruned from the final output")
+    p.add_argument("--sync", type=_bool_tuple_arg, default=Config.sync,
+                    help="stub (TODO), not implemented -- raises NotImplementedError if set True")
     p.add_argument("--weight_sharing", type=_bool_tuple_arg, default=Config.weight_sharing)
     p.add_argument("--precision", type=str, default=Config.precision, choices=["bf16", "fp32"])
     p.add_argument("--curriculum_mode", type=str, default=Config.curriculum_mode, choices=["freeze", "no_freeze"])
@@ -1799,6 +1882,10 @@ def main():
     p.add_argument("--use_qknorm", type=lambda x: x.lower() != "false", default=Config.use_qknorm)
     p.add_argument("--remat", type=lambda x: x.lower() != "false", default=Config.remat)
     p.add_argument("--attn_window", type=_tuple_arg, default=Config.attn_window)
+    p.add_argument("--attn_lookahead", type=_tuple_arg, default=Config.attn_lookahead,
+                    help="encoder self-attention shifted-triangular lookahead -- 0 (default) "
+                         "plain causal, int>0 query may additionally see keys up to that many "
+                         "positions ahead (splash LocalMask's native right-side window)")
     p.add_argument("--use_attn_sink", type=lambda x: x.lower() != "false", default=Config.use_attn_sink)
     p.add_argument("--byte_group", type=int, default=Config.byte_group)
     p.add_argument("--token_head_type", type=str, default=Config.token_head_type)
@@ -1860,7 +1947,8 @@ def main():
     print(f"jax devices ({n_devices} used of {jax.local_device_count()} local): {jax.devices()}")
     cfg = Config(**{k: getattr(args, k) for k in CONFIG_FIELDS})
     n_levels = len(cfg.strides)
-    n_phases = n_levels - 1
+    top_level_trainable = cfg.strides[-1] != -1
+    n_phases = n_levels if top_level_trainable else n_levels - 1
     n_positions = n_positions_of(cfg)
     pixel_order = pixel_order_for(cfg)
 

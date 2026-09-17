@@ -1,20 +1,5 @@
 """
 uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/stream16_unbounded.py
-
-STREAMING preset (chat 2026-09-15, renamed from "pardec_fullctx_16" -- that name was wrong, this
-is NOT fullctx): decoder_ncodes=16 (fixed chunk size, as if new encoder codes keep arriving 16 at
-a time) with ncodes_window=-1 (each new 16-chunk gets unbounded lookback into everything decoded
-so far), uniformly across every level. 16 is level2's (the deepest DECODED level's) own max
-n_blocks, so level2 degenerates to ONE single group there (falls back to the fast original
-sequential decode automatically, see decode_generate_pardec's fallback docstring); levels 0
-(n_blocks=256) and 1 (n_blocks=64) stay genuinely streaming-parallel at chunk=16 with full
-unbounded lookback. True FULLCTX (no streaming, entire sequence known upfront) is a DIFFERENT
-point in the same (decoder_ncodes, ncodes_window) space -- see pardec_fullctx_parallel.py
-(decoder_ncodes=1, ncodes_window=-1, "one seed one token") and the fast-fallback case
-(decoder_ncodes=n_blocks, single group, "one long slow AR"). No new flag needed -- both scenarios
-were always expressible with the existing two params; the earlier confusion was a naming/config
-mistake, not a parameterization gap. See pardec_1_unbounded.py for the decoder_ncodes-vs-n_groups
-table.
 """
 
 
@@ -23,12 +8,12 @@ img_size = 32
 # d_model = (256, 256, 256, 256, )
 # d_model = (128, 256, 512, 1,)
 
-# d_model = (128, 128, 128, 1,)
-# n_layers = (1, 1, 1, 1)
+d_model = (128, 128, 128, 1,)
+n_layers = (1, 1, 1, 1)
 
 # n_layers = (2, 2, 2, 2,)
-d_model = (512, 512, 512, 512, )
-n_layers = (4, 4, 4, 4,)
+# d_model = (512, 512, 512, 512, )
+# n_layers = (4, 4, 4, 4,)
 # n_layers = (2, 3, 4, 1)
 n_heads = (2, 2, 2, 1)
 n_kv_heads = (None, None, None, None,)
