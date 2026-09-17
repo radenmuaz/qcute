@@ -1955,6 +1955,9 @@ def main():
     p.add_argument("--wa_verbose", type=lambda x: x.lower() != "false", default=True,
                     help="log a line every time a wa (ema/wma) snapshot is saved. Default True; "
                          "set False to suppress (the snapshot is still saved either way)")
+    p.add_argument("--epoch_verbose", type=lambda x: x.lower() != "false", default=True,
+                    help="log a line at the start of every epoch. Default True; "
+                         "set False to suppress it")
     p.add_argument("--wa_every_step", type=int, default=None, help="WA update cadence, in steps")
     p.add_argument("--wa_every_epoch", type=float, default=None,
                     help="WA update cadence, in epochs (auto-converted to steps). At most one "
@@ -2214,8 +2217,8 @@ def main():
         bpb, acc, ntp_bpb, ntp_acc, util, val_mse = [float(a) for a in aux]
         loss = float(loss)
         val_time_s = time.monotonic() - val_t0
-        logger(f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_ntp_acc={ntp_acc:.2f} "
-               f"val_time={val_time_s:.1f}s",
+        logger(f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_mse={val_mse:.4f} "
+               f"val_ntp_acc={ntp_acc:.2f} val_time={val_time_s:.1f}s",
                tag=tag, val_loss=loss, val_dec_acc=acc, val_dec_bpb=bpb,
                val_ntp_acc=ntp_acc, val_ntp_bpb=ntp_bpb, val_util=util, val_mse=val_mse,
                val_time_s=val_time_s)
@@ -2348,7 +2351,8 @@ def main():
         epoch_num = start_phase_step // steps_per_epoch
         while phase_step < phase_total_steps:
             epoch_num += 1
-            logger(f"{active_desc}: epoch {epoch_num} (step {step})")
+            if args.epoch_verbose:
+                logger(f"{active_desc}: epoch {epoch_num} (step {step})")
             global_pbar.update(step - last_global_step)
             last_global_step = step
             for flat in train_iter:
@@ -2373,10 +2377,10 @@ def main():
                                   acc=f"{acc:.2f}",
                                   lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
-                    logger(f"l={phase - 1} s={step} loss={loss0:.2f} dec_acc={acc:.2f} "
+                    logger(f"l={phase - 1} e={epoch_num} s={step} loss={loss0:.2f} dec_acc={acc:.2f} "
                            f"ntp_acc={ntp_acc:.2f} util={util:.2f} train_mse={train_mse:.1f} "
                            f"lr={lr_str} grad_norm={grad_norm:.2f}",
-                           level=phase - 1, step=step, loss=loss0, dec_bpb=bpb,
+                           level=phase - 1, epoch=epoch_num, step=step, loss=loss0, dec_bpb=bpb,
                            dec_acc=acc, ntp_bpb=ntp_bpb, ntp_acc=ntp_acc, util=util,
                            train_mse=train_mse, lr=lr, grad_norm=grad_norm)
 

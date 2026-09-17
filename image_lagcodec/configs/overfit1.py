@@ -6,7 +6,7 @@ uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/ov
 img_size = 32
 # d_model = (128, 128)
 d_model = (256, 256)
-n_layers = (4, 4)
+n_layers = (2, 2)
 n_heads = (2, 2)
 n_kv_heads = (None, None)
 # strides = (4, 4)
@@ -15,28 +15,36 @@ pq_chunks = (3, 3)
 mlp_mult = 4
 rope_base = 10000.0
 
-ntp_weight = 1.0
-mtp_weight = 0.1
-mse_weight = 0.1
+# ntp_weight = 1.0
+ntp_weight = 0.1
+mtp_weight = 0.0
+mse_weight = 0.0
 entropy_weight = 0.1
 
-strides = (2, 2)
+strides = (4, 4)
+# strides = (2, 2)
 decoder_ncodes = 1
-ncodes_window = 0
-# ncodes_window = -1
+# ncodes_window = 0
+ncodes_window = 64
 attn_lookahead = 0
-decode_past = 16
+decode_past = 0
+# decode_future = 8
 decode_future = 16
 weight_sharing = False
 # weight_sharing = True
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
-gumbel_temperature = 1.0
-# gumbel_temperature = 0.1
+# gumbel_temperature = 1.0
+gumbel_temperature = 0.1
 gumbel_at_inference = False
+
 mse_softmax_tau = 1.0
-level_drop = 0.8
-quantize_drop = 0.8
+level_drop = 0.9
+quantize_drop = 0.9
+# feedback_p = 0.5
+# feedback_p = 0.0
+
+
 init_scheme = "llama"
 use_xsa = True
 use_attn_sink = True
@@ -57,12 +65,14 @@ eval_gen_train = True
 # --- training ---
 batch_size = 16
 val_batch_size = 8
-phase_steps = (int(1e4), int(1e5))
+phase_steps = (int(5e2), int(1e5))
 seed = 0
 # warmup_steps = 2
 # train_subset_n = None
 train_subset_n = 1000
+# train_subset_n = 100
 gen_eval_every_step = 1000
+epoch_verbose = False
 
 grad_clip = 10.0
 lr = 1e-3
@@ -76,12 +86,12 @@ weight_decay = 1e-2
 optimizer = "adamw"
 optimizer_kwargs = {}
 
-# wa_mode = "none"
+wa_mode = "none"
 
-wa_mode = "ema"
-wa_every_step = 100
-wa_ema_decay = 0.9
-wa_verbose = False
+# wa_mode = "ema"
+# wa_every_step = 100
+# wa_ema_decay = 0.9
+# wa_verbose = False
 
 # wa_mode = "wma"
 # wa_every_epoch = 1
