@@ -15,11 +15,10 @@ pq_chunks = (3, 3)
 mlp_mult = 4
 rope_base = 10000.0
 
-# ntp_weight = 1.0
-ntp_weight = 0.1
+ntp_weight = 1.0
 mtp_weight = 0.0
 mse_weight = 0.0
-entropy_weight = 0.1
+entropy_weight = 0.0
 
 strides = (4, 4)
 # strides = (2, 2)
@@ -69,7 +68,7 @@ phase_steps = (int(5e2), int(1e5))
 seed = 0
 # warmup_steps = 2
 # train_subset_n = None
-train_subset_n = 1000
+train_subset_n = 100
 # train_subset_n = 100
 gen_eval_every_step = 1000
 epoch_verbose = False

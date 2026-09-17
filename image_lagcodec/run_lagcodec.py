@@ -599,32 +599,7 @@ def pardec_block_chunk_step(blk: Block, x_chunk, cache_k, cache_v, cache_pos_sta
 
 
 def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: jnp.ndarray,
-                                 min_valid_pos: jnp.ndarray, real_query: jnp.ndarray = None,
-                                 tail_pos: jnp.ndarray = None, own_chain_key: jnp.ndarray = None) -> jnp.ndarray:
-    """real_query/tail_pos/own_chain_key (chat 2026-09-17, fixes TWO real bugs found via actual
-    search-run data -- decode_future>0 runs hit dec_acc=1.0 with degenerate generation):
-
-    Bug 1 (single-layer leak): a naive per-query additive shift `key <= query+lookahead` also
-    relaxes visibility into later NOT-YET-PREDICTED positions within the SAME real Kspan block
-    (any key up to Pf ahead), not just the intended trailing Pf-tail extension.
-
-    Bug 2 (transitive 2-layer leak, survived fixing bug 1 alone): even with relaxation correctly
-    scoped to (real_query, tail_key) pairs only, the tail positions LEGITIMATELY see the real
-    Kspan's own late values via plain causality in layer 1 (the tail comes after Kspan in the raw
-    sequence) -- their layer-1 hidden state then encodes that value, and layer 2's relaxation lets
-    an EARLY real-Kspan query attend to that now-contaminated tail hidden state, transitively
-    recovering a later value it must not have seen. Confirmed by directly perturbing one real
-    target value and checking an earlier position's logits changed (they did, even after fixing
-    bug 1). Fix: the tail must be blocked from attending into this group's own draft/prediction
-    chain (decode_past + real Kspan) at ALL layers -- it may only see ctx/bos, mirroring true
-    generation-time semantics where an independent async group's decode_future draft would never
-    have been conditioned on THIS group's specific realized predictions in the first place.
-
-    allowed(q,k) = causal(q,k)
-                   AND NOT (tail_pos[q] AND own_chain_key[k])     -- tail can't see this group's own chain
-                   OR  (real_query[q] AND tail_pos[k])            -- real queries DO get to see the tail
-
-    All three params are (T,) booleans; None (default) = plain causal, unchanged."""
+                                 min_valid_pos: jnp.ndarray) -> jnp.ndarray:
     Bc, T, D = x.shape
     hd = D // attn.n_heads
     qkv = x @ attn.qkv
@@ -645,11 +620,6 @@ def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: j
     scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale
     idx = jnp.arange(T)
     causal = idx[None, :] <= idx[:, None]
-    if real_query is not None:
-        blocked = tail_pos[:, None] & own_chain_key[None, :]
-        causal = causal & ~blocked
-        extra = real_query[:, None] & tail_pos[None, :]
-        causal = causal | extra
     validmin = idx[None, :] >= min_valid_pos[:, None]
     mask = causal[None] & validmin[:, None, :]
     scores = jnp.where(mask[:, None], scores, -1e9)
@@ -662,11 +632,9 @@ def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: j
 
 
 def run_block_pardec(blk: Block, x: jnp.ndarray, rope_pos_ids: jnp.ndarray, min_valid_pos: jnp.ndarray,
-                      remat: bool, real_query: jnp.ndarray = None, tail_pos: jnp.ndarray = None,
-                      own_chain_key: jnp.ndarray = None) -> jnp.ndarray:
+                      remat: bool) -> jnp.ndarray:
     def f(x):
-        x = x + dense_self_attention_pardec(blk.attn, blk.norm1(x), rope_pos_ids, min_valid_pos,
-                                             real_query, tail_pos, own_chain_key)
+        x = x + dense_self_attention_pardec(blk.attn, blk.norm1(x), rope_pos_ids, min_valid_pos)
         x = x + blk.mlp(blk.norm2(x))
         return x
     return jax.checkpoint(f)(x) if remat else f(x)
@@ -911,11 +879,6 @@ class EncDecLevel(eqx.Module):
         p_avg = jnp.mean(probs, axis=(0, 1))
         entropy_loss = jnp.mean(jnp.sum(p_avg * jnp.log(jnp.maximum(p_avg, 1e-9)), axis=-1))
 
-        # shift must EXCEED attn_lookahead: h[i] already attends up to key i+attn_lookahead (the
-        # encoder's own self-attention window), so predicting anything at or before that offset
-        # is trivially visible, not a real prediction task -- confirmed a real leak this session
-        # (ntp_acc trivially ~1.0, useless as training signal) for any attn_lookahead>=1 at the
-        # old fixed shift=1.
         ntp_shift = 1 + self.attn_lookahead
         if L > ntp_shift:
             ntp_logits = reshape_pq(h[:, :-ntp_shift, :] @ self.ntp_head, self.in_pq_chunks, self.in_code_vocab)
@@ -1156,14 +1119,6 @@ class EncDecLevel(eqx.Module):
         per_group_len = per_group_len + Pp + Pf
 
         rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])[:, None]
-        # rope_target split at the draft/real boundary (chat 2026-09-17, fixes a real rope
-        # collision): a single linear formula across the whole widened span makes the LAST draft
-        # position (j=Pp-1) land on EXACTLY bos's own rope value ((g+1)*G) whenever Pp>0 -- two
-        # physically different positions, Pp apart, sharing one rope value, confirmed live on a
-        # real run (search0.py, Pp=16). Fix: draft (j<Pp) gets its OWN formula ending one BEFORE
-        # bos_pos (never touching it); real+tail (j>=Pp) keeps the original, already-tested
-        # anchor `(g+1)*G+1+k` unchanged (so real target[0]'s own key position is untouched --
-        # still exactly bos_pos+1, same as the non-widened Pp=Pf=0 case always was).
         rope_draft = jnp.stack([(g + 1) * G - Pp + jnp.arange(Pp) for g in range(n_groups)], axis=0)
         rope_real_tail = jnp.stack(
             [(g + 1) * G + 1 + jnp.arange(widened_len - Pp) for g in range(n_groups)], axis=0)
@@ -1171,30 +1126,9 @@ class EncDecLevel(eqx.Module):
         rope_pos_ids_g = jnp.concatenate([rope_ctx_g, rope_bos, rope_target], axis=1)
         rope_pos_ids = jnp.broadcast_to(rope_pos_ids_g[None], (B, n_groups, per_group_len)).reshape(B2, per_group_len)
 
-        if Pf > 0:
-            pos_idx = jnp.arange(per_group_len)
-            kspan_start = Wg + Pp   # query-space: positions whose hidden state predicts a real target
-            kspan_end_q = kspan_start + Kspan   # one past the last such query
-            # key-space is offset by +1 from query-space: predicting te_flat[m] uses the hidden
-            # state at query position kspan_start+m, but te_flat[m] itself is EMBEDDED (as a key)
-            # one position later, at kspan_start+1+m -- so the real Kspan's own key positions are
-            # [kspan_start+1, kspan_start+1+Kspan), and the tail starts right after THAT, not
-            # right after kspan_end_q (using kspan_end_q here was the bug: it's one position too
-            # early, exactly the LAST real value's own key position, which every within-Kspan
-            # query could then trivially see -- confirmed via a real leak test 2026-09-17).
-            tail_start = kspan_start + 1 + Kspan
-            real_query = (pos_idx >= kspan_start) & (pos_idx < kspan_end_q)
-            tail_pos = (pos_idx >= tail_start) & (pos_idx < tail_start + Pf)
-            # own_chain_key: this group's own draft+real chain (decode_past + real Kspan), the
-            # tail must NEVER attend into it (see dense_self_attention_pardec's docstring, bug 2)
-            own_chain_key = (pos_idx >= Wg + 1) & (pos_idx < tail_start)
-        else:
-            real_query = tail_pos = own_chain_key = None
-
         x = xe
         for blk in blocks:
-            x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, self.remat,
-                                  real_query, tail_pos, own_chain_key)
+            x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, self.remat)
         h = ln_f(x)
         pred_pos = Wg + Pp + jnp.arange(G * self.K)
         h_t = h[:, pred_pos, :]
@@ -1316,9 +1250,7 @@ class EncDecLevel(eqx.Module):
         fullctx = (not self.streaming) and (self.ncodes_window == -1)
         N = self.ncodes_window if self.ncodes_window >= 0 else (n_groups - 1)
         Wg = n_blocks_p if fullctx else (N + 1) * G
-        Pp = self.decode_past   # decode_future is TRAIN-ONLY -- never used at generation, see
-        # Config.sync's docstring (sync=True, TODO, would let a later group read an earlier
-        # group's ACTUAL decode_future output; until then it's simply not decoded here at all)
+        Pp = self.decode_past
         per_group_len = Wg + 1 + Pp + G * self.K
 
         ctx_tok = code_embed_proj(ctx_idx, self.ctx_embed, self.ctx_proj)
@@ -1376,15 +1308,6 @@ class EncDecLevel(eqx.Module):
         total_steps = Pp + G * self.K
 
         def widened_pos(t):
-            # matches training's PER-POSITION clip exactly (decode_logits_and_target_pardec's
-            # rope_target formula) -- must NOT be a running "+1 from an already-clipped value"
-            # (that silently drifts off training's positions for any boundary group where Pp
-            # reaches before real history exists: incrementing a clipped 0 gives 1, but the next
-            # widened index may ALSO still be in the pre-clip negative region and should stay 0
-            # too. Confirmed as a real train/inference mismatch for early groups 2026-09-17.)
-            # Also matches training's draft/real split (t is a static Python int, branch is free):
-            # draft (t<Pp) ends one BEFORE bos's own rope value, never colliding with it; real (t>=Pp)
-            # keeps the original bos_pos+1+k anchor untouched (see rope_draft/rope_real_tail above).
             if t < Pp:
                 return jnp.clip(rope_bos_flat - Pp + t, 0, None)
             return rope_bos_flat + 1 + (t - Pp)
@@ -1399,7 +1322,7 @@ class EncDecLevel(eqx.Module):
             rope_pos_row = widened_pos(0)
             h = h_chunk[:, -1, :]
             val, rng = token_predict(h, rng)
-            vals = [val] if Pp == 0 else []   # t=0's own output is a decode_past DRAFT, pruned, if Pp>0
+            vals = [val] if Pp == 0 else []
             x_input = self._dec_embed_target(val)
             for t in range(1, total_steps):
                 h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
@@ -1543,33 +1466,6 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
                    layer_drop_prob=None, label_reg_weight: float = 0.0, label_fn=None,
                    pixel_order=None, feedback_p=None, feedback_rng=None, feedback_detach: bool = True,
                    _feedback_recursed: bool = False) -> tuple:
-    """level_drop/cascade_rng (chat 2026-09-17, reverted to the original cascade_rollout_prob
-    semantic -- value directly means "probability of rollout", not "probability of dropping it"):
-    None/None -- always real ctx (eval). Otherwise, an INDEPENDENT bernoulli draw at every level
-    transition i->i-1 (not one shared draw for the whole step): p(rollout)=level_drop[i] (or the
-    same scalar for every transition), p(real)=1-level_drop[i]. Genuinely per-level -- outcomes
-    like real,rollout,real across a 3-level cascade are possible, not just "real for a while then
-    rollout for the rest." real_ctx is that level's own differentiable encode() output (not an
-    external label), so gradient flows end-to-end through EITHER branch back into the encoder
-    above -- using real ctx never detaches anything.
-
-    feedback_p/feedback_rng (generalizes torch qcute_lagcodec's byte_consistency_p to any level,
-    additive like encoder_ste_p rather than in-place like level_drop): per level i, independent
-    bernoulli draw p=feedback_p[i] (or scalar for all levels). On fire, argmax level i's OWN decode
-    reconstruction and jax.lax.stop_gradient it (full stop, unlike level_drop's pseudo_ctx which
-    keeps a straight-through path back into level i's decoder on purpose) -- this pseudo
-    reconstruction is then treated as if it were real and re-decoded, and that second loss is added
-    UNWEIGHTED to the main loss. feedback_detach (default True) controls only the i>0 path: True
-    keeps the full stop_gradient described above; False leaves quantize_hard's own straight-through
-    path intact (gradient flows back into level i's decoder through the softmax, same shape as
-    torch's encoder_ste_p additive+STE mode) -- i==0's recursive pass is always fully detached
-    (argmax itself has no gradient; a differentiable version would need a soft-byte input path,
-    not implemented). i>0: pseudo codes[i-1] becomes ctx for a second decode cascade
-    through levels i-1..0 (reusing the real codes/codes_soft already computed below i), testing
-    "can the lower levels still recover ground truth if this level's own reconstruction is trusted
-    as context." i==0: pseudo bytes re-enter the WHOLE model as a fresh input via one guarded
-    recursive phase_forward call (_feedback_recursed=True to prevent runaway recursion), testing
-    full-pipeline idempotence -- torch's original byte_consistency_p is exactly this i==0 case."""
     levels = model.levels
     x = code_embed_proj(flat_bytes, levels[0].own_input_embed, levels[0].own_input_proj)
     target = flat_bytes
