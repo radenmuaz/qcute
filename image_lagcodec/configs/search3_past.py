@@ -1,19 +1,8 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run_1.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/search3_past.py
 
-chat 2026-09-17: fixed the "wasted top level" semantics bug -- the top level (last tuple entry)
-used to be structurally unused: strides[-1]=-1 was a don't-care sentinel, has_decoder=(i<n-1)
-skipped it, and phase_forward's encoder loop (capped at n_phases=n_levels-1) never reached it
-either. Its d_model/n_heads/etc still allocated real params (they were deliberately starved to
-d_model=1/n_heads=1 in the old version of this file specifically BECAUSE they were known-dead
-weight) that never received gradient. Fix: strides[-1] is now a REAL stride (opts into
-top_level_trainable=True in Config.__post_init__) -- this gives the top level a real decoder too,
-and n_phases becomes n_levels (not n_levels-1), so phase_epochs (and every other per-phase tuple)
-needs one MORE entry than before. d_model/n_heads on the top level restored to real values to
-match. This fix is OPT-IN (gated on strides[-1] != -1) -- every other existing config keeps
-strides[-1]=-1 and is completely unaffected.
+8-way random search off run_1.py (top_level_trainable base), chat 2026-09-17. Ablates attn_lookahead=0, decode_past=2, decode_future=0 on level0 (2^3 factorial across search1-8, this is run 3/8).
 """
-
 
 # --- model ---
 img_size = 32
@@ -97,3 +86,7 @@ gen_eval_every_epoch = 10
 ckpt_every_epoch = 100
 ckpt_keep = 1
 qual_gen_n = 16
+
+attn_lookahead = (0, 0, 0, 0)
+decode_past = (2, 0, 0, 0)
+decode_future = (0, 0, 0, 0)

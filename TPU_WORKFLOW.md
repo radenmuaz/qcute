@@ -16,12 +16,19 @@ ssh -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -i ~/.ssh/google_compute_
 ssh -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.15.67
 ssh -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@107.167.160.20
 ssh -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.33.7
-
+ssh -o ControlPath=~/.ssh/controlmasters/tpu5-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.115.139
+ssh -o ControlPath=~/.ssh/controlmasters/tpu6-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.86.22
+ssh -o ControlPath=~/.ssh/controlmasters/tpu7-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.34.230
+ssh -o ControlPath=~/.ssh/controlmasters/tpu8-%r@%h:%p -i ~/.ssh/google_compute_engine muaz@35.186.110.50
 # attach
-tmux attach -t overfit1k_baseline
-tmux attach -t overfit1k_mse1
-tmux attach -t overfit1k_qdrop05
-tmux attach -t overfit1k_ema
+tmux attach -t search1_base
+tmux attach -t search2_lookahead
+tmux attach -t search3_past
+tmux attach -t search4_future
+tmux attach -t search5_lookahead_past
+tmux attach -t search6_lookahead_future
+tmux attach -t search7_past_future
+tmux attach -t search8_all
 
 # pull lagcodec
 rsync -avz --exclude="checkpoints/" \

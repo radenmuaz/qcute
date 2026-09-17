@@ -1471,8 +1471,16 @@ class HierEncDec(eqx.Module):
 
 
 def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=None,
-                   use_cascade=None, gumbel_temperature: float = 1.0, layer_drop_prob=None,
-                   label_reg_weight: float = 0.0, label_fn=None, pixel_order=None) -> tuple:
+                   cascade_rollout_drop=None, cascade_rng=None, gumbel_temperature: float = 1.0,
+                   layer_drop_prob=None, label_reg_weight: float = 0.0, label_fn=None,
+                   pixel_order=None) -> tuple:
+    """cascade_rollout_drop/cascade_rng (chat 2026-09-17): None/None -- always real ctx (eval).
+    Otherwise, an INDEPENDENT bernoulli draw at every level transition i->i-1 (not one shared
+    draw for the whole step): p(real)=1-cascade_rollout_drop[i] (or the same scalar for every
+    transition). Genuinely per-level -- outcomes like real,rollout,real across a 3-level cascade
+    are possible, not just "real for a while then rollout for the rest." real_ctx is that level's
+    own differentiable encode() output (not an external label), so gradient flows end-to-end
+    through EITHER branch back into the encoder above -- using real ctx never detaches anything."""
     levels = model.levels
     x = code_embed_proj(flat_bytes, levels[0].own_input_embed, levels[0].own_input_proj)
     target = flat_bytes
@@ -1502,6 +1510,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     dec_losses, dec_accs = [], []
     byte_mse = None
     ctx = codes_soft[phase - 1]
+    cascade_rngs = [None] * phase if cascade_rng is None else list(jax.random.split(cascade_rng, phase))
     for i in range(phase - 1, -1, -1):
         dec_target = flat_bytes if i == 0 else codes[i - 1]
         dec_rng = level_rngs[2 * i + 1]
@@ -1524,11 +1533,14 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
                 mse_loss = 0.0
         if i > 0:
             real_ctx = codes_soft[i - 1]
-            if use_cascade is None:
+            if cascade_rollout_drop is None:
                 ctx = real_ctx
             else:
+                drop_i = cascade_rollout_drop if isinstance(cascade_rollout_drop, (int, float)) \
+                    else cascade_rollout_drop[i]
+                use_cascade_i = jax.random.bernoulli(cascade_rngs[i], p=1.0 - drop_i)
                 pseudo_ctx, _ = quantize_hard(logits)
-                ctx = jnp.where(use_cascade, pseudo_ctx, real_ctx)
+                ctx = jnp.where(use_cascade_i, pseudo_ctx, real_ctx)
 
     dec_loss_total = jnp.mean(jnp.stack(dec_losses))
     byte_acc = dec_accs[-1]
@@ -2098,10 +2110,11 @@ def main():
         cascade_rollout_drop_phase = args.cascade_rollout_drop[phase - 1]
         layer_drop_prob_phase = args.layer_drop_prob[phase - 1]
 
-        def loss_fn(diff_model, static_model, flat_bytes, rng, use_cascade, phase=phase):
+        def loss_fn(diff_model, static_model, flat_bytes, rng, cascade_rng, phase=phase):
             m = eqx.combine(diff_model, static_model)
             m = cast_pytree(m, compute_dtype)
-            return phase_forward(m, flat_bytes, phase, rng=rng, use_cascade=use_cascade,
+            return phase_forward(m, flat_bytes, phase, rng=rng,
+                                  cascade_rollout_drop=cascade_rollout_drop_phase, cascade_rng=cascade_rng,
                                   gumbel_temperature=gumbel_temperature_phase,
                                   layer_drop_prob=layer_drop_prob_phase,
                                   label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
@@ -2127,9 +2140,8 @@ def main():
 
         def train_step(diff_model, opt_state, rng, flat_bytes, static_model=static_model):
             rng, level_rng, cascade_rng = jax.random.split(rng, 3)
-            use_cascade = jax.random.bernoulli(cascade_rng, p=1.0 - cascade_rollout_drop_phase)
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-                diff_model, static_model, flat_bytes, level_rng, use_cascade)
+                diff_model, static_model, flat_bytes, level_rng, cascade_rng)
             grads = jax.lax.pmean(grads, axis_name="d")
             loss = jax.lax.pmean(loss, axis_name="d")
             aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
