@@ -1,0 +1,69 @@
+decode_future leak fix -- diagnostic + consistency audit
+Run: 2026-09-18, tpu1, JAX_PLATFORMS=cpu
+Checkpoint: image_lagcodec/logs/overfit1_diag/checkpoints/phase_2_step1000 (trained AFTER the
+real_query->tail_pos leak fix in run_lagcodec.py's dense_self_attention_pardec)
+Config: image_lagcodec/logs/overfit1_diag/config_overfit1.py
+  strides=(4,4) decoder_ncodes=(1,1) ncodes_window=(64,64) decode_future=(16,16) decode_past=(0,0)
+
+=== Bug found (initial diagnostic, before this audit) ===
+dense_self_attention_pardec had `extra = real_query & tail_pos`, letting real (loss-computing)
+Kspan queries attend into decode_future's tail region -- which embeds REAL ground-truth tokens
+from the NEXT group. Ablating just that term on the trained checkpoint:
+  acc_with_leak (original code) = 0.9990
+  acc_no_leak   (extra removed) = 0.1374
+  drop = 0.8617
+This explained the symptom: near-perfect teacher-forced accuracy, near-garbage free-running
+generation (which structurally never had access to decode_future's tail).
+
+=== Fix applied ===
+Removed real_query/tail_pos/own_chain_key entirely from dense_self_attention_pardec /
+run_block_pardec / decode_logits_and_target_pardec. Plain causal masking over the whole widened
+(draft+real+tail) per-group sequence is sufficient and correct: tail sits chronologically after
+real positions, so standard causal masking already excludes it from real queries at every layer --
+no custom masking was ever needed. The old own_chain_key block was only required to plug a
+transitive path that the `extra` term itself created; removing `extra` makes it unnecessary too.
+
+=== BEFORE/AFTER on the (already-fixed) checkpoint ===
+BEFORE (old leaky mask reconstructed and applied to the fixed checkpoint's weights):
+  dense TF acc vs real = 0.0850
+AFTER (current fixed mask, matches how the checkpoint was actually trained):
+  dense TF acc vs real = 0.7796  (level0), 0.7253 (level1)
+Accuracy DROPS under the old leaky mask here (opposite direction from the original bug demo)
+because these weights were trained under the fixed (causal-only) regime -- forcing the old mask
+on them is now the mismatch. Confirms training and current code are mutually consistent.
+
+=== AUDIT 1: level0 only (ctx = level0's own real code) ===
+1a. dense teacher-forced acc vs real bytes:            0.7796
+1b. free rollout (own predictions fed back) acc:       0.0241  (expected -- exposure bias)
+1c. incremental KV-cache loop, REAL tokens force-fed at every step, vs dense teacher-forced:
+    positions: 3072   mismatches: 0/3072 (0.0000%)
+    ALL STEPS MATCH -- dense teacher-forced == incremental teacher-forced exactly
+
+=== AUDIT 2: level0<-level1<-level0-decode cascade ===
+2a. level1 dense teacher-forced acc vs real code0:     0.7253
+2b. free rollout cascade (level1 gen -> level0 gen) acc vs real bytes: 0.0169  (expected)
+2c. level1 incremental KV-cache loop, REAL code0 force-fed at every step, vs dense TF:
+    positions: 768    mismatches: 0/768 (0.0000%)
+    ALL STEPS MATCH -- dense teacher-forced == incremental teacher-forced exactly
+
+Note: level0 decode conditioned on REAL level0 ctx (audit 1) is the actual training signal for
+level0 -- level1's reconstruction of level0's codes never feeds level0's ctx during real
+(non-cascade) teacher forcing, only during level_drop/feedback_p rollout steps.
+
+=== OVERALL ===
+PASS -- incremental KV-cache generation matches dense teacher-forced exactly, at every step, at
+both levels. No implementation mismatch between train (dense) and infer (incremental) paths.
+
+=== Remaining free-rollout gap (NOT a bug) ===
+Dense TF acc ~72-78% but free rollout collapses to ~2%. Textbook exposure-bias compounding over
+1024 sequential positions, expected given:
+  - train_subset_n=100, only 500-1000 training steps total
+  - level_drop=0.9, quantize_drop=0.9 (90% of steps still use cascade/soft ctx, not real)
+Addressed by more training / lower level_drop+quantize_drop at convergence, not further code
+changes -- the train/infer mechanism itself is now proven consistent end-to-end.
+
+=== Regression gate ===
+JAX_PLATFORMS=cpu uv run python3 -m image_lagcodec.scripts.pardec_v2_consistency_check
+  -> PASS all (unaffected by the mask simplification, byte-identical at defaults)
+
+Scripts used (tpu1:~/): tf_vs_gen.py, diag_leak.py, tf_incremental_audit.py

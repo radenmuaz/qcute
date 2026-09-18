@@ -49,6 +49,8 @@ class Config:
     decode_past: tuple = 0
     decode_future: tuple = 0
     sync: tuple = False
+    n_refine_passes: tuple = 1
+    refine_window: tuple = 0
     weight_sharing: tuple = True
     precision: str = "bf16"
     curriculum_mode: str = "freeze"
@@ -61,7 +63,7 @@ class Config:
 
     attn_window: tuple = -1
     attn_lookahead: tuple = 0
-    use_attn_sink: bool = False
+    use_sink: bool = False
 
     remat: bool = False
 
@@ -81,9 +83,15 @@ class Config:
     traversal: str = "raster"
 
     mse_weight: float = 0.0
-    mse_softmax_tau: float = 0.1
+    mse_softmax_tau: float = 1.0
 
     label_reg_weight: float = 0.0
+
+    multipass_detach: bool = True
+    refine_gumbel: bool = False
+    refine_temperature: float = 1.0
+    refine_quantize_drop: float = 0.0
+    refine_remat: bool = None
 
     def __post_init__(self):
         n = len(self.strides)
@@ -101,6 +109,8 @@ class Config:
         bcast("decode_past", int)
         bcast("decode_future", int)
         bcast("sync", bool)
+        bcast("n_refine_passes", int)
+        bcast("refine_window", int)
         bcast("weight_sharing", bool)
         bcast("token_head_type", str)
         bcast("token_dim", int)
@@ -119,6 +129,7 @@ class Config:
         assert len(self.mlp_mult) == n and len(self.rope_base) == n and len(self.decoder_ncodes) == n
         assert len(self.ncodes_window) == n and len(self.streaming) == n
         assert len(self.decode_past) == n and len(self.decode_future) == n and len(self.sync) == n
+        assert len(self.n_refine_passes) == n and len(self.refine_window) == n
         for i in range(n):
             assert self.ncodes_window[i] >= -1, \
                 f"level {i}: ncodes_window={self.ncodes_window[i]} must be -1 (all) or >=0 " \
@@ -130,6 +141,10 @@ class Config:
                     f"-1 (true fullctx) or 0 (disjoint, streaming moot) are supported under streaming=False")
             assert self.decode_past[i] >= 0 and self.decode_future[i] >= 0, \
                 f"level {i}: decode_past={self.decode_past[i]}/decode_future={self.decode_future[i]} must be >=0"
+            assert self.n_refine_passes[i] >= 1, \
+                f"level {i}: n_refine_passes={self.n_refine_passes[i]} must be >=1 (1=off, current behavior)"
+            assert self.refine_window[i] >= 0, \
+                f"level {i}: refine_window={self.refine_window[i]} must be >=0"
             if self.sync[i]:
                 raise NotImplementedError(
                     f"level {i}: sync=True is a stub (TODO) -- real cross-group pipelining "
@@ -181,6 +196,27 @@ class Config:
                     f"-- the naive causal window pads EVERY group to the FULL n_blocks width, so "
                     f"compute/memory scales as O(n_groups*n_blocks); recommend a larger "
                     f"decoder_ncodes or a bounded ncodes_window instead")
+            if self.refine_window[i] > 0 and self.n_refine_passes[i] <= 1:
+                warnings.warn(
+                    f"level {i}: refine_window={self.refine_window[i]} has NO EFFECT with "
+                    f"n_refine_passes={self.n_refine_passes[i]} (need >1 for a second pass to use "
+                    f"it) -- either raise n_refine_passes or set refine_window=0 for clarity")
+            if self.n_refine_passes[i] > 1 and self.refine_window[i] <= 0:
+                warnings.warn(
+                    f"level {i}: n_refine_passes={self.n_refine_passes[i]} runs extra passes with "
+                    f"ZERO peer context (refine_window=0) -- each extra pass degenerates to "
+                    f"recomputing pass 1 (wasted compute, not a no-op); set refine_window>0 or "
+                    f"n_refine_passes=1")
+        if self.refine_gumbel and not any(self.n_refine_passes[i] > 1 and self.refine_window[i] > 0 for i in range(n)):
+            warnings.warn(
+                "refine_gumbel=True has NO EFFECT -- no level has both n_refine_passes>1 and "
+                "refine_window>0, so no refine pass ever runs")
+        if self.refine_quantize_drop > 0 and self.multipass_detach:
+            warnings.warn(
+                f"refine_quantize_drop={self.refine_quantize_drop} has NO EFFECT with "
+                f"multipass_detach=True (fully-detached refine passes only ever use the hard "
+                f"argmax index, never the soft/drop-mixed code) -- set multipass_detach=False or "
+                f"refine_quantize_drop=0 for clarity")
 
         assert len(self.weight_sharing) == n
         assert len(self.token_head_type) == n
@@ -735,6 +771,8 @@ class EncDecLevel(eqx.Module):
     decode_past: int = eqx.field(static=True)
     decode_future: int = eqx.field(static=True)
     attn_lookahead: int = eqx.field(static=True)
+    n_refine_passes: int = eqx.field(static=True)
+    refine_window: int = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config, level: int, has_decoder: bool, weight_sharing: bool):
         D = cfg.d_model[level]
@@ -748,6 +786,8 @@ class EncDecLevel(eqx.Module):
         self.decode_past = cfg.decode_past[level]
         self.decode_future = cfg.decode_future[level]
         self.attn_lookahead = cfg.attn_lookahead[level]
+        self.n_refine_passes = cfg.n_refine_passes[level]
+        self.refine_window = cfg.refine_window[level]
         is_byte_level = (level == 0)
         self.pq_chunks, self.code_vocab = cfg.pq_chunks[level], cfg.code_vocab[level]
         self.in_pq_chunks = cfg.byte_group if is_byte_level else cfg.pq_chunks[level - 1]
@@ -774,7 +814,7 @@ class EncDecLevel(eqx.Module):
         enc_lookahead = cfg.attn_lookahead[level]
         self.blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
                              n_layers=n_layers, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
-                             window=enc_window, lookahead=enc_lookahead, use_sink=cfg.use_attn_sink) for k in block_keys]
+                             window=enc_window, lookahead=enc_lookahead, use_sink=cfg.use_sink) for k in block_keys]
         self.ln_f = RMSNorm(D)
         self.code_head = init_matrix(keys[2], (D, self.pq_chunks * self.code_vocab), scheme)
         self.ntp_head = init_matrix(keys[3], (D, ntp_out), scheme)
@@ -848,7 +888,7 @@ class EncDecLevel(eqx.Module):
              self.mtp_out_proj) = (None,) * 6
 
 
-    def encode(self, x: jnp.ndarray, target_idx: jnp.ndarray, rng=None, gumbel_temperature: float = 1.0,
+    def encode(self, x: jnp.ndarray, target_idx: jnp.ndarray, rng=None, encode_temperature: float = 1.0,
                layer_drop_prob=None) -> dict:
         h = x
         n_blk = len(self.blocks)
@@ -871,9 +911,9 @@ class EncDecLevel(eqx.Module):
         pooled = h_blocks[:, :, self.K - 1, :]
         logits = reshape_pq(pooled @ self.code_head, self.pq_chunks, self.code_vocab)
         if quant_rng is not None and self.quantize_mode == "gumbel":
-            code_soft, code_idx = quantize_gumbel(logits, quant_rng, gumbel_temperature, self.quantize_drop)
+            code_soft, code_idx = quantize_gumbel(logits, quant_rng, encode_temperature, self.quantize_drop)
         else:
-            code_soft, code_idx = quantize_hard(logits, quant_rng, self.quantize_drop, gumbel_temperature)
+            code_soft, code_idx = quantize_hard(logits, quant_rng, self.quantize_drop, encode_temperature)
 
         probs = jax.nn.softmax(logits, axis=-1)
         p_avg = jnp.mean(probs, axis=(0, 1))
@@ -1063,9 +1103,12 @@ class EncDecLevel(eqx.Module):
         return logits, target, mask, mtp_loss
 
     def decode_logits_and_target_pardec(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
-                                         decoder_ncodes: int, rng=None) -> tuple:
+                                         decoder_ncodes: int, rng=None, decode_past_override: int = None,
+                                         draft_override: jnp.ndarray = None,
+                                         draft_embed_override: jnp.ndarray = None,
+                                         remat_override: bool = None) -> tuple:
         n_blocks_check = ctx_code_soft.shape[1]
-        if decoder_ncodes >= n_blocks_check:
+        if decoder_ncodes >= n_blocks_check and decode_past_override is None:
             return self.decode_logits_and_target(target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
         blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
         B = target_seq.shape[0]
@@ -1103,20 +1146,44 @@ class EncDecLevel(eqx.Module):
         target_windows = jnp.stack(
             [target_p[:, g * G * self.K:(g + 1) * G * self.K] for g in range(n_groups)], axis=1)
 
-        Pp, Pf = self.decode_past, self.decode_future
+        Pp = self.decode_past if decode_past_override is None else decode_past_override
+        Pf = self.decode_future
         Kspan = G * self.K
         widened_len = Pp + Kspan + Pf
-        if Pp > 0 or Pf > 0:
-            target_p_wide = jnp.pad(target_p, ((0, 0), (Pp, Pf), (0, 0)))
-            target_windows_wide = jnp.stack(
-                [target_p_wide[:, g * Kspan:g * Kspan + widened_len] for g in range(n_groups)], axis=1)
+        if Pf > 0:
+            tail_p = jnp.pad(target_p, ((0, 0), (0, Pf), (0, 0)))
+            real_tail_windows = jnp.stack(
+                [tail_p[:, g * Kspan:g * Kspan + Kspan + Pf] for g in range(n_groups)], axis=1)
         else:
-            target_windows_wide = target_windows
-        target_flat = target_windows_wide.reshape(B2, widened_len, *target_seq.shape[2:])
-        te_flat = self._dec_embed_target(target_flat)
+            real_tail_windows = target_windows
+        real_tail_flat = real_tail_windows.reshape(B2, Kspan + Pf, *target_seq.shape[2:])
+        real_tail_te = self._dec_embed_target(real_tail_flat)
+
+        if Pp > 0:
+            if draft_embed_override is not None:
+                draft_embed_p = jnp.pad(draft_embed_override, ((0, 0), (Pp, 0), (0, 0)))
+                draft_te = jnp.stack(
+                    [draft_embed_p[:, g * Kspan:g * Kspan + Pp, :] for g in range(n_groups)], axis=1
+                ).reshape(B2, Pp, D)
+            else:
+                if draft_override is None:
+                    draft_source = target_p
+                elif pad_blocks > 0:
+                    draft_source = jnp.pad(draft_override, ((0, 0), (0, pad_blocks * self.K)) +
+                                            ((0, 0),) * (draft_override.ndim - 2))
+                else:
+                    draft_source = draft_override
+                draft_p = jnp.pad(draft_source, ((0, 0), (Pp, 0)) + ((0, 0),) * (draft_source.ndim - 2))
+                draft_windows = jnp.stack([draft_p[:, g * Kspan:g * Kspan + Pp] for g in range(n_groups)], axis=1)
+                draft_flat = draft_windows.reshape(B2, Pp, *target_seq.shape[2:])
+                draft_te = self._dec_embed_target(draft_flat)
+            te_flat = jnp.concatenate([draft_te, real_tail_te], axis=1)
+        else:
+            te_flat = real_tail_te
         bos = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
         xe = jnp.concatenate([ctx_flat, bos, te_flat], axis=1)
         per_group_len = per_group_len + Pp + Pf
+        remat = self.remat if remat_override is None else remat_override
 
         rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])[:, None]
         rope_draft = jnp.stack([(g + 1) * G - Pp + jnp.arange(Pp) for g in range(n_groups)], axis=0)
@@ -1128,7 +1195,7 @@ class EncDecLevel(eqx.Module):
 
         x = xe
         for blk in blocks:
-            x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, self.remat)
+            x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, remat)
         h = ln_f(x)
         pred_pos = Wg + Pp + jnp.arange(G * self.K)
         h_t = h[:, pred_pos, :]
@@ -1234,9 +1301,10 @@ class EncDecLevel(eqx.Module):
         return out[:, :n_blocks * self.K]
 
     def decode_generate_pardec(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
-                                temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
+                                temperature: float = 1.0, seed: int = 0, decode_past_override: int = None,
+                                draft_override_flat: jnp.ndarray = None) -> jnp.ndarray:
         n_blocks_check = ctx_idx.shape[1]
-        if decoder_ncodes >= n_blocks_check:
+        if decoder_ncodes >= n_blocks_check and decode_past_override is None:
             return self.decode_generate(ctx_idx, decoder_ncodes, greedy, temperature, seed)
         blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
         B, n_blocks, _ = ctx_idx.shape
@@ -1250,7 +1318,7 @@ class EncDecLevel(eqx.Module):
         fullctx = (not self.streaming) and (self.ncodes_window == -1)
         N = self.ncodes_window if self.ncodes_window >= 0 else (n_groups - 1)
         Wg = n_blocks_p if fullctx else (N + 1) * G
-        Pp = self.decode_past
+        Pp = self.decode_past if decode_past_override is None else decode_past_override
         per_group_len = Wg + 1 + Pp + G * self.K
 
         ctx_tok = code_embed_proj(ctx_idx, self.ctx_embed, self.ctx_proj)
@@ -1323,7 +1391,7 @@ class EncDecLevel(eqx.Module):
             h = h_chunk[:, -1, :]
             val, rng = token_predict(h, rng)
             vals = [val] if Pp == 0 else []
-            x_input = self._dec_embed_target(val)
+            x_input = self._dec_embed_target(val if draft_override_flat is None else draft_override_flat[:, 0])
             for t in range(1, total_steps):
                 h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
                 pos = pos + 1
@@ -1331,6 +1399,8 @@ class EncDecLevel(eqx.Module):
                 val, rng = token_predict(h, rng)
                 if t >= Pp:
                     vals.append(val)
+                if draft_override_flat is not None and t < Pp:
+                    val = draft_override_flat[:, t]
                 x_input = self._dec_embed_target(val)
             _, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
             return jnp.stack(vals, axis=1)
@@ -1414,6 +1484,91 @@ class EncDecLevel(eqx.Module):
         return out[:, :n_blocks * self.K]
 
 
+def decode_logits_and_target_multipass(level: EncDecLevel, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
+                                        decoder_ncodes: int, rng=None, multipass_detach: bool = True,
+                                        refine_gumbel: bool = False, refine_temperature: float = 1.0,
+                                        refine_quantize_drop: float = 0.0, refine_rng=None,
+                                        refine_remat: bool = None) -> tuple:
+    """n_refine_passes<=1 (default): identical to a single decode_logits_and_target_pardec call.
+    n_refine_passes>1: pass 1 is unchanged (ctx-only); each further pass re-decodes every group
+    with extra causal peer context -- refine_window preceding groups' PREVIOUS PASS predicted
+    codes at this level. Reuses decode_past's existing widened-window/RoPE machinery via
+    decode_past_override/draft_override(_embed) -- no new masking logic.
+    multipass_detach (default True): fully stop_gradient's the draft (hard argmax index, own
+    predictions, never real ground truth -- matches what generation can actually supply). False:
+    STE instead -- embeds quantize_hard/quantize_gumbel's soft-plus-straight-through code directly
+    (code_embed_proj's int/float branching makes this a drop-in swap for the hard int embed), so
+    gradient from the LAST pass's loss flows back through every earlier pass's decoder output --
+    trains those weights to be refine-friendly, at the cost of a BPTT-like backward graph that
+    grows with n_refine_passes (memory/compute scale with it, unlike the detached default where
+    each pass is independently computed).
+    refine_gumbel/refine_temperature/refine_quantize_drop: own dedicated knobs (NOT shared
+    with the encoder's quantize_mode/encode_temperature/quantize_drop), controlling only the
+    draft's stochasticity -- gumbel perturbs WHICH code gets drafted (works even under
+    multipass_detach=True, pure exploration, no gradient either way); quantize_drop only matters
+    when multipass_detach=False (mixes soft/STE code into the draft embedding). refine_temperature
+    also shapes the plain (non-gumbel) argmax path's softmax whenever quantize_drop>0, since the
+    soft component being mixed in is temperature-dependent even without gumbel noise -- argmax
+    itself is temperature-invariant (dividing logits by tau doesn't change which is largest), only
+    the SHARPNESS of the soft/STE component that quantize_drop occasionally substitutes changes.
+    refine_remat: overrides self.remat for just the refine passes (pass 1 always uses self.remat
+    unchanged); None (default) leaves refine passes on self.remat too."""
+    logits, target_out, mask, mtp_loss = level.decode_logits_and_target_pardec(
+        target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
+    if level.n_refine_passes <= 1 or level.refine_window <= 0:
+        return logits, target_out, mask, mtp_loss
+    Kspan = decoder_ncodes * level.K
+    Pp = level.refine_window * Kspan
+    n_extra = level.n_refine_passes - 1
+    refine_rngs = [None] * n_extra if refine_rng is None else list(jax.random.split(refine_rng, n_extra))
+    for p_idx in range(n_extra):
+        r_rng = refine_rngs[p_idx]
+        if refine_gumbel:
+            assert r_rng is not None, "refine_gumbel=True needs refine_rng"
+            code_soft, idx = quantize_gumbel(logits, r_rng, refine_temperature, refine_quantize_drop)
+        else:
+            code_soft, idx = quantize_hard(logits, r_rng if refine_quantize_drop > 0 else None,
+                                            refine_quantize_drop, refine_temperature)
+        if multipass_detach:
+            kwargs = dict(draft_override=jax.lax.stop_gradient(idx))
+        else:
+            kwargs = dict(draft_embed_override=level._dec_embed_target(code_soft))
+        logits, target_out, mask, mtp_loss = level.decode_logits_and_target_pardec(
+            target_seq, ctx_code_soft, decoder_ncodes, rng=rng,
+            decode_past_override=Pp, remat_override=refine_remat, **kwargs)
+    return logits, target_out, mask, mtp_loss
+
+
+def decode_generate_multipass(level: EncDecLevel, ctx_idx: jnp.ndarray, decoder_ncodes: int,
+                               greedy: bool = True, temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
+    """Generation-side counterpart of decode_logits_and_target_multipass -- see its docstring.
+    Each refinement pass is a SEPARATE full decode_generate_pardec call (its own fresh KV-cache
+    build via self_chunk_step/self_step), not a continuation of pass 1's cache: pass k's peer
+    context needs pass (k-1)'s COMPLETE (all-groups) output, which only exists once pass k-1 has
+    fully finished, so the passes cannot be fused into one incremental KV-cache stream. Generation
+    cost scales ~linearly with n_refine_passes (each pass is roughly as expensive as today's
+    single-pass call)."""
+    pred = level.decode_generate_pardec(ctx_idx, decoder_ncodes, greedy=greedy, temperature=temperature, seed=seed)
+    if level.n_refine_passes <= 1 or level.refine_window <= 0:
+        return pred
+    B, n_blocks = ctx_idx.shape[0], ctx_idx.shape[1]
+    G = decoder_ncodes
+    pad_blocks = (-n_blocks) % G
+    n_groups = (n_blocks + pad_blocks) // G
+    Kspan = G * level.K
+    Pp = level.refine_window * Kspan
+    for _ in range(level.n_refine_passes - 1):
+        pred_p = pred if pad_blocks == 0 else jnp.pad(
+            pred, ((0, 0), (0, pad_blocks * level.K)) + ((0, 0),) * (pred.ndim - 2))
+        draft_p = jnp.pad(pred_p, ((0, 0), (Pp, 0)) + ((0, 0),) * (pred_p.ndim - 2))
+        draft_windows = jnp.stack([draft_p[:, g * Kspan:g * Kspan + Pp] for g in range(n_groups)], axis=1)
+        draft_override_flat = draft_windows.reshape(B * n_groups, Pp, *pred.shape[2:])
+        pred = level.decode_generate_pardec(ctx_idx, decoder_ncodes, greedy=greedy, temperature=temperature,
+                                             seed=seed, decode_past_override=Pp,
+                                             draft_override_flat=draft_override_flat)
+    return pred
+
+
 def mtp_predict_no_verify_standalone(level: EncDecLevel, h_pos, rng, greedy, temperature):
     K, chunks, vocab = level.mtp_horizon, level.in_pq_chunks, level.in_code_vocab
     if level.mtp_mode == "parallel":
@@ -1462,7 +1617,7 @@ class HierEncDec(eqx.Module):
 
 
 def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=None,
-                   level_drop=None, cascade_rng=None, gumbel_temperature: float = 1.0,
+                   level_gt_drop=None, cascade_rng=None, encode_temperature: float = 1.0,
                    layer_drop_prob=None, label_reg_weight: float = 0.0, label_fn=None,
                    pixel_order=None, feedback_p=None, feedback_rng=None, feedback_detach: bool = True,
                    _feedback_recursed: bool = False) -> tuple:
@@ -1473,7 +1628,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     enc_losses, enc_accs, utils, entropy_losses, label_losses = [], [], [], [], []
     level_rngs = [None] * (2 * phase) if rng is None else list(jax.random.split(rng, 2 * phase))
     for i in range(phase):
-        out = levels[i].encode(x, target, rng=level_rngs[2 * i], gumbel_temperature=gumbel_temperature,
+        out = levels[i].encode(x, target, rng=level_rngs[2 * i], encode_temperature=encode_temperature,
                                 layer_drop_prob=layer_drop_prob)
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
@@ -1501,8 +1656,12 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     for i in range(phase - 1, -1, -1):
         dec_target = flat_bytes if i == 0 else codes[i - 1]
         dec_rng = level_rngs[2 * i + 1]
-        logits, target_i, mask_i, mtp_loss_i = levels[i].decode_logits_and_target_pardec(
-            dec_target, ctx, model.cfg.decoder_ncodes[i], rng=dec_rng)
+        logits, target_i, mask_i, mtp_loss_i = decode_logits_and_target_multipass(
+            levels[i], dec_target, ctx, model.cfg.decoder_ncodes[i], rng=dec_rng,
+            multipass_detach=model.cfg.multipass_detach, refine_gumbel=model.cfg.refine_gumbel,
+            refine_temperature=model.cfg.refine_temperature,
+            refine_quantize_drop=model.cfg.refine_quantize_drop, refine_rng=dec_rng,
+            refine_remat=model.cfg.refine_remat)
         loss_i, acc_i = levels[i]._dec_loss_acc(logits, target_i, mask_i)
         loss_i = loss_i + levels[i].mtp_weight * mtp_loss_i
         dec_losses.append(loss_i)
@@ -1542,8 +1701,8 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
                     def _feedback_fire(logits=logits):
                         pseudo_bytes = jax.lax.stop_gradient(jnp.argmax(logits, axis=-1))
                         l2, _ = phase_forward(
-                            model, pseudo_bytes, phase, rng=rng, level_drop=level_drop,
-                            cascade_rng=cascade_rng, gumbel_temperature=gumbel_temperature,
+                            model, pseudo_bytes, phase, rng=rng, level_gt_drop=level_gt_drop,
+                            cascade_rng=cascade_rng, encode_temperature=encode_temperature,
                             layer_drop_prob=layer_drop_prob, label_reg_weight=0.0, label_fn=None,
                             pixel_order=None, feedback_p=None, feedback_rng=None,
                             _feedback_recursed=True)
@@ -1551,12 +1710,12 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
                 feedback_losses.append(jax.lax.cond(fire_i, _feedback_fire, lambda: zero))
         if i > 0:
             real_ctx = codes_soft[i - 1]
-            if level_drop is None:
+            if level_gt_drop is None:
                 ctx = real_ctx
             else:
-                level_drop_i = level_drop if isinstance(level_drop, (int, float)) \
-                    else level_drop[i]
-                use_cascade_i = jax.random.bernoulli(cascade_rngs[i], p=level_drop_i)
+                level_gt_drop_i = level_gt_drop if isinstance(level_gt_drop, (int, float)) \
+                    else level_gt_drop[i]
+                use_cascade_i = jax.random.bernoulli(cascade_rngs[i], p=level_gt_drop_i)
                 pseudo_ctx, _ = quantize_hard(logits)
                 ctx = jnp.where(use_cascade_i, pseudo_ctx, real_ctx)
 
@@ -1762,9 +1921,11 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
 CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "decoder_ncodes",
                   "ncodes_window", "streaming", "decode_past", "decode_future", "sync",
+                  "n_refine_passes", "refine_window", "multipass_detach", "refine_gumbel",
+                  "refine_temperature", "refine_quantize_drop", "refine_remat",
                   "weight_sharing", "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
                   "gumbel_at_inference", "init_scheme", "use_xsa",
-                  "use_qknorm", "remat", "attn_window", "attn_lookahead", "use_attn_sink",
+                  "use_qknorm", "remat", "attn_window", "attn_lookahead", "use_sink",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "mse_weight",
                   "mse_softmax_tau", "traversal", "label_reg_weight")
@@ -1785,19 +1946,19 @@ def main():
                     help="training batch size -- a bare int applies uniformly to every phase; a "
                          "tuple gives one value per phase (length must equal n_phases)")
     p.add_argument("--n_devices", type=int, default=None)
-    p.add_argument("--phase_steps", type=_tuple_arg, default=None,
+    p.add_argument("--level_steps", type=_tuple_arg, default=None,
                     help="steps per phase -- a bare int applies uniformly to every phase; a "
-                         "tuple gives one value per phase. At most one of --phase_steps/"
-                         "--phase_epochs may be set")
-    p.add_argument("--phase_epochs", type=_tuple_arg, default=None,
+                         "tuple gives one value per phase. At most one of --level_steps/"
+                         "--level_epochs may be set")
+    p.add_argument("--level_epochs", type=_tuple_arg, default=None,
                     help="epochs per phase -- a bare int applies uniformly to every phase; a "
-                         "tuple gives one value per phase. At most one of --phase_steps/"
-                         "--phase_epochs may be set. Default (both unset): 1000 epochs")
+                         "tuple gives one value per phase. At most one of --level_steps/"
+                         "--level_epochs may be set. Default (both unset): 1000 epochs")
     p.add_argument("--no_curriculum", type=lambda x: x.lower() != "false", default=False,
                     help="skip the phase-by-phase curriculum entirely: train ALL levels jointly "
                          "from step 1 (curriculum_mode='no_freeze' still required). Reuses the "
                          "same phase loop with phase fixed at n_phases for its only iteration; "
-                         "phase_steps/phase_epochs's single/last entry is used.")
+                         "level_steps/level_epochs's single/last entry is used.")
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--warmup_steps", type=int, default=None,
                     help="warmup length, in steps. At most one of --warmup_steps/--warmup_epochs "
@@ -1819,7 +1980,6 @@ def main():
                          "holds flat at lr_min for the rest of the phase. At most one of "
                          "--lr_min_step/--lr_min_epoch may be set. Default (both unset): reach "
                          "lr_min exactly at phase end (old behavior)")
-    p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--optimizer", type=str, default="sinkgd", choices=["adamw", "sinkgd"])
     p.add_argument("--optimizer_kwargs", type=json.loads, default={"sinkhorn_iters": 1, "weight_decay": 0})
     p.add_argument("--grad_clip", type=lambda x: None if x.lower() == "none" else float(x), default=1.0,
@@ -1854,6 +2014,9 @@ def main():
     p.add_argument("--epoch_verbose", type=lambda x: x.lower() != "false", default=True,
                     help="log a line at the start of every epoch. Default True; "
                          "set False to suppress it")
+    p.add_argument("--verbose", type=lambda x: x.lower() != "false", default=True,
+                    help="gen-eval: when the eval batch has fewer than 10 samples, also log a "
+                         "per-sample mse1=.. mse2=.. line. Default True")
     p.add_argument("--wa_every_step", type=int, default=None, help="WA update cadence, in steps")
     p.add_argument("--wa_every_epoch", type=float, default=None,
                     help="WA update cadence, in epochs (auto-converted to steps). At most one "
@@ -1865,7 +2028,11 @@ def main():
                     help="wma mode only: one raw score per stack slot (oldest first), "
                          "softmax-normalized to sum to 1 -- length must equal wa_stack_size. "
                          "Default None: uniform (1/wa_stack_size each)")
-    p.add_argument("--train_subset_n", type=int, default=100)
+    p.add_argument("--train_subset_n", type=int, default=None)
+    p.add_argument("--val_subset_n", type=int, default=None,
+                    help="cap the val pool to the first N images (None: use the full val set). "
+                         "Independent of val_batch_size, which only controls how many of this "
+                         "pool are used per single eval/gen-eval call")
     p.add_argument("--eval_gen_train", type=lambda x: x.lower() != "false", default=True,
                     help="also run gen-eval (cascade generation + sample grid) on a TRAIN-set "
                          "prompt, in addition to the usual val-set one -- same count as "
@@ -1900,16 +2067,55 @@ def main():
                          "lands (stub, not implemented) -- pruned from the final output")
     p.add_argument("--sync", type=_bool_tuple_arg, default=Config.sync,
                     help="stub (TODO), not implemented -- raises NotImplementedError if set True")
+    p.add_argument("--n_refine_passes", type=_tuple_arg, default=Config.n_refine_passes,
+                    help="1 (default) = current single-pass decode, unchanged. >1: after pass 1 "
+                         "(unchanged, ctx-only), each further pass re-decodes every group with "
+                         "extra causal peer context -- refine_window preceding groups' PREVIOUS "
+                         "PASS decoded codes at this same level (own predictions during training, "
+                         "stop-gradient'd; own generated codes during generation) -- not real "
+                         "ground truth, so train and generate see the same (imperfect) signal. "
+                         "More passes = closer to full AR across groups, but each pass is a full "
+                         "extra decode call (cost scales ~linearly with n_refine_passes)")
+    p.add_argument("--refine_window", type=_tuple_arg, default=Config.refine_window,
+                    help="n_refine_passes>1 only: how many preceding groups' previous-pass decoded "
+                         "codes are visible as extra causal context each refinement pass (like "
+                         "ncodes_window, but sourced from this level's own decode output, not the "
+                         "level above's ctx)")
+    p.add_argument("--multipass_detach", type=lambda x: x.lower() != "false", default=Config.multipass_detach,
+                    help="refine passes (n_refine_passes>1): True (default) fully stop_gradient's "
+                         "the draft (own prediction, no gradient reaches the earlier pass that "
+                         "produced it). False: STE instead, so the last pass's loss gradient flows "
+                         "back through every earlier pass's decoder output -- backward cost grows "
+                         "with n_refine_passes (BPTT-like), unlike the detached default")
+    p.add_argument("--refine_gumbel", type=lambda x: x.lower() != "false", default=Config.refine_gumbel,
+                    help="refine passes only: gumbel-perturb which code gets drafted each pass "
+                         "(own dedicated knob, NOT the encoder's quantize_mode). Default False "
+                         "(plain deterministic argmax draft)")
+    p.add_argument("--refine_temperature", type=float, default=Config.refine_temperature,
+                    help="own dedicated temperature, not shared with the encoder's "
+                         "encode_temperature. Used by refine_gumbel=True's gumbel-softmax, and "
+                         "also as the plain argmax path's tau when refine_quantize_drop>0 (shapes "
+                         "the soft component that gets mixed into the draft)")
+    p.add_argument("--refine_quantize_drop", type=float, default=Config.refine_quantize_drop,
+                    help="refine passes only, and only when multipass_detach=False -- probability "
+                         "of mixing the soft (not STE-hard) code into the draft embedding. Own "
+                         "dedicated knob, not shared with the encoder's quantize_drop. No effect "
+                         "under multipass_detach=True (detached passes only ever use the hard "
+                         "argmax index)")
+    p.add_argument("--refine_remat", type=lambda x: None if x.lower() == "none" else x.lower() != "false",
+                    default=Config.refine_remat,
+                    help="overrides --remat for just the refine passes (pass 1 always uses --remat "
+                         "unchanged). 'none' (default): refine passes also use --remat, unchanged")
     p.add_argument("--weight_sharing", type=_bool_tuple_arg, default=Config.weight_sharing)
     p.add_argument("--precision", type=str, default=Config.precision, choices=["bf16", "fp32"])
     p.add_argument("--curriculum_mode", type=str, default=Config.curriculum_mode, choices=["freeze", "no_freeze"])
     p.add_argument("--quantize_mode", type=str, default=Config.quantize_mode, choices=["argmax", "gumbel"])
     p.add_argument("--quantize_drop", type=float, default=Config.quantize_drop)
-    p.add_argument("--gumbel_temperature", type=_float_tuple_arg, default=(1.0,),
+    p.add_argument("--encode_temperature", type=_float_tuple_arg, default=(1.0,),
                     help="gumbel-softmax temperature -- global (not per-level), per-phase tuple. "
                          "A bare scalar broadcasts to every phase")
     p.add_argument("--gumbel_at_inference", type=lambda x: x.lower() != "false", default=Config.gumbel_at_inference)
-    p.add_argument("--level_drop", type=_float_tuple_arg, default=(0.5,),
+    p.add_argument("--level_gt_drop", type=_float_tuple_arg, default=(0.5,),
                     help="probability of using cascade-simulated rollout (dropping ground-truth "
                          "ctx) at each level transition during training -- independent draw per "
                          "level, not one shared draw for the whole step. Per-phase tuple (bare "
@@ -1944,7 +2150,7 @@ def main():
                     help="encoder self-attention shifted-triangular lookahead -- 0 (default) "
                          "plain causal, int>0 query may additionally see keys up to that many "
                          "positions ahead (splash LocalMask's native right-side window)")
-    p.add_argument("--use_attn_sink", type=lambda x: x.lower() != "false", default=Config.use_attn_sink)
+    p.add_argument("--use_sink", type=lambda x: x.lower() != "false", default=Config.use_sink)
     p.add_argument("--byte_group", type=int, default=Config.byte_group)
     p.add_argument("--token_head_type", type=str, default=Config.token_head_type)
     p.add_argument("--token_dim", type=_tuple_arg, default=Config.token_dim)
@@ -1986,9 +2192,9 @@ def main():
         if s is None and e is None and default_step is not None:
             setattr(args, step_name, default_step)
 
-    _resolve_pair("phase_steps", "phase_epochs", default_step=None)
-    if args.phase_steps is None and args.phase_epochs is None:
-        args.phase_epochs = (1000,)
+    _resolve_pair("level_steps", "level_epochs", default_step=None)
+    if args.level_steps is None and args.level_epochs is None:
+        args.level_epochs = (1000,)
     _resolve_pair("warmup_steps", "warmup_epochs", default_step=100)
     _resolve_pair("lr_min_step", "lr_min_epoch")
     _resolve_pair("gen_eval_every_step", "gen_eval_every_epoch")
@@ -2021,12 +2227,12 @@ def main():
         assert len(val) == n_phases, f"{name} has {len(val)} entries, need {n_phases} (one per phase)"
         setattr(args, name, val)
 
-    _bcast_per_phase("phase_steps")
-    _bcast_per_phase("phase_epochs")
+    _bcast_per_phase("level_steps")
+    _bcast_per_phase("level_epochs")
     _bcast_per_phase("batch_size")
     _bcast_per_phase("val_batch_size")
-    _bcast_per_phase("gumbel_temperature")
-    _bcast_per_phase("level_drop")
+    _bcast_per_phase("encode_temperature")
+    _bcast_per_phase("level_gt_drop")
     _bcast_per_phase("layer_drop_prob")
     _bcast_per_phase("feedback_p")
 
@@ -2036,6 +2242,8 @@ def main():
         (train_np, train_labels), (val_np, val_labels) = load_cifar10(Path(args.data_root))
     if args.train_subset_n:
         train_np = train_np[:args.train_subset_n]
+    if args.val_subset_n:
+        val_np = val_np[:args.val_subset_n]
 
     rng = jax.random.PRNGKey(args.seed)
     model = HierEncDec(rng, cfg)
@@ -2074,7 +2282,7 @@ def main():
         eval_rngs = ([None] * (top + 1) if not cfg.gumbel_at_inference
                      else list(jax.random.split(jax.random.fold_in(jax.random.PRNGKey(0), hash(tag) % (2**31)), top + 1)))
         for i in range(top + 1):
-            out = m.levels[i].encode(x, target, rng=eval_rngs[i], gumbel_temperature=args.gumbel_temperature[phase - 1])
+            out = m.levels[i].encode(x, target, rng=eval_rngs[i], encode_temperature=args.encode_temperature[phase - 1])
             codes.append(out["code_idx"])
             codes_soft.append(out["code_soft"])
             if i < top:
@@ -2085,33 +2293,52 @@ def main():
 
         cur_code = codes[top]
         for i in range(top, 0, -1):
-            cur_code = m.levels[i].decode_generate_pardec(cur_code, cfg.decoder_ncodes[i], greedy=True, seed=0)
-        cascade_recon = m.levels[0].decode_generate_pardec(cur_code, cfg.decoder_ncodes[0], greedy=True, seed=0)
+            cur_code = decode_generate_multipass(m.levels[i], cur_code, cfg.decoder_ncodes[i], greedy=True, seed=0)
+        cascade_recon = decode_generate_multipass(m.levels[0], cur_code, cfg.decoder_ncodes[0], greedy=True, seed=0)
         cascade_acc = float(jnp.mean(cascade_recon == flat_prompt))
         cascade_img = positions_to_image(np.asarray(cascade_recon), cfg, pixel_order)
         cascade_mse = pixel_mse(cascade_img, gt_img)
-        save_compare_grid(cascade_img, gt_img, run_dir / f"samples_{tag}_cascade.png")
+        save_compare_grid(cascade_img, gt_img, run_dir / f"samples_{tag}.png")
 
         gen_time_s = time.monotonic() - gen_t0
         msg = f"[{tag}] top={top} CASCADE gen_byte_acc={cascade_acc:.4f} gen_cascade_mse={cascade_mse:.2f}"
         rec = dict(tag=tag, gen_cascade_acc=cascade_acc, gen_cascade_mse=cascade_mse, gen_time_s=gen_time_s)
         msg += f" gen_time={gen_time_s:.1f}s"
         logger(msg, **rec)
+        if args.verbose and cascade_img.shape[0] < 10:
+            per_sample_mse = [pixel_mse(cascade_img[i:i + 1], gt_img[i:i + 1]) for i in range(cascade_img.shape[0])]
+            logger(" ".join(f"mse{i + 1}={m:.2f}" for i, m in enumerate(per_sample_mse)))
         return recon_acc, cascade_acc
 
     def run_gen_eval_both(eval_model, top: int, tag: str) -> tuple:
-        result = run_gen_eval(eval_model, top, tag, flat_prompt, gt_img)
+        result = run_gen_eval(eval_model, top, f"{tag}_val", flat_prompt, gt_img)
         if args.eval_gen_train:
             run_gen_eval(eval_model, top, f"{tag}_train", train_flat_prompt, train_gt_img)
         return result
 
+    val_eval_jit = eqx.filter_jit(phase_forward)
+
     def run_val_eval(eval_model, phase: int, tag: str) -> tuple:
         val_t0 = time.monotonic()
         m = cast_pytree(eval_model, compute_dtype)
-        loss, aux = phase_forward(m, flat_prompt, phase, rng=None, gumbel_temperature=args.gumbel_temperature[phase - 1],
-                                   label_reg_weight=cfg.label_reg_weight, label_fn=label_fn, pixel_order=pixel_order)
-        bpb, acc, ntp_bpb, ntp_acc, util, val_mse = [float(a) for a in aux]
-        loss = float(loss)
+        bs = args.val_batch_size[phase - 1]
+        n = len(val_np)
+        sums = np.zeros(6, dtype=np.float64)
+        total_loss = 0.0
+        total_n = 0
+        for start in range(0, n, bs):
+            batch_imgs = val_np[start:start + bs]
+            bn = len(batch_imgs)
+            batch_flat = jnp.array(images_to_positions(batch_imgs, cfg, pixel_order))
+            loss_b, aux_b = val_eval_jit(m, batch_flat, phase, rng=None,
+                                          encode_temperature=args.encode_temperature[phase - 1],
+                                          label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
+                                          pixel_order=pixel_order)
+            sums += bn * np.array([float(a) for a in aux_b])
+            total_loss += bn * float(loss_b)
+            total_n += bn
+        bpb, acc, ntp_bpb, ntp_acc, util, val_mse = (sums / total_n).tolist()
+        loss = total_loss / total_n
         val_time_s = time.monotonic() - val_t0
         logger(f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_mse={val_mse:.4f} "
                f"val_ntp_acc={ntp_acc:.2f} val_time={val_time_s:.1f}s",
@@ -2126,9 +2353,9 @@ def main():
             f"wa_stack_size={args.wa_stack_size}"
 
     def _phase_total_steps(idx, steps_per_epoch):
-        if args.phase_steps is not None:
-            return args.phase_steps[idx]
-        return round(args.phase_epochs[idx] * steps_per_epoch)
+        if args.level_steps is not None:
+            return args.level_steps[idx]
+        return round(args.level_epochs[idx] * steps_per_epoch)
 
     def _every_steps(step_val, epoch_val, steps_per_epoch):
         return step_val if step_val is not None else round(epoch_val * steps_per_epoch)
@@ -2164,8 +2391,8 @@ def main():
         filter_spec = phase_trainable_filter(model, phase)
         diff_model, static_model = eqx.partition(model, filter_spec)
 
-        gumbel_temperature_phase = args.gumbel_temperature[phase - 1]
-        level_drop_phase = args.level_drop[phase - 1]
+        encode_temperature_phase = args.encode_temperature[phase - 1]
+        level_gt_drop_phase = args.level_gt_drop[phase - 1]
         layer_drop_prob_phase = args.layer_drop_prob[phase - 1]
         feedback_p_phase = args.feedback_p[phase - 1]
 
@@ -2173,8 +2400,8 @@ def main():
             m = eqx.combine(diff_model, static_model)
             m = cast_pytree(m, compute_dtype)
             return phase_forward(m, flat_bytes, phase, rng=rng,
-                                  level_drop=level_drop_phase, cascade_rng=cascade_rng,
-                                  gumbel_temperature=gumbel_temperature_phase,
+                                  level_gt_drop=level_gt_drop_phase, cascade_rng=cascade_rng,
+                                  encode_temperature=encode_temperature_phase,
                                   layer_drop_prob=layer_drop_prob_phase,
                                   label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
                                   pixel_order=pixel_order,
@@ -2194,7 +2421,7 @@ def main():
         if args.optimizer == "sinkgd":
             optimizer = sinkgd(lr_schedule, **args.optimizer_kwargs)
         else:
-            optimizer = optax.adamw(lr_schedule, weight_decay=args.weight_decay, **args.optimizer_kwargs)
+            optimizer = optax.adamw(lr_schedule, **args.optimizer_kwargs)
         if args.grad_clip is not None:
             optimizer = optax.chain(optax.clip_by_global_norm(args.grad_clip), optimizer)
         opt_state = optimizer.init(diff_model)
@@ -2282,8 +2509,8 @@ def main():
 
                 if step % gen_eval_every_steps == 0:
                     snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
-                    run_val_eval(snapshot, phase, tag=f"phase{phase}_step{step}")
-                    run_gen_eval_both(snapshot, top=phase - 1, tag=f"phase{phase}_step{step}")
+                    run_val_eval(snapshot, phase, tag=f"level{phase - 1}_step{step}")
+                    run_gen_eval_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{step}")
 
                 if step % ckpt_every_steps == 0:
                     ckpt_model = eqx.combine(to_host(unreplicate(p_diff_model)), static_model)
@@ -2319,8 +2546,8 @@ def main():
         save_checkpoint(ckpt_dir, model, to_host(unreplicate(p_opt_state)), to_host(p_rng), train_iter,
                          phase=phase, phase_step=phase_total_steps, step=step, seed=args.seed)
         prune_checkpoints(run_dir, args.ckpt_keep)
-        run_val_eval(model, phase, tag=f"phase{phase}_final")
-        run_gen_eval_both(model, top=phase - 1, tag=f"phase{phase}_final")
+        run_val_eval(model, phase, tag=f"level{phase - 1}_final")
+        run_gen_eval_both(model, top=phase - 1, tag=f"level{phase - 1}_final")
 
     global_pbar.update(step - last_global_step)
     global_pbar.close()
