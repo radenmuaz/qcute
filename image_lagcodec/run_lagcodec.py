@@ -2014,6 +2014,11 @@ def main():
     p.add_argument("--epoch_verbose", type=lambda x: x.lower() != "false", default=True,
                     help="log a line at the start of every epoch. Default True; "
                          "set False to suppress it")
+    p.add_argument("--final_eval", type=lambda x: x.lower() != "false", default=False,
+                    help="run the val loss + gen-eval at the END of each phase (tag "
+                         "'level{N}_final'). Default False (skip); the periodic in-phase eval "
+                         "(--gen_eval_every_step/--gen_eval_every_epoch) and the all-phases-done "
+                         "final eval still run regardless of this flag")
     p.add_argument("--verbose", type=lambda x: x.lower() != "false", default=True,
                     help="gen-eval: when the eval batch has fewer than 10 samples, also log a "
                          "per-sample mse1=.. mse2=.. line. Default True")
@@ -2546,8 +2551,9 @@ def main():
         save_checkpoint(ckpt_dir, model, to_host(unreplicate(p_opt_state)), to_host(p_rng), train_iter,
                          phase=phase, phase_step=phase_total_steps, step=step, seed=args.seed)
         prune_checkpoints(run_dir, args.ckpt_keep)
-        run_val_eval(model, phase, tag=f"level{phase - 1}_final")
-        run_gen_eval_both(model, top=phase - 1, tag=f"level{phase - 1}_final")
+        if args.final_eval:
+            run_val_eval(model, phase, tag=f"level{phase - 1}_final")
+            run_gen_eval_both(model, top=phase - 1, tag=f"level{phase - 1}_final")
 
     global_pbar.update(step - last_global_step)
     global_pbar.close()

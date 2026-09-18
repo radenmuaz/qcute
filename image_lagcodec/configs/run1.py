@@ -1,5 +1,5 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/overfit1.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run1.py
 """
 
 # --- model ---
@@ -24,16 +24,14 @@ entropy_weight = 0.1
 # Pp    = refine_window × Kspan # = refine_window × decoder_ncodes × stride[level]
 
 strides = (4, 4)
-# strides = (2, 2)
 decoder_ncodes = 4
 ncodes_window = 4
-# ncodes_window = 1
-refine_window = 1
-n_refine_passes = 1
 attn_lookahead = 0
 decode_past = 0
-# decode_future = 8
-decode_future = 0
+decode_future = 16
+refine_window = 1
+n_refine_passes = 2
+
 weight_sharing = False
 # weight_sharing = True
 curriculum_mode = "no_freeze"
@@ -68,17 +66,18 @@ eval_gen_train = True
 # --- training ---
 batch_size = 16
 val_batch_size = 8
-level_steps = (int(5e3), int(1e4))
+level_steps = (int(1e3), int(1e5))
 seed = 0
 # warmup_steps = 2
-# train_subset_n = None
-train_subset_n = 100
-val_subset_n = 10
+train_subset_n = None
+val_subset_n = None
+# train_subset_n = 100
+# val_subset_n = 10
 # train_subset_n = 100
 gen_eval_every_step = 1000
 epoch_verbose = False
 
-grad_clip = 10.0
+grad_clip = 1.0
 lr = 1e-3
 lr_schedule = "cosine"
 lr_min = 1e-5
@@ -88,19 +87,20 @@ warmup_steps = 1000
 # lr_min_epoch = 400
 # weight_decay = 1e-2
 optimizer = "adamw"
-optimizer_kwargs = dict(weight_decay=0,
+optimizer_kwargs = dict(
+                        weight_decay=1e-5,
                         # b1=0.8, b2=0.9,
                         #  eps=1e-8,eps_root=0.0,
                         #  nesterov=False
 
 )
 
-wa_mode = "none"
+# wa_mode = "none"
 
-# wa_mode = "ema"
-# wa_every_step = 100
-# wa_ema_decay = 0.9
-# wa_verbose = False
+wa_mode = "ema"
+wa_every_step = 100
+wa_ema_decay = 0.9
+wa_verbose = False
 
 # wa_mode = "wma"
 # wa_every_epoch = 1
