@@ -65,7 +65,7 @@ eval_gen_train = True
 
 # --- training ---
 batch_size = 16
-val_batch_size = 8
+val_batch_size = 16
 level_steps = (int(1e3), int(1e5))
 seed = 0
 # warmup_steps = 2

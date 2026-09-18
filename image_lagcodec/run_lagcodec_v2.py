@@ -1539,16 +1539,6 @@ def decode_logits_and_target_multipass(level: EncDecLevel, target_seq: jnp.ndarr
     return logits, target_out, mask, mtp_loss
 
 
-def _decode_generate_pardec_call(level, ctx_idx, decoder_ncodes, greedy, temperature, seed,
-                                  decode_past_override, draft_override_flat):
-    return level.decode_generate_pardec(ctx_idx, decoder_ncodes, greedy=greedy, temperature=temperature,
-                                         seed=seed, decode_past_override=decode_past_override,
-                                         draft_override_flat=draft_override_flat)
-
-
-_decode_generate_pardec_jit = eqx.filter_jit(_decode_generate_pardec_call)
-
-
 def decode_generate_multipass(level: EncDecLevel, ctx_idx: jnp.ndarray, decoder_ncodes: int,
                                greedy: bool = True, temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
     """Generation-side counterpart of decode_logits_and_target_multipass -- see its docstring.
@@ -1557,16 +1547,8 @@ def decode_generate_multipass(level: EncDecLevel, ctx_idx: jnp.ndarray, decoder_
     context needs pass (k-1)'s COMPLETE (all-groups) output, which only exists once pass k-1 has
     fully finished, so the passes cannot be fused into one incremental KV-cache stream. Generation
     cost scales ~linearly with n_refine_passes (each pass is roughly as expensive as today's
-    single-pass call).
-
-    Calls go through _decode_generate_pardec_jit, a MODULE-LEVEL eqx.filter_jit wrapper created
-    once at import time -- decode_generate_pardec's own internal @jax.jit (on its nested
-    run_pardec closure) is defined fresh inside the method body on every call, so it recompiles
-    from scratch every time regardless of shape reuse; wrapping the whole call here the same way
-    run_val_eval's phase_forward call was fixed (a persistent jit object, not a fresh one per
-    call) gives real cross-call caching -- repeated calls with matching level/decoder_ncodes/
-    decode_past_override shapes reuse the compiled executable instead of recompiling."""
-    pred = _decode_generate_pardec_jit(level, ctx_idx, decoder_ncodes, greedy, temperature, seed, None, None)
+    single-pass call)."""
+    pred = level.decode_generate_pardec(ctx_idx, decoder_ncodes, greedy=greedy, temperature=temperature, seed=seed)
     if level.n_refine_passes <= 1 or level.refine_window <= 0:
         return pred
     B, n_blocks = ctx_idx.shape[0], ctx_idx.shape[1]
@@ -1581,8 +1563,9 @@ def decode_generate_multipass(level: EncDecLevel, ctx_idx: jnp.ndarray, decoder_
         draft_p = jnp.pad(pred_p, ((0, 0), (Pp, 0)) + ((0, 0),) * (pred_p.ndim - 2))
         draft_windows = jnp.stack([draft_p[:, g * Kspan:g * Kspan + Pp] for g in range(n_groups)], axis=1)
         draft_override_flat = draft_windows.reshape(B * n_groups, Pp, *pred.shape[2:])
-        pred = _decode_generate_pardec_jit(level, ctx_idx, decoder_ncodes, greedy, temperature, seed,
-                                            Pp, draft_override_flat)
+        pred = level.decode_generate_pardec(ctx_idx, decoder_ncodes, greedy=greedy, temperature=temperature,
+                                             seed=seed, decode_past_override=Pp,
+                                             draft_override_flat=draft_override_flat)
     return pred
 
 
