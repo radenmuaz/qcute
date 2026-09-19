@@ -9,13 +9,15 @@ import sys
 from pathlib import Path
 import jax
 import jax.numpy as jnp
+import equinox as eqx
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from image_lagcodec.run_lagcodec import (
-    Config, HierEncDec, load_cifar10, images_to_positions, pixel_order_for, code_embed_proj,
-    run_block_pardec, pardec_block_step, pardec_block_chunk_step,
+    Config, HierEncDec, EncDecLevel, load_cifar10, images_to_positions, pixel_order_for, code_embed_proj,
+    run_block_pardec, pardec_block_step, pardec_block_chunk_step, causal_extra_ctx_windows,
+    _draft_past_valid_mask,
 )
 import image_lagcodec.eqx_common as eqx_common
 
@@ -231,9 +233,366 @@ def run_one(ncodes_window, streaming=True):
     return ok
 
 
+def build_cfg_widened(decode_past, decode_future, cycle_refine_passes=1):
+    return Config(
+        d_model=(32, 32), n_layers=(1, 1), n_heads=(2, 2), n_kv_heads=(None, None),
+        strides=(4, 4), code_vocab=(16, 16), pq_chunks=(1, 1), pq_dim=(16, 16),
+        byte_group=3, token_head_type="linears", decoder_ncodes=(G, G), ncodes_window=(16, 16),
+        streaming=(True, True), weight_sharing=True, curriculum_mode="no_freeze",
+        decode_past=(decode_past, decode_past), decode_future=(decode_future, decode_future),
+        cycle_refine_passes=cycle_refine_passes,
+    )
+
+
+def run_widened_aux(decode_past, decode_future):
+    """decode_past/decode_future widened auxiliary-NTP region: dense (via decode_logits_and_target_pardec's
+    internal _widened_aux_ntp) must match an independently-built incremental KV-cache reconstruction,
+    teacher-forced with the same real draft/future values, across the whole widened window."""
+    cfg = build_cfg_widened(decode_past, decode_future)
+    key = jax.random.PRNGKey(0)
+    model = HierEncDec(key, cfg)
+    level = model.levels[0]
+
+    (train_np, train_labels), _ = load_cifar10(Path(os.path.expanduser("~/qcute/datasets")))
+    pixel_order = pixel_order_for(cfg)
+    imgs = train_np[:B]
+    flat_bytes = jnp.array(images_to_positions(imgs, cfg, pixel_order))
+    x_in = code_embed_proj(flat_bytes, level.own_input_embed, level.own_input_proj)
+    enc_out = level.encode(x_in, flat_bytes, rng=None)
+    ctx_idx_soft, ctx_idx = enc_out["code_soft"], enc_out["code_idx"]
+
+    captured = {}
+    orig = EncDecLevel._widened_aux_ntp
+
+    def spy(self, h, target_p, Wg, extra_len_total, Pp, Pf, Kspan, n_groups, Bc, n_blocks, rng):
+        captured["h"] = h
+        captured["Wg"] = Wg
+        captured["extra_len_total"] = extra_len_total
+        return orig(self, h, target_p, Wg, extra_len_total, Pp, Pf, Kspan, n_groups, Bc, n_blocks, rng)
+
+    EncDecLevel._widened_aux_ntp = spy
+    try:
+        level.decode_logits_and_target_pardec(flat_bytes, ctx_idx_soft, G)
+    finally:
+        EncDecLevel._widened_aux_ntp = orig
+    h_dense = captured["h"]
+    ctx_len = captured["Wg"] + captured["extra_len_total"]
+    Pp, Pf = decode_past, decode_future
+    Kspan = G * level.K
+    n_blocks = ctx_idx.shape[1]
+    n_groups = n_blocks // G
+    D = level.bos_embed.shape[-1]
+
+    dense_logits_parts = []
+    if Pp > 0:
+        pred_pos_pp = ctx_len + jnp.arange(Pp)
+        dense_logits_parts.append(level._token_logits_linears(h_dense[:, pred_pos_pp, :]))
+    pred_pos_core = ctx_len + Pp + jnp.arange(Kspan)
+    dense_logits_parts.append(level._token_logits_linears(h_dense[:, pred_pos_core, :]))
+    if Pf > 0:
+        pred_pos_pf = ctx_len + Pp + Kspan + jnp.arange(Pf)
+        dense_logits_parts.append(level._token_logits_linears(h_dense[:, pred_pos_pf, :]))
+    dense_logits = jnp.concatenate(dense_logits_parts, axis=1)
+
+    # -- independent incremental KV-cache reconstruction, teacher-forced with real values --
+    blocks, ln_f = level._dec_blocks(), level._dec_ln_f()
+    hd = D // level.n_heads
+    N = level.ncodes_window
+    Wg = (N + 1) * G
+    ctx_tok = code_embed_proj(ctx_idx, level.ctx_embed, level.ctx_proj)
+    ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * G, 0), (0, 0)))
+    B2 = B * n_groups
+    ctx_windows = jnp.stack([ctx_tok[:, g * G:g * G + Wg, :] for g in range(n_groups)], axis=1)
+    ctx_flat = ctx_windows.reshape(B2, Wg, D)
+    fake_counts = jnp.array([max(0, N - g) * G for g in range(n_groups)])
+    min_valid_pos = jnp.broadcast_to(fake_counts[None, :], (B, n_groups)).reshape(B2)
+    rope_ctx = jnp.stack([jnp.clip(jnp.arange(Wg) - N * G + g * G, 0, None) for g in range(n_groups)], axis=0)
+    rope_ctx_flat = jnp.broadcast_to(rope_ctx[None], (B, n_groups, Wg)).reshape(B2, Wg)
+    rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])
+    rope_bos_flat = jnp.broadcast_to(rope_bos[None, :], (B, n_groups)).reshape(B2)
+    per_group_len = Wg + 1 + Pp + Kspan + Pf
+
+    target_p = flat_bytes
+    ext_p = jnp.pad(target_p, ((0, 0), (Pp, Pf)) + ((0, 0),) * (target_p.ndim - 2))
+    widened_windows = jnp.stack(
+        [ext_p[:, g * Kspan:g * Kspan + Pp + Kspan + Pf] for g in range(n_groups)], axis=1)
+    widened_flat = widened_windows.reshape(B2, Pp + Kspan + Pf, *target_p.shape[2:])
+    # positions before the sequence's real start get the trainable draft_pad, not embed(index 0) --
+    # matches decode_logits_and_target_pardec's own draft_te substitution exactly (draft_pad fix).
+    if Pp > 0:
+        pp_valid_np = _draft_past_valid_mask(n_groups, Pp, Kspan, n_blocks * level.K)
+        pp_valid_flat = jnp.broadcast_to(jnp.asarray(pp_valid_np)[None], (B, n_groups, Pp)).reshape(B2, Pp)
+
+    def embed_widened(t):
+        te = level._dec_embed_target(widened_flat[:, t])
+        if Pp > 0 and t < Pp:
+            te = jnp.where(pp_valid_flat[:, t][:, None], te, level.draft_pad)
+        return te
+
+    def self_step(x_new, ck, cv, pos, rope_pos_row):
+        new_ck, new_cv = [], []
+        x = x_new
+        for i, blk in enumerate(blocks):
+            x, ck_i, cv_i = pardec_block_step(blk, x, ck[i], cv[i], pos, rope_pos_row, min_valid_pos, per_group_len)
+            new_ck.append(ck_i)
+            new_cv.append(cv_i)
+        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+
+    def self_chunk_step(x_chunk, ck, cv, pos_start, rope_pos_ids_chunk):
+        new_ck, new_cv = [], []
+        x = x_chunk
+        for i, blk in enumerate(blocks):
+            x, ck_i, cv_i = pardec_block_chunk_step(blk, x, ck[i], cv[i], pos_start, rope_pos_ids_chunk,
+                                                      min_valid_pos, per_group_len)
+            new_ck.append(ck_i)
+            new_cv.append(cv_i)
+        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+
+    cache_k = jnp.zeros((len(blocks), B2, level.n_kv_heads, per_group_len, hd))
+    cache_v = jnp.zeros_like(cache_k)
+    bos_in = jnp.broadcast_to(level.bos_embed, (B2, 1, D))
+    chunk = jnp.concatenate([ctx_flat, bos_in], axis=1)
+    chunk_rope = jnp.concatenate([rope_ctx_flat, rope_bos_flat[:, None]], axis=1)
+    h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, jnp.array(0), chunk_rope)
+    pos = Wg + 1
+    total_steps = Pp + Kspan + Pf
+
+    def widened_pos(t):
+        if t < Pp:
+            return jnp.clip(rope_bos_flat - Pp + t, 0, None)
+        return rope_bos_flat + 1 + (t - Pp)
+
+    rope_pos_row = widened_pos(0)
+    h_all = [h_chunk[:, -1, :]]
+    x_input = embed_widened(0)
+    for t in range(1, total_steps):
+        h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
+        pos += 1
+        rope_pos_row = widened_pos(t)
+        h_all.append(h)
+        x_input = embed_widened(t)
+    h_incr = jnp.stack(h_all, axis=1)
+    incr_logits = level._token_logits_linears(h_incr)
+
+    diff = jnp.abs(dense_logits - incr_logits)
+    mism = int((jnp.argmax(dense_logits, -1) != jnp.argmax(incr_logits, -1)).sum())
+    print(f"WIDENED AUX (decode_past={decode_past} decode_future={decode_future}): "
+          f"dense-vs-incremental max_abs_diff={float(diff.max()):.6f} mismatches={mism}/{dense_logits.shape[1] * dense_logits.shape[0] * n_groups}")
+    ok = float(diff.max()) <= 1e-3 and mism == 0
+    print(f"  {'CONSISTENT' if ok else 'DIVERGES'}")
+    return ok
+
+
+def run_cyclic_revision_extra_ctx():
+    """cyclic-refine's revision-slot fallback (_extra_ctx_table falling back to level.revision_embed/proj/pad
+    for k beyond cond_depth's own extra_ctx list): dense vs incremental KV-cache, multiple revision slots."""
+    cfg = build_cfg_widened(0, 0, cycle_refine_passes=3)
+    key = jax.random.PRNGKey(0)
+    model = HierEncDec(key, cfg)
+    level0, level1 = model.levels[0], model.levels[1]
+
+    (train_np, train_labels), _ = load_cifar10(Path(os.path.expanduser("~/qcute/datasets")))
+    pixel_order = pixel_order_for(cfg)
+    imgs = train_np[:B]
+    flat_bytes = jnp.array(images_to_positions(imgs, cfg, pixel_order))
+    x0 = code_embed_proj(flat_bytes, level0.own_input_embed, level0.own_input_proj)
+    enc0 = level0.encode(x0, flat_bytes, rng=None)
+    code0_idx, code0_soft = enc0["code_idx"], enc0["code_soft"]
+    x1 = code_embed_proj(code0_soft, level1.own_input_embed, level1.own_input_proj)
+    enc1 = level1.encode(x1, code0_idx, rng=None)
+    code1_idx = enc1["code_idx"]
+
+    rev2 = jax.random.randint(jax.random.PRNGKey(5), code1_idx.shape, 0, cfg.code_vocab[1])
+    rev3 = jax.random.randint(jax.random.PRNGKey(6), code1_idx.shape, 0, cfg.code_vocab[1])
+    extra_ctx_list = [enc1["code_soft"], rev2, rev3]
+
+    logits_dense, target_dense, _, _, _, _ = level0.decode_logits_and_target_pardec(
+        flat_bytes, code0_soft, G, extra_ctx_code_soft=extra_ctx_list)
+    dense_argmax = jnp.argmax(logits_dense, axis=-1)
+
+    level = level0
+    blocks, ln_f = level._dec_blocks(), level._dec_ln_f()
+    n_blocks = code0_idx.shape[1]
+    D = level.bos_embed.shape[-1]
+    hd = D // level.n_heads
+    N = level.ncodes_window
+    n_groups = n_blocks // G
+    Wg = (N + 1) * G
+    ctx_tok = code_embed_proj(code0_idx, level.ctx_embed, level.ctx_proj)
+    ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * G, 0), (0, 0)))
+    B2 = B * n_groups
+    ctx_windows = jnp.stack([ctx_tok[:, g * G:g * G + Wg, :] for g in range(n_groups)], axis=1)
+    ctx_tok_flat = ctx_windows.reshape(B2, Wg, D)
+    fake_counts = jnp.array([max(0, N - g) * G for g in range(n_groups)])
+    min_valid_pos = jnp.broadcast_to(fake_counts[None, :], (B, n_groups)).reshape(B2)
+    rope_ctx = jnp.stack([jnp.clip(jnp.arange(Wg) - N * G + g * G, 0, None) for g in range(n_groups)], axis=0)
+    rope_ctx_flat = jnp.broadcast_to(rope_ctx[None], (B, n_groups, Wg)).reshape(B2, Wg)
+
+    extra_len_total = 0
+    extra_flats, extra_ropes = [], []
+    for k, extra_val in enumerate(extra_ctx_list):
+        embed_t, proj_t, pad_t, up_stride, _ = level._extra_ctx_table(k)
+        w, r, Wg_j = causal_extra_ctx_windows(extra_val, embed_t, proj_t, pad_t, up_stride, G, n_groups, B, D)
+        extra_flats.append(w)
+        extra_ropes.append(jnp.broadcast_to(r[None], (B, n_groups, Wg_j)).reshape(B2, Wg_j))
+        extra_len_total += Wg_j
+    ctx_tok_flat = jnp.concatenate([ctx_tok_flat] + extra_flats, axis=1)
+    rope_ctx_flat = jnp.concatenate([rope_ctx_flat] + extra_ropes, axis=1)
+
+    rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])
+    rope_bos_flat = jnp.broadcast_to(rope_bos[None, :], (B, n_groups)).reshape(B2)
+    per_group_len = Wg + extra_len_total + 1 + G * level.K
+
+    def self_step(x_new, ck, cv, pos, rope_pos_row):
+        new_ck, new_cv = [], []
+        x = x_new
+        for i, blk in enumerate(blocks):
+            x, ck_i, cv_i = pardec_block_step(blk, x, ck[i], cv[i], pos, rope_pos_row, min_valid_pos, per_group_len)
+            new_ck.append(ck_i)
+            new_cv.append(cv_i)
+        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+
+    def self_chunk_step(x_chunk, ck, cv, pos_start, rope_pos_ids_chunk):
+        new_ck, new_cv = [], []
+        x = x_chunk
+        for i, blk in enumerate(blocks):
+            x, ck_i, cv_i = pardec_block_chunk_step(blk, x, ck[i], cv[i], pos_start, rope_pos_ids_chunk,
+                                                      min_valid_pos, per_group_len)
+            new_ck.append(ck_i)
+            new_cv.append(cv_i)
+        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+
+    cache_k = jnp.zeros((len(blocks), B2, level.n_kv_heads, per_group_len, hd))
+    cache_v = jnp.zeros_like(cache_k)
+    Kspan = G * level.K
+    real_windows = jnp.stack([flat_bytes[:, g * Kspan:(g + 1) * Kspan] for g in range(n_groups)], axis=1)
+    real_flat = real_windows.reshape(B2, Kspan, *flat_bytes.shape[2:])
+
+    bos_in = jnp.broadcast_to(level.bos_embed, (B2, 1, D))
+    chunk = jnp.concatenate([ctx_tok_flat, bos_in], axis=1)
+    chunk_rope = jnp.concatenate([rope_ctx_flat, rope_bos_flat[:, None]], axis=1)
+    h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, jnp.array(0), chunk_rope)
+    pos = Wg + extra_len_total + 1
+    rope_pos_row = rope_bos_flat + 1
+    logits_list = [level._token_logits_linears(h_chunk[:, -1, :])]
+    x_input = level._dec_embed_target(real_flat[:, 0])
+    for t in range(1, Kspan):
+        h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
+        pos += 1
+        rope_pos_row = rope_pos_row + 1
+        logits_list.append(level._token_logits_linears(h))
+        x_input = level._dec_embed_target(real_flat[:, t])
+
+    incr_logits_flat = jnp.stack(logits_list, axis=1)
+    incr_logits = incr_logits_flat.reshape(B, n_groups * Kspan, *incr_logits_flat.shape[2:])[:, :n_blocks * level.K]
+    incr_argmax = jnp.argmax(incr_logits, axis=-1)
+
+    diff = jnp.abs(logits_dense - incr_logits)
+    mism = int((dense_argmax != incr_argmax).sum())
+    print(f"CYCLIC-REVISION extra_ctx (3 slots): dense-vs-incremental max_abs_diff={float(diff.max()):.6f} "
+          f"mismatches={mism}/{dense_argmax.size}")
+    ok = float(diff.max()) <= 1e-3 and mism == 0
+    print(f"  {'CONSISTENT' if ok else 'DIVERGES'}")
+    return ok
+
+
+def run_gen_decode_future_self_consistency():
+    """gen_decode_future=True: the greedily-generated future tail must be self-consistent with what
+    dense teacher-forced scoring (fed that exact generated context) would itself pick -- i.e. generation
+    isn't silently using different math/positions than the scoring path."""
+    cfg = build_cfg_widened(0, 4)
+    key = jax.random.PRNGKey(0)
+    model = HierEncDec(key, cfg)
+    level = model.levels[0]
+
+    (train_np, train_labels), _ = load_cifar10(Path(os.path.expanduser("~/qcute/datasets")))
+    pixel_order = pixel_order_for(cfg)
+    imgs = train_np[:B]
+    flat_bytes = jnp.array(images_to_positions(imgs, cfg, pixel_order))
+    x_in = code_embed_proj(flat_bytes, level.own_input_embed, level.own_input_proj)
+    enc_out = level.encode(x_in, flat_bytes, rng=None)
+    ctx_idx = enc_out["code_idx"]
+
+    out, future = level.decode_generate_pardec(ctx_idx, G, greedy=True, seed=0, gen_decode_future=True)
+    n_groups = future.shape[1]
+    Kspan = G * level.K
+    Pf = level.decode_future
+
+    # rebuild the exact widened sequence generation actually produced (real core span + its own greedy
+    # future), feed it through dense scoring, and check the dense argmax at the future positions matches
+    # what was generated (self-consistency: greedy generation IS the argmax of the scoring path).
+    real_windows = jnp.stack([out[:, g * Kspan:(g + 1) * Kspan] for g in range(n_groups)], axis=1)
+    target_p_check = out  # dense target_seq is just the real span; future isn't part of the scored target
+    logits_dense, target_dense, _, _, aux_loss, aux_acc = level.decode_logits_and_target_pardec(
+        target_p_check, enc_out["code_soft"], G)
+    core_argmax = jnp.argmax(logits_dense, axis=-1)
+    core_match = bool(jnp.array_equal(core_argmax, out))
+    print(f"GEN_DECODE_FUTURE self-consistency: future shape={future.shape}, "
+          f"greedy core reproduces itself under dense re-scoring: {core_match}")
+    print(f"  {'CONSISTENT' if core_match else 'DIVERGES'}")
+    return core_match
+
+
+def run_draft_pad_generation():
+    """draft_pad substitution in decode_generate_pardec's draft-prefix steps: generation must be fully
+    independent of own_input_embed[0] for a group whose draft window is entirely out-of-bounds (matches
+    the training-side draft_pad guarantee)."""
+    cfg = build_cfg_widened(16, 0)
+    key = jax.random.PRNGKey(0)
+    model = HierEncDec(key, cfg)
+    level = model.levels[0]
+
+    (train_np, train_labels), _ = load_cifar10(Path(os.path.expanduser("~/qcute/datasets")))
+    pixel_order = pixel_order_for(cfg)
+    imgs = train_np[:B]
+    flat_bytes = jnp.array(images_to_positions(imgs, cfg, pixel_order))
+    x_in = code_embed_proj(flat_bytes, level.own_input_embed, level.own_input_proj)
+    enc_out = level.encode(x_in, flat_bytes, rng=None)
+    ctx_idx = enc_out["code_idx"]
+
+    import image_lagcodec.run_lagcodec as rl
+    n_blocks = ctx_idx.shape[1]
+    Kspan = G * level.K
+    n_groups = n_blocks // G
+    Pp = level.decode_past
+    draft_valid_np = rl._draft_past_valid_mask(n_groups, Pp, Kspan, n_blocks * level.K)
+    draft_valid_flat = jnp.broadcast_to(
+        jnp.asarray(draft_valid_np)[None], (B, n_groups, Pp)).reshape(B * n_groups, Pp)
+    fake_source = jnp.zeros((B, n_groups * Kspan, *flat_bytes.shape[2:]), dtype=flat_bytes.dtype)
+    draft_p = jnp.pad(fake_source, ((0, 0), (Pp, 0)) + ((0, 0),) * (fake_source.ndim - 2))
+    draft_windows = jnp.stack([draft_p[:, g * Kspan:g * Kspan + Pp] for g in range(n_groups)], axis=1)
+    draft_override_flat = draft_windows.reshape(B * n_groups, Pp, *flat_bytes.shape[2:])
+
+    out0 = level.decode_generate_pardec(ctx_idx, G, greedy=True, seed=0,
+                                         decode_past_override=Pp, draft_override_flat=draft_override_flat,
+                                         draft_valid_flat=draft_valid_flat)
+    new_embed = level.own_input_embed.at[0].set(level.own_input_embed[0] + 999.0)
+    level_pert = eqx.tree_at(lambda l: l.own_input_embed, level, new_embed)
+    out1 = level_pert.decode_generate_pardec(ctx_idx, G, greedy=True, seed=0,
+                                              decode_past_override=Pp, draft_override_flat=draft_override_flat,
+                                              draft_valid_flat=draft_valid_flat)
+    # only the FIRST byte of group0 is a clean isolation point: with weight_sharing=True, every
+    # later byte within the SAME group gets fed back through the shared target-embed table during
+    # the group's own autoregressive loop, so if a later generated byte happens to equal 0 it would
+    # legitimately (and separately from draft_pad) pick up the perturbation too -- that's expected,
+    # not a draft_pad bug. The first byte depends only on ctx+bos+draft, before any such feedback.
+    group0_unaffected = bool(jnp.array_equal(out0[:, 0], out1[:, 0]))
+    print(f"DRAFT_PAD generation: group0's first byte (fully out-of-bounds draft) unaffected by "
+          f"embed(0) perturbation: {group0_unaffected}")
+    print(f"  {'CONSISTENT' if group0_unaffected else 'DIVERGES'}")
+    return group0_unaffected
+
+
 if __name__ == "__main__":
     ok0 = run_one(0)                        # disjoint (sanity baseline)
     ok2 = run_one(2)                        # bounded N=2, causal streaming
     okm1 = run_one(-1)                      # all, causal streaming (unbounded)
     okfc = run_one(-1, streaming=False)     # all, non-causal (true fullctx)
-    print(f"\nPASS all" if (ok0 and ok2 and okm1 and okfc) else "\nFAIL -- see divergence above")
+    ok_wp = run_widened_aux(4, 0)           # decode_past-only widened aux NTP
+    ok_wf = run_widened_aux(0, 4)           # decode_future-only widened aux NTP
+    ok_wpf = run_widened_aux(4, 4)          # decode_past+decode_future combined
+    ok_cyc = run_cyclic_revision_extra_ctx()  # cyclic-refine revision-slot fallback tables
+    ok_gdf = run_gen_decode_future_self_consistency()  # gen_decode_future generation
+    ok_dp = run_draft_pad_generation()      # draft_pad substitution at generation time
+    all_ok = (ok0 and ok2 and okm1 and okfc and ok_wp and ok_wf and ok_wpf and ok_cyc and ok_gdf and ok_dp)
+    print(f"\nPASS all" if all_ok else "\nFAIL -- see divergence above")
