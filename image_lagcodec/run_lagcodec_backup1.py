@@ -1489,30 +1489,6 @@ def decode_logits_and_target_multipass(level: EncDecLevel, target_seq: jnp.ndarr
                                         refine_gumbel: bool = False, refine_temperature: float = 1.0,
                                         refine_quantize_drop: float = 0.0, refine_rng=None,
                                         refine_remat: bool = None) -> tuple:
-    """n_refine_passes<=1 (default): identical to a single decode_logits_and_target_pardec call.
-    n_refine_passes>1: pass 1 is unchanged (ctx-only); each further pass re-decodes every group
-    with extra causal peer context -- refine_window preceding groups' PREVIOUS PASS predicted
-    codes at this level. Reuses decode_past's existing widened-window/RoPE machinery via
-    decode_past_override/draft_override(_embed) -- no new masking logic.
-    multipass_detach (default True): fully stop_gradient's the draft (hard argmax index, own
-    predictions, never real ground truth -- matches what generation can actually supply). False:
-    STE instead -- embeds quantize_hard/quantize_gumbel's soft-plus-straight-through code directly
-    (code_embed_proj's int/float branching makes this a drop-in swap for the hard int embed), so
-    gradient from the LAST pass's loss flows back through every earlier pass's decoder output --
-    trains those weights to be refine-friendly, at the cost of a BPTT-like backward graph that
-    grows with n_refine_passes (memory/compute scale with it, unlike the detached default where
-    each pass is independently computed).
-    refine_gumbel/refine_temperature/refine_quantize_drop: own dedicated knobs (NOT shared
-    with the encoder's quantize_mode/encode_temperature/quantize_drop), controlling only the
-    draft's stochasticity -- gumbel perturbs WHICH code gets drafted (works even under
-    multipass_detach=True, pure exploration, no gradient either way); quantize_drop only matters
-    when multipass_detach=False (mixes soft/STE code into the draft embedding). refine_temperature
-    also shapes the plain (non-gumbel) argmax path's softmax whenever quantize_drop>0, since the
-    soft component being mixed in is temperature-dependent even without gumbel noise -- argmax
-    itself is temperature-invariant (dividing logits by tau doesn't change which is largest), only
-    the SHARPNESS of the soft/STE component that quantize_drop occasionally substitutes changes.
-    refine_remat: overrides self.remat for just the refine passes (pass 1 always uses self.remat
-    unchanged); None (default) leaves refine passes on self.remat too."""
     logits, target_out, mask, mtp_loss = level.decode_logits_and_target_pardec(
         target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
     if level.n_refine_passes <= 1 or level.refine_window <= 0:
@@ -1539,16 +1515,19 @@ def decode_logits_and_target_multipass(level: EncDecLevel, target_seq: jnp.ndarr
     return logits, target_out, mask, mtp_loss
 
 
+def _decode_generate_pardec_call(level, ctx_idx, decoder_ncodes, greedy, temperature, seed,
+                                  decode_past_override, draft_override_flat):
+    return level.decode_generate_pardec(ctx_idx, decoder_ncodes, greedy=greedy, temperature=temperature,
+                                         seed=seed, decode_past_override=decode_past_override,
+                                         draft_override_flat=draft_override_flat)
+
+
+_decode_generate_pardec_jit = eqx.filter_jit(_decode_generate_pardec_call)
+
+
 def decode_generate_multipass(level: EncDecLevel, ctx_idx: jnp.ndarray, decoder_ncodes: int,
                                greedy: bool = True, temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
-    """Generation-side counterpart of decode_logits_and_target_multipass -- see its docstring.
-    Each refinement pass is a SEPARATE full decode_generate_pardec call (its own fresh KV-cache
-    build via self_chunk_step/self_step), not a continuation of pass 1's cache: pass k's peer
-    context needs pass (k-1)'s COMPLETE (all-groups) output, which only exists once pass k-1 has
-    fully finished, so the passes cannot be fused into one incremental KV-cache stream. Generation
-    cost scales ~linearly with n_refine_passes (each pass is roughly as expensive as today's
-    single-pass call)."""
-    pred = level.decode_generate_pardec(ctx_idx, decoder_ncodes, greedy=greedy, temperature=temperature, seed=seed)
+    pred = _decode_generate_pardec_jit(level, ctx_idx, decoder_ncodes, greedy, temperature, seed, None, None)
     if level.n_refine_passes <= 1 or level.refine_window <= 0:
         return pred
     B, n_blocks = ctx_idx.shape[0], ctx_idx.shape[1]
@@ -1563,9 +1542,8 @@ def decode_generate_multipass(level: EncDecLevel, ctx_idx: jnp.ndarray, decoder_
         draft_p = jnp.pad(pred_p, ((0, 0), (Pp, 0)) + ((0, 0),) * (pred_p.ndim - 2))
         draft_windows = jnp.stack([draft_p[:, g * Kspan:g * Kspan + Pp] for g in range(n_groups)], axis=1)
         draft_override_flat = draft_windows.reshape(B * n_groups, Pp, *pred.shape[2:])
-        pred = level.decode_generate_pardec(ctx_idx, decoder_ncodes, greedy=greedy, temperature=temperature,
-                                             seed=seed, decode_past_override=Pp,
-                                             draft_override_flat=draft_override_flat)
+        pred = _decode_generate_pardec_jit(level, ctx_idx, decoder_ncodes, greedy, temperature, seed,
+                                            Pp, draft_override_flat)
     return pred
 
 
@@ -2277,6 +2255,7 @@ def main():
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
     recon_prompt = flat_prompt = gt_img = None
     train_recon_prompt = train_flat_prompt = train_gt_img = None
+    gen_jit_timed = [False]
 
     def run_gen_eval(eval_model, top: int, tag: str, flat_prompt, gt_img) -> tuple:
         gen_t0 = time.monotonic()
@@ -2296,10 +2275,15 @@ def main():
 
         recon_acc = recon_mse = None
 
+        cascade_t0 = time.monotonic()
         cur_code = codes[top]
         for i in range(top, 0, -1):
             cur_code = decode_generate_multipass(m.levels[i], cur_code, cfg.decoder_ncodes[i], greedy=True, seed=0)
         cascade_recon = decode_generate_multipass(m.levels[0], cur_code, cfg.decoder_ncodes[0], greedy=True, seed=0)
+        gen_compile_s = None
+        if not gen_jit_timed[0]:
+            gen_compile_s = time.monotonic() - cascade_t0
+            gen_jit_timed[0] = True
         cascade_acc = float(jnp.mean(cascade_recon == flat_prompt))
         cascade_img = positions_to_image(np.asarray(cascade_recon), cfg, pixel_order)
         cascade_mse = pixel_mse(cascade_img, gt_img)
@@ -2309,6 +2293,9 @@ def main():
         msg = f"[{tag}] top={top} CASCADE gen_byte_acc={cascade_acc:.4f} gen_cascade_mse={cascade_mse:.2f}"
         rec = dict(tag=tag, gen_cascade_acc=cascade_acc, gen_cascade_mse=cascade_mse, gen_time_s=gen_time_s)
         msg += f" gen_time={gen_time_s:.1f}s"
+        if gen_compile_s is not None:
+            msg += f" (first call, incl. jit compile: {gen_compile_s:.1f}s)"
+            rec["gen_compile_s"] = gen_compile_s
         logger(msg, **rec)
         if args.verbose and cascade_img.shape[0] < 10:
             per_sample_mse = [pixel_mse(cascade_img[i:i + 1], gt_img[i:i + 1]) for i in range(cascade_img.shape[0])]
@@ -2322,6 +2309,7 @@ def main():
         return result
 
     val_eval_jit = eqx.filter_jit(phase_forward)
+    val_jit_timed = [False]
 
     def run_val_eval(eval_model, phase: int, tag: str) -> tuple:
         val_t0 = time.monotonic()
@@ -2331,25 +2319,34 @@ def main():
         sums = np.zeros(6, dtype=np.float64)
         total_loss = 0.0
         total_n = 0
+        val_compile_s = None
         for start in range(0, n, bs):
             batch_imgs = val_np[start:start + bs]
             bn = len(batch_imgs)
             batch_flat = jnp.array(images_to_positions(batch_imgs, cfg, pixel_order))
+            batch_t0 = time.monotonic()
             loss_b, aux_b = val_eval_jit(m, batch_flat, phase, rng=None,
                                           encode_temperature=args.encode_temperature[phase - 1],
                                           label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
                                           pixel_order=pixel_order)
+            if not val_jit_timed[0]:
+                val_compile_s = time.monotonic() - batch_t0
+                val_jit_timed[0] = True
             sums += bn * np.array([float(a) for a in aux_b])
             total_loss += bn * float(loss_b)
             total_n += bn
         bpb, acc, ntp_bpb, ntp_acc, util, val_mse = (sums / total_n).tolist()
         loss = total_loss / total_n
         val_time_s = time.monotonic() - val_t0
-        logger(f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_mse={val_mse:.4f} "
-               f"val_ntp_acc={ntp_acc:.2f} val_time={val_time_s:.1f}s",
-               tag=tag, val_loss=loss, val_dec_acc=acc, val_dec_bpb=bpb,
-               val_ntp_acc=ntp_acc, val_ntp_bpb=ntp_bpb, val_util=util, val_mse=val_mse,
-               val_time_s=val_time_s)
+        msg = (f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_mse={val_mse:.4f} "
+               f"val_ntp_acc={ntp_acc:.2f} val_time={val_time_s:.1f}s")
+        rec = dict(tag=tag, val_loss=loss, val_dec_acc=acc, val_dec_bpb=bpb,
+                    val_ntp_acc=ntp_acc, val_ntp_bpb=ntp_bpb, val_util=util, val_mse=val_mse,
+                    val_time_s=val_time_s)
+        if val_compile_s is not None:
+            msg += f" (first batch, incl. jit compile: {val_compile_s:.1f}s)"
+            rec["val_compile_s"] = val_compile_s
+        logger(msg, **rec)
         return loss, acc
 
     if args.wa_mode == "wma" and args.wa_wma_weights is not None:
