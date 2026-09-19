@@ -1,21 +1,21 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run2.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run4.py
 """
 
 # --- model ---
 img_size = 32
-d_model = (256, 256)
-# d_model = (512, 512)
+# d_model = (256, 256)
+d_model = (512, 512)
 # n_layers = (2, 2)
 n_layers = (4, 4)
-# n_heads = (4, 4)
-n_heads = (2, 2)
+n_heads = (4, 4)
 n_kv_heads = (None, None)
 # strides = (4, 4)
 # pq_chunks = (6, 6)
-code_vocab = (64, 64)
+code_vocab = (1024, 1024)
+token_dim = (256, 256)
 pq_chunks = (8, 8)
-pq_dim = (128, 128)
+pq_dim = (256, 256)
 mlp_mult = 4
 rope_base = 10000.0
 
@@ -28,17 +28,18 @@ entropy_weight = 0.1
 # Pp    = level_refine_window × Kspan # = level_refine_window × decoder_ncodes × stride[level]
 
 strides = (4, 4)
-decoder_ncodes = 4
-ncodes_window = -1
+decoder_ncodes = 1
+ncodes_window = 4
 attn_lookahead = 0
-decode_past = 16
-decode_future = 16
-level_refine_window = 0
-level_refine_passes = 1
+decode_past = 4
+decode_future = 4
+level_refine_window = 2
+level_refine_gumbel = True
+level_refine_temperature = 1.0
+level_refine_passes = 3
 cycle_refine_passes = 1
-# cond_depth = (1, 1)
-# cond_depth = (2, 1)
-# cond_drop = 0.5
+cond_depth = (2, 1)
+cond_drop = 0.5
 
 additive_drop_loss = True
 weight_sharing = False
@@ -63,7 +64,6 @@ precision = "fp32"
 
 byte_group = 3
 token_head_type = "ar"
-token_dim = (128, 128)
 token_n_heads = 2
 mtp_horizon = 1
 # mtp_mode = "ar"
@@ -73,8 +73,8 @@ eval_gen_train = True
 
 
 # --- training ---
-batch_size = 8
-val_batch_size = 8
+batch_size = 4
+val_batch_size = 4
 level_steps = (int(1e3), int(1e5))
 seed = 0
 # warmup_steps = 2

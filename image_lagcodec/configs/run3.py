@@ -39,7 +39,7 @@ level_refine_temperature = 1.0
 level_refine_passes = 3
 cycle_refine_passes = 1
 cond_depth = (2, 1)
-cond_drop = 0.9
+cond_drop = 0.5
 
 additive_drop_loss = True
 weight_sharing = False

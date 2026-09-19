@@ -2831,10 +2831,10 @@ def main():
         loss = total_loss / total_n
         val_time_s = time.monotonic() - val_t0
         msg = (f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_mse={val_mse:.4f} "
-               f"val_ntp_acc={ntp_acc:.2f} val_aux_ntp_acc={aux_ntp_acc:.2f} val_time={val_time_s:.1f}s")
+               f"val_e_ntp_acc={ntp_acc:.2f} val_d_ntp_acc={aux_ntp_acc:.2f} val_time={val_time_s:.1f}s")
         rec = dict(tag=tag, val_loss=loss, val_dec_acc=acc,
-                    val_ntp_acc=ntp_acc, val_util=util, val_mse=val_mse,
-                    val_aux_ntp_acc=aux_ntp_acc,
+                    val_e_ntp_acc=ntp_acc, val_util=util, val_mse=val_mse,
+                    val_d_ntp_acc=aux_ntp_acc,
                     val_time_s=val_time_s)
         if val_compile_s is not None:
             msg += f" (first batch, incl. jit compile: {val_compile_s:.1f}s)"
@@ -2998,12 +2998,12 @@ def main():
                                   lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
                     logger(f"l={phase - 1} e={epoch_num} s={step} loss={loss0:.2f} dec_acc={acc:.2f} "
-                           f"ntp_acc={ntp_acc:.2f} util={util:.2f} train_mse={train_mse:.1f} "
-                           f"aux_ntp_acc={aux_ntp_acc:.2f} "
+                           f"e_ntp_acc={ntp_acc:.2f} util={util:.2f} mse={train_mse:.1f} "
+                           f"d_ntp_acc={aux_ntp_acc:.2f} "
                            f"lr={lr_str} grad_norm={grad_norm:.2f}",
                            level=phase - 1, epoch=epoch_num, step=step, loss=loss0,
-                           dec_acc=acc, ntp_acc=ntp_acc, util=util,
-                           train_mse=train_mse, aux_ntp_acc=aux_ntp_acc,
+                           dec_acc=acc, e_ntp_acc=ntp_acc, util=util,
+                           mse=train_mse, d_ntp_acc=aux_ntp_acc,
                            lr=lr, grad_norm=grad_norm)
 
                 if step % gen_eval_every_steps == 0:
