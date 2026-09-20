@@ -633,7 +633,7 @@ def sample_idx(logits: jnp.ndarray, rng, greedy: bool, temperature: float) -> tu
 
 
 def run_block(blk: Block, x: jnp.ndarray, remat: bool, rng=None, drop_prob: float = 0.0) -> jnp.ndarray:
-    out = eqx.filter_checkpoint(blk)(x) if remat else blk(x)
+    out = jax.checkpoint(blk)(x) if remat else blk(x)
     if rng is not None and drop_prob > 0.0:
         keep = jax.random.bernoulli(rng, p=1.0 - drop_prob)
         out = jnp.where(keep, out, x)

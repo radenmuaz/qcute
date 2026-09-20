@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 from image_lagcodec.scripts import stepwise_generation_check as sg
-from image_lagcodec.run_lagcodec import (Config, HierEncDec, load_cifar10, images_to_positions, pixel_order_for,
+from image_lagcodec.run_lagcodec import (Config, HierEncDec, dataset_from_config, images_to_positions, pixel_order_for,
                                          code_embed_proj, load_config_module, CONFIG_FIELDS, pardec_block_step,
                                          pardec_block_chunk_step)
 
@@ -52,7 +52,7 @@ cv.pop("label_fn", None)
 cfg = Config(**{k: cv[k] for k in CONFIG_FIELDS if k in cv})
 model = eqx.tree_deserialise_leaves(ck / "model.eqx", HierEncDec(jax.random.PRNGKey(0), cfg))
 model = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32) if eqx.is_array(x) else x, model)
-(_, _), (val, _) = load_cifar10(sg.REPO_ROOT / "datasets")
+(_, _), (val, _) = dataset_from_config(cv, sg.REPO_ROOT)
 NIMG = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 fb = jnp.array(images_to_positions(val[:NIMG], cfg, pixel_order_for(cfg)))
 L0, L1 = model.levels

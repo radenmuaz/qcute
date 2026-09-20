@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 import image_lagcodec.eqx_common as eqx_common
 from image_lagcodec.run_lagcodec import (
-    Config, HierEncDec, load_cifar10, images_to_positions, pixel_order_for, code_embed_proj,
+    Config, HierEncDec, dataset_from_config, images_to_positions, pixel_order_for, code_embed_proj,
     load_config_module, CONFIG_FIELDS, pardec_block_step, pardec_block_chunk_step, causal_extra_ctx_windows,
     token_ar_teacher_forced,
 )
@@ -142,7 +142,7 @@ def main():
     cfg = Config(**{k: cv[k] for k in CONFIG_FIELDS if k in cv})
     model = eqx.tree_deserialise_leaves(ck / "model.eqx", HierEncDec(jax.random.PRNGKey(0), cfg))
     model = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32) if eqx.is_array(x) else x, model)
-    (_, _), (val, _) = load_cifar10(REPO_ROOT / "datasets")
+    (_, _), (val, _) = dataset_from_config(cv, REPO_ROOT)
     fb = jnp.array(images_to_positions(val[:n_img], cfg, pixel_order_for(cfg)))
     L0, L1 = model.levels
     e0 = L0.encode(code_embed_proj(fb, L0.own_input_embed, L0.own_input_proj), fb, rng=None)

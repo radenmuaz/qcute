@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 import image_lagcodec.eqx_common as eqx_common
 from image_lagcodec.run_lagcodec import (
-    Config, HierEncDec, load_cifar10, images_to_positions, pixel_order_for, positions_to_image, code_embed_proj,
+    Config, HierEncDec, dataset_from_config, images_to_positions, pixel_order_for, positions_to_image, code_embed_proj,
     load_config_module, CONFIG_FIELDS, decode_generate_multipass, save_compare_grid, pixel_mse,
 )
 
@@ -50,7 +50,7 @@ def main():
     n_levels = len(model.levels)
     n_img = int(scalar(cv.get("val_batch_size", 8)))
     enc_t = float(scalar(cv.get("encode_temperature", 1.0)))
-    (train_np, _), (val_np, _) = load_cifar10(REPO_ROOT / "datasets")
+    (train_np, _), (val_np, _) = dataset_from_config(cv, REPO_ROOT)
     pixel_order = pixel_order_for(cfg)
     print(f"run={run} ckpt={ck.name} backend={jax.default_backend()} n_img={n_img} levels={n_levels}", flush=True)
 

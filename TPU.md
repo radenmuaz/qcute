@@ -22,6 +22,7 @@ gcloud compute tpus queued-resources list --project raden-tpu --zone us-east1-d
 
 ```
 gcloud compute tpus queued-resources create tpu4 --node-id tpunode4 --project raden-tpu --zone us-central2-b --accelerator-type v4-8 --runtime-version tpu-ubuntu2204-base
+gcloud compute tpus queued-resources create tpu34 --node-id tpunode34 --project raden-tpu --zone us-central2-b --accelerator-type v4-16 --runtime-version tpu-ubuntu2204-base
 
 gcloud compute tpus queued-resources describe tpu1 --project raden-tpu --zone us-central2-b
 
@@ -32,7 +33,7 @@ gcloud compute tpus queued-resources ssh tpu1 --project raden-tpu --zone us-cent
 
 
 ```
-gcloud compute tpus queued-resources create tpu1 --node-id tpunode1 --project raden-tpu --zone europe-west4-a --accelerator-type v6e-1 --runtime-version v2-alpha-tpuv6e --spot
+gcloud compute tpus queued-resources create tpu1 --node-id tpunode1 --project raden-tpu --zone europe-west4-a --accelerator-type v6e-64 --runtime-version v2-alpha-tpuv6e --spot
 
 gcloud compute tpus queued-resources describe tpu1 --project raden-tpu --zone europe-west4-a
 
