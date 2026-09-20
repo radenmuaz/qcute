@@ -67,9 +67,7 @@ rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -i ~/.ssh/
 
 rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -i ~/.ssh/google_compute_engine" --filter=':- ../.gitignore' --exclude=".git/" image_lagcodec/ muaz@107.167.160.20:~/qcute/image_lagcodec/
 
-rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -i ~/.ssh/google_compute_engine" \
-  --filter=':- ../.gitignore' --exclude=".git/" \
-  /Users/muaz/code/qcute/image_lagcodec/ muaz@35.186.33.7:~/qcute/image_lagcodec/
+rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -i ~/.ssh/google_compute_engine" --filter=':- ../.gitignore' --exclude=".git/" /Users/muaz/code/qcute/image_lagcodec/ muaz@35.186.33.7:~/qcute/image_lagcodec/
 
 # push reset all
 rsync -avz --delete \

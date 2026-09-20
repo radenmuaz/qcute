@@ -1,21 +1,21 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run4.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run1_rgb.py
 """
 
 # --- model ---
 img_size = 32
-# d_model = (256, 256)
-d_model = (512, 512)
+d_model = (256, 256)
+# d_model = (512, 512)
 # n_layers = (2, 2)
 n_layers = (4, 4)
-n_heads = (4, 4)
+# n_heads = (4, 4)
+n_heads = (2, 2)
 n_kv_heads = (None, None)
 # strides = (4, 4)
 # pq_chunks = (6, 6)
-code_vocab = (1024, 1024)
-token_dim = (256, 256)
-pq_chunks = (8, 8)
-pq_dim = (256, 256)
+code_vocab = (256, 256)
+pq_chunks = (3, 3)
+pq_dim = (128, 128)
 mlp_mult = 4
 rope_base = 10000.0
 
@@ -39,7 +39,7 @@ level_refine_temperature = 1.0
 level_refine_passes = 2
 cycle_refine_passes = 1
 cond_depth = (2, 1)
-# cond_drop = 0.5
+cond_drop = 0.5
 
 additive_drop_loss = True
 weight_sharing = False
@@ -64,6 +64,7 @@ precision = "fp32"
 
 byte_group = 3
 token_head_type = "ar"
+token_dim = (128, 128)
 token_n_heads = 2
 mtp_horizon = 1
 # mtp_mode = "ar"
@@ -73,8 +74,8 @@ eval_gen_train = True
 
 
 # --- training ---
-batch_size = 4
-val_batch_size = 4
+batch_size = 8
+val_batch_size = 8
 level_steps = (int(1e3), int(1e5))
 seed = 0
 # warmup_steps = 2

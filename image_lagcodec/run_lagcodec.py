@@ -484,9 +484,18 @@ class BatchIterator:
             yield positions.reshape(self.n_devices, self.batch_size, self.n_positions, self.cfg.byte_group)
 
 
+def safe_argmax(x: jnp.ndarray) -> jnp.ndarray:
+    # first index of the max over the last axis. jnp.argmax fused into a following gather returns the max
+    # value's float bits instead of the index under jit on TPU (XLA bug; seen at >=256 rows in generation),
+    # so use plain max/min reductions.
+    V = x.shape[-1]
+    m = jnp.max(x, axis=-1, keepdims=True)
+    return jnp.minimum(jnp.min(jnp.where(x == m, jnp.arange(V), V), axis=-1), V - 1)
+
+
 def quantize_hard(logits: jnp.ndarray, rng=None, quantize_drop: float = 0.0, tau: float = 1.0) -> tuple:
     soft = jax.nn.softmax(logits / tau, axis=-1)
-    idx = jnp.argmax(soft, axis=-1)
+    idx = safe_argmax(soft)
     hard = jax.nn.one_hot(idx, logits.shape[-1], dtype=soft.dtype)
     st = soft + jax.lax.stop_gradient(hard - soft)
     if quantize_drop > 0 and rng is not None:
@@ -503,7 +512,7 @@ def quantize_gumbel(logits: jnp.ndarray, rng, tau: float = 1.0, quantize_drop: f
     gumbel_noise = -jnp.log(-jnp.log(u))
     noisy_logits = (logits + gumbel_noise) / tau
     soft = jax.nn.softmax(noisy_logits, axis=-1)
-    idx = jnp.argmax(soft, axis=-1)
+    idx = safe_argmax(soft)
     hard = jax.nn.one_hot(idx, logits.shape[-1], dtype=soft.dtype)
     st = soft + jax.lax.stop_gradient(hard - soft)
     if quantize_drop > 0:
@@ -577,7 +586,7 @@ def reshape_pq(logits: jnp.ndarray, pq_chunks: int, code_vocab: int) -> jnp.ndar
 
 def sample_idx(logits: jnp.ndarray, rng, greedy: bool, temperature: float) -> tuple:
     if greedy:
-        return jnp.argmax(logits, axis=-1), rng
+        return safe_argmax(logits), rng
     rng, k_ = jax.random.split(rng)
     return jax.random.categorical(k_, logits / temperature, axis=-1), rng
 
@@ -2061,7 +2070,7 @@ def level_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
                         return total / i
                 else:
                     def _feedback_fire(logits=logits):
-                        pseudo_bytes = jax.lax.stop_gradient(jnp.argmax(logits, axis=-1))
+                        pseudo_bytes = jax.lax.stop_gradient(safe_argmax(logits))
                         l2, _ = level_forward(
                             model, pseudo_bytes, phase, rng=rng, level_gt_drop=level_gt_drop,
                             cascade_rng=cascade_rng, encode_temperature=encode_temperature,
@@ -2727,6 +2736,8 @@ def main():
             logger("--resume set but no checkpoint found under this run_dir -- starting fresh")
 
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
+    if cfg.precision != "bf16":
+        jax.config.update("jax_default_matmul_precision", "highest")
     recon_prompt = flat_prompt = gt_img = None
     train_recon_prompt = train_flat_prompt = train_gt_img = None
     gen_jit_timed = [False]

@@ -28,16 +28,17 @@ entropy_weight = 0.1
 # Pp    = level_refine_window × Kspan # = level_refine_window × decoder_ncodes × stride[level]
 
 strides = (4, 4)
-decoder_ncodes = 4
-ncodes_window = -1
+decoder_ncodes = 1
+ncodes_window = 4
 attn_lookahead = 0
-decode_past = 16
-decode_future = 16
-level_refine_window = 0
-level_refine_passes = 1
+decode_past = 0
+decode_future = 4
+level_refine_window = 1
+level_refine_gumbel = True
+level_refine_temperature = 1.0
+level_refine_passes = 2
 cycle_refine_passes = 1
-# cond_depth = (1, 1)
-# cond_depth = (2, 1)
+cond_depth = (1, 1)
 # cond_drop = 0.5
 
 additive_drop_loss = True
@@ -97,8 +98,7 @@ warmup_steps = 1000
 # weight_decay = 1e-2
 optimizer = "adamw"
 optimizer_kwargs = dict(
-                        weight_decay=0,
-                        # weight_decay=1e-5,
+                        weight_decay=1e-3,
                         # b1=0.8, b2=0.9,
                         #  eps=1e-8,eps_root=0.0,
                         #  nesterov=False

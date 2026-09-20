@@ -1,5 +1,5 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run4.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run3_rgb.py
 """
 
 # --- model ---
@@ -12,10 +12,10 @@ n_heads = (4, 4)
 n_kv_heads = (None, None)
 # strides = (4, 4)
 # pq_chunks = (6, 6)
-code_vocab = (1024, 1024)
-token_dim = (256, 256)
-pq_chunks = (8, 8)
-pq_dim = (256, 256)
+code_vocab = (256, 256)
+token_dim = (128, 128)
+pq_chunks = (3, 3)
+pq_dim = (128, 128)
 mlp_mult = 4
 rope_base = 10000.0
 

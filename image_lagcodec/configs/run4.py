@@ -31,15 +31,15 @@ strides = (4, 4)
 decoder_ncodes = 1
 ncodes_window = 4
 attn_lookahead = 0
-decode_past = 4
+decode_past = 0
 decode_future = 4
-level_refine_window = 2
+level_refine_window = 1
 level_refine_gumbel = True
 level_refine_temperature = 1.0
-level_refine_passes = 3
+level_refine_passes = 2
 cycle_refine_passes = 1
-cond_depth = (2, 1)
-cond_drop = 0.5
+cond_depth = (1, 1)
+# cond_drop = 0.5
 
 additive_drop_loss = True
 weight_sharing = False
@@ -97,7 +97,7 @@ warmup_steps = 1000
 # weight_decay = 1e-2
 optimizer = "adamw"
 optimizer_kwargs = dict(
-                        weight_decay=0,
+                        weight_decay=1e-3,
                         # weight_decay=1e-5,
                         # b1=0.8, b2=0.9,
                         #  eps=1e-8,eps_root=0.0,

@@ -1,5 +1,5 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run4.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run4_rgb.py
 """
 
 # --- model ---
@@ -12,10 +12,10 @@ n_heads = (4, 4)
 n_kv_heads = (None, None)
 # strides = (4, 4)
 # pq_chunks = (6, 6)
-code_vocab = (1024, 1024)
-token_dim = (256, 256)
-pq_chunks = (8, 8)
-pq_dim = (256, 256)
+code_vocab = (256, 256)
+token_dim = (128, 128)
+pq_chunks = (3, 3)
+pq_dim = (128, 128)
 mlp_mult = 4
 rope_base = 10000.0
 
@@ -28,7 +28,7 @@ entropy_weight = 0.1
 # Pp    = level_refine_window × Kspan # = level_refine_window × decoder_ncodes × stride[level]
 
 strides = (4, 4)
-decoder_ncodes = 4
+decoder_ncodes = 1
 ncodes_window = 4
 attn_lookahead = 0
 decode_past = 0
@@ -38,7 +38,7 @@ level_refine_gumbel = True
 level_refine_temperature = 1.0
 level_refine_passes = 2
 cycle_refine_passes = 1
-cond_depth = (2, 1)
+cond_depth = (1, 1)
 # cond_drop = 0.5
 
 additive_drop_loss = True
@@ -98,6 +98,7 @@ warmup_steps = 1000
 optimizer = "adamw"
 optimizer_kwargs = dict(
                         weight_decay=1e-3,
+                        # weight_decay=1e-5,
                         # b1=0.8, b2=0.9,
                         #  eps=1e-8,eps_root=0.0,
                         #  nesterov=False
