@@ -8,6 +8,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import sys
 import warnings
 from pathlib import Path
+import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -20,7 +21,7 @@ from image_lagcodec.run_lagcodec import (
     Config, HierEncDec, EncDecLevel, load_cifar10, images_to_positions, pixel_order_for, code_embed_proj,
     run_block_pardec, pardec_block_step, pardec_block_chunk_step, causal_extra_ctx_windows,
     _draft_past_valid_mask, extra_ctx_visible_counts, encoder_free_run, encoder_hidden, encoder_ntp_logits,
-    generate_from_prompt,
+    generate_from_prompt, decode_logits_and_target_multipass,
 )
 import image_lagcodec.eqx_common as eqx_common
 
@@ -849,6 +850,63 @@ def run_generate_from_prompt():
     return ok
 
 
+def run_refine_gt_drop():
+    """level_refine_gt_drop: 1.0 == default (own output), 0.0 == refine pass drafted with the real targets,
+    0.5 differs from both; no refine rng (eval) ignores it."""
+    cfg = dataclasses.replace(build_cfg(2), level_refine_passes=(2, 1, 1, 1), level_refine_window=(1, 0, 0, 0))
+    model = HierEncDec(jax.random.PRNGKey(0), cfg)
+    level = model.levels[0]
+    imgs = np.random.default_rng(0).integers(0, 256, (B, 32, 32, 3)).astype(np.uint8)
+    flat = jnp.array(images_to_positions(imgs, cfg, pixel_order_for(cfg)))
+    enc = level.encode(code_embed_proj(flat, level.own_input_embed, level.own_input_proj), flat, rng=None)
+    ctx = enc["code_soft"]
+    key = jax.random.PRNGKey(3)
+    Pp = level.level_refine_window * G * level.K
+
+    def run(gd, rr=key):
+        return decode_logits_and_target_multipass(level, flat, ctx, G, rng=None, multipass_detach=True,
+                                                  level_refine_gt_drop=gd, refine_rng=rr)[0]
+    l_default = decode_logits_and_target_multipass(level, flat, ctx, G, rng=None, multipass_detach=True,
+                                                   refine_rng=key)[0]
+    _, tgt, *_ = level.decode_logits_and_target_pardec(flat, ctx, G, rng=None)
+    l_ref = level.decode_logits_and_target_pardec(flat, ctx, G, rng=None, draft_override=tgt,
+                                                  decode_past_override=Pp)[0]
+    d1 = float(jnp.abs(run(1.0) - l_default).max())
+    d0 = float(jnp.abs(run(0.0) - l_ref).max())
+    dh = min(float(jnp.abs(run(0.5) - l_default).max()), float(jnp.abs(run(0.5) - l_ref).max()))
+    de = float(jnp.abs(run(0.0, None) - l_default).max())
+    ok = d1 == 0.0 and d0 < 1e-5 and dh > 1e-6 and de == 0.0
+    print(f"REFINE gt_drop: 1.0==default diff={d1:.1e}  0.0==GT-drafted ref diff={d0:.1e}  0.5 differs (min diff)={dh:.1e}  "
+          f"no-rng ignores diff={de:.1e} {'OK' if ok else 'WRONG'}")
+    return ok
+
+
+def run_remat_level():
+    """remat / remat_level change memory only: loss and grads must match the no-remat run."""
+    imgs = np.random.default_rng(1).integers(0, 256, (2, 32, 32, 3)).astype(np.uint8)
+    res = {}
+    for name, kw in (("off", {}), ("block", dict(remat=True)), ("level", dict(remat_level=True))):
+        cfg = dataclasses.replace(build_cfg(2), **kw)
+        model = HierEncDec(jax.random.PRNGKey(0), cfg)
+        flat = jnp.array(images_to_positions(imgs, cfg, pixel_order_for(cfg)))
+
+        @eqx.filter_value_and_grad
+        def loss_fn(m):
+            lv = m.levels[0]
+            enc = lv.encode(code_embed_proj(flat, lv.own_input_embed, lv.own_input_proj), flat, rng=None)
+            logits = lv.decode_logits_and_target_pardec(flat, enc["code_soft"], G, rng=None)[0]
+            return enc["ntp_loss"] + jnp.mean(logits ** 2)
+        res[name] = loss_fn(model)
+    ok = True
+    for name in ("block", "level"):
+        dl = abs(float(res[name][0] - res["off"][0]))
+        dg = max(float(jnp.abs(a - b).max()) for a, b in zip(jax.tree_util.tree_leaves(eqx.filter(res[name][1], eqx.is_array)),
+                                                             jax.tree_util.tree_leaves(eqx.filter(res["off"][1], eqx.is_array))))
+        ok &= dl < 1e-5 and dg < 1e-4
+        print(f"REMAT {name}: |loss diff|={dl:.1e} max|grad diff|={dg:.1e} {'OK' if dl < 1e-5 and dg < 1e-4 else 'WRONG'}")
+    return ok
+
+
 if __name__ == "__main__":
     ok0 = run_one(0)                        # disjoint (sanity baseline)
     ok2 = run_one(2)                        # bounded N=2, causal streaming
@@ -864,7 +922,7 @@ if __name__ == "__main__":
                 run_cond_complete(4), run_cond_complete(1), run_cond_complete(2), run_cond_complete(4, cond_window=2),
                 run_cond_complete_leak(4), run_cond_complete_leak(1), run_cond_complete_leak(2),
                 run_cond_complete_leak(1, fullctx_control=True),
-                run_encoder_free_run(), run_generate_from_prompt()]
+                run_encoder_free_run(), run_generate_from_prompt(), run_refine_gt_drop(), run_remat_level()]
     all_ok = (ok0 and ok2 and okm1 and okfc and ok_wp and ok_wf and ok_wpf and ok_cyc and ok_gdf and ok_dp
               and all(cond_oks))
     print(f"\nPASS all" if all_ok else "\nFAIL -- see divergence above")

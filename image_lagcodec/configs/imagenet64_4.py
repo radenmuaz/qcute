@@ -1,17 +1,18 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run5_in64.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/imagenet64_4.py
 """
 
 # --- model ---
+multihost = True
 dataset = "imagenet64"
 data_root = "/dev/shm/imagenet64"
 img_size = 64
 d_model = (512, 512)
-n_layers = (6, 6)
+n_layers = (4, 4)
 n_heads = (8, 8)
 n_kv_heads = (None, None)
 code_vocab = (256, 256)
-pq_chunks = (6, 6)
+pq_chunks = (3, 3)
 pq_dim = (128, 128)
 mlp_mult = 4
 rope_base = 10000.0
@@ -57,7 +58,8 @@ init_scheme = "llama"
 use_xsa = False
 use_sink = False
 precision = "bf16"
-remat = True
+remat = False
+remat_level = True
 # pq_dim = (64, 64, 64, 64,)
 
 byte_group = 3
@@ -72,19 +74,19 @@ eval_gen_train = False
 
 # --- training ---
 batch_size = 4
-val_batch_size = 8
-level_epochs = (0, 10)
+val_batch_size = 4
+level_epochs = (0, 2)
 seed = 0
-train_subset_n = 400  # 10 epochs x 25 steps; ~3.6s/step on v4-8 so full imagenet epochs do not fit the 1h budget
+train_subset_n = None
 val_subset_n = 512
-gen_eval_every_step = 125
+gen_eval_every_step = 2000
 epoch_verbose = False
 
 grad_clip = 1.0
 lr = 1e-3
 lr_schedule = "cosine"
 lr_min = 1e-5
-warmup_steps = 25
+warmup_steps = 1000
 # lr_min_epoch = 50
 # lr_min_epoch = 400
 # weight_decay = 1e-2
@@ -110,7 +112,7 @@ wa_mode = "none"
 # wa_wma_weights = (5.0, 4.0, 3.0, 2.0, 1.0)
 
 # --- logging ---
-log_every = 10
-ckpt_every_step = 125
+log_every = 100
+ckpt_every_step = 2000
 ckpt_keep = 1
 

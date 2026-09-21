@@ -78,6 +78,7 @@ class Config:
     use_sink: bool = False
 
     remat: bool = False
+    remat_level: bool = False
 
     byte_group: int = 1
     token_head_type: tuple = "linears"
@@ -101,6 +102,7 @@ class Config:
 
     multipass_detach: bool = True
     level_refine_gumbel: bool = False
+    level_refine_gt_drop: float = 1.0
     level_refine_temperature: float = 1.0
     refine_quantize_drop: float = 0.0
     refine_remat: bool = None
@@ -110,6 +112,9 @@ class Config:
     cyclic_revise_remat: bool = True
 
     def __post_init__(self):
+        if self.remat and self.remat_level:
+            warnings.warn("remat and remat_level both set: remat_level wins (whole encoder/decoder stacks are "
+                          "checkpointed, not individual blocks)")
         n = len(self.strides)
 
         def bcast(name, types):
@@ -260,6 +265,10 @@ class Config:
             warnings.warn(
                 "level_refine_gumbel=True has NO EFFECT -- no level has both level_refine_passes>1 and "
                 "level_refine_window>0, so no refine pass ever runs")
+        assert 0.0 <= self.level_refine_gt_drop <= 1.0, f"level_refine_gt_drop={self.level_refine_gt_drop} must be in [0,1]"
+        if self.level_refine_gt_drop < 1.0 and not any(
+                self.level_refine_passes[i] > 1 and self.level_refine_window[i] > 0 for i in range(n)):
+            warnings.warn("level_refine_gt_drop<1 has NO EFFECT -- no level runs a refine pass")
         if self.refine_quantize_drop > 0 and self.multipass_detach:
             warnings.warn(
                 f"refine_quantize_drop={self.refine_quantize_drop} has NO EFFECT with "
@@ -497,19 +506,21 @@ class BatchIterator:
         self.batch_size, self.n_devices = batch_size, n_devices
         self.shuffle = shuffle
         self.rng = np.random.default_rng(seed)
+        self.pc, self.pi = jax.process_count(), jax.process_index()
         self.total = batch_size * n_devices
         self.cfg = cfg
         self.pixel_order = pixel_order_for(cfg)
         self.n_positions = n_positions_of(cfg)
 
     def __len__(self):
-        return len(self.images) // self.total
+        return len(self.images) // (self.total * self.pc)
 
     def __iter__(self):
         n = len(self.images)
         idx = self.rng.permutation(n) if self.shuffle else np.arange(n)
-        for start in range(0, n - self.total + 1, self.total):
-            sel = idx[start:start + self.total]
+        g = self.total * self.pc
+        for start in range(0, n - g + 1, g):
+            sel = idx[start + self.pi * self.total:start + (self.pi + 1) * self.total]
             img = self.images[sel]
             positions = images_to_positions(img, self.cfg, self.pixel_order)
             yield positions.reshape(self.n_devices, self.batch_size, self.n_positions, self.cfg.byte_group)
@@ -884,6 +895,7 @@ class EncDecLevel(eqx.Module):
     mtp_mode: str = eqx.field(static=True)
     mtp_weight: float = eqx.field(static=True)
     remat: bool = eqx.field(static=True)
+    remat_level: bool = eqx.field(static=True)
     pq_dim: int = eqx.field(static=True)
     ncodes_window: int = eqx.field(static=True)
     streaming: bool = eqx.field(static=True)
@@ -916,6 +928,7 @@ class EncDecLevel(eqx.Module):
         self.quantize_mode = cfg.quantize_mode
         self.quantize_drop = cfg.quantize_drop
         self.remat = cfg.remat
+        self.remat_level = cfg.remat_level
         self.ncodes_window = cfg.ncodes_window[level]
         self.streaming = cfg.streaming[level]
         self.decode_past = cfg.decode_past[level]
@@ -1075,8 +1088,11 @@ class EncDecLevel(eqx.Module):
             layer_drop_prob = (0.0,) * n_blk
         elif isinstance(layer_drop_prob, (int, float)):
             layer_drop_prob = (layer_drop_prob,) * n_blk
-        for i, blk in enumerate(self.blocks):
-            h = run_block(blk, h, self.remat, rng=layer_rngs[i], drop_prob=layer_drop_prob[i])
+        def _enc_stack(h):
+            for i, blk in enumerate(self.blocks):
+                h = run_block(blk, h, self.remat and not self.remat_level, rng=layer_rngs[i], drop_prob=layer_drop_prob[i])
+            return h
+        h = jax.checkpoint(_enc_stack)(h) if self.remat_level else _enc_stack(h)
         h = self.ln_f(h)
         M, L, D = h.shape
         n_blocks = L // self.K
@@ -1269,8 +1285,11 @@ class EncDecLevel(eqx.Module):
         bos_g = jnp.broadcast_to(self.bos_embed, (B, n_groups, 1, D))
         per_group_len = G + 1 + G * self.K
         xe = jnp.concatenate([ctx_g, bos_g, te_g], axis=2).reshape(B, n_groups * per_group_len, D)
-        for blk in blocks:
-            xe = run_block(blk, xe, self.remat)
+        def _dec_stack(xe):
+            for blk in blocks:
+                xe = run_block(blk, xe, self.remat and not self.remat_level)
+            return xe
+        xe = jax.checkpoint(_dec_stack)(xe) if self.remat_level else _dec_stack(xe)
         h = ln_f(xe)
         pred_pos = (jnp.arange(n_groups)[:, None] * per_group_len + G
                     + jnp.arange(G * self.K)[None, :]).reshape(-1)
@@ -1444,9 +1463,11 @@ class EncDecLevel(eqx.Module):
         rope_pos_ids_g = jnp.concatenate([rope_ctx_g, rope_bos, rope_target], axis=1)
         rope_pos_ids = jnp.broadcast_to(rope_pos_ids_g[None], (B, n_groups, per_group_len)).reshape(B2, per_group_len)
 
-        x = xe
-        for blk in blocks:
-            x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, remat)
+        def _pardec_stack(x):
+            for blk in blocks:
+                x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, remat and not self.remat_level)
+            return x
+        x = jax.checkpoint(_pardec_stack)(xe) if (self.remat_level and remat_override is not False) else _pardec_stack(xe)
         h = ln_f(x)
         pred_pos = Wg + extra_len_total + Pp + jnp.arange(G * self.K)
         h_t = h[:, pred_pos, :]
@@ -1870,7 +1891,7 @@ def decode_logits_and_target_cyclic_revision(levelN, dec_target_iN, ctx_code_sof
 def decode_logits_and_target_multipass(level: EncDecLevel, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
                                         decoder_ncodes: int, rng=None, multipass_detach: bool = True,
                                         level_refine_gumbel: bool = False, level_refine_temperature: float = 1.0,
-                                        refine_quantize_drop: float = 0.0, refine_rng=None,
+                                        level_refine_gt_drop: float = 1.0, refine_quantize_drop: float = 0.0, refine_rng=None,
                                         refine_remat: bool = None, extra_ctx_code_soft: list = None) -> tuple:
     logits, target_out, mask, mtp_loss, aux_loss, aux_acc = level.decode_logits_and_target_pardec(
         target_seq, ctx_code_soft, decoder_ncodes, rng=rng, extra_ctx_code_soft=extra_ctx_code_soft)
@@ -1887,6 +1908,12 @@ def decode_logits_and_target_multipass(level: EncDecLevel, target_seq: jnp.ndarr
         else:
             code_soft, idx = quantize_hard(logits, r_rng if refine_quantize_drop > 0 else None,
                                             refine_quantize_drop, level_refine_temperature)
+        if level_refine_gt_drop < 1.0 and r_rng is not None:
+            # per-token: prob level_refine_gt_drop keeps the sampled own output, else the real target
+            own = jax.random.bernoulli(jax.random.fold_in(r_rng, 1), p=level_refine_gt_drop, shape=idx.shape)
+            gt_idx = target_out.astype(idx.dtype)
+            code_soft = jnp.where(own[..., None], code_soft, jax.nn.one_hot(gt_idx, code_soft.shape[-1], dtype=code_soft.dtype))
+            idx = jnp.where(own, idx, gt_idx)
         if multipass_detach:
             kwargs = dict(draft_override=jax.lax.stop_gradient(idx))
         else:
@@ -2181,6 +2208,7 @@ def level_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
             logits, target_i, mask_i, mtp_loss_i, aux_loss_i, aux_acc_i = decode_logits_and_target_multipass(
                 levels[i], dec_target, ctx, model.cfg.decoder_ncodes[i], rng=dec_rng,
                 multipass_detach=model.cfg.multipass_detach, level_refine_gumbel=model.cfg.level_refine_gumbel,
+                level_refine_gt_drop=model.cfg.level_refine_gt_drop,
                 level_refine_temperature=model.cfg.level_refine_temperature,
                 refine_quantize_drop=model.cfg.refine_quantize_drop, refine_rng=dec_rng,
                 refine_remat=model.cfg.refine_remat, extra_ctx_code_soft=extra_ctx_i)
@@ -2315,12 +2343,19 @@ def replicate(pytree, n_devices: int):
                                    if eqx.is_array(x) else x, pytree)
 
 
+def local_array(x):
+    # this process's addressable slice of a pmap output (multi-host arrays are not fully addressable)
+    if getattr(x, "is_fully_addressable", True):
+        return x
+    return np.concatenate([np.asarray(s.data).reshape((-1,) + x.shape[1:]) for s in x.addressable_shards])
+
+
 def unreplicate(pytree):
-    return jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) else x, pytree)
+    return jax.tree_util.tree_map(lambda x: local_array(x)[0] if eqx.is_array(x) else x, pytree)
 
 
 def to_host(pytree):
-    return jax.tree_util.tree_map(lambda x: jnp.asarray(jax.device_get(x)) if eqx.is_array(x) else x, pytree)
+    return jax.tree_util.tree_map(lambda x: jnp.asarray(jax.device_get(local_array(x))) if eqx.is_array(x) else x, pytree)
 
 
 def to_single_device(tree, device=None):
@@ -2481,13 +2516,13 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
 CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "decoder_ncodes",
                   "ncodes_window", "streaming", "decode_past", "decode_future", "sync",
-                  "level_refine_passes", "level_refine_window", "multipass_detach", "level_refine_gumbel",
+                  "level_refine_passes", "level_refine_window", "multipass_detach", "level_refine_gumbel", "level_refine_gt_drop",
                   "level_refine_temperature", "refine_quantize_drop", "refine_remat", "cycle_refine_passes",
                   "cyclic_revise_detach", "cyclic_revise_remat",
                   "cond_depth", "cond_drop", "cond_window",
                   "weight_sharing", "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
                   "gumbel_at_inference", "init_scheme", "use_xsa",
-                  "use_qknorm", "remat", "attn_window", "attn_lookahead", "use_sink",
+                  "use_qknorm", "remat", "remat_level", "attn_window", "attn_lookahead", "use_sink",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "mse_weight",
                   "mse_softmax_tau", "traversal", "label_reg_weight")
@@ -2506,6 +2541,9 @@ def main():
                     help="training batch size -- a bare int applies uniformly to every phase; a "
                          "tuple gives one value per phase (length must equal n_phases)")
     p.add_argument("--n_devices", type=int, default=None)
+    p.add_argument("--multihost", type=lambda x: x.lower() != "false", default=False,
+                    help="jax.distributed.initialize() for a multi-host TPU slice: run the same command on every host; "
+                         "batch_size stays per device, each host feeds its own slice of the global batch")
     p.add_argument("--level_steps", type=_tuple_arg, default=None,
                     help="steps per phase -- a bare int applies uniformly to every phase; a "
                          "tuple gives one value per phase. At most one of --level_steps/"
@@ -2656,6 +2694,9 @@ def main():
                     help="refine passes only: gumbel-perturb which code gets drafted each pass "
                          "(own dedicated knob, NOT the encoder's quantize_mode). Default False "
                          "(plain deterministic argmax draft)")
+    p.add_argument("--level_refine_gt_drop", type=float, default=Config.level_refine_gt_drop,
+                    help="refine passes, training only: per-token prob of drafting the sampled own output; "
+                         "with prob 1-this the real target is drafted instead. Default 1.0 (always own output)")
     p.add_argument("--level_refine_temperature", type=float, default=Config.level_refine_temperature,
                     help="own dedicated temperature, not shared with the encoder's "
                          "encode_temperature. Used by level_refine_gumbel=True's gumbel-softmax, and "
@@ -2767,6 +2808,10 @@ def main():
     p.add_argument("--use_xsa", type=lambda x: x.lower() != "false", default=Config.use_xsa)
     p.add_argument("--use_qknorm", type=lambda x: x.lower() != "false", default=Config.use_qknorm)
     p.add_argument("--remat", type=lambda x: x.lower() != "false", default=Config.remat)
+    p.add_argument("--remat_level", type=lambda x: x.lower() != "false", default=Config.remat_level,
+                    help="checkpoint each level's whole encoder / decoder block stack as one unit (recompute at the "
+                         "level border) instead of per transformer block; less recompute, more live memory. "
+                         "Takes precedence over --remat inside the stacks")
     p.add_argument("--attn_window", type=_tuple_arg, default=Config.attn_window)
     p.add_argument("--attn_lookahead", type=_tuple_arg, default=Config.attn_lookahead,
                     help="encoder self-attention shifted-triangular lookahead -- 0 (default) "
@@ -2829,6 +2874,8 @@ def main():
     if args.wa_every_step is None and args.wa_every_epoch is None:
         args.wa_every_epoch = 10
 
+    if args.multihost:
+        jax.distributed.initialize()
     n_devices = args.n_devices or jax.local_device_count()
     print(f"jax devices ({n_devices} used of {jax.local_device_count()} local): {jax.devices()}")
     cfg = Config(**{k: getattr(args, k) for k in CONFIG_FIELDS})
@@ -3022,7 +3069,7 @@ def main():
     step = resume_meta["step"] if resume_meta else 0
     all_phases = [n_phases] if args.no_curriculum else list(range(1, n_phases + 1))
     total_all_steps = sum(
-        _phase_total_steps(p - 1, len(train_np) // (args.batch_size[p - 1] * n_devices))
+        _phase_total_steps(p - 1, len(train_np) // (args.batch_size[p - 1] * n_devices * jax.process_count()))
         for p in all_phases)
     global_pbar = tqdm(total=total_all_steps, initial=step, desc="total", dynamic_ncols=True, position=1, leave=True)
     last_global_step = step
@@ -3102,7 +3149,10 @@ def main():
         train_step = jax.pmap(train_step, axis_name="d")
         p_diff_model = replicate(diff_model, n_devices)
         p_opt_state = replicate(opt_state, n_devices)
-        p_rng = jax.random.split(jax.random.fold_in(jax.random.PRNGKey(args.seed), phase), n_devices)
+        p_rng_key = jax.random.fold_in(jax.random.PRNGKey(args.seed), phase)
+        if jax.process_count() > 1:
+            p_rng_key = jax.random.fold_in(p_rng_key, jax.process_index())
+        p_rng = jax.random.split(p_rng_key, n_devices)
 
         start_phase_step = 0
         if resume_meta is not None and phase == resume_meta["phase"]:
@@ -3148,13 +3198,13 @@ def main():
                 step += 1
                 phase_step += 1
                 pbar.update(1)
-                loss0 = float(loss[0])
+                loss0 = float(local_array(loss)[0])
                 if not jit_timed:
                     logger(f"{active_desc}: first train_step (incl. jit compile) took "
                            f"{time.monotonic() - jit_t0:.1f}s")
                     jit_timed = True
                 _bpb, acc, _ntp_bpb, ntp_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, grad_norm = \
-                    [float(a[0]) for a in aux]
+                    [float(local_array(a)[0]) for a in aux]
                 lr = float(lr_schedule(step - 1))
                 lr_str = _fmt_lr(lr)
                 pbar.set_postfix(step=step, loss=f"{loss0:.2f}",
@@ -3217,7 +3267,8 @@ def main():
     global_pbar.close()
     logger("=== all phases done, running final top-down cascade eval ===")
     run_val_eval(model, n_levels - 1, tag="final")
-    run_gen_eval_both(model, top=n_levels - 2, tag="final")
+    for top in range(n_phases - 1, -1, -1):
+        run_gen_eval_both(model, top=top, tag=f"final_top{top}")
     logger("training done")
 
 
