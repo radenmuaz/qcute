@@ -1769,27 +1769,35 @@ class EncDecLevel(eqx.Module):
             else:
                 return self._token_generate_diffusion(h_pos, rng, greedy, temperature)
 
+        def token_step(carry, _):
+            cache_k, cache_v, pos, rng, x_input = carry
+            h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
+            pos = pos + 1
+            val, rng = token_predict(h, rng)
+            x_input = self._dec_embed_target(val)
+            return (cache_k, cache_v, pos, rng, x_input), val
+
         def group_step(carry, group_codes):
+            # inner per-token loop is a lax.scan (not Python-unrolled) -- a G*K-1 unrolled trace compiles too
+            # slowly at real scale (measured: ~1589s for G*K-1=767, the decoder_ncodes=n_blocks "_lazy" single-
+            # group case; same class of issue fixed in decode_generate_interleave earlier, 2026-09-22).
             cache_k, cache_v, pos, rng = carry
             bos_in = jnp.broadcast_to(self.bos_embed, (B, 1, D))
             chunk = jnp.concatenate([group_codes, bos_in], axis=1)
             h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, pos)
             pos = pos + (G + 1)
             h = h_chunk[:, -1, :]
-            val, rng = token_predict(h, rng)
-            vals = [val]
-            x_input = self._dec_embed_target(val)
+            val0, rng = token_predict(h, rng)
+            x_input = self._dec_embed_target(val0)
 
-            for _ in range(G * self.K - 1):
-                h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
-                pos = pos + 1
-                val, rng = token_predict(h, rng)
-                vals.append(val)
-                x_input = self._dec_embed_target(val)
+            (cache_k, cache_v, pos, rng, x_input), vals_rest = jax.lax.scan(
+                token_step, (cache_k, cache_v, pos, rng, x_input), None, length=G * self.K - 1)
+            vals_rest = jnp.moveaxis(vals_rest, 0, 1)  # (B, G*K-1, *out_extra)
+            all_vals = jnp.concatenate([val0[:, None], vals_rest], axis=1)
 
             _, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
             pos = pos + 1
-            return (cache_k, cache_v, pos, rng), jnp.stack(vals, axis=1)
+            return (cache_k, cache_v, pos, rng), all_vals
 
         cache_k0 = jnp.zeros((len(blocks), B, self.n_kv_heads, L_total, hd))
         cache_v0 = jnp.zeros_like(cache_k0)
