@@ -71,11 +71,11 @@ eval_gen_train = True
 # --- training ---
 batch_size = 8
 val_batch_size = 8
-level_steps = (int(1e3), int(1e5))
+level_steps = (int(1e4), int(1e5))  # level0 1e4 (was 1e3) -- lazy/single-group converges much slower, give it more
 seed = 0
 train_subset_n = None
 val_subset_n = None
-gen_eval_every_step = 1000
+gen_eval_every_step = 2000  # was 1000 -- same slow-convergence reasoning
 epoch_verbose = False
 
 grad_clip = 1.0
