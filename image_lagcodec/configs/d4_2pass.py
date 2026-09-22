@@ -1,11 +1,11 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run18.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/d4_2pass.py
 """
-# Deep (DEPTH=4, stride=2) analog of run15.py: "full lazy, wait for the whole level" -- decoder_ncodes=1,
-# stream_chunks=1. interleave_decode is ALWAYS one fully sequential causal chain regardless of stream_chunks
-# (a no-op there, confirmed 2026-09-22), so this variant only exists under pardec -- interleave_decode is OFF
-# here (unlike run12/run13), same DEPTH=4/stride=2 model shape otherwise. Groups stay independent/parallel-
-# batched (pardec); only the context-window visibility is maximally lazy (waits for the whole level).
+# Deep (DEPTH=4, stride=2) analog of d2_2pass.py: "2 real dependent passes" -- decoder_ncodes = n_blocks/2 per
+# level (n_blocks=[512,256,128,64] -> G=[256,128,64,32]), interleave_decode=True (the only mechanism with real
+# cross-group/pass dependency -- pardec's parallel batching never makes separate groups depend on each other's
+# real output regardless of G). Needs the 2026-09-22 up_stride>=G removal (all four G values exceed
+# up_stride=2) to even run.
 
 # --- model ---
 img_size = 32
@@ -26,13 +26,9 @@ mse_weight = 0.0
 entropy_weight = 0.1
 
 strides = (2,)*DEPTH
-decoder_ncodes = 1
-stream_chunks = 1  # 1 chunk = wait for the whole level before any group's window is used (fully offline)
-ncodes_window = 16
-attn_window = (256,)*DEPTH
-attn_lookahead = 0
-cond_depth = (2, 2, 2, 1)  # each level conditions on the next coarser level's own codes; top level has none coarser
-# interleave_decode NOT set (pardec instead) -- this variant needs the independent/parallel-group property
+decoder_ncodes = (256, 128, 64, 32)  # n_blocks/2 per level -- exactly 2 groups/passes
+interleave_decode = True
+cond_depth = (2, 2, 2, 1)
 
 additive_drop_loss = False
 weight_sharing = False

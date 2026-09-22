@@ -1,8 +1,8 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run19.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/d4_chunk2.py
 """
-# Deep (DEPTH=4, stride=2) analog of run16.py: "2 chunks, independent across chunks, shared window within" --
-# decoder_ncodes=1, stream_chunks=2. Pardec (not interleave_decode, same reasoning as run18.py) -- exactly 2
+# Deep (DEPTH=4, stride=2) analog of d2_chunk2.py: "2 chunks, independent across chunks, shared window within" --
+# decoder_ncodes=1, stream_chunks=2. Pardec (not interleave_decode, same reasoning as d4_lazy.py) -- exactly 2
 # chunks per level; chunk A/B never see each other (still causal), groups inside one chunk share that chunk's
 # rounded window. Groups stay independent/parallel-batched.
 

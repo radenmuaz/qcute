@@ -1,10 +1,10 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run15.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/d2_chunk2.py
 """
-# Fork of run14.py (same decoder_ncodes=1): "full lazy, wait for the whole level" -- stream_chunks=1 (a
-# single chunk covering every group), so every group's own-context window waits for ALL of this level's
-# codes before it's used. Still pardec: groups remain independent/parallel-batched computations -- only the
-# CONTEXT VISIBILITY changed (maximally lazy), not the cross-group dependency (still none).
+# Fork of d2_eager.py (same decoder_ncodes=1): "2 chunks, independent across chunks, shared window within" --
+# stream_chunks=2 (exactly 2 chunks spanning each level's groups). Chunk A and chunk B never see each other
+# (still strictly causal); every group INSIDE one chunk shares that chunk's identical rounded window (the
+# "interleaved"/shared-visibility rounding). Still pardec: groups remain independent/parallel-batched.
 
 # --- model ---
 img_size = 32
@@ -25,7 +25,7 @@ entropy_weight = 0.1
 
 strides = (4, 4)
 decoder_ncodes = 1
-stream_chunks = 1  # 1 chunk = wait for the whole level before any group's window is used (fully offline)
+stream_chunks = 2  # exactly 2 chunks per level -- independent across the chunk boundary, shared window within
 ncodes_window = 4
 attn_lookahead = 0
 decode_past = 0

@@ -1,13 +1,11 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run17.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/d2_eager.py
 """
-# Fork of run1.py: "2 real dependent passes" -- decoder_ncodes = n_blocks/2 per level (level0 n_blocks=256 ->
-# G=128, level1 n_blocks=64 -> G=32), so exactly 2 groups/passes per level. Pardec's parallel batching NEVER
-# makes separate groups depend on each other's real output regardless of G (that was the correction from the
-# stream_chunks-vs-decoder_ncodes discussion) -- genuine "pass 2 waits for pass 1's real decoded bytes" needs
-# interleave_decode's single real causal chain instead. Needs the 2026-09-22 up_stride>=G removal (G=128/32
-# both exceed up_stride=4) to even run. decode_future/level_refine_passes are ignored under interleave_decode
-# (same as dense_decode) -- left in place, a warning fires and they're simply unused.
+# Fork of run1.py (the original 2-level config): "fully AR eager, 1 ncode" -- decoder_ncodes=1 (finest possible groups), stream_chunks=0
+# (default, no window-rounding wait). Pardec (not interleave_decode): groups stay independent/parallel-batched,
+# this variant only tightens each group's own context window to per-group granularity (least wait possible).
+
+# --- model ---
 img_size = 32
 d_model = (256, 256)
 n_layers = (4, 4)
@@ -25,9 +23,18 @@ mse_weight = 0.0
 entropy_weight = 0.1
 
 strides = (4, 4)
-decoder_ncodes = (128, 32)  # n_blocks/2 per level -- exactly 2 groups/passes
-interleave_decode = True  # the only mechanism with real cross-group (pass-to-pass) dependency
+decoder_ncodes = 1  # was 4 in run1 -- finest granularity
+ncodes_window = 4
+attn_lookahead = 0
+decode_past = 0
+decode_future = 4
+level_refine_window = 1
+level_refine_gumbel = True
+level_refine_temperature = 1.0
+level_refine_passes = 2
+cycle_refine_passes = 1
 cond_depth = (2, 1)
+cond_drop = 0.5
 
 additive_drop_loss = True
 weight_sharing = False
