@@ -1,10 +1,12 @@
 """
 uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/d2_lazy.py
 """
-# Fork of d2_eager.py (same decoder_ncodes=1): "full lazy, wait for the whole level" -- stream_chunks=1 (a
-# single chunk covering every group), so every group's own-context window waits for ALL of this level's
-# codes before it's used. Still pardec: groups remain independent/parallel-batched computations -- only the
-# CONTEXT VISIBILITY changed (maximally lazy), not the cross-group dependency (still none).
+# Fork of d2_eager.py: "full lazy, wait for the whole level" -- REVISED 2026-09-22 to avoid stream_chunks=1's
+# O(n_groups^2) padding blowup (OOM'd: needed 74G vs 30.75G HBM). Instead: decoder_ncodes = n_blocks per level
+# (256, 64) -- a SINGLE group covering the entire level's own codes, which collapses pardec to the plain
+# fully-sequential original decode (no windowing/padding approximation needed at all -- "wait for everything"
+# is just the natural behavior of one group spanning everything). cond_depth disabled (1,1) since a single
+# group already sees its whole own level; cross-level conditioning isn't the point of this variant.
 
 # --- model ---
 img_size = 32
@@ -24,8 +26,7 @@ mse_weight = 0.0
 entropy_weight = 0.1
 
 strides = (4, 4)
-decoder_ncodes = 1
-stream_chunks = 1  # 1 chunk = wait for the whole level before any group's window is used (fully offline)
+decoder_ncodes = (256, 64)  # = n_blocks per level -- single group, waits for/sees the whole level, no padding
 ncodes_window = 4
 attn_lookahead = 0
 decode_past = 0
@@ -35,8 +36,8 @@ level_refine_gumbel = True
 level_refine_temperature = 1.0
 # level_refine_passes = 2
 cycle_refine_passes = 1
-cond_depth = (2, 1)
-cond_drop = 0.5
+cond_depth = (1, 1)  # disabled -- single group already sees its whole own level
+# cond_drop = 0.5  # no effect with cond_depth<=1
 
 additive_drop_loss = True
 weight_sharing = False

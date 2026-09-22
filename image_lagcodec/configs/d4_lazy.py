@@ -1,11 +1,11 @@
 """
 uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/d4_lazy.py
 """
-# Deep (DEPTH=4, stride=2) analog of d2_lazy.py: "full lazy, wait for the whole level" -- decoder_ncodes=1,
-# stream_chunks=1. interleave_decode is ALWAYS one fully sequential causal chain regardless of stream_chunks
-# (a no-op there, confirmed 2026-09-22), so this variant only exists under pardec -- interleave_decode is OFF
-# here (unlike run12/run13), same DEPTH=4/stride=2 model shape otherwise. Groups stay independent/parallel-
-# batched (pardec); only the context-window visibility is maximally lazy (waits for the whole level).
+# Deep (DEPTH=4, stride=2) analog of d2_lazy.py: "full lazy, wait for the whole level" -- REVISED 2026-09-22
+# to avoid stream_chunks=1's O(n_groups^2) padding blowup (OOM'd: needed 80G vs 30.75G HBM). Instead:
+# decoder_ncodes = n_blocks per level (512,256,128,64) -- a SINGLE group covering the entire level's own
+# codes, collapsing pardec to the plain fully-sequential original decode (no windowing/padding approximation
+# needed). cond_depth disabled (1,1,1,1) -- a single group already sees its whole own level.
 
 # --- model ---
 img_size = 32
@@ -26,13 +26,12 @@ mse_weight = 0.0
 entropy_weight = 0.1
 
 strides = (2,)*DEPTH
-decoder_ncodes = 1
-stream_chunks = 1  # 1 chunk = wait for the whole level before any group's window is used (fully offline)
+decoder_ncodes = (512, 256, 128, 64)  # = n_blocks per level -- single group, waits for/sees the whole level
 ncodes_window = 16
 # attn_window = (256,)*DEPTH
 attn_lookahead = 0
-cond_depth = (2, 2, 2, 1)  # each level conditions on the next coarser level's own codes; top level has none coarser
-# interleave_decode NOT set (pardec instead) -- this variant needs the independent/parallel-group property
+cond_depth = (1, 1, 1, 1)  # disabled -- single group already sees its whole own level
+# interleave_decode NOT set (pardec instead) -- consistent with the rest of the d4 pardec family
 
 additive_drop_loss = False
 weight_sharing = False
