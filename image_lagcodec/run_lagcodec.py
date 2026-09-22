@@ -55,6 +55,9 @@ class Config:
     decoder_ncodes: tuple = 1
     ncodes_window: tuple = 0
     stream_chunks: tuple = 0
+    stream_lag: tuple = 0  # alternate way to set stream_chunks: desired own-group wait cadence L (>=1), resolved
+    # per-level to stream_chunks=ceil(n_groups/L) once n_groups is known (level-independent lag, unlike stream_chunks
+    # itself which is n_groups-dependent). XOR with stream_chunks -- set only one (default 0 = unset for both).
     decode_past: tuple = 0
     decode_future: tuple = 0
     sync: tuple = False
@@ -107,7 +110,6 @@ class Config:
     level_refine_drop: float = 0.0
     gen_temperature: float = 1.0
     gen_top_k: int = 8
-    gen_sync: tuple = False
     dense_decode: tuple = False
     interleave_decode: tuple = False
     level_refine_temperature: float = 1.0
@@ -145,7 +147,7 @@ class Config:
         bcast("decoder_ncodes", int)
         bcast("ncodes_window", int)
         bcast("stream_chunks", int)
-        bcast("gen_sync", bool)
+        bcast("stream_lag", int)
         bcast("dense_decode", bool)
         bcast("interleave_decode", bool)
         bcast("decode_past", int)
@@ -173,7 +175,7 @@ class Config:
         assert len(self.d_model) == n and len(self.n_layers) == n and len(self.n_heads) == n \
             and len(self.n_kv_heads) == n and len(self.code_vocab) == n and len(self.pq_chunks) == n
         assert len(self.mlp_mult) == n and len(self.rope_base) == n and len(self.decoder_ncodes) == n
-        assert len(self.ncodes_window) == n and len(self.stream_chunks) == n and len(self.gen_sync) == n and len(self.dense_decode) == n and len(self.interleave_decode) == n
+        assert len(self.ncodes_window) == n and len(self.stream_chunks) == n and len(self.stream_lag) == n and len(self.dense_decode) == n and len(self.interleave_decode) == n
         assert len(self.decode_past) == n and len(self.decode_future) == n and len(self.sync) == n
         assert len(self.level_refine_passes) == n and len(self.level_refine_window) == n
         assert len(self.cond_depth) == n
@@ -234,11 +236,11 @@ class Config:
             assert self.dec_attn_window[i] == -1 or self.dec_attn_window[i] >= 1, \
                 f"level {i}: dec_attn_window={self.dec_attn_window[i]} must be -1 (unbounded) or >=1"
             if self.dense_decode[i] and (self.cond_depth[i] > 1 or self.decode_future[i] != 0
-                                          or self.level_refine_passes[i] > 1 or self.gen_sync[i]):
+                                          or self.level_refine_passes[i] > 1):
                 warnings.warn(
-                    f"level {i}: dense_decode=True IGNORES cond_depth/decode_future/level_refine_passes/gen_sync "
+                    f"level {i}: dense_decode=True IGNORES cond_depth/decode_future/level_refine_passes "
                     f"entirely (decode_logits_and_target/decode_generate don't take extra ctx, a future tail, "
-                    f"refine passes, or sync -- there's nothing to refine/sync, every step already sees the real "
+                    f"or refine passes -- there's nothing to refine, every step already sees the real "
                     f"whole prefix)")
             if self.dense_decode[i] and self.interleave_decode[i]:
                 raise ValueError(f"level {i}: dense_decode and interleave_decode are mutually exclusive "
@@ -246,10 +248,9 @@ class Config:
             if self.interleave_decode[i] and self.cond_depth[i] > 2:
                 raise NotImplementedError(f"level {i}: interleave_decode only supports cond_depth<=2 (hardcoded, "
                                           f"one flat sequence with at most one coarser level's codes interleaved)")
-            if self.interleave_decode[i] and (self.decode_future[i] != 0 or self.level_refine_passes[i] > 1
-                                              or self.gen_sync[i]):
+            if self.interleave_decode[i] and (self.decode_future[i] != 0 or self.level_refine_passes[i] > 1):
                 warnings.warn(
-                    f"level {i}: interleave_decode=True IGNORES decode_future/level_refine_passes/gen_sync "
+                    f"level {i}: interleave_decode=True IGNORES decode_future/level_refine_passes "
                     f"entirely, same reasons as dense_decode")
             if self.dec_attn_window[i] != -1 and self.weight_sharing:
                 warnings.warn(
@@ -260,6 +261,7 @@ class Config:
 
         top_level_trainable = self.strides[-1] != -1
         code_count = total_bytes_of(self) // self.byte_group
+        stream_chunks_resolved = list(self.stream_chunks)
         for i in range(n):
             K_i = self.strides[i] if self.strides[i] != -1 else 1
             code_count = code_count // K_i
@@ -274,6 +276,12 @@ class Config:
                     f"{n_blocks_i} (the fully-sequential 'original' degenerate case); recommend "
                     f"setting decoder_ncodes={n_blocks_i} explicitly for clarity")
             n_groups_i = -(-n_blocks_i // G_i)
+            if self.stream_lag[i] != 0:
+                assert S_i == 0, (f"level {i}: stream_chunks={S_i} and stream_lag={self.stream_lag[i]} are "
+                                   f"mutually exclusive (XOR) -- set only one")
+                assert self.stream_lag[i] >= 1, \
+                    f"level {i}: stream_lag={self.stream_lag[i]} must be >=1 (own-groups to wait before the window advances)"
+                S_i = stream_chunks_resolved[i] = -(-n_groups_i // self.stream_lag[i])  # ceil(n_groups_i / lag)
             assert S_i <= n_groups_i, f"level {i}: stream_chunks={S_i} exceeds n_groups={n_groups_i}"
             if 0 < S_i == n_groups_i:
                 warnings.warn(f"level {i}: stream_chunks={S_i} == n_groups (same as 0, per-group streaming)")
@@ -299,17 +307,13 @@ class Config:
                     f"level {i}: level_refine_window={self.level_refine_window[i]} has NO EFFECT with "
                     f"level_refine_passes={self.level_refine_passes[i]} (need >1 for a second pass to use "
                     f"it) -- either raise level_refine_passes or set level_refine_window=0 for clarity")
-            if self.gen_sync[i] and self.level_refine_passes[i] > 1:
-                warnings.warn(
-                    f"level {i}: gen_sync=True with level_refine_passes={self.level_refine_passes[i]} -- refine "
-                    f"passes are not yet composed with sync, they still redraft privately on top of the sync "
-                    f"pass-1 output")
             if self.level_refine_passes[i] > 1 and self.level_refine_window[i] <= 0:
                 warnings.warn(
                     f"level {i}: level_refine_passes={self.level_refine_passes[i]} runs extra passes with "
                     f"ZERO peer context (level_refine_window=0) -- each extra pass degenerates to "
                     f"recomputing pass 1 (wasted compute, not a no-op); set level_refine_window>0 or "
                     f"level_refine_passes=1")
+        self.stream_chunks = tuple(stream_chunks_resolved)  # any stream_lag[i]!=0 entries now hold the resolved value
         if self.level_refine_gumbel and not any(self.level_refine_passes[i] > 1 and self.level_refine_window[i] > 0 for i in range(n)):
             warnings.warn(
                 "level_refine_gumbel=True has NO EFFECT -- no level has both level_refine_passes>1 and "
@@ -663,14 +667,12 @@ def extra_ctx_visible_counts(n_groups: int, G: int, up_stride: int, ends=None) -
 
 
 def causal_extra_ctx_windows(extra_val, embed_table, proj_table, up_stride: int, G: int,
-                              n_groups: int, B: int, D: int, window: int = -1, ends=None, groups=None) -> tuple:
+                              n_groups: int, B: int, D: int, window: int = -1, ends=None) -> tuple:
     # per-group window of the coarser code; positions before the sequence start are zero-filled and marked invalid.
-    # groups: optional subset of global group indices to materialize (default all) -- used by decode_generate_pardec_sync
-    # to build only one wave's rows while keeping the SAME global chunk-boundary math (ends is for ALL n_groups).
     counts_all = extra_ctx_visible_counts(n_groups, G, up_stride, ends)
     full = max(counts_all)
     Wg_j = full if window < 0 else min(window, full)
-    gidx = list(range(n_groups)) if groups is None else list(groups)
+    gidx = list(range(n_groups))
     counts = [counts_all[g] for g in gidx]
     extra_tok = code_embed_proj(extra_val, embed_table, proj_table)
     M = extra_tok.shape[1]
@@ -953,7 +955,6 @@ class EncDecLevel(eqx.Module):
     remat: bool = eqx.field(static=True)
     remat_level: bool = eqx.field(static=True)
     gen_top_k: int = eqx.field(static=True)
-    gen_sync: bool = eqx.field(static=True)
     dense_decode: bool = eqx.field(static=True)
     interleave_decode: bool = eqx.field(static=True)
     pq_dim: int = eqx.field(static=True)
@@ -987,7 +988,6 @@ class EncDecLevel(eqx.Module):
         self.remat = cfg.remat
         self.remat_level = cfg.remat_level
         self.gen_top_k = cfg.gen_top_k
-        self.gen_sync = cfg.gen_sync[level]
         self.dense_decode = cfg.dense_decode[level]
         self.interleave_decode = cfg.interleave_decode[level]
         self.ncodes_window = cfg.ncodes_window[level]
@@ -1205,15 +1205,13 @@ class EncDecLevel(eqx.Module):
         return self.revision_embed, self.revision_proj, self.revision_up_stride, self.revision_n_blocks
 
     def _pardec_ctx_rows(self, ctx_tok, extra_codes, G: int, n_groups: int, n_blocks: int, rng=None,
-                          drop_extras: bool = False, groups=None) -> tuple:
+                          drop_extras: bool = False) -> tuple:
         # Shared by training and generation. Row order: [extras (coarsest first) | own-level window]. Slots that do
         # not exist (before the sequence start, past the last real code, cond_drop) are zero-filled and marked
         # invalid: they stay in the row for static shapes but are masked as keys (never attended).
-        # groups: optional subset of GLOBAL group indices to materialize (default all) -- lets a caller build just
-        # one wave's rows (decode_generate_pardec_sync) while chunk boundaries stay computed over the full sequence.
         B, _, D = ctx_tok.shape
         n_blocks_p = n_groups * G
-        gidx = list(range(n_groups)) if groups is None else list(groups)
+        gidx = list(range(n_groups))
         Bn = len(gidx)
         B2 = B * Bn
         # chunked visibility: group g sees parent codes up to end(g), the end of its chunk (0 = its own group)
@@ -1233,7 +1231,7 @@ class EncDecLevel(eqx.Module):
                 continue
             embed_t, proj_t, up_stride, _ = self._extra_ctx_table(k)
             w, r, v, Wj = causal_extra_ctx_windows(extra, embed_t, proj_t, up_stride, G, n_groups, B, D,
-                                                    self.cond_window, ends_all, gidx)
+                                                    self.cond_window, ends_all)
             v = jnp.broadcast_to(jnp.asarray(v)[None], (B, Bn, Wj)).reshape(B2, Wj)
             if drop_extras:
                 v = jnp.zeros_like(v)
@@ -1947,158 +1945,10 @@ class EncDecLevel(eqx.Module):
         return out[:, :n_blocks * self.K]
 
 
-    def decode_generate_pardec_sync(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
-                                     temperature: float = 1.0, seed: int = 0, extra_ctx_idx: list = None,
-                                     wave_groups: int = None) -> jnp.ndarray:
-        # Real cross-wave sync (the "sync" flag's actual mechanism, generalized): splits the n_groups into
-        # sequential waves of `wave_groups` groups each (default: self.stream_chunks's own chunk size -- reuses
-        # that single knob, wave_groups=n_groups is degenerate/identical to plain decode_generate_pardec,
-        # wave_groups=1 is the fully-causal group-by-group extreme). Within a wave groups still decode in one
-        # parallel batch with zero mutual info (same as today -- level_refine is still the fix for that, not
-        # this function). Across waves, decode_past's draft is the REAL previous wave's output (read off a
-        # running `emitted` buffer), not a private per-group redecode -- this is what makes train (teacher-forced,
-        # always real) and generate agree for decode_past, which plain decode_generate_pardec does not.
-        # Scope (2026-09-22): only cond_depth<=1 is exercised/tested; cond_depth>1 extra_ctx_idx is threaded
-        # through generically (composes via the same `ends`/chunk-boundary math _pardec_ctx_rows already uses)
-        # but not covered by a test yet. cycle_refine_passes is an orchestration layer above this function
-        # (cyclic_refine_generate calls decode_generate_pardec/decode_generate_multipass directly) and is
-        # unaffected either way.
-        blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
-        B, n_blocks, _ = ctx_idx.shape
-        D = self.bos_embed.shape[-1]
-        hd = D // self.n_heads
-        out_extra = (self.in_pq_chunks,)
-        G = decoder_ncodes
-        pad_blocks = (-n_blocks) % G
-        n_blocks_p = n_blocks + pad_blocks
-        n_groups = n_blocks_p // G
-        Pp = self.decode_past
-        Kspan = G * self.K
-        chunk_groups = 1 if self.stream_chunks <= 0 else -(-n_groups // self.stream_chunks)
-        Wgg = wave_groups if wave_groups is not None else chunk_groups
-        n_waves = -(-n_groups // Wgg)
-        ctx_tok = code_embed_proj(ctx_idx, self.ctx_embed, self.ctx_proj)
-
-        def token_predict(h_pos, rng):
-            if self.token_head_type == "linears":
-                logits = self._token_logits_linears(h_pos)
-                return sample_idx(logits, rng, greedy, temperature, self.gen_top_k)
-            elif self.token_head_type == "ar":
-                return self._token_generate_ar(h_pos, rng, greedy, temperature)
-            else:
-                return self._token_generate_diffusion(h_pos, rng, greedy, temperature)
-
-        rng = jax.random.PRNGKey(seed)
-        emitted = jnp.zeros((B, n_groups * Kspan) + out_extra, dtype=jnp.int32)
-        wave_outs = []
-        for w in range(n_waves):
-            groups_real = list(range(w * Wgg, min((w + 1) * Wgg, n_groups)))
-            n_real = len(groups_real)
-            groups_w = groups_real + [groups_real[-1]] * (Wgg - n_real)  # pad to a uniform Wgg with a repeated group
-            wave_start_tok = groups_real[0] * Kspan
-            B2w = B * Wgg
-
-            ctx_tok_flat, rope_ctx_g, valid_ctx, Wg, extra_len_total = self._pardec_ctx_rows(
-                ctx_tok, extra_ctx_idx, G, n_groups, n_blocks, None, drop_extras=self.cond_drop >= 1.0,
-                groups=groups_w)
-            rope_ctx_flat = jnp.broadcast_to(rope_ctx_g[None], (B, Wgg, rope_ctx_g.shape[1])).reshape(B2w, -1)
-            per_group_len = Wg + extra_len_total + 1 + Pp + Kspan
-            rope_bos = jnp.array([(g + 1) * G for g in groups_w])
-            rope_bos_flat = jnp.broadcast_to(rope_bos[None, :], (B, Wgg)).reshape(B2w)
-
-            if Pp > 0:
-                abs_pos = np.array([[g * Kspan - Pp + t for t in range(Pp)] for g in groups_w])  # (Wgg, Pp)
-                before_start = abs_pos < 0
-                is_real_np = (~before_start) & (abs_pos < wave_start_tok)
-                clipped = np.clip(abs_pos, 0, n_groups * Kspan - 1)
-                real_vals = emitted[:, clipped].reshape((B2w, Pp) + out_extra)
-                is_real = jnp.broadcast_to(jnp.asarray(is_real_np)[None], (B, Wgg, Pp)).reshape(B2w, Pp)
-                # draft_valid == is_real (NOT ~before_start): a not-yet-real position (same, still-unfinished wave)
-                # must be masked exactly like "before sequence start", never filled with this row's own private
-                # guess -- that guess is computed in total isolation from whichever row actually owns that
-                # position, so treating it as valid content would be hallucination, not history.
-                draft_valid = is_real
-            else:
-                real_vals = jnp.zeros((B2w, 0) + out_extra, dtype=jnp.int32)
-                is_real = jnp.zeros((B2w, 0), dtype=bool)
-                draft_valid = jnp.ones((B2w, 0), dtype=bool)
-            key_valid = jnp.concatenate([valid_ctx, jnp.ones((B2w, 1), dtype=bool), draft_valid,
-                                          jnp.ones((B2w, Kspan), dtype=bool)], axis=1)
-
-            def self_step(x_new, ck, cv, pos, rope_pos_row):
-                new_ck, new_cv = [], []
-                x = x_new
-                for i, blk in enumerate(blocks):
-                    x, ck_i, cv_i = pardec_block_step(blk, x, ck[i], cv[i], pos, rope_pos_row, key_valid,
-                                                      per_group_len)
-                    new_ck.append(ck_i)
-                    new_cv.append(cv_i)
-                return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
-
-            def self_chunk_step(x_chunk, ck, cv, pos_start, rope_pos_ids_chunk):
-                new_ck, new_cv = [], []
-                x = x_chunk
-                for i, blk in enumerate(blocks):
-                    x, ck_i, cv_i = pardec_block_chunk_step(blk, x, ck[i], cv[i], pos_start,
-                                                              rope_pos_ids_chunk, key_valid, per_group_len)
-                    new_ck.append(ck_i)
-                    new_cv.append(cv_i)
-                return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
-
-            def widened_pos(t):
-                return jnp.where(t < Pp, jnp.clip(rope_bos_flat - Pp + t, 0, None), rope_bos_flat + 1 + (t - Pp))
-
-            def embed_tok(val, t):
-                te = self._dec_embed_target(val)
-                if Pp == 0:
-                    return te
-                tc = jnp.minimum(t, Pp - 1)
-                return jnp.where((t < Pp) & draft_valid[:, tc][:, None], te, jnp.where(t < Pp, 0.0, te))
-
-            def src_at(val, t):
-                if Pp == 0:
-                    return val
-                tc = jnp.minimum(t, Pp - 1)
-                return jnp.where((t < Pp) & is_real[:, tc][:, None], real_vals[:, tc], val)
-
-            total_steps = Pp + Kspan
-
-            @jax.jit
-            def run_wave(ctx_tok_flat, rng):
-                cache_k = jnp.zeros((len(blocks), B2w, self.n_kv_heads, per_group_len, hd))
-                cache_v = jnp.zeros_like(cache_k)
-                bos_in = jnp.broadcast_to(self.bos_embed, (B2w, 1, D))
-                chunk = jnp.concatenate([ctx_tok_flat, bos_in], axis=1)
-                chunk_rope = jnp.concatenate([rope_ctx_flat, rope_bos_flat[:, None]], axis=1)
-                h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, jnp.array(0), chunk_rope)
-                val0, rng = token_predict(h_chunk[:, -1, :], rng)
-                x0 = embed_tok(src_at(val0, jnp.array(0)), jnp.array(0))
-
-                def step(carry, t):
-                    x_input, ck, cv, rng_c = carry
-                    h, ck, cv = self_step(x_input, ck, cv, Wg + extra_len_total + t, widened_pos(t - 1))
-                    val, rng_c = token_predict(h, rng_c)
-                    src = src_at(val, t)
-                    return (embed_tok(src, t), ck, cv, rng_c), val
-
-                carry, vals_rest = jax.lax.scan(step, (x0, cache_k, cache_v, rng), jnp.arange(1, total_steps))
-                all_vals = jnp.concatenate([val0[None], vals_rest], axis=0)
-                return jnp.moveaxis(all_vals[Pp:], 0, 1)  # (B2w, Kspan, *out_extra)
-
-            wave_out = run_wave(ctx_tok_flat, rng)
-            rng = jax.random.fold_in(rng, w)
-            wave_out = wave_out.reshape(B, Wgg, Kspan, *out_extra)[:, :n_real].reshape(B, n_real * Kspan, *out_extra)
-            wave_outs.append(wave_out)
-            emitted = jax.lax.dynamic_update_slice_in_dim(emitted, wave_out.astype(jnp.int32), wave_start_tok, axis=1)
-
-        out = jnp.concatenate(wave_outs, axis=1).astype(jnp.int32)
-        return out[:, :n_blocks * self.K]
-
-
 
     def decode_generate_interleave(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
                                     temperature: float = 1.0, seed: int = 0,
-                                    extra_ctx_idx: list = None) -> jnp.ndarray:
+                                    extra_ctx_idx: list = None, chunk_groups: int = 1) -> jnp.ndarray:
         # Hardcoded interleave, cond_depth<=2 only: generation counterpart of decode_logits_and_target_interleave.
         # ONE real, single, always-growing KV cache, plain blk.step/chunk_step (same simple incremental primitives
         # as decode_generate -- no masking, no pardec machinery). Own codes and (at most one) coarser level's
@@ -2107,6 +1957,9 @@ class EncDecLevel(eqx.Module):
         # matching decode_logits_and_target_interleave's layout exactly so train/generate agree on every
         # absolute (rope) position. lax.scan over groups (compiled once; a Python-unrolled loop here doesn't
         # compile in reasonable time at real n_groups, confirmed 2026-09-22).
+        # chunk_groups: how many own-groups are unrolled per lax.scan carry-step (default 1 = today's exact
+        # behavior). Purely a scan-arity knob -- same ops, same real growing cache, same causal order, just
+        # fewer/larger scan trips (fewer XLA scan-carry round-trips); zero effect on the values produced.
         blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
         B, n_blocks, _ = ctx_idx.shape
         D = self.bos_embed.shape[-1]
@@ -2165,9 +2018,8 @@ class EncDecLevel(eqx.Module):
             else:
                 return self._token_generate_diffusion(h_pos, rng, greedy, temperature)
 
-        def group_step(carry, xs):
+        def one_group(carry, own_g, extra_g):
             cache_k, cache_v, pos, rng = carry
-            own_g, extra_g = xs
             bos_in = jnp.broadcast_to(self.bos_embed, (B, 1, D))
             if has_extra:
                 prefill = jnp.concatenate([extra_g, own_g, bos_in], axis=1)
@@ -2189,13 +2041,31 @@ class EncDecLevel(eqx.Module):
             pos = pos + 1
             return (cache_k, cache_v, pos, rng), jnp.stack(vals, axis=1)
 
+        def group_step(carry, xs):
+            # xs: (chunk_groups, B, G, D) / (chunk_groups, B, ?, D) -- chunk_groups own-groups unrolled in a
+            # plain Python loop per scan step, sequentially, same real cache as chunk_groups=1 (see note above).
+            own_chunk, extra_chunk = xs
+            vals_chunk = []
+            for c in range(chunk_groups):
+                carry, val = one_group(carry, own_chunk[c], extra_chunk[c])
+                vals_chunk.append(val)
+            return carry, jnp.stack(vals_chunk, axis=0)
+
+        assert n_groups % chunk_groups == 0, \
+            f"decode_generate_interleave: n_groups={n_groups} not divisible by chunk_groups={chunk_groups}"
+        n_chunks = n_groups // chunk_groups
+        ctx_c = ctx_g.reshape(n_chunks, chunk_groups, B, G, D)
+        extra_c = extra_slot_g.reshape(n_chunks, chunk_groups, B, extra_slot_g.shape[2], D)
+
         cache_k0 = jnp.zeros((len(blocks), B, self.n_kv_heads, L_total, hd))
         cache_v0 = jnp.zeros_like(cache_k0)
-        xs = (ctx_g, extra_slot_g)
+        xs = (ctx_c, extra_c)
 
         @jax.jit
         def run_all(cache_k, cache_v, rng):
             carry, vals_all = jax.lax.scan(group_step, (cache_k, cache_v, jnp.array(0), rng), xs)
+            # vals_all: (n_chunks, chunk_groups, B, G*K, *out_extra) -> (n_groups, B, G*K, *out_extra) -> (B, ...)
+            vals_all = vals_all.reshape(n_groups, B, G * self.K, *out_extra)
             return jnp.moveaxis(vals_all, 0, 1)
 
         vals_all = run_all(cache_k0, cache_v0, jax.random.PRNGKey(seed))
@@ -2294,11 +2164,8 @@ _decode_generate_pardec_jit = eqx.filter_jit(_decode_generate_pardec_call)
 def decode_generate_multipass(level: EncDecLevel, ctx_idx: jnp.ndarray, decoder_ncodes: int,
                                greedy: bool = True, temperature: float = 1.0, seed: int = 0,
                                extra_ctx_idx: list = None) -> jnp.ndarray:
-    if level.gen_sync:
-        pred = level.decode_generate_pardec_sync(ctx_idx, decoder_ncodes, greedy, temperature, seed, extra_ctx_idx)
-    else:
-        pred = _decode_generate_pardec_jit(level, ctx_idx, decoder_ncodes, greedy, temperature, seed, None, None,
-                                            extra_ctx_idx)
+    pred = _decode_generate_pardec_jit(level, ctx_idx, decoder_ncodes, greedy, temperature, seed, None, None,
+                                        extra_ctx_idx)
     if level.level_refine_passes <= 1 or level.level_refine_window <= 0:
         return pred
     B, n_blocks = ctx_idx.shape[0], ctx_idx.shape[1]
@@ -2873,8 +2740,8 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
 
 CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "decoder_ncodes",
-                  "ncodes_window", "stream_chunks", "decode_past", "decode_future", "sync",
-                  "level_refine_passes", "level_refine_window", "multipass_detach", "level_refine_gumbel", "level_refine_gt_drop", "level_refine_drop", "gen_temperature", "gen_top_k", "gen_sync", "dense_decode", "interleave_decode",
+                  "ncodes_window", "stream_chunks", "stream_lag", "decode_past", "decode_future", "sync",
+                  "level_refine_passes", "level_refine_window", "multipass_detach", "level_refine_gumbel", "level_refine_gt_drop", "level_refine_drop", "gen_temperature", "gen_top_k", "dense_decode", "interleave_decode",
                   "level_refine_temperature", "refine_quantize_drop", "refine_remat", "cycle_refine_passes",
                   "cyclic_revise_detach", "cyclic_revise_remat",
                   "cond_depth", "cond_drop", "cond_window",
@@ -3021,7 +2888,15 @@ def main():
                     help="per level: parent codes arrive in this many chunks and a group decodes once its whole chunk "
                          "is available (sees all parent codes up to the chunk end). 0 = per-group streaming (sees "
                          "up to its own group end), 1 = wait once (sees all), n = wait n times (e.g. 4 = quarter "
-                         "image). ncodes_window bounds the history before the chunk (-1 = all)")
+                         "image). ncodes_window bounds the history before the chunk (-1 = all). Mutually exclusive "
+                         "(XOR) with --stream_lag -- set only one.")
+    p.add_argument("--stream_lag", type=_tuple_arg, default=Config.stream_lag,
+                    help="alternate way to set stream_chunks: per level, the desired own-group wait cadence L>=1 "
+                         "directly (1 = eager/per-group streaming, n_groups = fully offline), resolved once "
+                         "n_groups is known to stream_chunks=ceil(n_groups/L). Unlike stream_chunks itself (whose "
+                         "effective lag depends on n_groups, which varies per level/decoder_ncodes), this gives a "
+                         "level-independent lag. Mutually exclusive (XOR) with --stream_chunks -- set only one "
+                         "(default 0 = unset for both, meaning stream_chunks applies as given).")
     p.add_argument("--decode_past", type=_tuple_arg, default=Config.decode_past,
                     help="redecode this many extra target positions before a group's own real "
                          "span (teacher-forced at training; at generation, the group's own private "
@@ -3070,8 +2945,8 @@ def main():
     p.add_argument("--dense_decode", type=_bool_tuple_arg, default=Config.dense_decode,
                     help="regress this level to the original, fully-interleaved [code,BOS,K bytes,code,BOS,...] "
                          "flat causal decoder (decode_logits_and_target / decode_generate): no windowing, no "
-                         "groups/batching approximation, no decode_past/level_refine/cond_depth/stream_chunks/"
-                         "gen_sync (all ignored). Training uses splash (full causal, O(T) memory); generation "
+                         "groups/batching approximation, no decode_past/level_refine/cond_depth/stream_chunks "
+                         "(all ignored). Training uses splash (full causal, O(T) memory); generation "
                          "uses a single real growing KV cache (lax.scan over own-codes), no padding/magic numbers "
                          "-- every step genuinely sees the whole real prefix. O(T^2) total compute either way, "
                          "same as any correct full-attention causal LM; dec_attn_window bounds it if desired.")
@@ -3079,14 +2954,7 @@ def main():
                     help="dense_decode + cond_depth<=2 support (hardcoded): one flat causal sequence, at most one "
                          "coarser level's codes prefilled into it exactly when each becomes causally revealed. "
                          "Same real-single-growing-cache property as dense_decode -- no padding, no chunking, no "
-                         "gen_sync/refine (ignored).")
-    p.add_argument("--gen_sync", type=_bool_tuple_arg, default=Config.gen_sync,
-                    help="generation only (no effect on training, which is already teacher-forced/real): use "
-                         "decode_generate_pardec_sync instead of the plain private-redraft decode_past path. "
-                         "wave_groups = this level's own stream_chunks chunk size (default stream_chunks=0 -> "
-                         "wave_groups=1, fully causal group-by-group). Not yet composed with level_refine_passes>1 "
-                         "(a warning is printed if both are set; the refine passes still run on top of the sync "
-                         "pass-1 output, same private-redraft mechanism as before, for now)")
+                         "refine (ignored).")
     p.add_argument("--level_refine_temperature", type=float, default=Config.level_refine_temperature,
                     help="own dedicated temperature, not shared with the encoder's "
                          "encode_temperature. Used by level_refine_gumbel=True's gumbel-softmax, and "
