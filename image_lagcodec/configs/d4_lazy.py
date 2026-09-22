@@ -27,7 +27,7 @@ entropy_weight = 0.1
 
 strides = (2,)*DEPTH
 decoder_ncodes = (512, 256, 128, 64)  # = n_blocks per level -- single group, waits for/sees the whole level
-ncodes_window = 16
+ncodes_window = -1  # no effect either way: decoder_ncodes=n_blocks (single group) already sees everything
 # attn_window = (256,)*DEPTH
 attn_lookahead = 0
 cond_depth = (1, 1, 1, 1)  # disabled -- single group already sees its whole own level
