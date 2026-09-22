@@ -29,7 +29,7 @@ strides = (2,)*DEPTH
 decoder_ncodes = 1
 stream_chunks = 1  # 1 chunk = wait for the whole level before any group's window is used (fully offline)
 ncodes_window = 16
-attn_window = (256,)*DEPTH
+# attn_window = (256,)*DEPTH
 attn_lookahead = 0
 cond_depth = (2, 2, 2, 1)  # each level conditions on the next coarser level's own codes; top level has none coarser
 # interleave_decode NOT set (pardec instead) -- this variant needs the independent/parallel-group property

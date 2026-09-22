@@ -28,7 +28,7 @@ strides = (2,)*DEPTH
 decoder_ncodes = 1
 stream_chunks = 2  # exactly 2 chunks per level -- independent across the chunk boundary, shared window within
 ncodes_window = 16
-attn_window = (256,)*DEPTH
+# attn_window = (256,)*DEPTH
 attn_lookahead = 0
 cond_depth = (2, 2, 2, 1)
 # interleave_decode NOT set (pardec instead) -- this variant needs the independent/parallel-group property
