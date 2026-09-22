@@ -8,7 +8,7 @@ uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/d2
 # --- model ---
 img_size = 32
 d_model = (256, 256)
-n_layers = (4, 4)
+n_layers = (2, 2)
 n_heads = (2, 2)
 n_kv_heads = (None, None)
 code_vocab = (256, 256)
