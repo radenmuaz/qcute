@@ -33,8 +33,8 @@ level_refine_gumbel = True
 level_refine_temperature = 1.0
 # level_refine_passes = 2
 cycle_refine_passes = 1
-cond_depth = (2, 1)
-cond_drop = 0.5
+cond_depth = (1, 1)  # was (2, 1) -- disabled to isolate cond_depth's effect (2026-09-22)
+# cond_drop = 0.5  # no effect with cond_depth<=1
 
 additive_drop_loss = False
 weight_sharing = False
