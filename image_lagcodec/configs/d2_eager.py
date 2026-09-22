@@ -36,7 +36,7 @@ cycle_refine_passes = 1
 cond_depth = (2, 1)
 cond_drop = 0.5
 
-additive_drop_loss = True
+additive_drop_loss = False
 weight_sharing = False
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"

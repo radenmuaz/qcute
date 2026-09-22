@@ -39,7 +39,7 @@ cycle_refine_passes = 1
 cond_depth = (1, 1)  # disabled -- single group already sees its whole own level
 # cond_drop = 0.5  # no effect with cond_depth<=1
 
-additive_drop_loss = True
+additive_drop_loss = False
 weight_sharing = False
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"

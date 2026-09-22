@@ -29,7 +29,7 @@ decoder_ncodes = (128, 32)  # n_blocks/2 per level -- exactly 2 groups/passes
 interleave_decode = True  # the only mechanism with real cross-group (pass-to-pass) dependency
 cond_depth = (2, 1)
 
-additive_drop_loss = True
+additive_drop_loss = False
 weight_sharing = False
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
