@@ -46,6 +46,19 @@ class Config:
     n_layers: tuple = (2, 2, 2, 2)
     n_heads: tuple = (4, 4, 4, 4)
     n_kv_heads: tuple = (None, None, None, None)
+    # decoder_*/encoder_* (all default None = fully unset): per-level override of d_model/n_layers/n_heads/
+    # n_kv_heads for JUST that side of a level's blocks. None (unset) -> that side uses the base field (today's
+    # symmetric behavior, unchanged). Only meaningful with weight_sharing=False for that level (asserted) --
+    # weight_sharing=True ties the decoder to the encoder's own blocks, so there is no separate "decoder side"
+    # to override. XOR per field: encoder_* and decoder_* can each independently override their own side.
+    decoder_d_model: tuple = None
+    decoder_n_layers: tuple = None
+    decoder_n_heads: tuple = None
+    decoder_n_kv_heads: tuple = None
+    encoder_d_model: tuple = None
+    encoder_n_layers: tuple = None
+    encoder_n_heads: tuple = None
+    encoder_n_kv_heads: tuple = None
     strides: tuple = (3, 16, 16, -1)
     code_vocab: tuple = (4, 4, 4, 4)
     pq_chunks: tuple = (5, 5, 5, 5)
@@ -142,6 +155,15 @@ class Config:
             if isinstance(val, types):
                 setattr(self, name, (val,) * n)
 
+        def bcast_opt(name, types):
+            # like bcast, but a bare None (the "fully unset" default) broadcasts to (None,)*n instead of being
+            # left alone -- a per-level tuple (possibly mixing None and real values) still passes through as-is.
+            val = getattr(self, name)
+            if val is None:
+                setattr(self, name, (None,) * n)
+            elif isinstance(val, types):
+                setattr(self, name, (val,) * n)
+
         bcast("mlp_mult", int)
         bcast("rope_base", (int, float))
         bcast("decoder_ncodes", int)
@@ -159,6 +181,14 @@ class Config:
         bcast("cond_drop", (int, float))
         bcast("cond_window", int)
         bcast("weight_sharing", bool)
+        bcast_opt("decoder_d_model", int)
+        bcast_opt("decoder_n_layers", int)
+        bcast_opt("decoder_n_heads", int)
+        bcast_opt("decoder_n_kv_heads", int)
+        bcast_opt("encoder_d_model", int)
+        bcast_opt("encoder_n_layers", int)
+        bcast_opt("encoder_n_heads", int)
+        bcast_opt("encoder_n_kv_heads", int)
         bcast("token_head_type", str)
         bcast("token_dim", int)
         bcast("token_n_heads", int)
@@ -341,6 +371,18 @@ class Config:
                 f"-- needs at least 2 (operates on the top two levels of whatever phase is active)")
 
         assert len(self.weight_sharing) == n
+        assert (len(self.decoder_d_model) == n and len(self.decoder_n_layers) == n and len(self.decoder_n_heads) == n
+                and len(self.decoder_n_kv_heads) == n and len(self.encoder_d_model) == n
+                and len(self.encoder_n_layers) == n and len(self.encoder_n_heads) == n
+                and len(self.encoder_n_kv_heads) == n)
+        for i in range(n):
+            dec_overridden = any(x[i] is not None for x in
+                                  (self.decoder_d_model, self.decoder_n_layers, self.decoder_n_heads, self.decoder_n_kv_heads))
+            if dec_overridden and self.weight_sharing[i]:
+                raise ValueError(f"level {i}: decoder_d_model/decoder_n_layers/decoder_n_heads/decoder_n_kv_heads "
+                                  f"override set but weight_sharing=True -- weight_sharing ties the decoder to the "
+                                  f"encoder's own blocks, there's no separate decoder side to override; set "
+                                  f"weight_sharing[{i}]=False first")
         assert len(self.token_head_type) == n
         assert len(self.pq_dim) == n
         assert all(t in ("linears", "ar", "diffusion") for t in self.token_head_type)
@@ -981,8 +1023,19 @@ class EncDecLevel(eqx.Module):
 
     def __init__(self, key, cfg: Config, level: int, has_decoder: bool, weight_sharing: bool):
         D = cfg.d_model[level]
+        # encoder/decoder dimension overrides (None -> symmetric, falls back to the base D/n_layers/n_heads/
+        # n_kv_heads field, today's behavior unchanged). self.n_heads/self.n_kv_heads below become the
+        # DECODER's values (that's what every decode_*/generate_* hot path reads via self.n_heads); the
+        # encoder-only Block stack uses D_enc/n_layers_enc/n_heads_enc/n_kv_heads_enc directly, not self.*.
+        D_enc = cfg.encoder_d_model[level] if cfg.encoder_d_model[level] is not None else D
+        D_dec = cfg.decoder_d_model[level] if cfg.decoder_d_model[level] is not None else D
+        n_layers_enc = cfg.encoder_n_layers[level] if cfg.encoder_n_layers[level] is not None else cfg.n_layers[level]
+        n_layers_dec = cfg.decoder_n_layers[level] if cfg.decoder_n_layers[level] is not None else cfg.n_layers[level]
+        n_heads_enc = cfg.encoder_n_heads[level] if cfg.encoder_n_heads[level] is not None else cfg.n_heads[level]
+        n_kv_heads_enc = cfg.encoder_n_kv_heads[level] if cfg.encoder_n_kv_heads[level] is not None else cfg.n_kv_heads[level]
         self.K = cfg.strides[level] if cfg.strides[level] != -1 else 1
-        self.n_heads, self.n_kv_heads = cfg.n_heads[level], cfg.n_kv_heads[level]
+        self.n_heads = cfg.decoder_n_heads[level] if cfg.decoder_n_heads[level] is not None else cfg.n_heads[level]
+        self.n_kv_heads = cfg.decoder_n_kv_heads[level] if cfg.decoder_n_kv_heads[level] is not None else cfg.n_kv_heads[level]
         self.quantize_mode = cfg.quantize_mode
         self.quantize_drop = cfg.quantize_drop
         self.remat = cfg.remat
@@ -1016,20 +1069,19 @@ class EncDecLevel(eqx.Module):
 
         scheme, use_xsa, use_qknorm = cfg.init_scheme, cfg.use_xsa, cfg.use_qknorm
         self.own_input_embed = init_matrix(keys[0], (own_vocab, self.pq_dim), scheme)
-        self.own_input_proj = init_matrix(keys[20], (self.in_pq_chunks * self.pq_dim, D), scheme)
-        n_layers = cfg.n_layers[level]
-        block_keys = jax.random.split(keys[1], n_layers)
+        self.own_input_proj = init_matrix(keys[20], (self.in_pq_chunks * self.pq_dim, D_enc), scheme)
+        block_keys = jax.random.split(keys[1], n_layers_enc)
         enc_window = None if cfg.attn_window[level] == -1 else cfg.attn_window[level]
         enc_lookahead = cfg.attn_lookahead[level]
-        self.blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
-                             n_layers=n_layers, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
+        self.blocks = [Block(k, D_enc, n_heads_enc, n_kv_heads_enc, cfg.mlp_mult[level], cfg.rope_base[level],
+                             n_layers=n_layers_enc, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
                              window=enc_window, lookahead=enc_lookahead, use_sink=cfg.use_sink) for k in block_keys]
-        self.ln_f = RMSNorm(D)
-        self.code_head = init_matrix(keys[2], (D, self.pq_chunks * self.code_vocab), scheme)
-        self.ntp_head = init_matrix(keys[3], (D, ntp_out), scheme)
-        self.bos_embed = init_vector(keys[4], D, scheme)
+        self.ln_f = RMSNorm(D_enc)
+        self.code_head = init_matrix(keys[2], (D_enc, self.pq_chunks * self.code_vocab), scheme)
+        self.ntp_head = init_matrix(keys[3], (D_enc, ntp_out), scheme)
+        self.bos_embed = init_vector(keys[4], D_dec, scheme)
         self.ctx_embed = init_matrix(keys[5], (self.code_vocab, self.pq_dim), scheme)
-        self.ctx_proj = init_matrix(keys[21], (self.pq_chunks * self.pq_dim, D), scheme)
+        self.ctx_proj = init_matrix(keys[21], (self.pq_chunks * self.pq_dim, D_dec), scheme)
 
         self.cond_depth = cfg.cond_depth[level]
         self.cond_drop = cfg.cond_drop[level]
@@ -1044,7 +1096,7 @@ class EncDecLevel(eqx.Module):
                 self.extra_ctx_embed.append(
                     init_matrix(extra_keys[3 * (k - 1)], (cfg.code_vocab[j], cfg.pq_dim[j]), scheme))
                 self.extra_ctx_proj.append(
-                    init_matrix(extra_keys[3 * (k - 1) + 1], (cfg.pq_chunks[j] * cfg.pq_dim[j], D), scheme))
+                    init_matrix(extra_keys[3 * (k - 1) + 1], (cfg.pq_chunks[j] * cfg.pq_dim[j], D_dec), scheme))
                 extra_n_blocks.append(n_blocks_for_level(cfg, j))
                 up_stride *= cfg.strides[j] if cfg.strides[j] != -1 else 1
                 extra_up_stride.append(up_stride)
@@ -1058,7 +1110,7 @@ class EncDecLevel(eqx.Module):
             j = level + 1
             rev_keys = jax.random.split(jax.random.fold_in(key, 9003), 3)
             self.revision_embed = init_matrix(rev_keys[0], (cfg.code_vocab[j], cfg.pq_dim[j]), scheme)
-            self.revision_proj = init_matrix(rev_keys[1], (cfg.pq_chunks[j] * cfg.pq_dim[j], D), scheme)
+            self.revision_proj = init_matrix(rev_keys[1], (cfg.pq_chunks[j] * cfg.pq_dim[j], D_dec), scheme)
             self.revision_up_stride = cfg.strides[j] if cfg.strides[j] != -1 else 1
             self.revision_n_blocks = n_blocks_for_level(cfg, j)
         else:
@@ -1067,21 +1119,21 @@ class EncDecLevel(eqx.Module):
             self.revision_n_blocks = 0
 
         if has_decoder and not weight_sharing:
-            dec_block_keys = jax.random.split(keys[6], n_layers)
+            dec_block_keys = jax.random.split(keys[6], n_layers_dec)
             dec_window = None if cfg.dec_attn_window[level] == -1 else cfg.dec_attn_window[level]
-            self.dec_blocks = [Block(k, D, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
-                                     n_layers=n_layers, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
+            self.dec_blocks = [Block(k, D_dec, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
+                                     n_layers=n_layers_dec, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
                                      window=dec_window) for k in dec_block_keys]
-            self.dec_ln_f = RMSNorm(D)
+            self.dec_ln_f = RMSNorm(D_dec)
             self.dec_target_embed = init_matrix(keys[7], (own_vocab, self.pq_dim), scheme)
-            self.dec_target_proj = init_matrix(keys[22], (self.in_pq_chunks * self.pq_dim, D), scheme)
-            self.dec_head = init_matrix(keys[8], (D, ntp_out), scheme)
+            self.dec_target_proj = init_matrix(keys[22], (self.in_pq_chunks * self.pq_dim, D_dec), scheme)
+            self.dec_head = init_matrix(keys[8], (D_dec, ntp_out), scheme)
         else:
             self.dec_blocks, self.dec_ln_f, self.dec_target_embed, self.dec_target_proj, self.dec_head = None, None, None, None, None
 
         if has_decoder and self.token_head_type in ("ar", "diffusion"):
             tdim, theads = cfg.token_dim[level], cfg.token_n_heads[level]
-            self.token_in_proj = init_matrix(keys[9], (D, tdim), scheme)
+            self.token_in_proj = init_matrix(keys[9], (D_dec, tdim), scheme)
             self.token_member_embed = init_matrix(keys[10], (self.in_code_vocab, tdim), scheme)
             self.token_norm1 = RMSNorm(tdim)
             self.token_attn = Attention(keys[11], tdim, theads, theads, cfg.rope_base[level], n_layers=1,
@@ -1101,12 +1153,12 @@ class EncDecLevel(eqx.Module):
         (self.mtp_heads_in_proj, self.mtp_heads_member_embed, self.mtp_heads_norm1,
          self.mtp_heads_attn, self.mtp_heads_ln_f, self.mtp_heads_out_head) = (None,) * 6
         if has_decoder and self.mtp_horizon > 1 and self.mtp_mode == "parallel" and self.token_head_type == "linears":
-            self.mtp_out_head = init_matrix(keys[13], (D, self.mtp_horizon * ntp_out), scheme)
+            self.mtp_out_head = init_matrix(keys[13], (D_dec, self.mtp_horizon * ntp_out), scheme)
             (self.mtp_in_proj, self.mtp_attn, self.mtp_norm1, self.mtp_ln_f, self.mtp_out_proj) = (None,) * 5
         elif has_decoder and self.mtp_horizon > 1 and self.mtp_mode == "parallel" and self.token_head_type == "ar":
             tdim, theads = cfg.token_dim[level], cfg.token_n_heads[level]
             head_keys = jax.random.split(keys[19], self.mtp_horizon * 3)
-            self.mtp_heads_in_proj = [init_matrix(head_keys[3 * k], (D, tdim), scheme)
+            self.mtp_heads_in_proj = [init_matrix(head_keys[3 * k], (D_dec, tdim), scheme)
                                        for k in range(self.mtp_horizon)]
             self.mtp_heads_member_embed = [init_matrix(head_keys[3 * k + 1], (self.in_code_vocab, tdim), scheme)
                                             for k in range(self.mtp_horizon)]
@@ -1121,12 +1173,12 @@ class EncDecLevel(eqx.Module):
              self.mtp_ln_f, self.mtp_out_proj) = (None,) * 6
         elif has_decoder and self.mtp_horizon > 1 and self.mtp_mode == "ar":
             tdim, theads = cfg.token_dim[level], cfg.token_n_heads[level]
-            self.mtp_in_proj = init_matrix(keys[16], (D, tdim), scheme)
+            self.mtp_in_proj = init_matrix(keys[16], (D_dec, tdim), scheme)
             self.mtp_attn = Attention(keys[17], tdim, theads, theads, cfg.rope_base[level], n_layers=1,
                                        init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
             self.mtp_norm1 = RMSNorm(tdim)
             self.mtp_ln_f = RMSNorm(tdim)
-            self.mtp_out_proj = init_matrix(keys[18], (tdim, D), scheme)
+            self.mtp_out_proj = init_matrix(keys[18], (tdim, D_dec), scheme)
             self.mtp_out_head = None
         else:
             (self.mtp_out_head, self.mtp_in_proj, self.mtp_attn, self.mtp_norm1, self.mtp_ln_f,
@@ -2751,7 +2803,9 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
     (run_dir / "resolved_config.py").write_text("\n".join(lines) + "\n")
 
 
-CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
+CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads",
+                  "decoder_d_model", "decoder_n_layers", "decoder_n_heads", "decoder_n_kv_heads",
+                  "encoder_d_model", "encoder_n_layers", "encoder_n_heads", "encoder_n_kv_heads", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "decoder_ncodes",
                   "ncodes_window", "stream_chunks", "stream_lag", "decode_past", "decode_future", "sync",
                   "level_refine_passes", "level_refine_window", "multipass_detach", "level_refine_gumbel", "level_refine_gt_drop", "level_refine_drop", "gen_temperature", "gen_top_k", "dense_decode", "interleave_decode",
@@ -2889,6 +2943,17 @@ def main():
     p.add_argument("--n_layers", type=_tuple_arg, default=Config.n_layers)
     p.add_argument("--n_heads", type=_tuple_arg, default=Config.n_heads)
     p.add_argument("--n_kv_heads", type=_tuple_arg, default=Config.n_kv_heads)
+    p.add_argument("--decoder_d_model", type=_tuple_arg, default=Config.decoder_d_model,
+                    help="per-level override of the decoder's own d_model (None entries fall back to d_model). "
+                         "Needs weight_sharing=False for that level (asserted).")
+    p.add_argument("--decoder_n_layers", type=_tuple_arg, default=Config.decoder_n_layers)
+    p.add_argument("--decoder_n_heads", type=_tuple_arg, default=Config.decoder_n_heads)
+    p.add_argument("--decoder_n_kv_heads", type=_tuple_arg, default=Config.decoder_n_kv_heads)
+    p.add_argument("--encoder_d_model", type=_tuple_arg, default=Config.encoder_d_model,
+                    help="per-level override of the encoder's own d_model (None entries fall back to d_model).")
+    p.add_argument("--encoder_n_layers", type=_tuple_arg, default=Config.encoder_n_layers)
+    p.add_argument("--encoder_n_heads", type=_tuple_arg, default=Config.encoder_n_heads)
+    p.add_argument("--encoder_n_kv_heads", type=_tuple_arg, default=Config.encoder_n_kv_heads)
     p.add_argument("--strides", type=_tuple_arg, default=Config.strides)
     p.add_argument("--code_vocab", type=_tuple_arg, default=Config.code_vocab)
     p.add_argument("--pq_chunks", type=_tuple_arg, default=Config.pq_chunks)
