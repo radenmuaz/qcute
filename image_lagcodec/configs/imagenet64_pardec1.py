@@ -37,7 +37,8 @@ decoder_ncodes = 32  # was 4 -- OOM'd twice (613G, 380G vs 30.75G); fewer/bigger
 # batched rows (n_groups=1024/32=32, B2=8*32=256, was B2=2048) -- the actual driver of the blowup
 # interleave_decode NOT set (pardec instead) -- cond_window is pardec-only, meaningless under interleave_decode
 attn_lookahead = 0
-attn_window = (1024, 1024)  # was (64, 64)
+attn_window = (256, 256)  # was 1024 -- 4th OOM was only 1.3G short (26.18G vs 24.88G free); this is the
+# encoder's own unbounded self-attention over n_blocks=1024, untouched by earlier cuts
 cond_depth = (2, 1)
 cond_window = 16  # was (4, -1) -- widened; level1's cond_window has no effect anyway (cond_depth=1 there)
 cond_drop = 0.5
