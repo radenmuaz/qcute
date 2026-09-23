@@ -33,7 +33,8 @@ mse_weight = 0.0
 entropy_weight = 0.1
 
 strides = (4, 4)
-decoder_ncodes = 4  # was 1 in imagenet64_ar
+decoder_ncodes = 32  # was 4 -- OOM'd twice (613G, 380G vs 30.75G); fewer/bigger pardec groups = far fewer
+# batched rows (n_groups=1024/32=32, B2=8*32=256, was B2=2048) -- the actual driver of the blowup
 # interleave_decode NOT set (pardec instead) -- cond_window is pardec-only, meaningless under interleave_decode
 attn_lookahead = 0
 attn_window = (1024, 1024)  # was (64, 64)
@@ -41,12 +42,12 @@ cond_depth = (2, 1)
 cond_window = 16  # was (4, -1) -- widened; level1's cond_window has no effect anyway (cond_depth=1 there)
 cond_drop = 0.5
 
-level_refine_window = 16  # groups of Kspan tokens; draft = previous pass output
+level_refine_window = 4  # was 16 -- groups of Kspan tokens; draft = previous pass output
 level_refine_gumbel = True
 level_refine_temperature = 1.0
 level_refine_gt_drop = 0.8
 level_refine_drop = 0.5  # stop before each extra pass w.p. 0.5 -> 1..level_refine_passes passes per step
-level_refine_passes = 3
+level_refine_passes = 2  # was 3
 # refine_quantize_drop = 0.5  # disabled -- multipass_detach=False (needed for it) keeps more graph alive
 # through the refine passes for backward, a real memory contributor at this scale; back to run7.py's own
 # (commented-out) pattern, multipass_detach stays at its True default
