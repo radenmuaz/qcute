@@ -79,7 +79,7 @@ traversal = "zorder"
 eval_gen_train = False
 
 # --- training ---
-batch_size = 8  # check first -- reduce if OOM (bigger decoder + wide attn_window)
+batch_size = 2  # was 8 -- 3rd OOM (106G vs 30.75G, ~3.4x over) after decoder/refine/ncodes cuts; batch scales ~linearly
 val_batch_size = 4
 level_epochs = (0, 2)
 seed = 0
