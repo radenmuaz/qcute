@@ -275,9 +275,6 @@ class Config:
             if self.dense_decode[i] and self.interleave_decode[i]:
                 raise ValueError(f"level {i}: dense_decode and interleave_decode are mutually exclusive "
                                   f"(interleave_decode is dense_decode + cond_depth support)")
-            if self.interleave_decode[i] and self.cond_depth[i] > 2:
-                raise NotImplementedError(f"level {i}: interleave_decode only supports cond_depth<=2 (hardcoded, "
-                                          f"one flat sequence with at most one coarser level's codes interleaved)")
             if self.interleave_decode[i] and (self.decode_future[i] != 0 or self.level_refine_passes[i] > 1):
                 warnings.warn(
                     f"level {i}: interleave_decode=True IGNORES decode_future/level_refine_passes "
@@ -1645,11 +1642,12 @@ class EncDecLevel(eqx.Module):
 
     def decode_logits_and_target_interleave(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
                                              decoder_ncodes: int, extra_ctx_code_soft=None, rng=None) -> tuple:
-        # Hardcoded interleave, cond_depth<=2 only: one flat causal sequence per image, own codes and (at most
-        # one) coarser level's codes appearing in strict causal order -- [.. extra codes revealed so far ..,
-        # own_code_g, BOS, K target bytes, own_code_{g+1}, BOS, K target bytes, .. more extra codes when THEY
-        # become revealed ..]. No windowing, no padding, no chunk-rounding: positions are natural sequence
-        # order (0,1,2,...), so rope just works via the existing dense splash call, same as decode_logits_and_target.
+        # Hardcoded interleave: one flat causal sequence per image, own codes and any number of coarser levels'
+        # codes (cond_depth-1 of them, no restriction since 2026-09-23) appearing in strict causal order --
+        # [.. extra codes revealed so far (coarsest first) .., own_code_g, BOS, K target bytes, own_code_{g+1},
+        # BOS, K target bytes, .. more extra codes when THEY become revealed ..]. No windowing, no padding, no
+        # chunk-rounding: positions are natural sequence order (0,1,2,...), so rope just works via the existing
+        # dense splash call, same as decode_logits_and_target.
         blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
         B = target_seq.shape[0]
         D = self.bos_embed.shape[-1]
@@ -1665,15 +1663,30 @@ class EncDecLevel(eqx.Module):
             te = jnp.pad(te, ((0, 0), (0, pad_blocks * self.K), (0, 0)))
         bos = jnp.broadcast_to(self.bos_embed, (B, 1, D))
 
-        has_extra = bool(extra_ctx_code_soft) and extra_ctx_code_soft[0] is not None
-        extra_tok = extra_reveal = None
-        extra_slots = 0
-        if has_extra:
-            assert len(extra_ctx_code_soft) == 1, "decode_logits_and_target_interleave only supports cond_depth<=2"
-            embed_t, proj_t, up_stride, extra_n_blocks = self._extra_ctx_table(0)
-            extra_slots = -(-G // up_stride)  # ceil(G/up_stride): max new extra codes revealable within one own-group's span
-            extra_tok = code_embed_proj(extra_ctx_code_soft[0], embed_t, proj_t)
-            extra_reveal = self._interleave_reveal_schedule(n_groups, G, up_stride, extra_n_blocks)
+        # Multiple coarser levels supported (cond_depth-1 entries, nearest coarser first in the input list, same
+        # as pardec's extra_ctx_* convention): each gets its own extra_slots_k=ceil(G/up_stride_k) reveal-order
+        # slots, concatenated coarsest-first (matching _pardec_ctx_rows' "extras (coarsest first)" row order).
+        # Removed cond_depth<=2 restriction 2026-09-23 (same generalization as the earlier up_stride>=G removal).
+        n_cond = len(extra_ctx_code_soft) if extra_ctx_code_soft else 0
+        extra_g_parts, extra_slots_parts = [], []
+        for k in range(n_cond):
+            if extra_ctx_code_soft[k] is None:
+                continue  # curriculum: this coarser level isn't encoded yet
+            embed_t, proj_t, up_stride, extra_n_blocks = self._extra_ctx_table(k)
+            extra_slots_k = -(-G // up_stride)  # ceil(G/up_stride): max new extra codes revealable within one own-group's span
+            extra_tok_k = code_embed_proj(extra_ctx_code_soft[k], embed_t, proj_t)
+            reveal_k = np.asarray(self._interleave_reveal_schedule(n_groups, G, up_stride, extra_n_blocks))
+            cum = np.cumsum(reveal_k)
+            prev_cum = cum - reveal_k  # extras already revealed before this group
+            slot_j = np.arange(extra_slots_k)
+            idx = prev_cum[:, None] + slot_j[None, :]  # (n_groups, extra_slots_k)
+            valid = slot_j[None, :] < reveal_k[:, None]
+            idx_clipped = np.clip(idx, 0, extra_n_blocks - 1)
+            g = extra_tok_k[:, idx_clipped, :]  # (B, n_groups, extra_slots_k, D), static gather
+            g = jnp.where(jnp.asarray(valid)[None, :, :, None], g, jnp.zeros_like(g))
+            extra_g_parts.append(g)
+            extra_slots_parts.append(extra_slots_k)
+        extra_g_parts.reverse()  # nearest-first input -> coarsest-first row order
 
         # ALWAYS reserve extra_slots extra-code slots per own-group (real embeddings, filled low-to-high in
         # reveal order, for however many were revealed this group; zero placeholders for the rest) -- matching
@@ -1684,19 +1697,9 @@ class EncDecLevel(eqx.Module):
         # Vectorized (reshape-based, like decode_logits_and_target) -- a Python per-group loop building
         # n_groups*3+ tiny concatenated slices compiles/runs far too slowly at real scale (measured: 32s/step,
         # dominated by XLA fusing hundreds of small ops -- see 2026-09-22 smoke12 audit).
+        extra_slots = sum(extra_slots_parts)
         per_group_len = extra_slots + G + 1 + G * self.K
-        if has_extra:
-            reveal = np.asarray(extra_reveal)
-            cum = np.cumsum(reveal)
-            prev_cum = cum - reveal  # extras already revealed before this group
-            slot_j = np.arange(extra_slots)
-            idx = prev_cum[:, None] + slot_j[None, :]  # (n_groups, extra_slots)
-            valid = slot_j[None, :] < reveal[:, None]
-            idx_clipped = np.clip(idx, 0, extra_n_blocks - 1)
-            extra_g = extra_tok[:, idx_clipped, :]  # (B, n_groups, extra_slots, D), static gather
-            extra_g = jnp.where(jnp.asarray(valid)[None, :, :, None], extra_g, jnp.zeros_like(extra_g))
-        else:
-            extra_g = jnp.zeros((B, n_groups, 0, D), dtype=ctx_tok.dtype)
+        extra_g = jnp.concatenate(extra_g_parts, axis=2) if extra_g_parts else jnp.zeros((B, n_groups, 0, D), dtype=ctx_tok.dtype)
         own_g = ctx_tok.reshape(B, n_groups, G, D)
         bos_g = jnp.broadcast_to(bos[:, None, :, :], (B, n_groups, 1, D))
         te_g = te.reshape(B, n_groups, G * self.K, D)
@@ -2014,16 +2017,16 @@ class EncDecLevel(eqx.Module):
     def decode_generate_interleave(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
                                     temperature: float = 1.0, seed: int = 0,
                                     extra_ctx_idx: list = None, chunk_groups: int = 1) -> jnp.ndarray:
-        # Hardcoded interleave, cond_depth<=2 only: generation counterpart of decode_logits_and_target_interleave.
-        # ONE real, single, always-growing KV cache, plain blk.step/chunk_step (same simple incremental primitives
-        # as decode_generate -- no masking, no pardec machinery). Own codes and (at most one) coarser level's
-        # codes prefilled into it in strict causal order; every own-group reserves extra_slots=ceil(G/up_stride)
-        # extra-code slots (real embeddings, filled low-to-high in reveal order, for however many are revealed
-        # this group; zero placeholders for the rest) -- a FIXED per-group width, matching
-        # decode_logits_and_target_interleave's layout exactly so train/generate agree on every absolute (rope)
-        # position. No up_stride>=G restriction (removed 2026-09-22): extra_slots grows with G instead. lax.scan
-        # over groups (compiled once; a Python-unrolled loop here doesn't compile in reasonable time at real
-        # n_groups, confirmed 2026-09-22).
+        # Hardcoded interleave: generation counterpart of decode_logits_and_target_interleave. ONE real, single,
+        # always-growing KV cache, plain blk.step/chunk_step (same simple incremental primitives as
+        # decode_generate -- no masking, no pardec machinery). Own codes and any number of coarser levels'
+        # codes (cond_depth-1 of them, no restriction since 2026-09-23) prefilled into it in strict causal
+        # order; every own-group reserves extra_slots=sum(ceil(G/up_stride_k)) extra-code slots across all
+        # coarser levels (real embeddings, filled low-to-high in reveal order per level, coarsest first; zero
+        # placeholders for the rest) -- a FIXED per-group width, matching decode_logits_and_target_interleave's
+        # layout exactly so train/generate agree on every absolute (rope) position. No up_stride>=G restriction
+        # (removed 2026-09-22): extra_slots grows with G instead. lax.scan over groups (compiled once; a
+        # Python-unrolled loop here doesn't compile in reasonable time at real n_groups, confirmed 2026-09-22).
         # chunk_groups: how many own-groups are unrolled per lax.scan carry-step (default 1 = today's exact
         # behavior). Purely a scan-arity knob -- same ops, same real growing cache, same causal order, just
         # fewer/larger scan trips (fewer XLA scan-carry round-trips); zero effect on the values produced.
@@ -2041,23 +2044,33 @@ class EncDecLevel(eqx.Module):
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
         ctx_g = jnp.swapaxes(ctx_tok.reshape(B, n_groups, G, D), 0, 1)  # (n_groups, B, G, D)
 
-        has_extra = extra_ctx_idx is not None and len(extra_ctx_idx) > 0 and extra_ctx_idx[0] is not None
-        extra_slots = 0
-        if has_extra:
-            assert len(extra_ctx_idx) == 1, "decode_generate_interleave only supports cond_depth<=2"
-            embed_t, proj_t, up_stride, extra_n_blocks = self._extra_ctx_table(0)
-            extra_slots = -(-G // up_stride)  # ceil(G/up_stride): max new extra codes revealable within one own-group's span
-            extra_tok_real = code_embed_proj(extra_ctx_idx[0], embed_t, proj_t)  # (B, extra_n_blocks, D)
+        # Multiple coarser levels supported (see decode_logits_and_target_interleave -- same generalization,
+        # removed cond_depth<=2 restriction 2026-09-23). extra_ctx_idx entries ordered nearest coarser first;
+        # concatenated coarsest-first to match training's row order.
+        n_cond = len(extra_ctx_idx) if extra_ctx_idx else 0
+        extra_parts, extra_slots_parts = [], []
+        for k in range(n_cond):
+            if extra_ctx_idx[k] is None:
+                continue
+            embed_t, proj_t, up_stride, extra_n_blocks = self._extra_ctx_table(k)
+            extra_slots_k = -(-G // up_stride)  # ceil(G/up_stride): max new extra codes revealable within one own-group's span
+            extra_tok_real = code_embed_proj(extra_ctx_idx[k], embed_t, proj_t)  # (B, extra_n_blocks, D)
             reveal = np.asarray(self._interleave_reveal_schedule(n_groups, G, up_stride, extra_n_blocks))  # (n_groups,)
             cum = np.cumsum(reveal)
             prev_cum = cum - reveal
-            slot_j = np.arange(extra_slots)
-            idx = prev_cum[:, None] + slot_j[None, :]  # (n_groups, extra_slots)
+            slot_j = np.arange(extra_slots_k)
+            idx = prev_cum[:, None] + slot_j[None, :]  # (n_groups, extra_slots_k)
             valid = slot_j[None, :] < reveal[:, None]
             idx_clipped = np.clip(idx, 0, extra_n_blocks - 1)
-            real_slot_g = jnp.swapaxes(extra_tok_real[:, idx_clipped, :], 0, 1)  # (n_groups,B,extra_slots,D)
-            valid_g = jnp.asarray(valid)[:, None, :, None]  # (n_groups,1,extra_slots,1)
-            extra_slot_g = jnp.where(valid_g, real_slot_g, jnp.zeros_like(real_slot_g))  # zero when not revealed
+            real_slot_g = jnp.swapaxes(extra_tok_real[:, idx_clipped, :], 0, 1)  # (n_groups,B,extra_slots_k,D)
+            valid_g = jnp.asarray(valid)[:, None, :, None]  # (n_groups,1,extra_slots_k,1)
+            extra_parts.append(jnp.where(valid_g, real_slot_g, jnp.zeros_like(real_slot_g)))
+            extra_slots_parts.append(extra_slots_k)
+        extra_parts.reverse()  # nearest-first input -> coarsest-first row order
+        has_extra = len(extra_parts) > 0
+        extra_slots = sum(extra_slots_parts)
+        if has_extra:
+            extra_slot_g = jnp.concatenate(extra_parts, axis=2)
             per_group_len = extra_slots + G + 1 + G * self.K  # extra slots + own codes + BOS + target
         else:
             extra_slot_g = jnp.zeros((n_groups, B, 0, D))
