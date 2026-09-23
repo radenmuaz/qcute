@@ -21,7 +21,7 @@ from image_lagcodec.run_lagcodec import (
     Config, HierEncDec, EncDecLevel, load_cifar10, images_to_positions, pixel_order_for, code_embed_proj,
     run_block_pardec, pardec_block_step, pardec_block_chunk_step, causal_extra_ctx_windows,
     _draft_past_valid_mask, extra_ctx_visible_counts, encoder_free_run, encoder_hidden, encoder_ntp_logits,
-    generate_from_prompt, decode_logits_and_target_multipass,
+    generate_from_prompt, decode_logits_and_target_multipass, decode_generate_multipass,
 )
 import image_lagcodec.eqx_common as eqx_common
 
@@ -52,15 +52,45 @@ B = 4
 G = 4
 
 
-def build_cfg(ncodes_window, streaming=True):
+def build_cfg(ncodes_window, stream_chunks=0):
     return Config(
         d_model=(64, 64, 64, 64), n_layers=(2, 2, 2, 2), n_heads=(2, 2, 2, 2),
         strides=(4, 4, 4, -1), code_vocab=(16, 16, 16, 16), pq_chunks=(4, 4, 4, 4),
         pq_dim=(32, 16, 16, 16), byte_group=3, token_head_type="linears", mtp_horizon=1,
         decoder_ncodes=(G, G, G, G), ncodes_window=(ncodes_window, 0, 0, 0),
-        streaming=(streaming, True, True, True),
+        stream_chunks=(stream_chunks, 0, 0, 0),
         weight_sharing=True, curriculum_mode="no_freeze",
     )
+
+
+def ctx_rows(level, ctx_idx, Gc, extras=None, rng=None):
+    """the production row builder (single source of truth for training and generation)."""
+    ctx_tok = code_embed_proj(ctx_idx, level.ctx_embed, level.ctx_proj)
+    n_blocks = ctx_idx.shape[1]
+    n_groups = -(-n_blocks // Gc)
+    return (*level._pardec_ctx_rows(ctx_tok, extras, Gc, n_groups, n_blocks, rng), n_groups)
+
+
+def build_cache_fns(level, blocks, ln_f, key_valid, per_group_len):
+    def self_step(x_new, ck, cv, pos, rope_pos_row):
+        new_ck, new_cv = [], []
+        x = x_new
+        for i, blk in enumerate(blocks):
+            x, ck_i, cv_i = pardec_block_step(blk, x, ck[i], cv[i], pos, rope_pos_row, key_valid, per_group_len)
+            new_ck.append(ck_i)
+            new_cv.append(cv_i)
+        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+
+    def self_chunk_step(x_chunk, ck, cv, pos_start, rope_pos_ids_chunk):
+        new_ck, new_cv = [], []
+        x = x_chunk
+        for i, blk in enumerate(blocks):
+            x, ck_i, cv_i = pardec_block_chunk_step(blk, x, ck[i], cv[i], pos_start, rope_pos_ids_chunk,
+                                                      key_valid, per_group_len)
+            new_ck.append(ck_i)
+            new_cv.append(cv_i)
+        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+    return self_step, self_chunk_step
 
 
 def dense_h_t(level, target_seq, ctx_idx, decoder_ncodes):
@@ -68,41 +98,19 @@ def dense_h_t(level, target_seq, ctx_idx, decoder_ncodes):
     Bc = target_seq.shape[0]
     D = level.bos_embed.shape[-1]
     Gc = decoder_ncodes
+    ctx_flat, rope_ctx_g, valid_ctx, Wg, _, n_groups = ctx_rows(level, ctx_idx, Gc)
     n_blocks = ctx_idx.shape[1]
-    pad_blocks = (-n_blocks) % Gc
-    n_blocks_p = n_blocks + pad_blocks
-    n_groups = n_blocks_p // Gc
-    fullctx = (not level.streaming) and (level.ncodes_window == -1)
     N = level.ncodes_window if level.ncodes_window >= 0 else (n_groups - 1)
-    Wg = n_blocks_p if fullctx else (N + 1) * Gc
     per_group_len = Wg + 1 + Gc * level.K
-
-    ctx_tok = code_embed_proj(ctx_idx, level.ctx_embed, level.ctx_proj)
-    target_p = target_seq
-    if pad_blocks > 0:
-        ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
-        target_p = jnp.pad(target_p, ((0, 0), (0, pad_blocks * level.K), (0, 0)))
-    if not fullctx and N > 0:
-        ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * Gc, 0), (0, 0)))
-
+    target_p = jnp.pad(target_seq, ((0, 0), (0, (n_groups * Gc - n_blocks) * level.K), (0, 0)))
     B2 = Bc * n_groups
-    if fullctx:
-        ctx_flat = jnp.broadcast_to(ctx_tok[:, None, :, :], (Bc, n_groups, Wg, D)).reshape(B2, Wg, D)
-        min_valid_pos = jnp.zeros((B2,), dtype=jnp.int32)
-        rope_ctx_g = jnp.broadcast_to(jnp.arange(Wg)[None, :], (n_groups, Wg))
-    else:
-        ctx_windows = jnp.stack([ctx_tok[:, g * Gc:g * Gc + Wg, :] for g in range(n_groups)], axis=1)
-        ctx_flat = ctx_windows.reshape(B2, Wg, D)
-        fake_counts = jnp.array([max(0, N - g) * Gc for g in range(n_groups)])
-        min_valid_pos = jnp.broadcast_to(fake_counts[None, :], (Bc, n_groups)).reshape(B2)
-        rope_ctx_g = jnp.stack([jnp.clip(jnp.arange(Wg) - N * Gc + g * Gc, 0, None) for g in range(n_groups)], axis=0)
-
     target_windows = jnp.stack(
         [target_p[:, g * Gc * level.K:(g + 1) * Gc * level.K] for g in range(n_groups)], axis=1)
     target_flat = target_windows.reshape(B2, Gc * level.K, *target_seq.shape[2:])
     te_flat = level._dec_embed_target(target_flat)
     bos = jnp.broadcast_to(level.bos_embed, (B2, 1, D))
     xe = jnp.concatenate([ctx_flat, bos, te_flat], axis=1)
+    key_valid = jnp.concatenate([valid_ctx, jnp.ones((B2, 1 + Gc * level.K), dtype=bool)], axis=1)
 
     rope_bos = jnp.array([(g + 1) * Gc for g in range(n_groups)])[:, None]
     rope_target = jnp.stack([(g + 1) * Gc + 1 + jnp.arange(Gc * level.K) for g in range(n_groups)], axis=0)
@@ -111,7 +119,7 @@ def dense_h_t(level, target_seq, ctx_idx, decoder_ncodes):
 
     x = xe
     for blk in blocks:
-        x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, level.remat)
+        x = run_block_pardec(blk, x, rope_pos_ids, key_valid, level.remat)
     h = ln_f(x)
     pred_pos = Wg + jnp.arange(Gc * level.K)
     h_t = h[:, pred_pos, :]
@@ -124,31 +132,11 @@ def incremental_kv_h_t(level, target_seq, ctx_idx, decoder_ncodes):
     D = level.bos_embed.shape[-1]
     hd = D // level.n_heads
     Gc = decoder_ncodes
-    pad_blocks = (-n_blocks) % Gc
-    n_blocks_p = n_blocks + pad_blocks
-    n_groups = n_blocks_p // Gc
-    fullctx = (not level.streaming) and (level.ncodes_window == -1)
-    N = level.ncodes_window if level.ncodes_window >= 0 else (n_groups - 1)
-    Wg = n_blocks_p if fullctx else (N + 1) * Gc
-    per_group_len = Wg + 1 + Gc * level.K
-
-    ctx_tok = code_embed_proj(ctx_idx, level.ctx_embed, level.ctx_proj)
-    if pad_blocks > 0:
-        ctx_tok = jnp.pad(ctx_tok, ((0, 0), (0, pad_blocks), (0, 0)))
-    if not fullctx and N > 0:
-        ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * Gc, 0), (0, 0)))
+    ctx_flat, rope_ctx_g, valid_ctx, Wg, _, n_groups = ctx_rows(level, ctx_idx, Gc)
     B2 = Bc * n_groups
-    if fullctx:
-        ctx_flat = jnp.broadcast_to(ctx_tok[:, None, :, :], (Bc, n_groups, Wg, D)).reshape(B2, Wg, D)
-        min_valid_pos = jnp.zeros((B2,), dtype=jnp.int32)
-        rope_ctx_flat = jnp.broadcast_to(jnp.arange(Wg)[None, :], (B2, Wg))
-    else:
-        ctx_windows = jnp.stack([ctx_tok[:, g * Gc:g * Gc + Wg, :] for g in range(n_groups)], axis=1)
-        ctx_flat = ctx_windows.reshape(B2, Wg, D)
-        fake_counts = jnp.array([max(0, N - g) * Gc for g in range(n_groups)])
-        min_valid_pos = jnp.broadcast_to(fake_counts[None, :], (Bc, n_groups)).reshape(B2)
-        rope_ctx = jnp.stack([jnp.clip(jnp.arange(Wg) - N * Gc + g * Gc, 0, None) for g in range(n_groups)], axis=0)
-        rope_ctx_flat = jnp.broadcast_to(rope_ctx[None], (Bc, n_groups, Wg)).reshape(B2, Wg)
+    per_group_len = Wg + 1 + Gc * level.K
+    key_valid = jnp.concatenate([valid_ctx, jnp.ones((B2, 1 + Gc * level.K), dtype=bool)], axis=1)
+    rope_ctx_flat = jnp.broadcast_to(rope_ctx_g[None], (Bc, n_groups, Wg)).reshape(B2, Wg)
     rope_bos = jnp.array([(g + 1) * Gc for g in range(n_groups)])
     rope_bos_flat = jnp.broadcast_to(rope_bos[None, :], (Bc, n_groups)).reshape(B2)
 
@@ -162,25 +150,7 @@ def incremental_kv_h_t(level, target_seq, ctx_idx, decoder_ncodes):
     target_windows = jnp.stack(
         [target_p[:, g * Gc * level.K:(g + 1) * Gc * level.K] for g in range(n_groups)], axis=1)
     target_flat = target_windows.reshape(B2, Gc * level.K, *target_seq.shape[2:])
-
-    def self_step(x_new, ck, cv, pos, rope_pos_row):
-        new_ck, new_cv = [], []
-        x = x_new
-        for i, blk in enumerate(blocks):
-            x, ck_i, cv_i = pardec_block_step(blk, x, ck[i], cv[i], pos, rope_pos_row, min_valid_pos, per_group_len)
-            new_ck.append(ck_i)
-            new_cv.append(cv_i)
-        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
-
-    def self_chunk_step(x_chunk, ck, cv, pos_start, rope_pos_ids_chunk):
-        new_ck, new_cv = [], []
-        x = x_chunk
-        for i, blk in enumerate(blocks):
-            x, ck_i, cv_i = pardec_block_chunk_step(blk, x, ck[i], cv[i], pos_start, rope_pos_ids_chunk,
-                                                      min_valid_pos, per_group_len)
-            new_ck.append(ck_i)
-            new_cv.append(cv_i)
-        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+    self_step, self_chunk_step = build_cache_fns(level, blocks, ln_f, key_valid, per_group_len)
 
     cache_k = jnp.zeros((len(blocks), B2, level.n_kv_heads, per_group_len, hd))
     cache_v = jnp.zeros_like(cache_k)
@@ -202,8 +172,8 @@ def incremental_kv_h_t(level, target_seq, ctx_idx, decoder_ncodes):
     return h_t.reshape(Bc, n_groups, Gc * level.K, D)
 
 
-def run_one(ncodes_window, streaming=True):
-    cfg = build_cfg(ncodes_window, streaming=streaming)
+def run_one(ncodes_window, stream_chunks=0):
+    cfg = build_cfg(ncodes_window, stream_chunks=stream_chunks)
     key = jax.random.PRNGKey(0)
     model = HierEncDec(key, cfg)
     level = model.levels[0]
@@ -224,7 +194,7 @@ def run_one(ncodes_window, streaming=True):
     tol = 1e-3
     n_nan_dense = int(jnp.isnan(h_dense).sum())
     n_nan_kv = int(jnp.isnan(h_kv).sum())
-    print(f"ncodes_window={ncodes_window} streaming={streaming} (effective N={N}) G={G} Wg={Wg} "
+    print(f"ncodes_window={ncodes_window} stream_chunks={stream_chunks} (effective N={N}) G={G} Wg={Wg} "
           f"n_groups={n_groups} per_group_len={per_group_len}")
     print(f"  NaN check: h_dense={n_nan_dense} h_kv={n_nan_kv}")
     print(f"  dense-vs-kv-cache: max_abs_diff={float(diff.max()):.6f} mean_abs_diff={float(diff.mean()):.6f}")
@@ -242,7 +212,7 @@ def build_cfg_widened(decode_past, decode_future, cycle_refine_passes=1):
         d_model=(32, 32), n_layers=(1, 1), n_heads=(2, 2), n_kv_heads=(None, None),
         strides=(4, 4), code_vocab=(16, 16), pq_chunks=(1, 1), pq_dim=(16, 16),
         byte_group=3, token_head_type="linears", decoder_ncodes=(G, G), ncodes_window=(16, 16),
-        streaming=(True, True), weight_sharing=True, curriculum_mode="no_freeze",
+        weight_sharing=True, curriculum_mode="no_freeze",
         decode_past=(decode_past, decode_past), decode_future=(decode_future, decode_future),
         cycle_refine_passes=cycle_refine_passes,
     )
@@ -301,16 +271,8 @@ def run_widened_aux(decode_past, decode_future):
     # -- independent incremental KV-cache reconstruction, teacher-forced with real values --
     blocks, ln_f = level._dec_blocks(), level._dec_ln_f()
     hd = D // level.n_heads
-    N = level.ncodes_window
-    Wg = (N + 1) * G
-    ctx_tok = code_embed_proj(ctx_idx, level.ctx_embed, level.ctx_proj)
-    ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * G, 0), (0, 0)))
+    ctx_flat, rope_ctx, valid_ctx, Wg, _, n_groups = ctx_rows(level, ctx_idx, G)
     B2 = B * n_groups
-    ctx_windows = jnp.stack([ctx_tok[:, g * G:g * G + Wg, :] for g in range(n_groups)], axis=1)
-    ctx_flat = ctx_windows.reshape(B2, Wg, D)
-    fake_counts = jnp.array([max(0, N - g) * G for g in range(n_groups)])
-    min_valid_pos = jnp.broadcast_to(fake_counts[None, :], (B, n_groups)).reshape(B2)
-    rope_ctx = jnp.stack([jnp.clip(jnp.arange(Wg) - N * G + g * G, 0, None) for g in range(n_groups)], axis=0)
     rope_ctx_flat = jnp.broadcast_to(rope_ctx[None], (B, n_groups, Wg)).reshape(B2, Wg)
     rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])
     rope_bos_flat = jnp.broadcast_to(rope_bos[None, :], (B, n_groups)).reshape(B2)
@@ -321,36 +283,20 @@ def run_widened_aux(decode_past, decode_future):
     widened_windows = jnp.stack(
         [ext_p[:, g * Kspan:g * Kspan + Pp + Kspan + Pf] for g in range(n_groups)], axis=1)
     widened_flat = widened_windows.reshape(B2, Pp + Kspan + Pf, *target_p.shape[2:])
-    # positions before the sequence's real start get the trainable draft_pad, not embed(index 0) --
-    # matches decode_logits_and_target_pardec's own draft_te substitution exactly (draft_pad fix).
+    # draft positions before the sequence's real start are masked as keys (key_valid), same as training
     if Pp > 0:
         pp_valid_np = _draft_past_valid_mask(n_groups, Pp, Kspan, n_blocks * level.K)
         pp_valid_flat = jnp.broadcast_to(jnp.asarray(pp_valid_np)[None], (B, n_groups, Pp)).reshape(B2, Pp)
+    else:
+        pp_valid_flat = jnp.ones((B2, 0), dtype=bool)
+    key_valid = jnp.concatenate([valid_ctx, jnp.ones((B2, 1), dtype=bool), pp_valid_flat,
+                                  jnp.ones((B2, Kspan + Pf), dtype=bool)], axis=1)
 
     def embed_widened(t):
         te = level._dec_embed_target(widened_flat[:, t])
-        if Pp > 0 and t < Pp:
-            te = jnp.where(pp_valid_flat[:, t][:, None], te, level.draft_pad)
-        return te
+        return jnp.where(pp_valid_flat[:, t][:, None], te, 0.0) if (Pp > 0 and t < Pp) else te
 
-    def self_step(x_new, ck, cv, pos, rope_pos_row):
-        new_ck, new_cv = [], []
-        x = x_new
-        for i, blk in enumerate(blocks):
-            x, ck_i, cv_i = pardec_block_step(blk, x, ck[i], cv[i], pos, rope_pos_row, min_valid_pos, per_group_len)
-            new_ck.append(ck_i)
-            new_cv.append(cv_i)
-        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
-
-    def self_chunk_step(x_chunk, ck, cv, pos_start, rope_pos_ids_chunk):
-        new_ck, new_cv = [], []
-        x = x_chunk
-        for i, blk in enumerate(blocks):
-            x, ck_i, cv_i = pardec_block_chunk_step(blk, x, ck[i], cv[i], pos_start, rope_pos_ids_chunk,
-                                                      min_valid_pos, per_group_len)
-            new_ck.append(ck_i)
-            new_cv.append(cv_i)
-        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+    self_step, self_chunk_step = build_cache_fns(level, blocks, ln_f, key_valid, per_group_len)
 
     cache_k = jnp.zeros((len(blocks), B2, level.n_kv_heads, per_group_len, hd))
     cache_v = jnp.zeros_like(cache_k)
@@ -419,52 +365,14 @@ def run_cyclic_revision_extra_ctx():
     n_blocks = code0_idx.shape[1]
     D = level.bos_embed.shape[-1]
     hd = D // level.n_heads
-    N = level.ncodes_window
-    n_groups = n_blocks // G
-    Wg = (N + 1) * G
-    ctx_tok = code_embed_proj(code0_idx, level.ctx_embed, level.ctx_proj)
-    ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * G, 0), (0, 0)))
+    ctx_tok_flat, rope_ctx, valid_ctx, Wg, extra_len_total, n_groups = ctx_rows(level, code0_idx, G, extra_ctx_list)
     B2 = B * n_groups
-    ctx_windows = jnp.stack([ctx_tok[:, g * G:g * G + Wg, :] for g in range(n_groups)], axis=1)
-    ctx_tok_flat = ctx_windows.reshape(B2, Wg, D)
-    fake_counts = jnp.array([max(0, N - g) * G for g in range(n_groups)])
-    min_valid_pos = jnp.broadcast_to(fake_counts[None, :], (B, n_groups)).reshape(B2)
-    rope_ctx = jnp.stack([jnp.clip(jnp.arange(Wg) - N * G + g * G, 0, None) for g in range(n_groups)], axis=0)
-    rope_ctx_flat = jnp.broadcast_to(rope_ctx[None], (B, n_groups, Wg)).reshape(B2, Wg)
-
-    extra_len_total = 0
-    extra_flats, extra_ropes = [], []
-    for k, extra_val in enumerate(extra_ctx_list):
-        embed_t, proj_t, pad_t, up_stride, _ = level._extra_ctx_table(k)
-        w, r, Wg_j = causal_extra_ctx_windows(extra_val, embed_t, proj_t, pad_t, up_stride, G, n_groups, B, D)
-        extra_flats.append(w)
-        extra_ropes.append(jnp.broadcast_to(r[None], (B, n_groups, Wg_j)).reshape(B2, Wg_j))
-        extra_len_total += Wg_j
-    ctx_tok_flat = jnp.concatenate([ctx_tok_flat] + extra_flats, axis=1)
-    rope_ctx_flat = jnp.concatenate([rope_ctx_flat] + extra_ropes, axis=1)
-
+    rope_ctx_flat = jnp.broadcast_to(rope_ctx[None], (B, n_groups, rope_ctx.shape[1])).reshape(B2, -1)
     rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])
     rope_bos_flat = jnp.broadcast_to(rope_bos[None, :], (B, n_groups)).reshape(B2)
     per_group_len = Wg + extra_len_total + 1 + G * level.K
-
-    def self_step(x_new, ck, cv, pos, rope_pos_row):
-        new_ck, new_cv = [], []
-        x = x_new
-        for i, blk in enumerate(blocks):
-            x, ck_i, cv_i = pardec_block_step(blk, x, ck[i], cv[i], pos, rope_pos_row, min_valid_pos, per_group_len)
-            new_ck.append(ck_i)
-            new_cv.append(cv_i)
-        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
-
-    def self_chunk_step(x_chunk, ck, cv, pos_start, rope_pos_ids_chunk):
-        new_ck, new_cv = [], []
-        x = x_chunk
-        for i, blk in enumerate(blocks):
-            x, ck_i, cv_i = pardec_block_chunk_step(blk, x, ck[i], cv[i], pos_start, rope_pos_ids_chunk,
-                                                      min_valid_pos, per_group_len)
-            new_ck.append(ck_i)
-            new_cv.append(cv_i)
-        return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+    key_valid = jnp.concatenate([valid_ctx, jnp.ones((B2, 1 + G * level.K), dtype=bool)], axis=1)
+    self_step, self_chunk_step = build_cache_fns(level, blocks, ln_f, key_valid, per_group_len)
 
     cache_k = jnp.zeros((len(blocks), B2, level.n_kv_heads, per_group_len, hd))
     cache_v = jnp.zeros_like(cache_k)
@@ -538,9 +446,8 @@ def run_gen_decode_future_self_consistency():
 
 
 def run_draft_pad_generation():
-    """draft_pad substitution in decode_generate_pardec's draft-prefix steps: generation must be fully
-    independent of own_input_embed[0] for a group whose draft window is entirely out-of-bounds (matches
-    the training-side draft_pad guarantee)."""
+    """out-of-bounds draft slots are masked as keys in decode_generate_pardec: generation must be fully
+    independent of own_input_embed[0] for a group whose draft window is entirely out-of-bounds."""
     cfg = build_cfg_widened(16, 0)
     key = jax.random.PRNGKey(0)
     model = HierEncDec(key, cfg)
@@ -581,18 +488,18 @@ def run_draft_pad_generation():
     # legitimately (and separately from draft_pad) pick up the perturbation too -- that's expected,
     # not a draft_pad bug. The first byte depends only on ctx+bos+draft, before any such feedback.
     group0_unaffected = bool(jnp.array_equal(out0[:, 0], out1[:, 0]))
-    print(f"DRAFT_PAD generation: group0's first byte (fully out-of-bounds draft) unaffected by "
+    print(f"DRAFT mask generation: group0's first byte (fully out-of-bounds draft) unaffected by "
           f"embed(0) perturbation: {group0_unaffected}")
     print(f"  {'CONSISTENT' if group0_unaffected else 'DIVERGES'}")
     return group0_unaffected
 
 
-def _cond_cfg(G_, cond_window=-1, fullctx=False):
+def _cond_cfg(G_, cond_window=-1, fullctx=False, stream_chunks=0):
     return Config(
         d_model=(32, 32), n_layers=(1, 1), n_heads=(2, 2), n_kv_heads=(None, None),
         strides=(4, 4), code_vocab=(16, 16), pq_chunks=(1, 1), pq_dim=(16, 16), byte_group=3,
         token_head_type="linears", decoder_ncodes=(G_, G_),
-        ncodes_window=(-1, -1) if fullctx else (2, 2), streaming=(not fullctx, not fullctx),
+        ncodes_window=(-1, -1) if fullctx else (2, 2), stream_chunks=(1, 1) if fullctx else (stream_chunks, stream_chunks),
         weight_sharing=True, curriculum_mode="no_freeze", cond_depth=(2, 1), cond_window=(cond_window, -1))
 
 
@@ -608,19 +515,20 @@ def run_cond_visibility_rule():
     D, V, C, Bc = 8, 16, 1, 2
     emb = jax.random.normal(key, (V, D))
     proj = jnp.eye(C * D)[:, :D] if C * D >= D else None
-    pad = jnp.full((D,), 7.0)
     n, G_, S = 8, 1, 4
     M = (n * G_) // S
     codes = jnp.broadcast_to(jnp.arange(M)[None, :, None], (Bc, M, C)) + 3
     for window in (-1, 1, 2):
-        w, r, Wg = causal_extra_ctx_windows(codes, emb, proj, pad, S, G_, n, Bc, D, window)
+        w, r, valid, Wg = causal_extra_ctx_windows(codes, emb, proj, S, G_, n, Bc, D, window)
         w = w.reshape(Bc, n, Wg, D)
         counts = extra_ctx_visible_counts(n, G_, S)
         want_w = -1 if window < 0 else min(window, counts[-1])
         good = Wg == (counts[-1] if window < 0 else want_w)
         for g in range(n):
             vis = [emb[3 + j] for j in range(counts[g])][-Wg:] if Wg else []
-            expect = [pad] * (Wg - len(vis)) + vis
+            expect = [jnp.zeros((D,))] * (Wg - len(vis)) + vis
+            want_valid = [False] * (Wg - len(vis)) + [True] * len(vis)
+            good &= list(valid[g]) == want_valid
             for t in range(Wg):
                 good &= bool(jnp.allclose(w[0, g, t], expect[t], atol=1e-6))
         print(f"COND window contents (G=1,S=4, cond_window={window}, width={Wg}): {'OK' if good else 'WRONG'}")
@@ -676,41 +584,15 @@ def run_cond_complete(G_, cond_window=-1, B_=2):
     n_blocks = code0_idx.shape[1]
     D = level.bos_embed.shape[-1]
     hd = D // level.n_heads
-    N = level.ncodes_window
-    n_groups = n_blocks // G_
-    Wg = (N + 1) * G_
-    ctx_tok = jnp.pad(code_embed_proj(code0_idx, level.ctx_embed, level.ctx_proj), ((0, 0), (N * G_, 0), (0, 0)))
+    ctx_flat, rope_ctx, valid_ctx, Wg, Wg_j, n_groups = ctx_rows(level, code0_idx, G_, [code1_idx])
     B2 = B_ * n_groups
-    ctx_flat = jnp.stack([ctx_tok[:, g * G_:g * G_ + Wg, :] for g in range(n_groups)], axis=1).reshape(B2, Wg, D)
-    fake = jnp.array([max(0, N - g) * G_ for g in range(n_groups)])
-    min_valid_pos = jnp.broadcast_to(fake[None, :], (B_, n_groups)).reshape(B2)
-    rope_ctx = jnp.stack([jnp.clip(jnp.arange(Wg) - N * G_ + g * G_, 0, None) for g in range(n_groups)], axis=0)
-    rope_ctx_flat = jnp.broadcast_to(rope_ctx[None], (B_, n_groups, Wg)).reshape(B2, Wg)
-    embed_t, proj_t, pad_t, up_stride, _ = level._extra_ctx_table(0)
-    w, r, Wg_j = causal_extra_ctx_windows(code1_idx, embed_t, proj_t, pad_t, up_stride, G_, n_groups, B_, D,
-                                          level.cond_window)
-    ctx_flat = jnp.concatenate([ctx_flat, w], axis=1)
-    rope_ctx_flat = jnp.concatenate([rope_ctx_flat, jnp.broadcast_to(r[None], (B_, n_groups, Wg_j)).reshape(B2, Wg_j)], 1)
+    rope_ctx_flat = jnp.broadcast_to(rope_ctx[None], (B_, n_groups, rope_ctx.shape[1])).reshape(B2, -1)
     rope_bos = jnp.array([(g + 1) * G_ for g in range(n_groups)])
     rope_bos_flat = jnp.broadcast_to(rope_bos[None, :], (B_, n_groups)).reshape(B2)
     Kspan = G_ * level.K
     per_group_len = Wg + Wg_j + 1 + Kspan
-
-    def self_step(x_new, ck, cv, pos, rp):
-        nk, nv, x = [], [], x_new
-        for i, blk in enumerate(blocks):
-            x, a, b = pardec_block_step(blk, x, ck[i], cv[i], pos, rp, min_valid_pos, per_group_len)
-            nk.append(a)
-            nv.append(b)
-        return ln_f(x), jnp.stack(nk), jnp.stack(nv)
-
-    def self_chunk_step(xc, ck, cv, pos0, rpi):
-        nk, nv, x = [], [], xc
-        for i, blk in enumerate(blocks):
-            x, a, b = pardec_block_chunk_step(blk, x, ck[i], cv[i], pos0, rpi, min_valid_pos, per_group_len)
-            nk.append(a)
-            nv.append(b)
-        return ln_f(x), jnp.stack(nk), jnp.stack(nv)
+    key_valid = jnp.concatenate([valid_ctx, jnp.ones((B2, 1 + Kspan), dtype=bool)], axis=1)
+    self_step, self_chunk_step = build_cache_fns(level, blocks, ln_f, key_valid, per_group_len)
 
     cache_k = jnp.zeros((len(blocks), B2, level.n_kv_heads, per_group_len, hd))
     cache_v = jnp.zeros_like(cache_k)
@@ -779,7 +661,7 @@ def _fr_cfg():
     return Config(
         d_model=(32, 32), n_layers=(1, 1), n_heads=(2, 2), n_kv_heads=(None, None), strides=(4, 4),
         code_vocab=(16, 16), pq_chunks=(2, 2), pq_dim=(16, 16), byte_group=3, token_head_type="linears",
-        decoder_ncodes=(4, 4), ncodes_window=(2, 2), streaming=(True, True), weight_sharing=True,
+        decoder_ncodes=(4, 4), ncodes_window=(2, 2), weight_sharing=True,
         curriculum_mode="no_freeze")
 
 
@@ -907,22 +789,245 @@ def run_remat_level():
     return ok
 
 
+def run_refine_drop():
+    """refine early exit: refine_active=[T,T] == 3 passes, [T,F] == 2 passes, [F,F] == 1 pass (also under jit,
+    with finite grads through the cond)."""
+    def mk(passes):
+        return dataclasses.replace(build_cfg(2), level_refine_passes=(passes, 1, 1, 1), level_refine_window=(1, 0, 0, 0))
+    m3 = HierEncDec(jax.random.PRNGKey(0), mk(3))
+    imgs = np.random.default_rng(0).integers(0, 256, (B, 32, 32, 3)).astype(np.uint8)
+    flat = jnp.array(images_to_positions(imgs, mk(3), pixel_order_for(mk(3))))
+    lv = m3.levels[0]
+    ctx = lv.encode(code_embed_proj(flat, lv.own_input_embed, lv.own_input_proj), flat, rng=None)["code_soft"]
+
+    def run(model, active):
+        return decode_logits_and_target_multipass(model.levels[0], flat, ctx, G, rng=None, multipass_detach=True,
+                                                  refine_active=active)[0]
+    def with_passes(n):   # same init key -> same weights, fewer configured (static) passes
+        return HierEncDec(jax.random.PRNGKey(0), mk(n))
+    l3, l2, l1 = (run(with_passes(n), None) for n in (3, 2, 1))
+    act = lambda a: jnp.array(a)
+    jr = jax.jit(lambda mm, a: run(mm, a))
+    d_tt = float(jnp.abs(jr(m3, act([True, True])) - l3).max())
+    d_tf = float(jnp.abs(jr(m3, act([True, False])) - l2).max())
+    d_ff = float(jnp.abs(jr(m3, act([False, False])) - l1).max())
+    g = jax.grad(lambda mm: jnp.mean(jr(mm, act([True, False])) ** 2))(eqx.filter(m3, eqx.is_inexact_array))
+    fin = all(bool(jnp.isfinite(x).all()) for x in jax.tree_util.tree_leaves(g))
+    ok = d_tt < 1e-5 and d_tf < 1e-5 and d_ff < 1e-5 and fin
+    print(f"REFINE drop: [T,T]==3 passes diff={d_tt:.1e}  [T,F]==2 passes diff={d_tf:.1e}  [F,F]==1 pass diff={d_ff:.1e}  "
+          f"grads finite={fin} {'OK' if ok else 'WRONG'}")
+    return ok
+
+
+def run_decoder_sampling():
+    """decoder sampling: deterministic per seed, differs from greedy, top_k=1 == greedy, top_k=8 stays inside greedy-ish
+    support (differs from top_k=0), all bytes valid."""
+    imgs = np.random.default_rng(2).integers(0, 256, (2, 32, 32, 3)).astype(np.uint8)
+    outs = {}
+    for name, k in (("k0", 0), ("k1", 1), ("k8", 8)):
+        cfg = dataclasses.replace(build_cfg(2), gen_top_k=k)
+        model = HierEncDec(jax.random.PRNGKey(0), cfg)
+        lv = model.levels[0]
+        flat = jnp.array(images_to_positions(imgs, cfg, pixel_order_for(cfg)))
+        ctx = lv.encode(code_embed_proj(flat, lv.own_input_embed, lv.own_input_proj), flat, rng=None)["code_idx"]
+        outs[name] = (np.asarray(decode_generate_multipass(lv, ctx, G, greedy=False, temperature=1.0, seed=3)),
+                      np.asarray(decode_generate_multipass(lv, ctx, G, greedy=False, temperature=1.0, seed=3)),
+                      np.asarray(decode_generate_multipass(lv, ctx, G, greedy=True)))
+    det = np.array_equal(outs["k8"][0], outs["k8"][1])
+    k1_greedy = np.array_equal(outs["k1"][0], outs["k1"][2])
+    differs = not np.array_equal(outs["k0"][0], outs["k8"][0]) and not np.array_equal(outs["k8"][0], outs["k8"][2])
+    valid = bool(((outs["k8"][0] >= 0) & (outs["k8"][0] <= 255)).all())
+    ok = det and k1_greedy and differs and valid
+    print(f"DECODER sampling: deterministic per seed={det} top_k=1 == greedy={k1_greedy} top_k=8 differs from top_k=0 and greedy={differs} "
+          f"bytes valid={valid} {'OK' if ok else 'WRONG'}")
+    return ok
+
+
+def run_ctx_rows_reference():
+    """independent python reference for the shared row builder: window contents, validity mask, rope ids, extra
+    slots (window, cond_drop, None slot skipped), chunked visibility, incl. a last group running past the real codes."""
+    ok = True
+    Bc, D = 2, 64
+    for (n_blocks, N, sc) in [(16, 2, 0), (16, -1, 0), (14, 1, 0), (16, -1, 1), (14, -1, 1), (16, 1, 2), (14, 2, 2), (16, -1, 4)]:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cfg = dataclasses.replace(build_cfg(N, sc), cond_depth=(2, 1, 1, 1), cond_window=(3, -1, -1, -1))
+        level = HierEncDec(jax.random.PRNGKey(0), cfg).levels[0]
+        tok = jax.random.normal(jax.random.PRNGKey(1), (Bc, n_blocks, D))
+        Sx = 4
+        M = n_blocks // Sx
+        extra = jax.random.randint(jax.random.PRNGKey(2), (Bc, M, 4), 0, 16)
+        n_groups = -(-n_blocks // G)
+        n_p = n_groups * G
+        cg = 1 if sc <= 0 else -(-n_groups // sc)
+        ends = [min((g // cg + 1) * cg, n_groups) * G for g in range(n_groups)]
+        Wg = n_p if N < 0 else min(N * G + cg * G, n_p)
+        ctx_flat, rope, valid, Wg_out, extra_len = level._pardec_ctx_rows(tok, [extra], G, n_groups, n_blocks)
+        etok = code_embed_proj(extra, level.extra_ctx_embed[0], level.extra_ctx_proj[0])
+        counts = [e // Sx for e in ends]
+        Wj = min(3, max(counts))
+        counts = [min(c, M) for c in counts]
+        good = Wg_out == Wg and extra_len == Wj and ctx_flat.shape == (Bc * n_groups, Wj + Wg, D)
+        flat = np.asarray(ctx_flat).reshape(Bc, n_groups, Wj + Wg, D)
+        val = np.asarray(valid).reshape(Bc, n_groups, Wj + Wg)
+        for g in range(n_groups):
+            for t in range(Wj):
+                idx = counts[g] - Wj + t
+                good &= bool(val[0, g, t]) == (idx >= 0)
+                want = np.asarray(etok[0, idx]) if idx >= 0 else np.zeros(D)
+                good &= np.allclose(flat[0, g, t], want, atol=1e-6)
+            for j in range(Wg):
+                a = ends[g] - Wg + j
+                v = 0 <= a < n_blocks
+                good &= bool(val[0, g, Wj + j]) == v
+                want = np.asarray(tok[0, a]) if v else np.zeros(D)
+                good &= np.allclose(flat[0, g, Wj + j], want, atol=1e-6)
+                good &= int(rope[g, Wj + j]) == max(a, 0)
+        dropped = level._pardec_ctx_rows(tok, [extra], G, n_groups, n_blocks, drop_extras=True)[2]
+        good &= not bool(np.asarray(dropped)[:, :Wj].any()) and bool(np.array_equal(np.asarray(dropped)[:, Wj:], val.reshape(-1, Wj + Wg)[:, Wj:]))
+        skipped = level._pardec_ctx_rows(tok, [None], G, n_groups, n_blocks)
+        good &= skipped[4] == 0 and skipped[0].shape[1] == Wg
+        print(f"CTX rows reference (n_blocks={n_blocks}, N={N}, stream_chunks={sc}, Wg={Wg}, extra width={Wj}): "
+              f"{'OK' if good else 'WRONG'}")
+        ok &= good
+    print(f"  {'CONSISTENT' if ok else 'DIVERGES'}")
+    return ok
+
+
+def run_chunk_equivalence():
+    """stream_chunks = n_groups must equal stream_chunks = 0 (per-group streaming) exactly."""
+    outs = []
+    for sc in (0, 64):
+        cfg = build_cfg(2, sc)
+        level = HierEncDec(jax.random.PRNGKey(0), cfg).levels[0]
+        imgs = np.random.default_rng(3).integers(0, 256, (2, 32, 32, 3)).astype(np.uint8)
+        flat = jnp.array(images_to_positions(imgs, cfg, pixel_order_for(cfg)))
+        enc = level.encode(code_embed_proj(flat, level.own_input_embed, level.own_input_proj), flat, rng=None)
+        outs.append(level.decode_logits_and_target_pardec(flat, enc["code_soft"], G)[0])
+    d = float(jnp.abs(outs[0] - outs[1]).max())
+    print(f"CHUNK equivalence: stream_chunks=64 (== n_groups) vs 0: max diff={d:.1e} {'OK' if d == 0.0 else 'WRONG'}")
+    return d == 0.0
+
+
+def run_chunk_leak(G_, sc, B_=2):
+    """chunked visibility: perturb every pixel of group gq. Groups in EARLIER chunks must be unchanged (they only see
+    parent codes up to their chunk end); an earlier group in the SAME chunk must change (positive control)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = _cond_cfg(G_, -1, stream_chunks=sc)
+        level0, level1, fb = _cond_inputs(cfg, B_)
+    Kspan = G_ * level0.K
+    n_groups = fb.shape[1] // Kspan
+    cg = -(-n_groups // sc)
+    gq = n_groups // 2 + cg // 2
+    chunk_start = (gq // cg) * cg
+
+    def logits_for(x):
+        e0, e1 = _cond_encode(level0, level1, x)
+        return level0.decode_logits_and_target_pardec(x, e0["code_soft"], G_, extra_ctx_code_soft=[e1["code_soft"]])[0]
+
+    base = logits_for(fb)
+    lo, hi = gq * Kspan, (gq + 1) * Kspan
+    pert = logits_for(fb.at[:, lo:hi, :].set((fb[:, lo:hi, :] + 97) % 256))
+    d = jnp.abs(base - pert).max(axis=tuple(range(2, base.ndim)))
+    earlier_chunks = float(d[:, :chunk_start * Kspan].max()) if chunk_start > 0 else 0.0
+    same_chunk_before = float(d[:, chunk_start * Kspan:gq * Kspan].max()) if gq > chunk_start else None
+    ok = earlier_chunks <= 1e-5 and (same_chunk_before is None or same_chunk_before > 1e-4)
+    print(f"CHUNK leak test (G={G_}, stream_chunks={sc}, chunk={cg} groups, gq={gq}, chunk_start={chunk_start}): "
+          f"earlier chunks change={earlier_chunks:.8f} (must be 0), same-chunk earlier groups change="
+          f"{same_chunk_before} (must be >0) {'OK' if ok else 'LEAK/BROKEN'}")
+    return ok
+
+
+def run_generation_matches_rescoring(sc, with_extra, G_=4):
+    """greedy generation (scan loop) must be the argmax of the dense teacher-forced scoring of its own output
+    (plain / cond extras / chunked visibility), and every byte must be a valid value."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = _cond_cfg(G_, -1, stream_chunks=sc)
+        level0, level1, fb = _cond_inputs(cfg, 2)
+    e0, e1 = _cond_encode(level0, level1, fb)
+    extras = [e1["code_idx"]] if with_extra else None
+    gen = level0.decode_generate_pardec(e0["code_idx"], G_, greedy=True, seed=0, extra_ctx_idx=extras)
+    logits, *_ = level0.decode_logits_and_target_pardec(
+        gen, e0["code_soft"], G_, extra_ctx_code_soft=[e1["code_soft"]] if with_extra else None)
+    same = bool(jnp.array_equal(jnp.argmax(logits, -1), gen))
+    valid = bool(((gen >= 0) & (gen <= 255)).all())
+    samp = level0.decode_generate_pardec(e0["code_idx"], G_, greedy=False, temperature=1.0, seed=3, extra_ctx_idx=extras)
+    samp_ok = bool(((samp >= 0) & (samp <= 255)).all()) and not bool(jnp.array_equal(samp, gen))
+    ok = same and valid and samp_ok
+    print(f"GEN scan (stream_chunks={sc}, extra={with_extra}): greedy == dense argmax of own output={same} "
+          f"bytes valid={valid} sampled valid & differs={samp_ok} {'OK' if ok else 'WRONG'}")
+    return ok
+
+
+def run_dense_decode():
+    """dense_decode=True bypasses pardec entirely: greedy generation must reproduce itself under
+    decode_logits_and_target_pardec's own teacher-forced re-scoring (proves the flag actually routes to
+    decode_logits_and_target/decode_generate and both agree, not just self-consistency by accident)."""
+    cfg = dataclasses.replace(build_cfg(2), dense_decode=(True, False, False, False))
+    model = HierEncDec(jax.random.PRNGKey(0), cfg)
+    level = model.levels[0]
+    imgs = np.random.default_rng(5).integers(0, 256, (B, 32, 32, 3)).astype(np.uint8)
+    flat = jnp.array(images_to_positions(imgs, cfg, pixel_order_for(cfg)))
+    enc = level.encode(code_embed_proj(flat, level.own_input_embed, level.own_input_proj), flat, rng=None)
+    gen = level.decode_generate_pardec(enc["code_idx"], G, greedy=True, seed=0)
+    logits, target, *_ = level.decode_logits_and_target_pardec(gen, enc["code_soft"], G, rng=None)
+    same = bool(jnp.array_equal(jnp.argmax(logits, -1), gen))
+    valid = bool(((gen >= 0) & (gen <= 255)).all())
+    ok = same and valid
+    print(f"DENSE_DECODE: greedy gen == dense teacher-forced argmax of own output={same} bytes valid={valid} "
+          f"{'OK' if ok else 'WRONG'}")
+    return ok
+
+
+def run_dec_attn_window():
+    """dec_attn_window: bounded decoder window must match a dense reference built by masking
+    decode_logits_and_target's own attention by hand (independent of the Attention.step/chunk_step fix,
+    checked via the two paths already agreeing -- dense (training) vs incremental (generation) outputs)."""
+    cfg = dataclasses.replace(build_cfg(2), dense_decode=(True, False, False, False),
+                               decoder_attn_window=(3, None, None, None), weight_sharing=False)
+    model = HierEncDec(jax.random.PRNGKey(0), cfg)
+    level = model.levels[0]
+    imgs = np.random.default_rng(6).integers(0, 256, (B, 32, 32, 3)).astype(np.uint8)
+    flat = jnp.array(images_to_positions(imgs, cfg, pixel_order_for(cfg)))
+    enc = level.encode(code_embed_proj(flat, level.own_input_embed, level.own_input_proj), flat, rng=None)
+    logits_dense, target, *_ = level.decode_logits_and_target_pardec(flat, enc["code_soft"], G, rng=None)
+    gen = level.decode_generate_pardec(enc["code_idx"], G, greedy=True, seed=0)
+    logits_incr, *_ = level.decode_logits_and_target_pardec(gen, enc["code_soft"], G, rng=None)
+    same = bool(jnp.array_equal(jnp.argmax(logits_incr, -1), gen))
+    valid = bool(((gen >= 0) & (gen <= 255)).all())
+    # windowed training loss must differ from an unwindowed model (window actually has an effect)
+    cfg_u = dataclasses.replace(cfg, decoder_attn_window=(-1, -1, -1, -1))
+    model_u = HierEncDec(jax.random.PRNGKey(0), cfg_u)
+    logits_u, *_ = model_u.levels[0].decode_logits_and_target_pardec(flat, enc["code_soft"], G, rng=None)
+    differs = not bool(jnp.array_equal(logits_dense, logits_u))
+    ok = same and valid and differs
+    print(f"DEC_ATTN_WINDOW: windowed gen == dense re-score argmax={same} bytes valid={valid} "
+          f"windowed differs from unwindowed={differs} {'OK' if ok else 'WRONG'}")
+    return ok
+
+
 if __name__ == "__main__":
     ok0 = run_one(0)                        # disjoint (sanity baseline)
     ok2 = run_one(2)                        # bounded N=2, causal streaming
     okm1 = run_one(-1)                      # all, causal streaming (unbounded)
-    okfc = run_one(-1, streaming=False)     # all, non-causal (true fullctx)
+    okfc = run_one(-1, stream_chunks=1)     # wait once: every group sees all parent codes
+    ok_c4 = run_one(2, stream_chunks=4)     # 4 chunks, bounded history
+    ok_c8 = run_one(-1, stream_chunks=8)    # 8 chunks, unbounded history
     ok_wp = run_widened_aux(4, 0)           # decode_past-only widened aux NTP
     ok_wf = run_widened_aux(0, 4)           # decode_future-only widened aux NTP
     ok_wpf = run_widened_aux(4, 4)          # decode_past+decode_future combined
     ok_cyc = run_cyclic_revision_extra_ctx()  # cyclic-refine revision-slot fallback tables
     ok_gdf = run_gen_decode_future_self_consistency()  # gen_decode_future generation
-    ok_dp = run_draft_pad_generation()      # draft_pad substitution at generation time
+    ok_dp = run_draft_pad_generation()      # out-of-bounds draft slots masked at generation time
     cond_oks = [run_cond_visibility_rule(), run_cond_alignment_warning(),
                 run_cond_complete(4), run_cond_complete(1), run_cond_complete(2), run_cond_complete(4, cond_window=2),
                 run_cond_complete_leak(4), run_cond_complete_leak(1), run_cond_complete_leak(2),
                 run_cond_complete_leak(1, fullctx_control=True),
-                run_encoder_free_run(), run_generate_from_prompt(), run_refine_gt_drop(), run_remat_level()]
-    all_ok = (ok0 and ok2 and okm1 and okfc and ok_wp and ok_wf and ok_wpf and ok_cyc and ok_gdf and ok_dp
+                run_encoder_free_run(), run_generate_from_prompt(), run_refine_gt_drop(), run_remat_level(), run_refine_drop(), run_decoder_sampling(), run_ctx_rows_reference(), run_chunk_equivalence(), run_chunk_leak(4, 4), run_chunk_leak(4, 8), run_chunk_leak(1, 4), run_dense_decode(), run_dec_attn_window(),
+                run_generation_matches_rescoring(0, False), run_generation_matches_rescoring(0, True),
+                run_generation_matches_rescoring(4, True), run_generation_matches_rescoring(1, True)]
+    all_ok = (ok0 and ok2 and okm1 and okfc and ok_c4 and ok_c8 and ok_wp and ok_wf and ok_wpf and ok_cyc and ok_gdf and ok_dp
               and all(cond_oks))
     print(f"\nPASS all" if all_ok else "\nFAIL -- see divergence above")

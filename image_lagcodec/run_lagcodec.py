@@ -89,8 +89,11 @@ class Config:
     use_xsa: bool = False
     use_qknorm: bool = True
 
-    attn_window: tuple = -1
-    dec_attn_window: tuple = -1
+    attn_window: tuple = -1  # symmetric base (-1=unbounded), used by BOTH encoder and decoder self-attention
+    # unless overridden below (same None-means-unset-override pattern as decoder_d_model/encoder_d_model
+    # above). When overridden, the value itself uses attn_window's own convention (-1=unbounded, >=1=window).
+    encoder_attn_window: tuple = None
+    decoder_attn_window: tuple = None
     attn_lookahead: tuple = 0
     use_sink: bool = False
 
@@ -195,7 +198,8 @@ class Config:
         bcast("mtp_horizon", int)
         bcast("mtp_mode", str)
         bcast("attn_window", int)
-        bcast("dec_attn_window", int)
+        bcast_opt("encoder_attn_window", int)
+        bcast_opt("decoder_attn_window", int)
         bcast("attn_lookahead", int)
         if self.pq_dim is None:
             self.pq_dim = self.d_model
@@ -259,12 +263,15 @@ class Config:
                     f"private redecode of past content, discarded after conditioning) -- "
                     f"decode_future is a training-only regularizer for now and is skipped entirely "
                     f"during decode_generate_pardec, regardless of its value, until sync=True lands")
-        assert len(self.attn_window) == n and len(self.attn_lookahead) == n and len(self.dec_attn_window) == n
+        assert (len(self.attn_window) == n and len(self.attn_lookahead) == n
+                and len(self.encoder_attn_window) == n and len(self.decoder_attn_window) == n)
         for i in range(n):
             assert self.attn_window[i] == -1 or self.attn_window[i] >= 1, \
                 f"level {i}: attn_window={self.attn_window[i]} must be -1 (unbounded/flash) or >=1 (splash LocalMask)"
-            assert self.dec_attn_window[i] == -1 or self.dec_attn_window[i] >= 1, \
-                f"level {i}: dec_attn_window={self.dec_attn_window[i]} must be -1 (unbounded) or >=1"
+            for name, val in (("encoder_attn_window", self.encoder_attn_window[i]),
+                               ("decoder_attn_window", self.decoder_attn_window[i])):
+                if val is not None:
+                    assert val == -1 or val >= 1, f"level {i}: {name}={val} must be -1 (unbounded) or >=1"
             if self.dense_decode[i] and (self.cond_depth[i] > 1 or self.decode_future[i] != 0
                                           or self.level_refine_passes[i] > 1):
                 warnings.warn(
@@ -279,10 +286,11 @@ class Config:
                 warnings.warn(
                     f"level {i}: interleave_decode=True IGNORES decode_future/level_refine_passes "
                     f"entirely, same reasons as dense_decode")
-            if self.dec_attn_window[i] != -1 and self.weight_sharing:
+            if self.decoder_attn_window[i] is not None and self.weight_sharing[i]:
                 warnings.warn(
-                    f"level {i}: dec_attn_window={self.dec_attn_window[i]} has NO EFFECT with weight_sharing=True "
-                    f"(decoder reuses the encoder's own blocks/window instead of its own dec_blocks)")
+                    f"level {i}: decoder_attn_window={self.decoder_attn_window[i]} has NO EFFECT with "
+                    f"weight_sharing=True (decoder reuses the encoder's own blocks/window instead of its own "
+                    f"dec_blocks)")
             assert self.attn_lookahead[i] >= 0, \
                 f"level {i}: attn_lookahead={self.attn_lookahead[i]} must be >=0 (0=plain causal)"
 
@@ -1068,7 +1076,8 @@ class EncDecLevel(eqx.Module):
         self.own_input_embed = init_matrix(keys[0], (own_vocab, self.pq_dim), scheme)
         self.own_input_proj = init_matrix(keys[20], (self.in_pq_chunks * self.pq_dim, D_enc), scheme)
         block_keys = jax.random.split(keys[1], n_layers_enc)
-        enc_window = None if cfg.attn_window[level] == -1 else cfg.attn_window[level]
+        enc_window_val = cfg.encoder_attn_window[level] if cfg.encoder_attn_window[level] is not None else cfg.attn_window[level]
+        enc_window = None if enc_window_val == -1 else enc_window_val
         enc_lookahead = cfg.attn_lookahead[level]
         self.blocks = [Block(k, D_enc, n_heads_enc, n_kv_heads_enc, cfg.mlp_mult[level], cfg.rope_base[level],
                              n_layers=n_layers_enc, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
@@ -1117,7 +1126,8 @@ class EncDecLevel(eqx.Module):
 
         if has_decoder and not weight_sharing:
             dec_block_keys = jax.random.split(keys[6], n_layers_dec)
-            dec_window = None if cfg.dec_attn_window[level] == -1 else cfg.dec_attn_window[level]
+            dec_window_val = cfg.decoder_attn_window[level] if cfg.decoder_attn_window[level] is not None else cfg.attn_window[level]
+            dec_window = None if dec_window_val == -1 else dec_window_val
             self.dec_blocks = [Block(k, D_dec, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
                                      n_layers=n_layers_dec, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
                                      window=dec_window) for k in dec_block_keys]
@@ -2835,7 +2845,8 @@ CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads",
                   "cond_depth", "cond_drop", "cond_window",
                   "weight_sharing", "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
                   "gumbel_at_inference", "init_scheme", "use_xsa",
-                  "use_qknorm", "remat", "remat_level", "attn_window", "attn_lookahead", "dec_attn_window", "use_sink",
+                  "use_qknorm", "remat", "remat_level", "attn_window", "attn_lookahead",
+                  "encoder_attn_window", "decoder_attn_window", "use_sink",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "mse_weight",
                   "mse_softmax_tau", "traversal", "label_reg_weight")
@@ -3048,7 +3059,7 @@ def main():
                          "(all ignored). Training uses splash (full causal, O(T) memory); generation "
                          "uses a single real growing KV cache (lax.scan over own-codes), no padding/magic numbers "
                          "-- every step genuinely sees the whole real prefix. O(T^2) total compute either way, "
-                         "same as any correct full-attention causal LM; dec_attn_window bounds it if desired.")
+                         "same as any correct full-attention causal LM; decoder_attn_window bounds it if desired.")
     p.add_argument("--interleave_decode", type=_bool_tuple_arg, default=Config.interleave_decode,
                     help="dense_decode + cond_depth<=2 support (hardcoded): one flat causal sequence, at most one "
                          "coarser level's codes prefilled into it exactly when each becomes causally revealed. "
@@ -3167,13 +3178,18 @@ def main():
                     help="checkpoint each level's whole encoder / decoder block stack as one unit (recompute at the "
                          "level border) instead of per transformer block; less recompute, more live memory. "
                          "Takes precedence over --remat inside the stacks")
-    p.add_argument("--attn_window", type=_tuple_arg, default=Config.attn_window)
-    p.add_argument("--dec_attn_window", type=_tuple_arg, default=Config.dec_attn_window,
-                    help="decoder-side causal sliding window (splash LocalMask in decode_logits_and_target's "
-                         "dense/flat form; a plain narrowed mask in decode_generate's incremental KV-cache form -- "
-                         "see Attention.step/chunk_step). -1 (default): unbounded, current behavior unchanged. "
-                         ">=1: bound the decoder's own causal attention span. No effect under weight_sharing=True "
-                         "(decoder reuses the encoder's blocks, and attn_window, instead)")
+    p.add_argument("--attn_window", type=_tuple_arg, default=Config.attn_window,
+                    help="symmetric base causal window (-1=unbounded), used by BOTH encoder and decoder "
+                         "self-attention unless overridden per-side below.")
+    p.add_argument("--encoder_attn_window", type=_tuple_arg, default=Config.encoder_attn_window,
+                    help="per-level override of the encoder's own attn_window (None entries fall back to "
+                         "--attn_window).")
+    p.add_argument("--decoder_attn_window", type=_tuple_arg, default=Config.decoder_attn_window,
+                    help="per-level override of the decoder's own attn_window (splash LocalMask in "
+                         "decode_logits_and_target's dense/flat form; a plain narrowed mask in decode_generate's "
+                         "incremental KV-cache form -- see Attention.step/chunk_step). None entries fall back to "
+                         "--attn_window. No effect under weight_sharing=True (decoder reuses the encoder's "
+                         "blocks/window instead).")
     p.add_argument("--attn_lookahead", type=_tuple_arg, default=Config.attn_lookahead,
                     help="encoder self-attention shifted-triangular lookahead -- 0 (default) "
                          "plain causal, int>0 query may additionally see keys up to that many "
