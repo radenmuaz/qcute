@@ -110,6 +110,12 @@ class Config:
     mtp_horizon: tuple = 1
     mtp_mode: tuple = "parallel"
     mtp_weight: float = 0.1
+    mtp_ar_chunk: tuple = 0  # mtp_mode="ar" only: chunk/scan N=B*valid_T instead of one dense batched call
+    # (same padding-free exact-divisibility pattern as interleave_decode's chunk_groups). 0 = no chunking
+    # (today's single dense call, N must still divide evenly if a non-zero chunk is set on this level).
+    mtp_ar_remat: tuple = False  # mtp_mode="ar" only: jax.checkpoint the per-chunk outer attention forward.
+    # Default off -- matters more at long mtp_horizon (e.g. 32, 128), where the single-layer outer attention's
+    # own QKV/attention-score intermediates become sizable even though there's only one layer to recompute.
 
     entropy_weight: float = 0.0
 
@@ -197,6 +203,8 @@ class Config:
         bcast("token_n_heads", int)
         bcast("mtp_horizon", int)
         bcast("mtp_mode", str)
+        bcast("mtp_ar_chunk", int)
+        bcast("mtp_ar_remat", bool)
         bcast("attn_window", int)
         bcast_opt("encoder_attn_window", int)
         bcast_opt("decoder_attn_window", int)
@@ -392,6 +400,7 @@ class Config:
         assert len(self.pq_dim) == n
         assert all(t in ("linears", "ar", "diffusion") for t in self.token_head_type)
         assert len(self.mtp_horizon) == n and len(self.mtp_mode) == n
+        assert len(self.mtp_ar_chunk) == n and len(self.mtp_ar_remat) == n
         assert all(m in ("parallel", "ar") for m in self.mtp_mode)
         for i in range(n):
             if self.token_head_type[i] in ("ar", "diffusion"):
@@ -998,6 +1007,8 @@ class EncDecLevel(eqx.Module):
     token_mask_prob: float = eqx.field(static=True)
     mtp_horizon: int = eqx.field(static=True)
     mtp_mode: str = eqx.field(static=True)
+    mtp_ar_chunk: int = eqx.field(static=True)
+    mtp_ar_remat: bool = eqx.field(static=True)
     mtp_weight: float = eqx.field(static=True)
     remat: bool = eqx.field(static=True)
     remat_level: bool = eqx.field(static=True)
@@ -1066,6 +1077,8 @@ class EncDecLevel(eqx.Module):
         self.token_mask_prob = cfg.token_mask_prob
         self.mtp_horizon = cfg.mtp_horizon[level]
         self.mtp_mode = cfg.mtp_mode[level]
+        self.mtp_ar_chunk = cfg.mtp_ar_chunk[level]
+        self.mtp_ar_remat = cfg.mtp_ar_remat[level]
         self.mtp_weight = cfg.mtp_weight
         self.pq_dim = cfg.pq_dim[level]
         own_vocab = 256 if is_byte_level else self.in_code_vocab
@@ -1384,6 +1397,12 @@ class EncDecLevel(eqx.Module):
         return jnp.mean(jnp.stack(losses))
 
     def _mtp_loss_ar_ar(self, h_t: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+        # N=B*valid_T flattens EVERY sequence position into one dense batched call -- same class of blowup as
+        # pardec's B*n_groups. mtp_ar_chunk (0=off, matches today's single dense call) chunks/scans this N
+        # axis instead of materializing it all at once (same exact-divisibility pattern as interleave_decode's
+        # chunk_groups, 2026-09-22). mtp_ar_remat (default off) checkpoints the per-chunk OUTER attention call
+        # only (not the inner per-k pq-chunk-axis token head) -- matters more at long mtp_horizon (32, 128),
+        # where that single layer's own QKV/attention-score intermediates become sizable.
         B, T, D = h_t.shape
         K, chunks = self.mtp_horizon, self.in_pq_chunks
         valid_T = T - K
@@ -1391,20 +1410,37 @@ class EncDecLevel(eqx.Module):
             return jnp.array(0.0, dtype=h_t.dtype)
         N = B * valid_T
         h_valid = h_t[:, :valid_T, :].reshape(N, D)
-        ctx0 = (h_valid @ self.mtp_in_proj)[:, None, :]
         future = jnp.stack([target[:, k + 1:k + 1 + valid_T, :] for k in range(K)], axis=2)
         future_flat = future.reshape(N, K, chunks)
-        group_embeds = code_embed(future_flat[:, :K - 1, :], self.token_member_embed)
-        seq_in = jnp.concatenate([ctx0, group_embeds], axis=1)
-        h1 = seq_in + dense_self_attention(self.mtp_attn, self.mtp_norm1(seq_in), causal=True)
-        outer_out = self.mtp_ln_f(h1)
-        ctx_per_k = outer_out @ self.mtp_out_proj
-        losses = []
-        for k in range(K):
-            inner_logits = self._token_teacher_forced_ar(ctx_per_k[:, k, :], future_flat[:, k, :])
-            loss_k, _ = self._dec_loss_acc(inner_logits, future_flat[:, k, :])
-            losses.append(loss_k)
-        return jnp.mean(jnp.stack(losses))
+
+        def _chunk_loss(h_chunk, future_chunk):
+            ctx0 = (h_chunk @ self.mtp_in_proj)[:, None, :]
+            group_embeds = code_embed(future_chunk[:, :K - 1, :], self.token_member_embed)
+            seq_in = jnp.concatenate([ctx0, group_embeds], axis=1)
+            attn_fn = lambda s: dense_self_attention(self.mtp_attn, self.mtp_norm1(s), causal=True)
+            attn_out = eqx.filter_checkpoint(attn_fn)(seq_in) if self.mtp_ar_remat else attn_fn(seq_in)
+            h1 = seq_in + attn_out
+            outer_out = self.mtp_ln_f(h1)
+            ctx_per_k = outer_out @ self.mtp_out_proj
+            losses = []
+            for k in range(K):
+                inner_logits = self._token_teacher_forced_ar(ctx_per_k[:, k, :], future_chunk[:, k, :])
+                loss_k, _ = self._dec_loss_acc(inner_logits, future_chunk[:, k, :])
+                losses.append(loss_k)
+            return jnp.mean(jnp.stack(losses))
+
+        chunk = self.mtp_ar_chunk if self.mtp_ar_chunk > 0 else N
+        assert N % chunk == 0, f"_mtp_loss_ar_ar: N=B*valid_T={N} not divisible by mtp_ar_chunk={chunk}"
+        n_chunks = N // chunk
+        if n_chunks == 1:
+            return _chunk_loss(h_valid, future_flat)
+        h_c = h_valid.reshape(n_chunks, chunk, D)
+        future_c = future_flat.reshape(n_chunks, chunk, K, chunks)
+
+        def _scan_body(carry, xs):
+            return carry, _chunk_loss(*xs)
+        _, chunk_losses = jax.lax.scan(_scan_body, None, (h_c, future_c))
+        return jnp.mean(chunk_losses)
 
     def _mtp_loss(self, h_t: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
         if self.mtp_horizon <= 1:
@@ -2848,7 +2884,7 @@ CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads",
                   "use_qknorm", "remat", "remat_level", "attn_window", "attn_lookahead",
                   "encoder_attn_window", "decoder_attn_window", "use_sink",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
-                  "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "mse_weight",
+                  "mtp_horizon", "mtp_mode", "mtp_ar_chunk", "mtp_ar_remat", "mtp_weight", "entropy_weight", "mse_weight",
                   "mse_softmax_tau", "traversal", "label_reg_weight")
 
 
@@ -3203,6 +3239,12 @@ def main():
     p.add_argument("--token_mask_prob", type=float, default=Config.token_mask_prob)
     p.add_argument("--mtp_horizon", type=_tuple_arg, default=Config.mtp_horizon)
     p.add_argument("--mtp_mode", type=str, default=Config.mtp_mode)
+    p.add_argument("--mtp_ar_chunk", type=_tuple_arg, default=Config.mtp_ar_chunk,
+                    help="mtp_mode='ar' only: chunk/scan N=B*valid_T instead of one dense batched call. "
+                         "0 (default) = no chunking. N must divide evenly by this value.")
+    p.add_argument("--mtp_ar_remat", type=_bool_tuple_arg, default=Config.mtp_ar_remat,
+                    help="mtp_mode='ar' only: checkpoint the per-chunk outer attention forward. Default off; "
+                         "matters more at long mtp_horizon (32, 128).")
     p.add_argument("--mtp_weight", type=float, default=Config.mtp_weight)
     p.add_argument("--entropy_weight", type=float, default=Config.entropy_weight)
     p.add_argument("--mse_weight", type=float, default=Config.mse_weight)
