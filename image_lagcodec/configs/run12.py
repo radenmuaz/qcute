@@ -1,5 +1,5 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run7.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run12.py
 """
 
 # --- model ---
@@ -25,23 +25,16 @@ decoder_ncodes = 1
 ncodes_window = 16
 attn_window = (256,)*DEPTH
 attn_lookahead = 0
-# 64 px = the whole previous 8x8 patch behind each group (full left/prev neighbour). Tokens per level: 64 px / 2^level
-decode_past = 0  # real past tokens exist only at training; generation would redecode them poorly (audit 2026-09-21)
-decode_future = 4
-
-# level_refine_window = (32, 16, 8, 4)  # groups of Kspan=2 tokens; draft = previous pass output (window*2 tokens behind each group)
-# level_refine_gumbel = True
-# level_refine_temperature = 1.0
-# level_refine_gt_drop = 0.8
-# level_refine_drop = 0.5  # stop before each extra pass w.p. 0.5 -> 1..level_refine_passes passes per step
-# refine_quantize_drop = 0.8
-
-# level_refine_passes = 2
-# refine_remat = True  # remat only the refine passes (pass 1 follows remat=False)
-# cycle_refine_passes = 1
-cond_depth = (2, 2, 2, 1)
-cond_window = (4, 4, 4, 4, -1)
-cond_drop = 0.5
+# Strict per-code causal decode WITH cond_depth support: decoder_ncodes=1 (one own-code + its target bytes per
+# row) + gen_sync=True (decode_generate_pardec_sync, real cross-group byte history off a running buffer, never a
+# same-step hallucination -- see the 2026-09-22 masking fix) + stream_chunks default 0 (chunk_groups=1, so
+# _pardec_ctx_rows' own-ctx AND cond_depth extra-ctx windows both use the EXACT per-group boundary (g+1)*G, no
+# chunk-rounding, no leak). dense_decode can't do this (decode_logits_and_target/decode_generate don't accept
+# extra_ctx at all); this is the cond_depth-capable equivalent of it, at the cost of _pardec_ctx_rows' padded
+# (not zero-copy) windows rather than a real growing cache.
+interleave_decode = True  # hardcoded cond_depth<=2 interleave, verified 2026-09-22 (see test)
+cond_depth = (2, 2, 2, 1)  # each level conditions on the next coarser level's own codes; top level has none coarser
+# decode_future left off: interleave_decode ignores it (same as dense_decode)
 
 additive_drop_loss = False
 weight_sharing = False
@@ -76,9 +69,9 @@ traversal = "zorder"
 eval_gen_train = True
 
 # --- training ---
-batch_size = 2
-val_batch_size = 2
-level_steps = (10_000, 10_000, 10_000, 50_000)  # staged: each phase adds one level (no_freeze), last phase long
+batch_size = 8
+val_batch_size = 8  # interleave_decode is a single real growing cache, not gen_sync's padded-wave approach -- try full batch first
+level_steps = (5_000, 5_000, 5_000, 30_000)  # staged: each phase adds one level (no_freeze)
 seed = 0
 # warmup_steps = 2
 train_subset_n = None
@@ -93,7 +86,7 @@ grad_clip = 1.0
 lr = 1e-3
 lr_schedule = "cosine"
 lr_min = 1e-5
-lr_min_step = 50_000  # reach lr_min near the end of all phases (60k global steps)
+lr_min_step = 43_000  # near the end of all phases (45k total)
 warmup_steps = int(1e3)
 # lr_min_epoch = 50
 # lr_min_epoch = 400

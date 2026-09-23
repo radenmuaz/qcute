@@ -8,6 +8,7 @@ Usage: python3 -m image_lagcodec.scripts.prompt_generate <run_name> [--levels 1,
 import os
 os.environ["JAX_PLATFORMS"] = "cpu"
 import argparse
+import dataclasses
 import sys
 import time
 from pathlib import Path
@@ -60,6 +61,7 @@ def main():
     ap.add_argument("--top_k", type=int, default=40)
     ap.add_argument("--decode_sample", action="store_true", help="sample (not argmax) in the decoder cascade too")
     ap.add_argument("--decode_temperature", type=float, default=0.8)
+    ap.add_argument("--decode_top_k", type=int, default=0, help="top-k of the decoder cascade when --decode_sample")
     ap.add_argument("--n_img", type=int, default=None)
     ap.add_argument("--tag", default="prompt")
     ap.add_argument("--seed", type=int, default=0)
@@ -70,6 +72,7 @@ def main():
     cv = load_config_module(run_dir / f"config_{a.run}.py")
     cv.pop("label_fn", None)
     cfg = Config(**{k: cv[k] for k in CONFIG_FIELDS if k in cv})
+    cfg = dataclasses.replace(cfg, gen_top_k=a.decode_top_k)
     model = eqx.tree_deserialise_leaves(ck / "model.eqx", HierEncDec(jax.random.PRNGKey(0), cfg))
     model = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32) if eqx.is_array(x) else x, model)
     n_img = a.n_img or int(scalar(cv.get("val_batch_size", 8)))

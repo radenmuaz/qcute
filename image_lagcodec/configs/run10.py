@@ -1,5 +1,5 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run7.py
+uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/run10.py
 """
 
 # --- model ---
@@ -10,7 +10,7 @@ n_layers = (2,)*DEPTH
 n_heads = (2,)*DEPTH
 n_kv_heads = (None,)* DEPTH
 code_vocab = (256,) *DEPTH
-pq_chunks = (3,)* DEPTH
+pq_chunks = (6,)* DEPTH
 pq_dim = (128,) * DEPTH
 mlp_mult = 4
 rope_base = 10000.0
@@ -25,23 +25,13 @@ decoder_ncodes = 1
 ncodes_window = 16
 attn_window = (256,)*DEPTH
 attn_lookahead = 0
-# 64 px = the whole previous 8x8 patch behind each group (full left/prev neighbour). Tokens per level: 64 px / 2^level
-decode_past = 0  # real past tokens exist only at training; generation would redecode them poorly (audit 2026-09-21)
-decode_future = 4
-
-# level_refine_window = (32, 16, 8, 4)  # groups of Kspan=2 tokens; draft = previous pass output (window*2 tokens behind each group)
-# level_refine_gumbel = True
-# level_refine_temperature = 1.0
-# level_refine_gt_drop = 0.8
-# level_refine_drop = 0.5  # stop before each extra pass w.p. 0.5 -> 1..level_refine_passes passes per step
-# refine_quantize_drop = 0.8
-
-# level_refine_passes = 2
-# refine_remat = True  # remat only the refine passes (pass 1 follows remat=False)
-# cycle_refine_passes = 1
-cond_depth = (2, 2, 2, 1)
-cond_window = (4, 4, 4, 4, -1)
-cond_drop = 0.5
+# Eager/naive fully-interleaved causal decoder: [code, BOS, K bytes, code, BOS, K bytes, ...] as ONE flat causal
+# sequence (decode_logits_and_target/decode_generate, not the windowed/batched pardec machinery). No windowing,
+# no groups/batching approximation, no decode_past/level_refine/cond_depth/stream_chunks/gen_sync -- every step
+# genuinely sees the whole real prefix, exactly. O(T^2) total compute, same as any correct full-attention causal
+# LM (accepted -- this run is a slow-but-correct reference, not a speed run).
+dense_decode = True
+decode_future = 0
 
 additive_drop_loss = False
 weight_sharing = False
@@ -76,8 +66,8 @@ traversal = "zorder"
 eval_gen_train = True
 
 # --- training ---
-batch_size = 2
-val_batch_size = 2
+batch_size = 8
+val_batch_size = 8
 level_steps = (10_000, 10_000, 10_000, 50_000)  # staged: each phase adds one level (no_freeze), last phase long
 seed = 0
 # warmup_steps = 2

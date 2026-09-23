@@ -30,6 +30,9 @@ strides = (4, 4)
 decoder_ncodes = 1  # eager
 ncodes_window = 4
 attn_lookahead = 0
+dec_attn_window = 256  # bounds the decoder's own refine-pass attention (was unbounded -- learned from
+# imagenet64_pardec1's OOM: an unbounded Pp=level_refine_window*decoder_ncodes*stride redraft window is a
+# real, uncapped memory driver)
 decode_past = 0
 decode_future = 16  # was 4 -- widened
 level_refine_window = 16  # was 1 -- widened

@@ -29,15 +29,15 @@ attn_lookahead = 0
 decode_past = 0  # real past tokens exist only at training; generation would redecode them poorly (audit 2026-09-21)
 decode_future = 4
 
-# level_refine_window = (32, 16, 8, 4)  # groups of Kspan=2 tokens; draft = previous pass output (window*2 tokens behind each group)
-# level_refine_gumbel = True
-# level_refine_temperature = 1.0
-# level_refine_gt_drop = 0.8
-# level_refine_drop = 0.5  # stop before each extra pass w.p. 0.5 -> 1..level_refine_passes passes per step
+level_refine_window = (32, 16, 8, 4)  # groups of Kspan=2 tokens; draft = previous pass output (window*2 tokens behind each group)
+level_refine_gumbel = True
+level_refine_temperature = 1.0
+level_refine_gt_drop = 0.8
+level_refine_drop = 0.5  # stop before each extra pass w.p. 0.5 -> 1..level_refine_passes passes per step
 # refine_quantize_drop = 0.8
 
-# level_refine_passes = 2
-# refine_remat = True  # remat only the refine passes (pass 1 follows remat=False)
+level_refine_passes = 2
+refine_remat = True  # remat only the refine passes (pass 1 follows remat=False)
 # cycle_refine_passes = 1
 cond_depth = (2, 2, 2, 1)
 cond_window = (4, 4, 4, 4, -1)

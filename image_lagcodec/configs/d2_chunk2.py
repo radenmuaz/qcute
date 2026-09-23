@@ -1,7 +1,7 @@
 """
 uv run python3 -m image_lagcodec.run_lagcodec --config image_lagcodec/configs/d2_chunk2.py
 """
-# Fork of d2_eager.py (same decoder_ncodes=1): "2 chunks, independent across chunks, shared window within" --
+# Fork of d2_eager_pardec.py (same decoder_ncodes=1): "2 chunks, independent across chunks, shared window within" --
 # stream_chunks=2 (exactly 2 chunks spanning each level's groups). Chunk A and chunk B never see each other
 # (still strictly causal); every group INSIDE one chunk shares that chunk's identical rounded window (the
 # "interleaved"/shared-visibility rounding). Still pardec: groups remain independent/parallel-batched.
@@ -35,7 +35,7 @@ level_refine_gumbel = True
 level_refine_temperature = 1.0
 # level_refine_passes = 2
 cycle_refine_passes = 1
-cond_depth = (2, 1)
+cond_depth = (1, 1)
 cond_drop = 0.5
 
 additive_drop_loss = False

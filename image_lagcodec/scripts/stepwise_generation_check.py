@@ -16,7 +16,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import image_lagcodec.eqx_common as eqx_common
 from image_lagcodec.run_lagcodec import (
     Config, HierEncDec, dataset_from_config, images_to_positions, pixel_order_for, code_embed_proj,
-    load_config_module, CONFIG_FIELDS, pardec_block_step, pardec_block_chunk_step, causal_extra_ctx_windows,
+    load_config_module, CONFIG_FIELDS, pardec_block_step, pardec_block_chunk_step,
     token_ar_teacher_forced,
 )
 
@@ -35,30 +35,14 @@ if jax.default_backend() == "cpu":
 def group_state(level, ctx_idx, extra_ctx_idx, G):
     Bc, n_blocks, _ = ctx_idx.shape
     D = level.bos_embed.shape[-1]
-    n_groups = n_blocks // G
-    assert level.streaming and level.ncodes_window >= 0
-    N = level.ncodes_window
-    Wg = (N + 1) * G
-    ctx_tok = jnp.pad(code_embed_proj(ctx_idx, level.ctx_embed, level.ctx_proj), ((0, 0), (N * G, 0), (0, 0)))
+    n_groups = -(-n_blocks // G)
     B2 = Bc * n_groups
-    ctx_flat = jnp.stack([ctx_tok[:, g * G:g * G + Wg] for g in range(n_groups)], 1).reshape(B2, Wg, D)
-    fake = jnp.array([max(0, N - g) * G for g in range(n_groups)])
-    min_valid = jnp.broadcast_to(fake[None], (Bc, n_groups)).reshape(B2)
-    rope = jnp.stack([jnp.clip(jnp.arange(Wg) - N * G + g * G, 0, None) for g in range(n_groups)], 0)
-    rope_flat = jnp.broadcast_to(rope[None], (Bc, n_groups, Wg)).reshape(B2, Wg)
-    extra_len = 0
-    if extra_ctx_idx:
-        fl, rp = [], []
-        for k, e in enumerate(extra_ctx_idx):
-            emb, prj, pad, up, _ = level._extra_ctx_table(k)
-            w, r, Wj = causal_extra_ctx_windows(e, emb, prj, pad, up, G, n_groups, Bc, D)
-            fl.append(w)
-            rp.append(jnp.broadcast_to(r[None], (Bc, n_groups, Wj)).reshape(B2, Wj))
-            extra_len += Wj
-        ctx_flat = jnp.concatenate([ctx_flat] + fl, 1)
-        rope_flat = jnp.concatenate([rope_flat] + rp, 1)
+    ctx_tok = code_embed_proj(ctx_idx, level.ctx_embed, level.ctx_proj)
+    ctx_flat, rope, valid, Wg, extra_len = level._pardec_ctx_rows(ctx_tok, extra_ctx_idx, G, n_groups, n_blocks)
+    rope_flat = jnp.broadcast_to(rope[None], (Bc, n_groups, rope.shape[1])).reshape(B2, -1)
+    key_valid = jnp.concatenate([valid, jnp.ones((B2, 1 + G * level.K), dtype=bool)], axis=1)
     rope_bos = jnp.broadcast_to(jnp.array([(g + 1) * G for g in range(n_groups)])[None], (Bc, n_groups)).reshape(B2)
-    return dict(ctx=ctx_flat, rope=rope_flat, min_valid=min_valid, rope_bos=rope_bos, Wg=Wg, extra_len=extra_len,
+    return dict(ctx=ctx_flat, rope=rope_flat, key_valid=key_valid, rope_bos=rope_bos, Wg=Wg, extra_len=extra_len,
                 n_groups=n_groups, B2=B2, D=D, per_group_len=Wg + extra_len + 1 + G * level.K)
 
 
@@ -85,7 +69,7 @@ def run_mode(level, st, gt_flat, mode, return_h=False):
     def step(x, ck, cv, pos, rp):
         nk, nv = [], []
         for i, blk in enumerate(blocks):
-            x, a, b = pardec_block_step(blk, x, ck[i], cv[i], pos, rp, st["min_valid"], plen)
+            x, a, b = pardec_block_step(blk, x, ck[i], cv[i], pos, rp, st["key_valid"], plen)
             nk.append(a)
             nv.append(b)
         return ln_f(x), jnp.stack(nk), jnp.stack(nv)
@@ -96,7 +80,7 @@ def run_mode(level, st, gt_flat, mode, return_h=False):
     x = chunk
     nk, nv = [], []
     for i, blk in enumerate(blocks):
-        x, a, b = pardec_block_chunk_step(blk, x, ck[i], cv[i], jnp.array(0), crope, st["min_valid"], plen)
+        x, a, b = pardec_block_chunk_step(blk, x, ck[i], cv[i], jnp.array(0), crope, st["key_valid"], plen)
         nk.append(a)
         nv.append(b)
     h_all = [ln_f(x)[:, -1]]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import pickle
@@ -30,6 +31,14 @@ def total_bytes_of(cfg) -> int:
     return cfg.img_size * cfg.img_size * 3
 
 
+def n_blocks_for_level(cfg, j: int) -> int:
+    code_count = total_bytes_of(cfg) // cfg.byte_group
+    for i in range(j + 1):
+        K_i = cfg.strides[i] if cfg.strides[i] != -1 else 1
+        code_count = code_count // K_i
+    return code_count
+
+
 @dataclass
 class Config:
     img_size: int = 32
@@ -49,8 +58,11 @@ class Config:
     decode_past: tuple = 0
     decode_future: tuple = 0
     sync: tuple = False
-    n_refine_passes: tuple = 1
-    refine_window: tuple = 0
+    level_refine_passes: tuple = 1
+    level_refine_window: tuple = 0
+    cond_depth: tuple = 1
+    cond_drop: tuple = 0.0
+    cond_window: tuple = -1
     weight_sharing: tuple = True
     precision: str = "bf16"
     curriculum_mode: str = "freeze"
@@ -66,6 +78,7 @@ class Config:
     use_sink: bool = False
 
     remat: bool = False
+    remat_level: bool = False
 
     byte_group: int = 1
     token_head_type: tuple = "linears"
@@ -88,12 +101,23 @@ class Config:
     label_reg_weight: float = 0.0
 
     multipass_detach: bool = True
-    refine_gumbel: bool = False
-    refine_temperature: float = 1.0
+    level_refine_gumbel: bool = False
+    level_refine_gt_drop: float = 1.0
+    level_refine_drop: float = 0.0
+    gen_temperature: float = 1.0
+    gen_top_k: int = 8
+    level_refine_temperature: float = 1.0
     refine_quantize_drop: float = 0.0
     refine_remat: bool = None
 
+    cycle_refine_passes: int = 1
+    cyclic_revise_detach: bool = True
+    cyclic_revise_remat: bool = True
+
     def __post_init__(self):
+        if self.remat and self.remat_level:
+            warnings.warn("remat and remat_level both set: remat_level wins (whole encoder/decoder stacks are "
+                          "checkpointed, not individual blocks)")
         n = len(self.strides)
 
         def bcast(name, types):
@@ -109,8 +133,11 @@ class Config:
         bcast("decode_past", int)
         bcast("decode_future", int)
         bcast("sync", bool)
-        bcast("n_refine_passes", int)
-        bcast("refine_window", int)
+        bcast("level_refine_passes", int)
+        bcast("level_refine_window", int)
+        bcast("cond_depth", int)
+        bcast("cond_drop", (int, float))
+        bcast("cond_window", int)
         bcast("weight_sharing", bool)
         bcast("token_head_type", str)
         bcast("token_dim", int)
@@ -129,7 +156,8 @@ class Config:
         assert len(self.mlp_mult) == n and len(self.rope_base) == n and len(self.decoder_ncodes) == n
         assert len(self.ncodes_window) == n and len(self.streaming) == n
         assert len(self.decode_past) == n and len(self.decode_future) == n and len(self.sync) == n
-        assert len(self.n_refine_passes) == n and len(self.refine_window) == n
+        assert len(self.level_refine_passes) == n and len(self.level_refine_window) == n
+        assert len(self.cond_depth) == n
         for i in range(n):
             assert self.ncodes_window[i] >= -1, \
                 f"level {i}: ncodes_window={self.ncodes_window[i]} must be -1 (all) or >=0 " \
@@ -141,10 +169,39 @@ class Config:
                     f"-1 (true fullctx) or 0 (disjoint, streaming moot) are supported under streaming=False")
             assert self.decode_past[i] >= 0 and self.decode_future[i] >= 0, \
                 f"level {i}: decode_past={self.decode_past[i]}/decode_future={self.decode_future[i]} must be >=0"
-            assert self.n_refine_passes[i] >= 1, \
-                f"level {i}: n_refine_passes={self.n_refine_passes[i]} must be >=1 (1=off, current behavior)"
-            assert self.refine_window[i] >= 0, \
-                f"level {i}: refine_window={self.refine_window[i]} must be >=0"
+            assert self.level_refine_passes[i] >= 1, \
+                f"level {i}: level_refine_passes={self.level_refine_passes[i]} must be >=1 (1=off, current behavior)"
+            assert self.level_refine_window[i] >= 0, \
+                f"level {i}: level_refine_window={self.level_refine_window[i]} must be >=0"
+            assert 1 <= self.cond_depth[i] <= n - i, \
+                f"level {i}: cond_depth={self.cond_depth[i]} must be >=1 (1=own level only, current " \
+                f"behavior) and <= {n - i} (can't condition past the top level)"
+            assert self.cond_window[i] == -1 or self.cond_window[i] >= 1, \
+                f"level {i}: cond_window={self.cond_window[i]} must be -1 (unbounded) or >=1"
+            if self.cond_window[i] != -1 and (self.cond_depth[i] <= 1 or not self.streaming[i]):
+                warnings.warn(
+                    f"level {i}: cond_window={self.cond_window[i]} has NO EFFECT (needs cond_depth>1 and "
+                    f"streaming=True; the non-streaming fullctx path always shows every coarser code)")
+            if self.cond_depth[i] > 1 and self.streaming[i]:
+                up_stride = 1
+                for k in range(1, self.cond_depth[i]):
+                    up_stride *= self.strides[i + k] if self.strides[i + k] != -1 else 1
+                    if self.decoder_ncodes[i] % up_stride != 0:
+                        warnings.warn(
+                            f"level {i}: cond_depth={self.cond_depth[i]} extra level {i + k} is coarser by a "
+                            f"cumulative stride of {up_stride} but decoder_ncodes[{i}]={self.decoder_ncodes[i]} "
+                            f"is not a multiple of it -- using the strictly causal 'complete' alignment: group g "
+                            f"sees only level-{i + k} codes whose whole span ends at or before the group's end "
+                            f"(floor((g+1)*{self.decoder_ncodes[i]}/{up_stride}) codes), so the level-{i + k} code "
+                            f"covering the group's own span stays hidden until that span finishes. Use a "
+                            f"decoder_ncodes multiple of {up_stride}, or streaming=False + ncodes_window=-1, to "
+                            f"see it")
+            assert 0.0 <= self.cond_drop[i] <= 1.0, \
+                f"level {i}: cond_drop={self.cond_drop[i]} must be in [0,1]"
+            if self.cond_drop[i] > 0 and self.cond_depth[i] <= 1:
+                warnings.warn(
+                    f"level {i}: cond_drop={self.cond_drop[i]} has NO EFFECT with cond_depth="
+                    f"{self.cond_depth[i]} (no extra ctx blocks to drop)")
             if self.sync[i]:
                 raise NotImplementedError(
                     f"level {i}: sync=True is a stub (TODO) -- real cross-group pipelining "
@@ -196,27 +253,42 @@ class Config:
                     f"-- the naive causal window pads EVERY group to the FULL n_blocks width, so "
                     f"compute/memory scales as O(n_groups*n_blocks); recommend a larger "
                     f"decoder_ncodes or a bounded ncodes_window instead")
-            if self.refine_window[i] > 0 and self.n_refine_passes[i] <= 1:
+            if self.level_refine_window[i] > 0 and self.level_refine_passes[i] <= 1:
                 warnings.warn(
-                    f"level {i}: refine_window={self.refine_window[i]} has NO EFFECT with "
-                    f"n_refine_passes={self.n_refine_passes[i]} (need >1 for a second pass to use "
-                    f"it) -- either raise n_refine_passes or set refine_window=0 for clarity")
-            if self.n_refine_passes[i] > 1 and self.refine_window[i] <= 0:
+                    f"level {i}: level_refine_window={self.level_refine_window[i]} has NO EFFECT with "
+                    f"level_refine_passes={self.level_refine_passes[i]} (need >1 for a second pass to use "
+                    f"it) -- either raise level_refine_passes or set level_refine_window=0 for clarity")
+            if self.level_refine_passes[i] > 1 and self.level_refine_window[i] <= 0:
                 warnings.warn(
-                    f"level {i}: n_refine_passes={self.n_refine_passes[i]} runs extra passes with "
-                    f"ZERO peer context (refine_window=0) -- each extra pass degenerates to "
-                    f"recomputing pass 1 (wasted compute, not a no-op); set refine_window>0 or "
-                    f"n_refine_passes=1")
-        if self.refine_gumbel and not any(self.n_refine_passes[i] > 1 and self.refine_window[i] > 0 for i in range(n)):
+                    f"level {i}: level_refine_passes={self.level_refine_passes[i]} runs extra passes with "
+                    f"ZERO peer context (level_refine_window=0) -- each extra pass degenerates to "
+                    f"recomputing pass 1 (wasted compute, not a no-op); set level_refine_window>0 or "
+                    f"level_refine_passes=1")
+        if self.level_refine_gumbel and not any(self.level_refine_passes[i] > 1 and self.level_refine_window[i] > 0 for i in range(n)):
             warnings.warn(
-                "refine_gumbel=True has NO EFFECT -- no level has both n_refine_passes>1 and "
-                "refine_window>0, so no refine pass ever runs")
+                "level_refine_gumbel=True has NO EFFECT -- no level has both level_refine_passes>1 and "
+                "level_refine_window>0, so no refine pass ever runs")
+        assert 0.0 <= self.level_refine_gt_drop <= 1.0, f"level_refine_gt_drop={self.level_refine_gt_drop} must be in [0,1]"
+        assert 0.0 <= self.level_refine_drop < 1.0, f"level_refine_drop={self.level_refine_drop} must be in [0,1)"
+        if self.level_refine_drop > 0.0 and not any(
+                self.level_refine_passes[i] > 2 for i in range(n)) and not any(
+                self.level_refine_passes[i] > 1 and self.level_refine_window[i] > 0 for i in range(n)):
+            warnings.warn("level_refine_drop>0 has NO EFFECT -- no level runs a refine pass")
+        if self.level_refine_gt_drop < 1.0 and not any(
+                self.level_refine_passes[i] > 1 and self.level_refine_window[i] > 0 for i in range(n)):
+            warnings.warn("level_refine_gt_drop<1 has NO EFFECT -- no level runs a refine pass")
         if self.refine_quantize_drop > 0 and self.multipass_detach:
             warnings.warn(
                 f"refine_quantize_drop={self.refine_quantize_drop} has NO EFFECT with "
                 f"multipass_detach=True (fully-detached refine passes only ever use the hard "
                 f"argmax index, never the soft/drop-mixed code) -- set multipass_detach=False or "
                 f"refine_quantize_drop=0 for clarity")
+        assert self.cycle_refine_passes >= 1, \
+            f"cycle_refine_passes={self.cycle_refine_passes} must be >=1 (1=off, current behavior)"
+        if self.cycle_refine_passes > 1 and n < 2:
+            warnings.warn(
+                f"cycle_refine_passes={self.cycle_refine_passes} has NO EFFECT with only {n} level(s) "
+                f"-- needs at least 2 (operates on the top two levels of whatever phase is active)")
 
         assert len(self.weight_sharing) == n
         assert len(self.token_head_type) == n
@@ -308,7 +380,12 @@ def load_cifar10(data_root: Path) -> tuple:
         import urllib.request
         tmp_path = tar_path.with_name(tar_path.name + ".tmp")
         print(f"downloading {CIFAR10_URL} -> {tar_path}")
-        urllib.request.urlretrieve(CIFAR10_URL, tmp_path)
+        with tqdm(unit="B", unit_scale=True, unit_divisor=1024, desc="cifar-10") as pbar:
+            def _hook(n_blocks, block_size, total_size):
+                if pbar.total is None and total_size > 0:
+                    pbar.total = total_size
+                pbar.update(n_blocks * block_size - pbar.n)
+            urllib.request.urlretrieve(CIFAR10_URL, tmp_path, reporthook=_hook)
         tmp_path.rename(tar_path)
     extract_dir = data_root / "cifar-10-batches-py"
     if not extract_dir.exists():
@@ -329,18 +406,37 @@ def load_cifar10(data_root: Path) -> tuple:
     return (train, train_labels), (test, test_labels)
 
 
-def load_imagenet64(data_root: Path, resolution: int = 64) -> tuple:
-    def load_split(split: str) -> np.ndarray:
-        shards = sorted(data_root.glob(f"imagenet64_{split}_*.npy"))
-        assert shards, f"no imagenet64_{split}_*.npy shards found under {data_root} -- run " \
-            f"image_gen_jax_1/scripts/download_imagenet64.py --split {split} --out_dir {data_root} first"
-        parts = [np.load(s, mmap_mode="r") for s in shards]
-        flat = np.concatenate(parts, axis=0)
-        return flat.reshape(-1, resolution, resolution, 3)
+def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = None) -> tuple:
+    def load_split(split: str, limit=None) -> np.ndarray:
+        shards = sorted(data_root.glob(f"imagenet{resolution}_{split}_*.npy"))
+        assert shards, f"no imagenet{resolution}_{split}_*.npy shards under {data_root} -- run " \
+            f"image_lagcodec/scripts/imagenet/download_imagenet{resolution}.py --split {split} --out_dir {data_root}"
+        parts = [np.load(s, mmap_mode="r") for s in shards[:limit]]
+        return np.concatenate(parts, axis=0).reshape(-1, resolution, resolution, 3)
 
-    train = load_split("train")
+    train = load_split("train", train_shards)
     val = load_split("validation")
     return (train, np.zeros(len(train), dtype=np.int32)), (val, np.zeros(len(val), dtype=np.int32))
+
+
+def load_imagenet64(data_root: Path, resolution: int = 64) -> tuple:
+    return load_imagenet(data_root, resolution)
+
+
+def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards: int = None) -> tuple:
+    # train_shards: only load the first N imagenet train shards (off-training scripts need a few images, not 15GB)
+    if name == "cifar":
+        res = 32
+    else:
+        assert name.startswith("imagenet"), f"unknown dataset {name!r}"
+        res = int(name[len("imagenet"):])
+    assert img_size is None or img_size == res, f"dataset {name} is {res}px but img_size={img_size}"
+    return load_cifar10(data_root) if name == "cifar" else load_imagenet(data_root, res, train_shards)
+
+
+def dataset_from_config(cv: dict, repo_root: Path, train_shards: int = 1) -> tuple:
+    root = Path(cv.get("data_root") or repo_root / "datasets")
+    return load_dataset(cv.get("dataset", "cifar"), root, cv.get("img_size"), train_shards)
 
 
 def images_to_positions(images: np.ndarray, cfg: Config, pixel_order: np.ndarray) -> np.ndarray:
@@ -418,27 +514,38 @@ class BatchIterator:
         self.batch_size, self.n_devices = batch_size, n_devices
         self.shuffle = shuffle
         self.rng = np.random.default_rng(seed)
+        self.pc, self.pi = jax.process_count(), jax.process_index()
         self.total = batch_size * n_devices
         self.cfg = cfg
         self.pixel_order = pixel_order_for(cfg)
         self.n_positions = n_positions_of(cfg)
 
     def __len__(self):
-        return len(self.images) // self.total
+        return len(self.images) // (self.total * self.pc)
 
     def __iter__(self):
         n = len(self.images)
         idx = self.rng.permutation(n) if self.shuffle else np.arange(n)
-        for start in range(0, n - self.total + 1, self.total):
-            sel = idx[start:start + self.total]
+        g = self.total * self.pc
+        for start in range(0, n - g + 1, g):
+            sel = idx[start + self.pi * self.total:start + (self.pi + 1) * self.total]
             img = self.images[sel]
             positions = images_to_positions(img, self.cfg, self.pixel_order)
             yield positions.reshape(self.n_devices, self.batch_size, self.n_positions, self.cfg.byte_group)
 
 
+def safe_argmax(x: jnp.ndarray) -> jnp.ndarray:
+    # first index of the max over the last axis. jnp.argmax fused into a following gather returns the max
+    # value's float bits instead of the index under jit on TPU (XLA bug; seen at >=256 rows in generation),
+    # so use plain max/min reductions.
+    V = x.shape[-1]
+    m = jnp.max(x, axis=-1, keepdims=True)
+    return jnp.minimum(jnp.min(jnp.where(x == m, jnp.arange(V), V), axis=-1), V - 1)
+
+
 def quantize_hard(logits: jnp.ndarray, rng=None, quantize_drop: float = 0.0, tau: float = 1.0) -> tuple:
     soft = jax.nn.softmax(logits / tau, axis=-1)
-    idx = jnp.argmax(soft, axis=-1)
+    idx = safe_argmax(soft)
     hard = jax.nn.one_hot(idx, logits.shape[-1], dtype=soft.dtype)
     st = soft + jax.lax.stop_gradient(hard - soft)
     if quantize_drop > 0 and rng is not None:
@@ -455,7 +562,7 @@ def quantize_gumbel(logits: jnp.ndarray, rng, tau: float = 1.0, quantize_drop: f
     gumbel_noise = -jnp.log(-jnp.log(u))
     noisy_logits = (logits + gumbel_noise) / tau
     soft = jax.nn.softmax(noisy_logits, axis=-1)
-    idx = jnp.argmax(soft, axis=-1)
+    idx = safe_argmax(soft)
     hard = jax.nn.one_hot(idx, logits.shape[-1], dtype=soft.dtype)
     st = soft + jax.lax.stop_gradient(hard - soft)
     if quantize_drop > 0:
@@ -502,19 +609,53 @@ def code_embed_proj(code: jnp.ndarray, table: jnp.ndarray, proj: jnp.ndarray) ->
     return jnp.concatenate(parts, axis=-1) @ proj
 
 
+def extra_ctx_visible_counts(n_groups: int, G: int, up_stride: int) -> list:
+    # "complete" alignment: group g (own-level codes [gG,(g+1)G)) sees coarser code j iff its whole span
+    # [j*S,(j+1)*S) ends at or before the group's end, i.e. (j+1)*S <= (g+1)*G. Equals (g+1)*(G//S) when
+    # G is a multiple of S (the old behaviour); otherwise the code covering the group's own span stays hidden.
+    return [((g + 1) * G) // up_stride for g in range(n_groups)]
+
+
+def causal_extra_ctx_windows(extra_val, embed_table, proj_table, pad_vec, up_stride: int, G: int,
+                              n_groups: int, B: int, D: int, window: int = -1) -> tuple:
+    counts = extra_ctx_visible_counts(n_groups, G, up_stride)
+    full = counts[-1]
+    Wg_j = full if window < 0 else min(window, full)
+    if extra_val is None:
+        eff = counts
+        windows = jnp.broadcast_to(pad_vec, (B, n_groups, Wg_j, D))
+    else:
+        extra_tok = code_embed_proj(extra_val, embed_table, proj_table)
+        M = extra_tok.shape[1]
+        eff = [min(c, M) for c in counts]
+        pad_block = jnp.broadcast_to(pad_vec, (B, Wg_j, D))
+        padded = jnp.concatenate([pad_block, extra_tok], axis=1)
+        windows = jnp.stack([padded[:, c:c + Wg_j, :] for c in eff], axis=1)
+    rope = jnp.stack([jnp.clip(jnp.arange(Wg_j) - Wg_j + c, 0, None) for c in eff], axis=0)
+    return windows.reshape(B * n_groups, Wg_j, D), rope, Wg_j
+
+
+def _draft_past_valid_mask(n_groups: int, Pp: int, Kspan: int, valid_len: int) -> np.ndarray:
+    abs_idx = np.array([[g * Kspan - Pp + t for t in range(Pp)] for g in range(n_groups)])
+    return (abs_idx >= 0) & (abs_idx < valid_len)
+
+
 def reshape_pq(logits: jnp.ndarray, pq_chunks: int, code_vocab: int) -> jnp.ndarray:
     return logits.reshape(*logits.shape[:-1], pq_chunks, code_vocab)
 
 
-def sample_idx(logits: jnp.ndarray, rng, greedy: bool, temperature: float) -> tuple:
+def sample_idx(logits: jnp.ndarray, rng, greedy: bool, temperature: float, top_k: int = 0) -> tuple:
     if greedy:
-        return jnp.argmax(logits, axis=-1), rng
+        return safe_argmax(logits), rng
     rng, k_ = jax.random.split(rng)
-    return jax.random.categorical(k_, logits / temperature, axis=-1), rng
+    lg = logits / temperature
+    if top_k and top_k < lg.shape[-1]:
+        lg = jnp.where(lg < jax.lax.top_k(lg, top_k)[0][..., -1:], -jnp.inf, lg)
+    return safe_argmax(lg + jax.random.gumbel(k_, lg.shape)), rng
 
 
 def run_block(blk: Block, x: jnp.ndarray, remat: bool, rng=None, drop_prob: float = 0.0) -> jnp.ndarray:
-    out = jax.checkpoint(blk)(x) if remat else blk(x)
+    out = eqx.filter_checkpoint(blk)(x) if remat else blk(x)
     if rng is not None and drop_prob > 0.0:
         keep = jax.random.bernoulli(rng, p=1.0 - drop_prob)
         out = jnp.where(keep, out, x)
@@ -693,7 +834,7 @@ def token_ar_teacher_forced(in_proj, member_embed, norm1, attn, ln_f, out_head, 
 
 
 def token_ar_generate(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks: int,
-                       h: jnp.ndarray, rng, greedy: bool, temperature: float) -> tuple:
+                       h: jnp.ndarray, rng, greedy: bool, temperature: float, top_k: int = 0) -> tuple:
     lead = h.shape[:-1]
     D = h.shape[-1]
     N = int(np.prod(lead)) if lead else 1
@@ -704,7 +845,7 @@ def token_ar_generate(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks
         seq_in = jnp.concatenate(collected, axis=1)
         h1 = seq_in + dense_self_attention(attn, norm1(seq_in), causal=True)
         logit_m = ln_f(h1)[:, -1, :] @ out_head
-        val_m, rng = sample_idx(logit_m, rng, greedy, temperature)
+        val_m, rng = sample_idx(logit_m, rng, greedy, temperature, top_k)
         vals.append(val_m)
         if m < chunks - 1:
             collected.append(member_embed[val_m][:, None, :])
@@ -765,14 +906,32 @@ class EncDecLevel(eqx.Module):
     mtp_mode: str = eqx.field(static=True)
     mtp_weight: float = eqx.field(static=True)
     remat: bool = eqx.field(static=True)
+    remat_level: bool = eqx.field(static=True)
+    gen_top_k: int = eqx.field(static=True)
     pq_dim: int = eqx.field(static=True)
     ncodes_window: int = eqx.field(static=True)
     streaming: bool = eqx.field(static=True)
     decode_past: int = eqx.field(static=True)
     decode_future: int = eqx.field(static=True)
     attn_lookahead: int = eqx.field(static=True)
-    n_refine_passes: int = eqx.field(static=True)
-    refine_window: int = eqx.field(static=True)
+    level_refine_passes: int = eqx.field(static=True)
+    level_refine_window: int = eqx.field(static=True)
+    cond_depth: int = eqx.field(static=True)
+    cond_drop: float = eqx.field(static=True)
+    cond_window: int = eqx.field(static=True)
+    extra_ctx_embed: list
+    extra_ctx_proj: list
+    extra_ctx_pad: list
+    extra_ctx_n_blocks: tuple = eqx.field(static=True)
+    extra_ctx_up_stride: tuple = eqx.field(static=True)
+    draft_pad: jnp.ndarray
+    revision_embed: jnp.ndarray
+    revision_proj: jnp.ndarray
+    revision_pad: jnp.ndarray
+    revision_up_stride: int = eqx.field(static=True)
+    revision_n_blocks: int = eqx.field(static=True)
+    cyclic_revise_detach: bool = eqx.field(static=True)
+    cyclic_revise_remat: bool = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config, level: int, has_decoder: bool, weight_sharing: bool):
         D = cfg.d_model[level]
@@ -781,13 +940,15 @@ class EncDecLevel(eqx.Module):
         self.quantize_mode = cfg.quantize_mode
         self.quantize_drop = cfg.quantize_drop
         self.remat = cfg.remat
+        self.remat_level = cfg.remat_level
+        self.gen_top_k = cfg.gen_top_k
         self.ncodes_window = cfg.ncodes_window[level]
         self.streaming = cfg.streaming[level]
         self.decode_past = cfg.decode_past[level]
         self.decode_future = cfg.decode_future[level]
         self.attn_lookahead = cfg.attn_lookahead[level]
-        self.n_refine_passes = cfg.n_refine_passes[level]
-        self.refine_window = cfg.refine_window[level]
+        self.level_refine_passes = cfg.level_refine_passes[level]
+        self.level_refine_window = cfg.level_refine_window[level]
         is_byte_level = (level == 0)
         self.pq_chunks, self.code_vocab = cfg.pq_chunks[level], cfg.code_vocab[level]
         self.in_pq_chunks = cfg.byte_group if is_byte_level else cfg.pq_chunks[level - 1]
@@ -821,6 +982,44 @@ class EncDecLevel(eqx.Module):
         self.bos_embed = init_vector(keys[4], D, scheme)
         self.ctx_embed = init_matrix(keys[5], (self.code_vocab, self.pq_dim), scheme)
         self.ctx_proj = init_matrix(keys[21], (self.pq_chunks * self.pq_dim, D), scheme)
+        self.draft_pad = init_vector(jax.random.fold_in(key, 9002), D, scheme)
+
+        self.cond_depth = cfg.cond_depth[level]
+        self.cond_drop = cfg.cond_drop[level]
+        self.cond_window = cfg.cond_window[level]
+        self.extra_ctx_embed, self.extra_ctx_proj, self.extra_ctx_pad = [], [], []
+        extra_n_blocks, extra_up_stride = [], []
+        if self.cond_depth > 1:
+            extra_keys = jax.random.split(jax.random.fold_in(key, 9001), 3 * (self.cond_depth - 1))
+            up_stride = 1
+            for k in range(1, self.cond_depth):
+                j = level + k
+                self.extra_ctx_embed.append(
+                    init_matrix(extra_keys[3 * (k - 1)], (cfg.code_vocab[j], cfg.pq_dim[j]), scheme))
+                self.extra_ctx_proj.append(
+                    init_matrix(extra_keys[3 * (k - 1) + 1], (cfg.pq_chunks[j] * cfg.pq_dim[j], D), scheme))
+                self.extra_ctx_pad.append(init_vector(extra_keys[3 * (k - 1) + 2], D, scheme))
+                extra_n_blocks.append(n_blocks_for_level(cfg, j))
+                up_stride *= cfg.strides[j] if cfg.strides[j] != -1 else 1
+                extra_up_stride.append(up_stride)
+        self.extra_ctx_n_blocks = tuple(extra_n_blocks)
+        self.extra_ctx_up_stride = tuple(extra_up_stride)
+
+        self.cyclic_revise_detach = cfg.cyclic_revise_detach
+        self.cyclic_revise_remat = cfg.cyclic_revise_remat if cfg.cyclic_revise_remat is not None else cfg.remat
+        n_levels = len(cfg.d_model)
+        if cfg.cycle_refine_passes > 1 and level + 1 < n_levels:
+            j = level + 1
+            rev_keys = jax.random.split(jax.random.fold_in(key, 9003), 3)
+            self.revision_embed = init_matrix(rev_keys[0], (cfg.code_vocab[j], cfg.pq_dim[j]), scheme)
+            self.revision_proj = init_matrix(rev_keys[1], (cfg.pq_chunks[j] * cfg.pq_dim[j], D), scheme)
+            self.revision_pad = init_vector(rev_keys[2], D, scheme)
+            self.revision_up_stride = cfg.strides[j] if cfg.strides[j] != -1 else 1
+            self.revision_n_blocks = n_blocks_for_level(cfg, j)
+        else:
+            self.revision_embed = self.revision_proj = self.revision_pad = None
+            self.revision_up_stride = 1
+            self.revision_n_blocks = 0
 
         if has_decoder and not weight_sharing:
             dec_block_keys = jax.random.split(keys[6], n_layers)
@@ -902,8 +1101,11 @@ class EncDecLevel(eqx.Module):
             layer_drop_prob = (0.0,) * n_blk
         elif isinstance(layer_drop_prob, (int, float)):
             layer_drop_prob = (layer_drop_prob,) * n_blk
-        for i, blk in enumerate(self.blocks):
-            h = run_block(blk, h, self.remat, rng=layer_rngs[i], drop_prob=layer_drop_prob[i])
+        def _enc_stack(h):
+            for i, blk in enumerate(self.blocks):
+                h = run_block(blk, h, self.remat and not self.remat_level, rng=layer_rngs[i], drop_prob=layer_drop_prob[i])
+            return h
+        h = jax.checkpoint(_enc_stack)(h) if self.remat_level else _enc_stack(h)
         h = self.ln_f(h)
         M, L, D = h.shape
         n_blocks = L // self.K
@@ -945,6 +1147,18 @@ class EncDecLevel(eqx.Module):
         proj = self.own_input_proj if self.weight_sharing else self.dec_target_proj
         return code_embed_proj(idx, table, proj)
 
+    def _extra_ctx_table(self, k: int) -> tuple:
+        # cond_depth's extra_ctx_* lists hold one dedicated table per (distinct, statically coarser)
+        # level; cyclic-refine revision slots all reference the SAME coarser level (level+1) at
+        # different refinement passes, so they share one table -- any k beyond the cond_depth list
+        # falls back to it.
+        n_cond = len(self.extra_ctx_embed)
+        if k < n_cond:
+            return (self.extra_ctx_embed[k], self.extra_ctx_proj[k], self.extra_ctx_pad[k],
+                    self.extra_ctx_up_stride[k], self.extra_ctx_n_blocks[k])
+        return self.revision_embed, self.revision_proj, self.revision_pad, self.revision_up_stride, \
+            self.revision_n_blocks
+
     def _dec_head_w(self) -> jnp.ndarray:
         return self.ntp_head if self.weight_sharing else self.dec_head
 
@@ -961,7 +1175,7 @@ class EncDecLevel(eqx.Module):
     def _token_generate_ar(self, h: jnp.ndarray, rng, greedy: bool, temperature: float) -> tuple:
         return token_ar_generate(self.token_in_proj, self.token_member_embed, self.token_norm1,
                                   self.token_attn, self.token_ln_f, self.token_out_head,
-                                  self.in_pq_chunks, h, rng, greedy, temperature)
+                                  self.in_pq_chunks, h, rng, greedy, temperature, self.gen_top_k)
 
     def _token_teacher_forced_diffusion(self, h: jnp.ndarray, target: jnp.ndarray, rng) -> tuple:
         lead = h.shape[:-1]
@@ -988,7 +1202,7 @@ class EncDecLevel(eqx.Module):
         tok = jnp.broadcast_to(tok, (N, chunks, self.token_dim))
         h1 = tok + dense_self_attention(self.token_attn, self.token_norm1(tok))
         logits = self.token_ln_f(h1) @ self.token_out_head
-        idx, rng = sample_idx(logits, rng, greedy, temperature)
+        idx, rng = sample_idx(logits, rng, greedy, temperature, self.gen_top_k)
         return idx.reshape(*lead, chunks), rng
 
 
@@ -1084,8 +1298,11 @@ class EncDecLevel(eqx.Module):
         bos_g = jnp.broadcast_to(self.bos_embed, (B, n_groups, 1, D))
         per_group_len = G + 1 + G * self.K
         xe = jnp.concatenate([ctx_g, bos_g, te_g], axis=2).reshape(B, n_groups * per_group_len, D)
-        for blk in blocks:
-            xe = run_block(blk, xe, self.remat)
+        def _dec_stack(xe):
+            for blk in blocks:
+                xe = run_block(blk, xe, self.remat and not self.remat_level)
+            return xe
+        xe = jax.checkpoint(_dec_stack)(xe) if self.remat_level else _dec_stack(xe)
         h = ln_f(xe)
         pred_pos = (jnp.arange(n_groups)[:, None] * per_group_len + G
                     + jnp.arange(G * self.K)[None, :]).reshape(-1)
@@ -1106,10 +1323,17 @@ class EncDecLevel(eqx.Module):
                                          decoder_ncodes: int, rng=None, decode_past_override: int = None,
                                          draft_override: jnp.ndarray = None,
                                          draft_embed_override: jnp.ndarray = None,
-                                         remat_override: bool = None) -> tuple:
+                                         draft_windowed_override: jnp.ndarray = None,
+                                         draft_valid_windowed: jnp.ndarray = None,
+                                         remat_override: bool = None,
+                                         extra_ctx_code_soft: list = None) -> tuple:
         n_blocks_check = ctx_code_soft.shape[1]
-        if decoder_ncodes >= n_blocks_check and decode_past_override is None:
-            return self.decode_logits_and_target(target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
+        if decoder_ncodes >= n_blocks_check and decode_past_override is None and not extra_ctx_code_soft \
+                and self.decode_future == 0:
+            logits, target_out, mask, mtp_loss = self.decode_logits_and_target(
+                target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
+            zero = jnp.array(0.0, dtype=logits.dtype)
+            return logits, target_out, mask, mtp_loss, zero, zero
         blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
         B = target_seq.shape[0]
         D = self.bos_embed.shape[-1]
@@ -1132,16 +1356,62 @@ class EncDecLevel(eqx.Module):
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * G, 0), (0, 0)))
 
         B2 = B * n_groups
+        extra_len_total = 0
         if fullctx:
             ctx_flat = jnp.broadcast_to(ctx_tok[:, None, :, :], (B, n_groups, Wg, D)).reshape(B2, Wg, D)
             min_valid_pos = jnp.zeros((B2,), dtype=jnp.int32)
             rope_ctx_g = jnp.broadcast_to(jnp.arange(Wg)[None, :], (n_groups, Wg))
+            if extra_ctx_code_soft:
+                extra_flats, extra_ropes = [], []
+                for k, extra_soft in enumerate(extra_ctx_code_soft):
+                    embed_t, proj_t, pad_t, _, n_blocks_t = self._extra_ctx_table(k)
+                    if extra_soft is None:
+                        n_extra = n_blocks_t
+                        extra_b = jnp.broadcast_to(pad_t, (B2, n_extra, D))
+                    else:
+                        extra_tok = code_embed_proj(extra_soft, embed_t, proj_t)
+                        n_extra = extra_tok.shape[1]
+                        extra_b = jnp.broadcast_to(extra_tok[:, None, :, :], (B, n_groups, n_extra, D)).reshape(
+                            B2, n_extra, D)
+                        if self.cond_drop > 0 and rng is not None:
+                            keep = jax.random.bernoulli(jax.random.fold_in(rng, k), p=1.0 - self.cond_drop,
+                                                         shape=(B, 1, 1))
+                            keep_b2 = jnp.broadcast_to(keep, (B, n_groups, 1)).reshape(B2, 1, 1)
+                            pad_b = jnp.broadcast_to(pad_t, (B2, n_extra, D))
+                            extra_b = jnp.where(keep_b2, extra_b, pad_b)
+                    extra_flats.append(extra_b)
+                    extra_ropes.append(jnp.broadcast_to(jnp.arange(n_extra)[None, :], (n_groups, n_extra)))
+                    extra_len_total += n_extra
+                ctx_flat = jnp.concatenate(list(reversed(extra_flats)) + [ctx_flat], axis=1)
+                rope_ctx_g = jnp.concatenate(list(reversed(extra_ropes)) + [rope_ctx_g], axis=1)
         else:
             ctx_windows = jnp.stack([ctx_tok[:, g * G:g * G + Wg, :] for g in range(n_groups)], axis=1)
             ctx_flat = ctx_windows.reshape(B2, Wg, D)
             fake_counts = jnp.array([max(0, N - g) * G for g in range(n_groups)])
             min_valid_pos = jnp.broadcast_to(fake_counts[None, :], (B, n_groups)).reshape(B2)
             rope_ctx_g = jnp.stack([jnp.clip(jnp.arange(Wg) - N * G + g * G, 0, None) for g in range(n_groups)], axis=0)
+            if extra_ctx_code_soft:
+                extra_flats, extra_ropes = [], []
+                for k, extra_soft in enumerate(extra_ctx_code_soft):
+                    embed_t, proj_t, pad_t, up_stride, _ = self._extra_ctx_table(k)
+                    real_w, real_r, Wg_j = causal_extra_ctx_windows(
+                        extra_soft, embed_t, proj_t, pad_t, up_stride, G, n_groups, B, D, self.cond_window)
+                    if extra_soft is not None and self.cond_drop > 0 and rng is not None:
+                        pad_w, _, _ = causal_extra_ctx_windows(
+                            None, embed_t, proj_t, pad_t, up_stride, G, n_groups, B, D, self.cond_window)
+                        keep = jax.random.bernoulli(jax.random.fold_in(rng, k), p=1.0 - self.cond_drop,
+                                                     shape=(B, 1, 1))
+                        keep_b2 = jnp.broadcast_to(keep, (B, n_groups, 1)).reshape(B2, 1, 1)
+                        real_w = jnp.where(keep_b2, real_w, pad_w)
+                    extra_flats.append(real_w)
+                    extra_ropes.append(real_r)
+                    extra_len_total += Wg_j
+                # own ctx stays first (min_valid_pos's fake-padding boundary is only valid as a lower
+                # bound when it applies to the sequence's own start -- extra ctx is always-valid
+                # (pad-filled, not masked), so it must come AFTER, not before, or min_valid_pos would
+                # incorrectly mask it out whenever fake_counts(g) is nonzero
+                ctx_flat = jnp.concatenate([ctx_flat] + extra_flats, axis=1)
+                rope_ctx_g = jnp.concatenate([rope_ctx_g] + extra_ropes, axis=1)
 
         target_windows = jnp.stack(
             [target_p[:, g * G * self.K:(g + 1) * G * self.K] for g in range(n_groups)], axis=1)
@@ -1160,11 +1430,20 @@ class EncDecLevel(eqx.Module):
         real_tail_te = self._dec_embed_target(real_tail_flat)
 
         if Pp > 0:
-            if draft_embed_override is not None:
+            # draft positions before the sequence's real start (early groups' widened window
+            # reaches before index 0) get zero-filled by jnp.pad -- but index/embedding 0 is a
+            # real vocab entry, indistinguishable from genuine data. Substitute the trainable
+            # draft_pad embedding there instead, so the model can actually tell "no draft yet"
+            # apart from "draft says 0" (same fix as extra_ctx_pad does for cond_depth).
+            if draft_windowed_override is not None:
+                draft_te = self._dec_embed_target(draft_windowed_override)
+                valid = draft_valid_windowed
+            elif draft_embed_override is not None:
                 draft_embed_p = jnp.pad(draft_embed_override, ((0, 0), (Pp, 0), (0, 0)))
                 draft_te = jnp.stack(
                     [draft_embed_p[:, g * Kspan:g * Kspan + Pp, :] for g in range(n_groups)], axis=1
                 ).reshape(B2, Pp, D)
+                valid = _draft_past_valid_mask(n_groups, Pp, Kspan, n_blocks * self.K)
             else:
                 if draft_override is None:
                     draft_source = target_p
@@ -1177,12 +1456,16 @@ class EncDecLevel(eqx.Module):
                 draft_windows = jnp.stack([draft_p[:, g * Kspan:g * Kspan + Pp] for g in range(n_groups)], axis=1)
                 draft_flat = draft_windows.reshape(B2, Pp, *target_seq.shape[2:])
                 draft_te = self._dec_embed_target(draft_flat)
+                valid = _draft_past_valid_mask(n_groups, Pp, Kspan, n_blocks * self.K)
+            if valid is not None:
+                valid_b2 = jnp.broadcast_to(jnp.asarray(valid)[None], (B, n_groups, Pp)).reshape(B2, Pp)
+                draft_te = jnp.where(valid_b2[:, :, None], draft_te, self.draft_pad)
             te_flat = jnp.concatenate([draft_te, real_tail_te], axis=1)
         else:
             te_flat = real_tail_te
         bos = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
         xe = jnp.concatenate([ctx_flat, bos, te_flat], axis=1)
-        per_group_len = per_group_len + Pp + Pf
+        per_group_len = per_group_len + Pp + Pf + extra_len_total
         remat = self.remat if remat_override is None else remat_override
 
         rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])[:, None]
@@ -1193,11 +1476,13 @@ class EncDecLevel(eqx.Module):
         rope_pos_ids_g = jnp.concatenate([rope_ctx_g, rope_bos, rope_target], axis=1)
         rope_pos_ids = jnp.broadcast_to(rope_pos_ids_g[None], (B, n_groups, per_group_len)).reshape(B2, per_group_len)
 
-        x = xe
-        for blk in blocks:
-            x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, remat)
+        def _pardec_stack(x):
+            for blk in blocks:
+                x = run_block_pardec(blk, x, rope_pos_ids, min_valid_pos, remat and not self.remat_level)
+            return x
+        x = jax.checkpoint(_pardec_stack)(xe) if (self.remat_level and remat_override is not False) else _pardec_stack(xe)
         h = ln_f(x)
-        pred_pos = Wg + Pp + jnp.arange(G * self.K)
+        pred_pos = Wg + extra_len_total + Pp + jnp.arange(G * self.K)
         h_t = h[:, pred_pos, :]
         h_t = h_t.reshape(B, n_groups * G * self.K, D)
         target_out = target_windows.reshape(B, n_groups * G * self.K, *target_seq.shape[2:])
@@ -1213,7 +1498,54 @@ class EncDecLevel(eqx.Module):
             assert rng is not None, "diffusion token head needs an rng even at eval (masking is inherent)"
             logits, mask = self._token_teacher_forced_diffusion(h_t, target_out, rng)
         mtp_loss = self._mtp_loss(h_t, target_out)
-        return logits, target_out, mask, mtp_loss
+        aux_loss, aux_acc = self._widened_aux_ntp(h, target_p, Wg, extra_len_total, Pp, Pf, Kspan,
+                                                    n_groups, B, n_blocks, rng)
+        return logits, target_out, mask, mtp_loss, aux_loss, aux_acc
+
+    def _widened_aux_ntp(self, h, target_p, Wg, extra_len_total, Pp, Pf, Kspan, n_groups, B, n_blocks,
+                          rng) -> tuple:
+        # decode_past/decode_future are real ground-truth tokens EMBEDDED AS INPUT (causal, shifted --
+        # no leakage) purely to give the core Kspan prediction extra context. Historically that context
+        # was silently unused/unscored (Pp/Pf never appeared in pred_pos) -- pure wasted lookahead
+        # instead of a genuine forecast. This scores them too, as a separate NTP loss/acc: a real
+        # next-token prediction at those positions using only causally-available (already-attended) info.
+        if Pp == 0 and Pf == 0:
+            zero = jnp.array(0.0, dtype=h.dtype)
+            return zero, zero
+        ctx_len = Wg + extra_len_total
+        ext_target_p = jnp.pad(target_p, ((0, 0), (Pp, Pf)) + ((0, 0),) * (target_p.ndim - 2))
+        D = h.shape[-1]
+        h_parts, tgt_parts, valid_parts = [], [], []
+        if Pp > 0:
+            pred_pos_pp = ctx_len + jnp.arange(Pp)
+            h_parts.append(h[:, pred_pos_pp, :].reshape(B, n_groups, Pp, D))
+            tgt_parts.append(jnp.stack(
+                [ext_target_p[:, g * Kspan:g * Kspan + Pp] for g in range(n_groups)], axis=1))
+            abs_idx = np.array([[g * Kspan - Pp + t for t in range(Pp)] for g in range(n_groups)])
+            valid_parts.append((abs_idx >= 0) & (abs_idx < n_blocks * self.K))
+        if Pf > 0:
+            pred_pos_pf = ctx_len + Pp + Kspan + jnp.arange(Pf)
+            h_parts.append(h[:, pred_pos_pf, :].reshape(B, n_groups, Pf, D))
+            tgt_parts.append(jnp.stack(
+                [ext_target_p[:, (g + 1) * Kspan + Pp:(g + 1) * Kspan + Pp + Pf] for g in range(n_groups)],
+                axis=1))
+            abs_idx = np.array([[(g + 1) * Kspan + t for t in range(Pf)] for g in range(n_groups)])
+            valid_parts.append((abs_idx >= 0) & (abs_idx < n_blocks * self.K))
+        h_extra = jnp.concatenate(h_parts, axis=2)
+        target_extra = jnp.concatenate(tgt_parts, axis=2)
+        valid_np = np.concatenate(valid_parts, axis=1)
+        valid = jnp.broadcast_to(jnp.asarray(valid_np)[None, :, :, None], (B, n_groups, Pp + Pf, 1))
+        if self.token_head_type == "linears":
+            logits_extra, mask_extra = self._token_logits_linears(h_extra), None
+        elif self.token_head_type == "ar":
+            logits_extra, mask_extra = self._token_teacher_forced_ar(h_extra, target_extra), None
+        else:
+            aux_rng = jax.random.fold_in(rng, 0x5eed) if rng is not None else None
+            assert aux_rng is not None, "diffusion token head needs an rng even at eval (masking is inherent)"
+            logits_extra, mask_extra = self._token_teacher_forced_diffusion(h_extra, target_extra, aux_rng)
+        full_mask = valid if mask_extra is None else (valid & mask_extra)
+        full_mask = jnp.broadcast_to(full_mask, target_extra.shape)
+        return self._dec_loss_acc(logits_extra, target_extra, full_mask)
 
     def decode(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray, decoder_ncodes: int, rng=None) -> tuple:
         logits, target, mask, mtp_loss = self.decode_logits_and_target(target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
@@ -1259,7 +1591,7 @@ class EncDecLevel(eqx.Module):
         def token_predict(h_pos, rng):
             if self.token_head_type == "linears":
                 logits = self._token_logits_linears(h_pos)
-                return sample_idx(logits, rng, greedy, temperature)
+                return sample_idx(logits, rng, greedy, temperature, self.gen_top_k)
             elif self.token_head_type == "ar":
                 return self._token_generate_ar(h_pos, rng, greedy, temperature)
             else:
@@ -1302,9 +1634,17 @@ class EncDecLevel(eqx.Module):
 
     def decode_generate_pardec(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
                                 temperature: float = 1.0, seed: int = 0, decode_past_override: int = None,
-                                draft_override_flat: jnp.ndarray = None) -> jnp.ndarray:
+                                draft_override_flat: jnp.ndarray = None, draft_valid_flat: jnp.ndarray = None,
+                                extra_ctx_idx: list = None, gen_decode_future: bool = False) -> jnp.ndarray:
+        # gen_decode_future=True (default False, not used anywhere yet): also autoregressively generate
+        # each group's decode_future tail and return it as a second array, shape (B, n_groups, Pf,
+        # *out_extra) -- raw per-group future speculation. Caller decides how to use it (e.g. feed to
+        # this level's own encode() as a lookahead prefill); this function does not consume its own output.
+        if gen_decode_future:
+            assert self.decode_future > 0, "gen_decode_future=True needs decode_future>0 for this level"
         n_blocks_check = ctx_idx.shape[1]
-        if decoder_ncodes >= n_blocks_check and decode_past_override is None:
+        if decoder_ncodes >= n_blocks_check and decode_past_override is None and not extra_ctx_idx \
+                and not gen_decode_future:
             return self.decode_generate(ctx_idx, decoder_ncodes, greedy, temperature, seed)
         blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
         B, n_blocks, _ = ctx_idx.shape
@@ -1327,10 +1667,28 @@ class EncDecLevel(eqx.Module):
         if not fullctx and N > 0:
             ctx_tok = jnp.pad(ctx_tok, ((0, 0), (N * G, 0), (0, 0)))
         B2 = B * n_groups
+        extra_len_total = 0
         if fullctx:
             ctx_tok_flat = jnp.broadcast_to(ctx_tok[:, None, :, :], (B, n_groups, Wg, D)).reshape(B2, Wg, D)
             min_valid_pos = jnp.zeros((B2,), dtype=jnp.int32)
             rope_ctx_flat = jnp.broadcast_to(jnp.arange(Wg)[None, :], (B2, Wg))
+            if extra_ctx_idx:
+                extra_flats, extra_ropes = [], []
+                for k, extra_idx in enumerate(extra_ctx_idx):
+                    embed_t, proj_t, pad_t, _, n_blocks_t = self._extra_ctx_table(k)
+                    if extra_idx is None or self.cond_drop >= 1.0:
+                        n_extra = n_blocks_t
+                        extra_b = jnp.broadcast_to(pad_t, (B2, n_extra, D))
+                    else:
+                        extra_tok = code_embed_proj(extra_idx, embed_t, proj_t)
+                        n_extra = extra_tok.shape[1]
+                        extra_b = jnp.broadcast_to(extra_tok[:, None, :, :], (B, n_groups, n_extra, D)).reshape(
+                            B2, n_extra, D)
+                    extra_flats.append(extra_b)
+                    extra_ropes.append(jnp.broadcast_to(jnp.arange(n_extra)[None, :], (B2, n_extra)))
+                    extra_len_total += n_extra
+                ctx_tok_flat = jnp.concatenate(list(reversed(extra_flats)) + [ctx_tok_flat], axis=1)
+                rope_ctx_flat = jnp.concatenate(list(reversed(extra_ropes)) + [rope_ctx_flat], axis=1)
         else:
             ctx_windows = jnp.stack([ctx_tok[:, g * G:g * G + Wg, :] for g in range(n_groups)], axis=1)
             ctx_tok_flat = ctx_windows.reshape(B2, Wg, D)
@@ -1338,8 +1696,21 @@ class EncDecLevel(eqx.Module):
             min_valid_pos = jnp.broadcast_to(fake_counts[None, :], (B, n_groups)).reshape(B2)
             rope_ctx = jnp.stack([jnp.clip(jnp.arange(Wg) - N * G + g * G, 0, None) for g in range(n_groups)], axis=0)
             rope_ctx_flat = jnp.broadcast_to(rope_ctx[None], (B, n_groups, Wg)).reshape(B2, Wg)
+            if extra_ctx_idx:
+                extra_flats, extra_ropes = [], []
+                for k, extra_idx in enumerate(extra_ctx_idx):
+                    embed_t, proj_t, pad_t, up_stride, _ = self._extra_ctx_table(k)
+                    use_idx = None if (extra_idx is None or self.cond_drop >= 1.0) else extra_idx
+                    extra_w, extra_r, Wg_j = causal_extra_ctx_windows(
+                        use_idx, embed_t, proj_t, pad_t, up_stride, G, n_groups, B, D, self.cond_window)
+                    extra_flats.append(extra_w)
+                    extra_ropes.append(jnp.broadcast_to(extra_r[None], (B, n_groups, Wg_j)).reshape(B2, Wg_j))
+                    extra_len_total += Wg_j
+                ctx_tok_flat = jnp.concatenate([ctx_tok_flat] + extra_flats, axis=1)
+                rope_ctx_flat = jnp.concatenate([rope_ctx_flat] + extra_ropes, axis=1)
         rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])
         rope_bos_flat = jnp.broadcast_to(rope_bos[None, :], (B, n_groups)).reshape(B2)
+        per_group_len = per_group_len + extra_len_total
 
         def self_step(x_new, ck, cv, pos, rope_pos_row):
             new_ck, new_cv = [], []
@@ -1363,7 +1734,7 @@ class EncDecLevel(eqx.Module):
         def token_predict(h_pos, rng):
             if self.token_head_type == "linears":
                 logits = self._token_logits_linears(h_pos)
-                return sample_idx(logits, rng, greedy, temperature)
+                return sample_idx(logits, rng, greedy, temperature, self.gen_top_k)
             elif self.token_head_type == "ar":
                 return self._token_generate_ar(h_pos, rng, greedy, temperature)
             else:
@@ -1373,12 +1744,19 @@ class EncDecLevel(eqx.Module):
         cache_v = jnp.zeros_like(cache_k)
         rng = jax.random.PRNGKey(seed)
 
-        total_steps = Pp + G * self.K
+        Pf = self.decode_future if gen_decode_future else 0
+        total_steps = Pp + G * self.K + Pf
 
         def widened_pos(t):
             if t < Pp:
                 return jnp.clip(rope_bos_flat - Pp + t, 0, None)
             return rope_bos_flat + 1 + (t - Pp)
+
+        def embed_draft_step(val, t):
+            te = self._dec_embed_target(val)
+            if draft_valid_flat is not None:
+                te = jnp.where(draft_valid_flat[:, t][:, None], te, self.draft_pad)
+            return te
 
         @jax.jit
         def run_pardec(ctx_tok_flat, cache_k, cache_v, rng):
@@ -1386,28 +1764,40 @@ class EncDecLevel(eqx.Module):
             chunk = jnp.concatenate([ctx_tok_flat, bos_in], axis=1)
             chunk_rope = jnp.concatenate([rope_ctx_flat, rope_bos_flat[:, None]], axis=1)
             h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, jnp.array(0), chunk_rope)
-            pos = Wg + 1
+            pos = Wg + extra_len_total + 1
             rope_pos_row = widened_pos(0)
             h = h_chunk[:, -1, :]
             val, rng = token_predict(h, rng)
-            vals = [val] if Pp == 0 else []
-            x_input = self._dec_embed_target(val if draft_override_flat is None else draft_override_flat[:, 0])
+            vals, future_vals = ([val] if Pp == 0 else []), []
+            if draft_override_flat is None:
+                x_input = self._dec_embed_target(val)
+            else:
+                x_input = embed_draft_step(draft_override_flat[:, 0], 0)
             for t in range(1, total_steps):
                 h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
                 pos = pos + 1
                 rope_pos_row = widened_pos(t)
                 val, rng = token_predict(h, rng)
-                if t >= Pp:
+                if Pp <= t < Pp + G * self.K:
                     vals.append(val)
+                elif t >= Pp + G * self.K:
+                    future_vals.append(val)
                 if draft_override_flat is not None and t < Pp:
-                    val = draft_override_flat[:, t]
-                x_input = self._dec_embed_target(val)
+                    x_input = embed_draft_step(draft_override_flat[:, t], t)
+                else:
+                    x_input = self._dec_embed_target(val)
             _, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos, rope_pos_row)
-            return jnp.stack(vals, axis=1)
+            vals_out = jnp.stack(vals, axis=1)
+            future_out = jnp.stack(future_vals, axis=1) if future_vals else None
+            return vals_out, future_out
 
-        vals_all = run_pardec(ctx_tok_flat, cache_k, cache_v, rng)
+        vals_all, future_all = run_pardec(ctx_tok_flat, cache_k, cache_v, rng)
         out = vals_all.reshape(B, n_groups * G * self.K, *out_extra).astype(jnp.int32)
-        return out[:, :n_blocks * self.K]
+        out = out[:, :n_blocks * self.K]
+        if not gen_decode_future:
+            return out
+        future_out = future_all.reshape(B, n_groups, Pf, *out_extra).astype(jnp.int32)
+        return out, future_out
 
     def decode_generate_mtp_no_verify(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
                                        temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
@@ -1484,74 +1874,262 @@ class EncDecLevel(eqx.Module):
         return out[:, :n_blocks * self.K]
 
 
+def decode_logits_and_target_cyclic_revision(levelN, dec_target_iN, ctx_code_soft, decoder_ncodes,
+                                              levelT_code_soft, cycle_refine_passes, rng,
+                                              encode_temperature, extra_ctx_code_soft=None) -> tuple:
+    # levelN conditions on a growing stack of revisions of the (fixed) coarser level's own code:
+    # pass 1 sees just v1 = levelT_code_soft (levelT's real, already-encoded code -- cond_depth-style
+    # extra ctx, unfilled slots trainable-pad); after each pass, levelN's own decode gets re-encoded
+    # (via levelN's own encoder) into the next revision, filling one more slot each pass. levelN never
+    # sees its own target as input -- only ever a revised version of a DIFFERENT (coarser) level's code.
+    detach = levelN.cyclic_revise_detach
+    revision_stack = [levelT_code_soft] + [None] * (cycle_refine_passes - 1)
+    static_extra = list(extra_ctx_code_soft) if extra_ctx_code_soft else []
+    logits = target_out = mask = mtp_loss = aux_loss = aux_acc = None
+    rngs = [None] * cycle_refine_passes if rng is None else list(jax.random.split(rng, cycle_refine_passes))
+    for p in range(cycle_refine_passes):
+        logits, target_out, mask, mtp_loss, aux_loss, aux_acc = levelN.decode_logits_and_target_pardec(
+            dec_target_iN, ctx_code_soft, decoder_ncodes, rng=rngs[p],
+            extra_ctx_code_soft=static_extra + revision_stack,
+            remat_override=(levelN.cyclic_revise_remat if not detach else None))
+        if p < cycle_refine_passes - 1:
+            code_soft, code_idx = quantize_hard(logits)
+            re_input = code_idx if detach else code_soft
+            x_re = code_embed_proj(re_input, levelN.own_input_embed, levelN.own_input_proj)
+            enc_re = levelN.encode(x_re, code_idx, rng=None, encode_temperature=encode_temperature)
+            revision_stack[p + 1] = jax.lax.stop_gradient(enc_re["code_idx"]) if detach else enc_re["code_soft"]
+    return logits, target_out, mask, mtp_loss, aux_loss, aux_acc
+
+
 def decode_logits_and_target_multipass(level: EncDecLevel, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
                                         decoder_ncodes: int, rng=None, multipass_detach: bool = True,
-                                        refine_gumbel: bool = False, refine_temperature: float = 1.0,
-                                        refine_quantize_drop: float = 0.0, refine_rng=None,
-                                        refine_remat: bool = None) -> tuple:
-    logits, target_out, mask, mtp_loss = level.decode_logits_and_target_pardec(
-        target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
-    if level.n_refine_passes <= 1 or level.refine_window <= 0:
-        return logits, target_out, mask, mtp_loss
+                                        level_refine_gumbel: bool = False, level_refine_temperature: float = 1.0,
+                                        level_refine_gt_drop: float = 1.0, refine_quantize_drop: float = 0.0, refine_rng=None,
+                                        refine_remat: bool = None, extra_ctx_code_soft: list = None,
+                                        refine_active=None) -> tuple:
+    logits, target_out, mask, mtp_loss, aux_loss, aux_acc = level.decode_logits_and_target_pardec(
+        target_seq, ctx_code_soft, decoder_ncodes, rng=rng, extra_ctx_code_soft=extra_ctx_code_soft)
+    if level.level_refine_passes <= 1 or level.level_refine_window <= 0:
+        return logits, target_out, mask, mtp_loss, aux_loss, aux_acc
     Kspan = decoder_ncodes * level.K
-    Pp = level.refine_window * Kspan
-    n_extra = level.n_refine_passes - 1
+    Pp = level.level_refine_window * Kspan
+    n_extra = level.level_refine_passes - 1
     refine_rngs = [None] * n_extra if refine_rng is None else list(jax.random.split(refine_rng, n_extra))
-    for p_idx in range(n_extra):
-        r_rng = refine_rngs[p_idx]
-        if refine_gumbel:
-            assert r_rng is not None, "refine_gumbel=True needs refine_rng"
-            code_soft, idx = quantize_gumbel(logits, r_rng, refine_temperature, refine_quantize_drop)
+    state = (logits, target_out, mask, mtp_loss, aux_loss, aux_acc)
+
+    def _refine_pass(state, r_rng):
+        logits, target_out = state[0], state[1]
+        if level_refine_gumbel and r_rng is not None:
+            code_soft, idx = quantize_gumbel(logits, r_rng, level_refine_temperature, refine_quantize_drop)
         else:
             code_soft, idx = quantize_hard(logits, r_rng if refine_quantize_drop > 0 else None,
-                                            refine_quantize_drop, refine_temperature)
+                                            refine_quantize_drop, level_refine_temperature)
+        if level_refine_gt_drop < 1.0 and r_rng is not None:
+            # per-token: prob level_refine_gt_drop keeps the sampled own output, else the real target
+            own = jax.random.bernoulli(jax.random.fold_in(r_rng, 1), p=level_refine_gt_drop, shape=idx.shape)
+            gt_idx = target_out.astype(idx.dtype)
+            code_soft = jnp.where(own[..., None], code_soft, jax.nn.one_hot(gt_idx, code_soft.shape[-1], dtype=code_soft.dtype))
+            idx = jnp.where(own, idx, gt_idx)
         if multipass_detach:
             kwargs = dict(draft_override=jax.lax.stop_gradient(idx))
         else:
             kwargs = dict(draft_embed_override=level._dec_embed_target(code_soft))
-        logits, target_out, mask, mtp_loss = level.decode_logits_and_target_pardec(
+        out = level.decode_logits_and_target_pardec(
             target_seq, ctx_code_soft, decoder_ncodes, rng=rng,
-            decode_past_override=Pp, remat_override=refine_remat, **kwargs)
-    return logits, target_out, mask, mtp_loss
+            decode_past_override=Pp, remat_override=refine_remat,
+            extra_ctx_code_soft=extra_ctx_code_soft, **kwargs)
+        return jax.tree_util.tree_map(lambda n, o: n.astype(o.dtype), out, state)
+
+    for p_idx in range(n_extra):
+        if refine_active is None:
+            state = _refine_pass(state, refine_rngs[p_idx])
+        else:
+            state = jax.lax.cond(refine_active[p_idx], lambda st, r=refine_rngs[p_idx]: _refine_pass(st, r),
+                                 lambda st: st, state)
+    logits, target_out, mask, mtp_loss, aux_loss, aux_acc = state
+    return logits, target_out, mask, mtp_loss, aux_loss, aux_acc
 
 
 def _decode_generate_pardec_call(level, ctx_idx, decoder_ncodes, greedy, temperature, seed,
-                                  decode_past_override, draft_override_flat):
+                                  decode_past_override, draft_override_flat, extra_ctx_idx=None,
+                                  draft_valid_flat=None):
     return level.decode_generate_pardec(ctx_idx, decoder_ncodes, greedy=greedy, temperature=temperature,
                                          seed=seed, decode_past_override=decode_past_override,
-                                         draft_override_flat=draft_override_flat)
+                                         draft_override_flat=draft_override_flat, extra_ctx_idx=extra_ctx_idx,
+                                         draft_valid_flat=draft_valid_flat)
 
 
 _decode_generate_pardec_jit = eqx.filter_jit(_decode_generate_pardec_call)
 
 
 def decode_generate_multipass(level: EncDecLevel, ctx_idx: jnp.ndarray, decoder_ncodes: int,
-                               greedy: bool = True, temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
-    pred = _decode_generate_pardec_jit(level, ctx_idx, decoder_ncodes, greedy, temperature, seed, None, None)
-    if level.n_refine_passes <= 1 or level.refine_window <= 0:
+                               greedy: bool = True, temperature: float = 1.0, seed: int = 0,
+                               extra_ctx_idx: list = None) -> jnp.ndarray:
+    pred = _decode_generate_pardec_jit(level, ctx_idx, decoder_ncodes, greedy, temperature, seed, None, None,
+                                        extra_ctx_idx)
+    if level.level_refine_passes <= 1 or level.level_refine_window <= 0:
         return pred
     B, n_blocks = ctx_idx.shape[0], ctx_idx.shape[1]
     G = decoder_ncodes
     pad_blocks = (-n_blocks) % G
     n_groups = (n_blocks + pad_blocks) // G
     Kspan = G * level.K
-    Pp = level.refine_window * Kspan
-    for _ in range(level.n_refine_passes - 1):
+    Pp = level.level_refine_window * Kspan
+    draft_valid_np = _draft_past_valid_mask(n_groups, Pp, Kspan, n_blocks * level.K)
+    for _ in range(level.level_refine_passes - 1):
         pred_p = pred if pad_blocks == 0 else jnp.pad(
             pred, ((0, 0), (0, pad_blocks * level.K)) + ((0, 0),) * (pred.ndim - 2))
         draft_p = jnp.pad(pred_p, ((0, 0), (Pp, 0)) + ((0, 0),) * (pred_p.ndim - 2))
         draft_windows = jnp.stack([draft_p[:, g * Kspan:g * Kspan + Pp] for g in range(n_groups)], axis=1)
         draft_override_flat = draft_windows.reshape(B * n_groups, Pp, *pred.shape[2:])
+        draft_valid_flat = jnp.broadcast_to(jnp.asarray(draft_valid_np)[None], (B, n_groups, Pp)).reshape(
+            B * n_groups, Pp)
         pred = _decode_generate_pardec_jit(level, ctx_idx, decoder_ncodes, greedy, temperature, seed,
-                                            Pp, draft_override_flat)
+                                            Pp, draft_override_flat, extra_ctx_idx, draft_valid_flat)
     return pred
+
+
+def cyclic_refine_generate(levels, phase, ctx_idx_top, decoder_ncodes_list, greedy, temperature, seed,
+                            encode_temperature, n_cycles):
+    # levelT generates once, via the standard single-pass path (matches training's "levelT decodes
+    # exactly once" design). levelN then re-decodes n_cycles times, conditioning on a growing stack
+    # of revisions of levelT's code (v1 = pred_T; each subsequent slot = a re-encode of levelN's own
+    # previous-cycle output) via the same extra_ctx mechanism cond_depth uses.
+    iT, iN = phase - 1, phase - 2
+    levelT, levelN = levels[iT], levels[iN]
+    GT = decoder_ncodes_list[iT]
+
+    pred_T = _decode_generate_pardec_jit(levelT, ctx_idx_top, GT, greedy, temperature, seed, None, None)
+
+    revision_stack = [pred_T] + [None] * (n_cycles - 1)
+    pred_N = None
+    for cyc in range(n_cycles):
+        pred_N = decode_generate_multipass(levelN, pred_T, decoder_ncodes_list[iN],
+                                            greedy=greedy, temperature=temperature, seed=seed,
+                                            extra_ctx_idx=list(revision_stack))
+        if cyc < n_cycles - 1:
+            x_re = code_embed_proj(pred_N, levelN.own_input_embed, levelN.own_input_proj)
+            enc_re = levelN.encode(x_re, pred_N, rng=None, encode_temperature=encode_temperature)
+            revision_stack[cyc + 1] = enc_re["code_idx"]
+    return pred_N
+
+
+def encoder_hidden(level: EncDecLevel, x: jnp.ndarray) -> jnp.ndarray:
+    h = x
+    for blk in level.blocks:
+        h = run_block(blk, h, False)
+    return level.ln_f(h)
+
+
+def encoder_ntp_logits(level: EncDecLevel, h: jnp.ndarray) -> jnp.ndarray:
+    return reshape_pq(h @ level.ntp_head, level.in_pq_chunks, level.in_code_vocab)
+
+
+def _sample_tokens(logits: jnp.ndarray, rng, greedy: bool, temperature, top_k: int = 0) -> jnp.ndarray:
+    # gumbel-max with safe_argmax (jnp.argmax feeding a gather is miscompiled on TPU, see safe_argmax)
+    if greedy:
+        return safe_argmax(logits)
+    lg = logits / temperature
+    if top_k and top_k < lg.shape[-1]:
+        kth = jax.lax.top_k(lg, top_k)[0][..., -1:]
+        lg = jnp.where(lg < kth, -jnp.inf, lg)
+    return safe_argmax(lg + jax.random.gumbel(rng, lg.shape))
+
+
+def _encoder_free_run(level: EncDecLevel, tokens: jnp.ndarray, P, rng, temperature, greedy: bool,
+                      top_k: int) -> jnp.ndarray:
+    # tokens (B,total_len,C) holds the prompt in [:P] (P may be traced); the rest is overwritten
+    x = code_embed_proj(tokens, level.own_input_embed, level.own_input_proj)
+
+    def body(t, carry):
+        tokens, x = carry
+        # exact training-time encoder forward over the whole fixed-length buffer; the encoder is causal, so
+        # positions <= t-1 never see the not-yet-generated (junk) positions after them
+        h = encoder_hidden(level, x)
+        lg = encoder_ntp_logits(level, jax.lax.dynamic_index_in_dim(h, t - 1, axis=1, keepdims=False))
+        tok = _sample_tokens(lg, jax.random.fold_in(rng, t), greedy, temperature, top_k)
+        tokens = tokens.at[:, t].set(tok.astype(tokens.dtype))
+        x = x.at[:, t].set(code_embed_proj(tok, level.own_input_embed, level.own_input_proj))
+        return tokens, x
+
+    tokens, _ = jax.lax.fori_loop(P, tokens.shape[1], body, (tokens, x))
+    return tokens
+
+
+_encoder_free_run_jit = eqx.filter_jit(_encoder_free_run)
+
+
+def encoder_free_run(level: EncDecLevel, prompt_tokens: jnp.ndarray, total_len: int, rng, greedy: bool = False,
+                     temperature: float = 1.0, top_k: int = 0) -> jnp.ndarray:
+    """Free-run one level's encoder as a language model over its own input tokens (its NTP head): keep the
+    prompt tokens, then sample the rest. greedy=True is argmax; otherwise temperature / top_k sampling."""
+    assert level.attn_lookahead == 0, \
+        f"encoder free-run needs attn_lookahead=0 (got {level.attn_lookahead}): a lookahead shifts the NTP target"
+    B, P, C = prompt_tokens.shape
+    assert 1 <= P <= total_len, f"prompt length {P} must be in [1, {total_len}]"
+    tokens = jnp.zeros((B, total_len, C), prompt_tokens.dtype).at[:, :P].set(prompt_tokens)
+    return _encoder_free_run_jit(level, tokens, jnp.asarray(P, jnp.int32), rng,
+                                 jnp.asarray(temperature, jnp.float32), greedy, top_k)
+
+
+def generate_from_prompt(model: HierEncDec, cfg: Config, prompt_bytes: jnp.ndarray, total_positions: int,
+                          sample_level: int, rng, greedy: bool = False, temperature: float = 1.0,
+                          top_k: int = 0, encode_temperature: float = 1.0, decode_greedy: bool = True,
+                          decode_temperature: float = 1.0, decode_seed: int = 0) -> dict:
+    """Prompted generation through an ENCODER's own next-token head (only the top two levels allowed).
+    prompt_bytes (B,P,byte_group) = leading positions of an image. The prompt is encoded up to `sample_level`,
+    that level's encoder is free-run (sampling its own input tokens: bytes at level 0, level-(L-1) codes above),
+    the completed sequence is encoded back up to the top (the codes the encoder emits), and those codes are
+    decoded down the usual cascade. Returns image bytes for decode_from "emitted" (cascade from the top emitted
+    code) and, when available, "sampled" (the free-run tokens themselves: the image for level 0, decoded from the
+    sampled level-(L-1) codes above it). greedy/temperature/top_k control the encoder free-run,
+    decode_greedy/decode_temperature the decoder cascade."""
+    levels = model.levels
+    n = len(levels)
+    assert n - 2 <= sample_level <= n - 1, f"sample_level {sample_level} must be one of the top two levels of {n}"
+    K0 = levels[0].K
+    B, P, _ = prompt_bytes.shape
+    assert P % K0 == 0, f"prompt length {P} must be a multiple of the level-0 stride {K0}"
+    tok = prompt_bytes
+    for i in range(sample_level):
+        x = code_embed_proj(tok, levels[i].own_input_embed, levels[i].own_input_proj)
+        tok = levels[i].encode(x, tok, rng=None, encode_temperature=encode_temperature)["code_idx"]
+        assert tok.shape[1] >= 1, "prompt too short to produce a single code at the sampling level"
+    ds = 1
+    for i in range(sample_level):
+        ds *= levels[i].K
+    tokens_L = encoder_free_run(levels[sample_level], tok, total_positions // ds, rng, greedy, temperature, top_k)
+
+    codes, x, tgt = {}, code_embed_proj(tokens_L, levels[sample_level].own_input_embed,
+                                        levels[sample_level].own_input_proj), tokens_L
+    for i in range(sample_level, n):
+        out = levels[i].encode(x, tgt, rng=None, encode_temperature=encode_temperature)
+        codes[i] = out["code_idx"]
+        if i < n - 1:
+            x = code_embed_proj(out["code_soft"], levels[i + 1].own_input_embed, levels[i + 1].own_input_proj)
+            tgt = out["code_idx"]
+
+    def cascade(cur, from_level):
+        for i in range(from_level, -1, -1):
+            lv = levels[i]
+            extra = [codes.get(j) for j in range(i + 1, i + lv.cond_depth)] if lv.cond_depth > 1 else None
+            cur = decode_generate_multipass(lv, cur, cfg.decoder_ncodes[i], greedy=decode_greedy,
+                                            temperature=decode_temperature, seed=decode_seed, extra_ctx_idx=extra)
+        return cur
+
+    res = dict(sampled_tokens=tokens_L, emitted_codes=codes, emitted=cascade(codes[n - 1], n - 1))
+    if sample_level == 0:
+        res["sampled"] = tokens_L
+    else:
+        res["sampled"] = cascade(tokens_L, sample_level - 1)
+    return res
 
 
 def mtp_predict_no_verify_standalone(level: EncDecLevel, h_pos, rng, greedy, temperature):
     K, chunks, vocab = level.mtp_horizon, level.in_pq_chunks, level.in_code_vocab
     if level.mtp_mode == "parallel":
         logits = (h_pos @ level.mtp_out_head).reshape(*h_pos.shape[:-1], K, chunks, vocab)
-        return sample_idx(logits, rng, greedy, temperature)
+        return sample_idx(logits, rng, greedy, temperature, level.gen_top_k)
     lead = h_pos.shape[:-1]
     D = h_pos.shape[-1]
     N = int(np.prod(lead)) if lead else 1
@@ -1574,7 +2152,7 @@ def mtp_predict_no_verify_standalone(level: EncDecLevel, h_pos, rng, greedy, tem
 def token_predict_standalone(level: EncDecLevel, h_pos, rng, greedy, temperature):
     if level.token_head_type == "linears":
         logits = level._token_logits_linears(h_pos)
-        return sample_idx(logits, rng, greedy, temperature)
+        return sample_idx(logits, rng, greedy, temperature, level.gen_top_k)
     elif level.token_head_type == "ar":
         return level._token_generate_ar(h_pos, rng, greedy, temperature)
     else:
@@ -1594,11 +2172,11 @@ class HierEncDec(eqx.Module):
                                     weight_sharing=cfg.weight_sharing[i]) for i in range(n)]
 
 
-def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=None,
+def level_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=None,
                    level_gt_drop=None, cascade_rng=None, encode_temperature: float = 1.0,
                    layer_drop_prob=None, label_reg_weight: float = 0.0, label_fn=None,
                    pixel_order=None, feedback_p=None, feedback_rng=None, feedback_detach: bool = True,
-                   _feedback_recursed: bool = False) -> tuple:
+                   _feedback_recursed: bool = False, refine_active=None) -> tuple:
     levels = model.levels
     x = code_embed_proj(flat_bytes, levels[0].own_input_embed, levels[0].own_input_proj)
     target = flat_bytes
@@ -1626,24 +2204,46 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
             target = out["code_idx"]
 
     dec_losses, dec_accs = [], []
+    aux_ntp_losses, aux_ntp_accs = [], []
+
+    def _aux_applies(level) -> bool:
+        return level.decode_future > 0 or level.decode_past > 0 or \
+            (level.level_refine_passes > 1 and level.level_refine_window > 0)
+
     feedback_losses = []
     byte_mse = None
+    mse_loss = 0.0
     ctx = codes_soft[phase - 1]
     cascade_rngs = [None] * phase if cascade_rng is None else list(jax.random.split(cascade_rng, phase))
     feedback_rngs = [None] * phase if feedback_rng is None else list(jax.random.split(feedback_rng, phase))
-    for i in range(phase - 1, -1, -1):
+
+    start_i = phase - 1
+    cyclic_iN = phase - 2 if (model.cfg.cycle_refine_passes > 1 and phase >= 2) else None
+
+    for i in range(start_i, -1, -1):
         dec_target = flat_bytes if i == 0 else codes[i - 1]
         dec_rng = level_rngs[2 * i + 1]
-        logits, target_i, mask_i, mtp_loss_i = decode_logits_and_target_multipass(
-            levels[i], dec_target, ctx, model.cfg.decoder_ncodes[i], rng=dec_rng,
-            multipass_detach=model.cfg.multipass_detach, refine_gumbel=model.cfg.refine_gumbel,
-            refine_temperature=model.cfg.refine_temperature,
-            refine_quantize_drop=model.cfg.refine_quantize_drop, refine_rng=dec_rng,
-            refine_remat=model.cfg.refine_remat)
+        extra_ctx_i = [codes_soft[j] if j < phase else None for j in range(i + 1, i + levels[i].cond_depth)] \
+            if levels[i].cond_depth > 1 else None
+        if i == cyclic_iN:
+            logits, target_i, mask_i, mtp_loss_i, aux_loss_i, aux_acc_i = decode_logits_and_target_cyclic_revision(
+                levels[i], dec_target, ctx, model.cfg.decoder_ncodes[i], codes_soft[i + 1],
+                model.cfg.cycle_refine_passes, dec_rng, encode_temperature, extra_ctx_code_soft=extra_ctx_i)
+        else:
+            logits, target_i, mask_i, mtp_loss_i, aux_loss_i, aux_acc_i = decode_logits_and_target_multipass(
+                levels[i], dec_target, ctx, model.cfg.decoder_ncodes[i], rng=dec_rng,
+                multipass_detach=model.cfg.multipass_detach, level_refine_gumbel=model.cfg.level_refine_gumbel,
+                level_refine_gt_drop=model.cfg.level_refine_gt_drop,
+                level_refine_temperature=model.cfg.level_refine_temperature,
+                refine_quantize_drop=model.cfg.refine_quantize_drop, refine_rng=dec_rng,
+                refine_remat=model.cfg.refine_remat, extra_ctx_code_soft=extra_ctx_i, refine_active=refine_active)
         loss_i, acc_i = levels[i]._dec_loss_acc(logits, target_i, mask_i)
         loss_i = loss_i + levels[i].mtp_weight * mtp_loss_i
         dec_losses.append(loss_i)
         dec_accs.append(acc_i)
+        if _aux_applies(levels[i]):
+            aux_ntp_losses.append(aux_loss_i)
+            aux_ntp_accs.append(aux_acc_i)
         if i == 0:
             pred_bytes = jnp.argmax(logits, axis=-1).astype(jnp.float32)
             byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)
@@ -1668,7 +2268,7 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
                         c, total = pseudo_ctx, 0.0
                         for j in range(i - 1, -1, -1):
                             dj = flat_bytes if j == 0 else codes[j - 1]
-                            lj, tj, mj, mtpj = levels[j].decode_logits_and_target_pardec(
+                            lj, tj, mj, mtpj, _, _ = levels[j].decode_logits_and_target_pardec(
                                 dj, c, model.cfg.decoder_ncodes[j])
                             lossj, _ = levels[j]._dec_loss_acc(lj, tj, mj)
                             total = total + lossj + levels[j].mtp_weight * mtpj
@@ -1677,13 +2277,13 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
                         return total / i
                 else:
                     def _feedback_fire(logits=logits):
-                        pseudo_bytes = jax.lax.stop_gradient(jnp.argmax(logits, axis=-1))
-                        l2, _ = phase_forward(
+                        pseudo_bytes = jax.lax.stop_gradient(safe_argmax(logits))
+                        l2, _ = level_forward(
                             model, pseudo_bytes, phase, rng=rng, level_gt_drop=level_gt_drop,
                             cascade_rng=cascade_rng, encode_temperature=encode_temperature,
                             layer_drop_prob=layer_drop_prob, label_reg_weight=0.0, label_fn=None,
                             pixel_order=None, feedback_p=None, feedback_rng=None,
-                            _feedback_recursed=True)
+                            _feedback_recursed=True, refine_active=refine_active)
                         return l2
                 feedback_losses.append(jax.lax.cond(fire_i, _feedback_fire, lambda: zero))
         if i > 0:
@@ -1703,11 +2303,47 @@ def phase_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
     label_loss_total = jnp.mean(jnp.stack(label_losses)) if label_losses else 0.0
     feedback_loss_total = jnp.mean(jnp.stack(feedback_losses)) if feedback_losses else 0.0
+    if aux_ntp_losses:
+        aux_ntp_loss_total = jnp.mean(jnp.stack(aux_ntp_losses))
+        aux_ntp_acc_total = jnp.mean(jnp.stack(aux_ntp_accs))
+    else:
+        aux_ntp_loss_total = jnp.array(0.0)
+        aux_ntp_acc_total = jnp.array(0.0)
     loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
-        + model.cfg.mse_weight * mse_loss + label_reg_weight * label_loss_total + feedback_loss_total
+        + model.cfg.mse_weight * mse_loss + label_reg_weight * label_loss_total + feedback_loss_total \
+        + model.cfg.ntp_weight * aux_ntp_loss_total
     bpb = dec_loss_total / jnp.log(2.0)
     return loss, (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
-                  jnp.mean(jnp.stack(utils)), byte_mse)
+                  jnp.mean(jnp.stack(utils)), byte_mse, aux_ntp_loss_total / jnp.log(2.0), aux_ntp_acc_total)
+
+
+def _zero_drop_model(model: HierEncDec) -> HierEncDec:
+    new_levels = []
+    for lvl in model.levels:
+        new_lvl = copy.copy(lvl)
+        object.__setattr__(new_lvl, "quantize_drop", 0.0)
+        object.__setattr__(new_lvl, "cond_drop", 0.0)
+        new_levels.append(new_lvl)
+    return eqx.tree_at(lambda m: m.levels, model, replace=new_levels)
+
+
+def phase_forward_additive_drop(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=None,
+                                 level_gt_drop=None, cascade_rng=None, encode_temperature: float = 1.0,
+                                 layer_drop_prob=None, label_reg_weight: float = 0.0, label_fn=None,
+                                 pixel_order=None, feedback_p=None, feedback_rng=None,
+                                 feedback_detach: bool = True, refine_active=None) -> tuple:
+    loss1, aux1 = level_forward(model, flat_bytes, phase, rng=rng, level_gt_drop=level_gt_drop,
+                                 cascade_rng=cascade_rng, encode_temperature=encode_temperature,
+                                 layer_drop_prob=layer_drop_prob, label_reg_weight=label_reg_weight,
+                                 label_fn=label_fn, pixel_order=pixel_order, feedback_p=feedback_p,
+                                 feedback_rng=feedback_rng, feedback_detach=feedback_detach,
+                                 refine_active=refine_active)
+    clean_model = _zero_drop_model(model)
+    loss2, aux2 = level_forward(clean_model, flat_bytes, phase, rng=rng, level_gt_drop=None, cascade_rng=None,
+                                 encode_temperature=encode_temperature, layer_drop_prob=layer_drop_prob,
+                                 label_reg_weight=label_reg_weight, label_fn=label_fn, pixel_order=pixel_order,
+                                 feedback_p=None, feedback_rng=None, refine_active=refine_active)
+    return loss1 + loss2, aux1
 
 
 def phase_trainable_filter(model: HierEncDec, phase: int):
@@ -1733,12 +2369,19 @@ def replicate(pytree, n_devices: int):
                                    if eqx.is_array(x) else x, pytree)
 
 
+def local_array(x):
+    # this process's addressable slice of a pmap output (multi-host arrays are not fully addressable)
+    if getattr(x, "is_fully_addressable", True):
+        return x
+    return np.concatenate([np.asarray(s.data).reshape((-1,) + x.shape[1:]) for s in x.addressable_shards])
+
+
 def unreplicate(pytree):
-    return jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) else x, pytree)
+    return jax.tree_util.tree_map(lambda x: local_array(x)[0] if eqx.is_array(x) else x, pytree)
 
 
 def to_host(pytree):
-    return jax.tree_util.tree_map(lambda x: jnp.asarray(jax.device_get(x)) if eqx.is_array(x) else x, pytree)
+    return jax.tree_util.tree_map(lambda x: jnp.asarray(jax.device_get(local_array(x))) if eqx.is_array(x) else x, pytree)
 
 
 def to_single_device(tree, device=None):
@@ -1899,11 +2542,13 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
 CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "decoder_ncodes",
                   "ncodes_window", "streaming", "decode_past", "decode_future", "sync",
-                  "n_refine_passes", "refine_window", "multipass_detach", "refine_gumbel",
-                  "refine_temperature", "refine_quantize_drop", "refine_remat",
+                  "level_refine_passes", "level_refine_window", "multipass_detach", "level_refine_gumbel", "level_refine_gt_drop", "level_refine_drop", "gen_temperature", "gen_top_k",
+                  "level_refine_temperature", "refine_quantize_drop", "refine_remat", "cycle_refine_passes",
+                  "cyclic_revise_detach", "cyclic_revise_remat",
+                  "cond_depth", "cond_drop", "cond_window",
                   "weight_sharing", "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
                   "gumbel_at_inference", "init_scheme", "use_xsa",
-                  "use_qknorm", "remat", "attn_window", "attn_lookahead", "use_sink",
+                  "use_qknorm", "remat", "remat_level", "attn_window", "attn_lookahead", "use_sink",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "mtp_horizon", "mtp_mode", "mtp_weight", "entropy_weight", "mse_weight",
                   "mse_softmax_tau", "traversal", "label_reg_weight")
@@ -1912,18 +2557,19 @@ CONFIG_FIELDS = ("img_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "st
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=Path, required=True)
-    p.add_argument("--dataset", type=str, default="cifar", choices=["cifar", "imagenet64"],
-                    help="cifar (default): downloads/caches under --data_root. imagenet64: reads "
-                         "pre-built shards from --data_root (produced by "
-                         "image_gen_jax_1/scripts/download_imagenet64.py -- does NOT download "
-                         "itself, run that script first). Config.img_size must match (32 for "
-                         "cifar, 64 for imagenet64).")
+    p.add_argument("--dataset", type=str, default="cifar", choices=["cifar", "imagenet64", "imagenet256"],
+                    help="cifar (default): downloads/caches under --data_root. imagenetN: reads "
+                         "pre-built shards from --data_root (scripts/imagenet/download_imagenetN.py; "
+                         "does not download itself). Config.img_size must match (32 cifar, N imagenetN).")
     p.add_argument("--data_root", type=str, default=str(REPO_ROOT / "datasets"))
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--batch_size", type=_tuple_arg, default=(16,),
                     help="training batch size -- a bare int applies uniformly to every phase; a "
                          "tuple gives one value per phase (length must equal n_phases)")
     p.add_argument("--n_devices", type=int, default=None)
+    p.add_argument("--multihost", type=lambda x: x.lower() != "false", default=False,
+                    help="jax.distributed.initialize() for a multi-host TPU slice: run the same command on every host; "
+                         "batch_size stays per device, each host feeds its own slice of the global batch")
     p.add_argument("--level_steps", type=_tuple_arg, default=None,
                     help="steps per phase -- a bare int applies uniformly to every phase; a "
                          "tuple gives one value per phase. At most one of --level_steps/"
@@ -2050,33 +2696,44 @@ def main():
                          "lands (stub, not implemented) -- pruned from the final output")
     p.add_argument("--sync", type=_bool_tuple_arg, default=Config.sync,
                     help="stub (TODO), not implemented -- raises NotImplementedError if set True")
-    p.add_argument("--n_refine_passes", type=_tuple_arg, default=Config.n_refine_passes,
+    p.add_argument("--level_refine_passes", type=_tuple_arg, default=Config.level_refine_passes,
                     help="1 (default) = current single-pass decode, unchanged. >1: after pass 1 "
                          "(unchanged, ctx-only), each further pass re-decodes every group with "
-                         "extra causal peer context -- refine_window preceding groups' PREVIOUS "
+                         "extra causal peer context -- level_refine_window preceding groups' PREVIOUS "
                          "PASS decoded codes at this same level (own predictions during training, "
                          "stop-gradient'd; own generated codes during generation) -- not real "
                          "ground truth, so train and generate see the same (imperfect) signal. "
                          "More passes = closer to full AR across groups, but each pass is a full "
-                         "extra decode call (cost scales ~linearly with n_refine_passes)")
-    p.add_argument("--refine_window", type=_tuple_arg, default=Config.refine_window,
-                    help="n_refine_passes>1 only: how many preceding groups' previous-pass decoded "
+                         "extra decode call (cost scales ~linearly with level_refine_passes)")
+    p.add_argument("--level_refine_window", type=_tuple_arg, default=Config.level_refine_window,
+                    help="level_refine_passes>1 only: how many preceding groups' previous-pass decoded "
                          "codes are visible as extra causal context each refinement pass (like "
                          "ncodes_window, but sourced from this level's own decode output, not the "
                          "level above's ctx)")
     p.add_argument("--multipass_detach", type=lambda x: x.lower() != "false", default=Config.multipass_detach,
-                    help="refine passes (n_refine_passes>1): True (default) fully stop_gradient's "
+                    help="refine passes (level_refine_passes>1): True (default) fully stop_gradient's "
                          "the draft (own prediction, no gradient reaches the earlier pass that "
                          "produced it). False: STE instead, so the last pass's loss gradient flows "
                          "back through every earlier pass's decoder output -- backward cost grows "
-                         "with n_refine_passes (BPTT-like), unlike the detached default")
-    p.add_argument("--refine_gumbel", type=lambda x: x.lower() != "false", default=Config.refine_gumbel,
+                         "with level_refine_passes (BPTT-like), unlike the detached default")
+    p.add_argument("--level_refine_gumbel", type=lambda x: x.lower() != "false", default=Config.level_refine_gumbel,
                     help="refine passes only: gumbel-perturb which code gets drafted each pass "
                          "(own dedicated knob, NOT the encoder's quantize_mode). Default False "
                          "(plain deterministic argmax draft)")
-    p.add_argument("--refine_temperature", type=float, default=Config.refine_temperature,
+    p.add_argument("--level_refine_gt_drop", type=float, default=Config.level_refine_gt_drop,
+                    help="refine passes, training only: per-token prob of drafting the sampled own output; "
+                         "with prob 1-this the real target is drafted instead. Default 1.0 (always own output)")
+    p.add_argument("--level_refine_drop", type=float, default=Config.level_refine_drop,
+                    help="refine early exit, training only: before each extra refine pass, stop with this prob "
+                         "(once stopped, later passes are skipped too), so a step runs 1..level_refine_passes passes "
+                         "(geometric); the same draw applies to every level and device. Default 0.0 (all passes)")
+    p.add_argument("--gen_temperature", type=float, default=Config.gen_temperature,
+                    help="temperature of the sampled (non-argmax) generation eval / decoder sampling")
+    p.add_argument("--gen_top_k", type=int, default=Config.gen_top_k,
+                    help="top-k of decoder sampling (0 = off); only used when sampling, never for argmax")
+    p.add_argument("--level_refine_temperature", type=float, default=Config.level_refine_temperature,
                     help="own dedicated temperature, not shared with the encoder's "
-                         "encode_temperature. Used by refine_gumbel=True's gumbel-softmax, and "
+                         "encode_temperature. Used by level_refine_gumbel=True's gumbel-softmax, and "
                          "also as the plain argmax path's tau when refine_quantize_drop>0 (shapes "
                          "the soft component that gets mixed into the draft)")
     p.add_argument("--refine_quantize_drop", type=float, default=Config.refine_quantize_drop,
@@ -2089,6 +2746,63 @@ def main():
                     default=Config.refine_remat,
                     help="overrides --remat for just the refine passes (pass 1 always uses --remat "
                          "unchanged). 'none' (default): refine passes also use --remat, unchanged")
+    p.add_argument("--cycle_refine_passes", type=int, default=Config.cycle_refine_passes,
+                    help="1 (default): off. >1: the lower of the top two levels of the active phase "
+                         "(levelN) re-decodes cycle_refine_passes times, each pass conditioning on a "
+                         "growing stack of revisions of the coarser level's (levelT) own code -- "
+                         "pass 1 sees just v1 (levelT's real code, cond_depth style extra ctx, "
+                         "remaining slots trainable-pad); after each pass, levelN's own decoded "
+                         "output is re-encoded (via levelT's own encoder) into the next revision "
+                         "(v2, v3, ...), filling one more slot each pass. levelT itself decodes "
+                         "exactly once, via the normal per-level loop (level_gt_drop etc. apply as "
+                         "usual) -- this flag never gives levelN's own literal target as input to "
+                         "itself. See --cyclic_revise_detach/--cyclic_revise_remat for how gradients "
+                         "flow across passes. Loss on the final pass only")
+    p.add_argument("--cyclic_revise_detach", type=lambda x: x.lower() != "false",
+                    default=Config.cyclic_revise_detach,
+                    help="cycle_refine_passes>1 only: True (default) stop_gradient's each pass's "
+                         "re-encoded revision before feeding it to the next pass (no BPTT-like "
+                         "gradient across passes). False lets gradients flow through the whole "
+                         "revision chain -- pair with --cyclic_revise_remat to control memory")
+    p.add_argument("--cyclic_revise_remat", type=lambda x: x.lower() != "false",
+                    default=Config.cyclic_revise_remat,
+                    help="cycle_refine_passes>1 and cyclic_revise_detach=False only: whether the "
+                         "revision passes remat (checkpoint) their activations to bound memory while "
+                         "gradients flow across the whole revision chain. True (default). No effect "
+                         "under cyclic_revise_detach=True")
+    p.add_argument("--cond_depth", type=_tuple_arg, default=Config.cond_depth,
+                    help="1 (default): level i's decode ctx = its own code only. >1: also condition on the "
+                         "next (cond_depth-1) coarser levels' own codes as extra ctx blocks (pervasive "
+                         "conditioning without cross-attention). Under streaming=True the extra codes are "
+                         "aligned causally: group g sees coarser code j iff its whole span ends at or "
+                         "before the group's end ('complete'); identical to the old behaviour when "
+                         "decoder_ncodes is a multiple of the cumulative stride, otherwise a warning is "
+                         "printed and the code covering the group's own span stays hidden. streaming=False "
+                         "+ ncodes_window=-1 shows every coarser code to every group (non-causal).")
+    p.add_argument("--cond_window", type=_tuple_arg, default=Config.cond_window,
+                    help="-1 (default): unbounded, each group sees all visible coarser-level codes (padded "
+                         "with the trainable pad up to the full width). >=1: only the last cond_window "
+                         "visible coarser codes. Needs cond_depth>1 and streaming=True (ignored by fullctx).")
+    p.add_argument("--cond_drop", type=_float_tuple_arg, default=Config.cond_drop,
+                    help="cond_depth>1 only. Per-extra-ctx-block independent bernoulli during "
+                         "training, p=cond_drop probability of zeroing that block's embedding for a "
+                         "given example; kept (non-dropped) blocks are scaled by 1/(1-cond_drop) "
+                         "(standard inverted dropout, matches generation's always-full-ctx "
+                         "magnitude). Generation never drops stochastically -- EXCEPT cond_drop=1.0 "
+                         "exactly, where the block is permanently zeroed at generation too (its "
+                         "extra_ctx_embed/proj weights never saw real content during training at "
+                         "that setting, so feeding them real content at generation would be "
+                         "undefined/out-of-distribution). 0 (default) = off")
+    p.add_argument("--additive_drop_loss", type=lambda x: x.lower() != "false", default=False,
+                    help="hacky 2nd-forward-pass variant of every rng-driven drop mechanism "
+                         "(quantize_drop, level_gt_drop, feedback_p, cond_drop): runs level_forward "
+                         "TWICE per step -- once normally (stochastic, as configured) and once on a "
+                         "copy of the model with quantize_drop/cond_drop forced to 0 and "
+                         "level_gt_drop/feedback_p forced off (always real/full ctx) -- and adds the "
+                         "two losses. Not true marginalization (that would need per-site weighted "
+                         "branches and blows up combinatorially with the number of drop sites); this "
+                         "just guarantees a 'clean' gradient signal every step in addition to the "
+                         "stochastic one, at 2x forward-pass cost. Default False")
     p.add_argument("--weight_sharing", type=_bool_tuple_arg, default=Config.weight_sharing)
     p.add_argument("--precision", type=str, default=Config.precision, choices=["bf16", "fp32"])
     p.add_argument("--curriculum_mode", type=str, default=Config.curriculum_mode, choices=["freeze", "no_freeze"])
@@ -2128,6 +2842,10 @@ def main():
     p.add_argument("--use_xsa", type=lambda x: x.lower() != "false", default=Config.use_xsa)
     p.add_argument("--use_qknorm", type=lambda x: x.lower() != "false", default=Config.use_qknorm)
     p.add_argument("--remat", type=lambda x: x.lower() != "false", default=Config.remat)
+    p.add_argument("--remat_level", type=lambda x: x.lower() != "false", default=Config.remat_level,
+                    help="checkpoint each level's whole encoder / decoder block stack as one unit (recompute at the "
+                         "level border) instead of per transformer block; less recompute, more live memory. "
+                         "Takes precedence over --remat inside the stacks")
     p.add_argument("--attn_window", type=_tuple_arg, default=Config.attn_window)
     p.add_argument("--attn_lookahead", type=_tuple_arg, default=Config.attn_lookahead,
                     help="encoder self-attention shifted-triangular lookahead -- 0 (default) "
@@ -2161,8 +2879,11 @@ def main():
     label_fn = config_vars.pop("label_fn", default_label_fn_jax)
     known = {a.dest for a in p._actions}
     unknown = set(config_vars) - known
-    if unknown:
-        p.error(f"--config {pre_args.config} sets unknown field(s): {sorted(unknown)}")
+    # helper constants (e.g. DEPTH = 4) are allowed: warn and ignore; imports/functions are ignored silently
+    consts = sorted(k for k in unknown if not callable(config_vars[k]) and not isinstance(config_vars[k], type(argparse)))
+    if consts:
+        warnings.warn(f"--config {pre_args.config}: ignoring non-field constant(s) {consts}")
+    config_vars = {k: v for k, v in config_vars.items() if k in known}
     p.set_defaults(**config_vars)
     args = p.parse_args()
     if args.run_name is None:
@@ -2190,6 +2911,8 @@ def main():
     if args.wa_every_step is None and args.wa_every_epoch is None:
         args.wa_every_epoch = 10
 
+    if args.multihost:
+        jax.distributed.initialize()
     n_devices = args.n_devices or jax.local_device_count()
     print(f"jax devices ({n_devices} used of {jax.local_device_count()} local): {jax.devices()}")
     cfg = Config(**{k: getattr(args, k) for k in CONFIG_FIELDS})
@@ -2219,10 +2942,7 @@ def main():
     _bcast_per_phase("layer_drop_prob")
     _bcast_per_phase("feedback_p")
 
-    if args.dataset == "imagenet64":
-        (train_np, train_labels), (val_np, val_labels) = load_imagenet64(Path(args.data_root))
-    else:
-        (train_np, train_labels), (val_np, val_labels) = load_cifar10(Path(args.data_root))
+    (train_np, train_labels), (val_np, val_labels) = load_dataset(args.dataset, Path(args.data_root), cfg.img_size)
     if args.train_subset_n:
         train_np = train_np[:args.train_subset_n]
     if args.val_subset_n:
@@ -2253,12 +2973,16 @@ def main():
             logger("--resume set but no checkpoint found under this run_dir -- starting fresh")
 
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
+    if cfg.precision != "bf16":
+        jax.config.update("jax_default_matmul_precision", "highest")
     recon_prompt = flat_prompt = gt_img = None
     train_recon_prompt = train_flat_prompt = train_gt_img = None
     gen_jit_timed = [False]
 
-    def run_gen_eval(eval_model, top: int, tag: str, flat_prompt, gt_img) -> tuple:
+    def run_gen_eval(eval_model, top: int, tag: str, flat_prompt, gt_img, sample: bool = False) -> tuple:
         gen_t0 = time.monotonic()
+        tag = tag + ("_sample" if sample else "")
+        g_kw = dict(greedy=not sample, temperature=cfg.gen_temperature, seed=1 if sample else 0)
         m = cast_pytree(eval_model, compute_dtype)
         x = code_embed_proj(flat_prompt, m.levels[0].own_input_embed, m.levels[0].own_input_proj)
         target = flat_prompt
@@ -2276,10 +3000,28 @@ def main():
         recon_acc = recon_mse = None
 
         cascade_t0 = time.monotonic()
-        cur_code = codes[top]
-        for i in range(top, 0, -1):
-            cur_code = decode_generate_multipass(m.levels[i], cur_code, cfg.decoder_ncodes[i], greedy=True, seed=0)
-        cascade_recon = decode_generate_multipass(m.levels[0], cur_code, cfg.decoder_ncodes[0], greedy=True, seed=0)
+        cyclic_fired_gen = cfg.cycle_refine_passes > 1 and top >= 1
+        if cyclic_fired_gen:
+            iN_gen = top - 1
+            cur_code = cyclic_refine_generate(m.levels, top + 1, codes[top], cfg.decoder_ncodes,
+                                               not sample, cfg.gen_temperature, g_kw["seed"], args.encode_temperature[phase - 1],
+                                               cfg.cycle_refine_passes)
+            loop_start = iN_gen - 1
+        else:
+            cur_code = codes[top]
+            loop_start = top
+        for i in range(loop_start, 0, -1):
+            extra_ctx_i = [codes[j] if j <= top else None for j in range(i + 1, i + m.levels[i].cond_depth)] \
+                if m.levels[i].cond_depth > 1 else None
+            cur_code = decode_generate_multipass(m.levels[i], cur_code, cfg.decoder_ncodes[i], **g_kw,
+                                                  extra_ctx_idx=extra_ctx_i)
+        if cyclic_fired_gen and iN_gen == 0:
+            cascade_recon = cur_code
+        else:
+            extra_ctx_0 = [codes[j] if j <= top else None for j in range(1, m.levels[0].cond_depth)] \
+                if m.levels[0].cond_depth > 1 else None
+            cascade_recon = decode_generate_multipass(m.levels[0], cur_code, cfg.decoder_ncodes[0], **g_kw,
+                                                        extra_ctx_idx=extra_ctx_0)
         gen_compile_s = None
         if not gen_jit_timed[0]:
             gen_compile_s = time.monotonic() - cascade_t0
@@ -2290,7 +3032,7 @@ def main():
         save_compare_grid(cascade_img, gt_img, run_dir / f"samples_{tag}.png")
 
         gen_time_s = time.monotonic() - gen_t0
-        msg = f"[{tag}] top={top} CASCADE gen_byte_acc={cascade_acc:.4f} gen_cascade_mse={cascade_mse:.2f}"
+        msg = f"[{tag}] top={top} CASCADE{' (sampled T=%g k=%d)' % (cfg.gen_temperature, cfg.gen_top_k) if sample else ''} gen_byte_acc={cascade_acc:.4f} gen_cascade_mse={cascade_mse:.2f}"
         rec = dict(tag=tag, gen_cascade_acc=cascade_acc, gen_cascade_mse=cascade_mse, gen_time_s=gen_time_s)
         msg += f" gen_time={gen_time_s:.1f}s"
         if gen_compile_s is not None:
@@ -2304,11 +3046,13 @@ def main():
 
     def run_gen_eval_both(eval_model, top: int, tag: str) -> tuple:
         result = run_gen_eval(eval_model, top, f"{tag}_val", flat_prompt, gt_img)
+        run_gen_eval(eval_model, top, f"{tag}_val", flat_prompt, gt_img, sample=True)
         if args.eval_gen_train:
             run_gen_eval(eval_model, top, f"{tag}_train", train_flat_prompt, train_gt_img)
+            run_gen_eval(eval_model, top, f"{tag}_train", train_flat_prompt, train_gt_img, sample=True)
         return result
 
-    val_eval_jit = eqx.filter_jit(phase_forward)
+    val_eval_jit = eqx.filter_jit(level_forward)
     val_jit_timed = [False]
 
     def run_val_eval(eval_model, phase: int, tag: str) -> tuple:
@@ -2316,7 +3060,7 @@ def main():
         m = cast_pytree(eval_model, compute_dtype)
         bs = args.val_batch_size[phase - 1]
         n = len(val_np)
-        sums = np.zeros(6, dtype=np.float64)
+        sums = np.zeros(8, dtype=np.float64)
         total_loss = 0.0
         total_n = 0
         val_compile_s = None
@@ -2335,13 +3079,14 @@ def main():
             sums += bn * np.array([float(a) for a in aux_b])
             total_loss += bn * float(loss_b)
             total_n += bn
-        bpb, acc, ntp_bpb, ntp_acc, util, val_mse = (sums / total_n).tolist()
+        _bpb, acc, _ntp_bpb, ntp_acc, util, val_mse, _aux_ntp_bpb, aux_ntp_acc = (sums / total_n).tolist()
         loss = total_loss / total_n
         val_time_s = time.monotonic() - val_t0
         msg = (f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_mse={val_mse:.4f} "
-               f"val_ntp_acc={ntp_acc:.2f} val_time={val_time_s:.1f}s")
-        rec = dict(tag=tag, val_loss=loss, val_dec_acc=acc, val_dec_bpb=bpb,
-                    val_ntp_acc=ntp_acc, val_ntp_bpb=ntp_bpb, val_util=util, val_mse=val_mse,
+               f"val_e_ntp_acc={ntp_acc:.2f} val_d_ntp_acc={aux_ntp_acc:.2f} val_time={val_time_s:.1f}s")
+        rec = dict(tag=tag, val_loss=loss, val_dec_acc=acc,
+                    val_e_ntp_acc=ntp_acc, val_util=util, val_mse=val_mse,
+                    val_d_ntp_acc=aux_ntp_acc,
                     val_time_s=val_time_s)
         if val_compile_s is not None:
             msg += f" (first batch, incl. jit compile: {val_compile_s:.1f}s)"
@@ -2365,7 +3110,7 @@ def main():
     step = resume_meta["step"] if resume_meta else 0
     all_phases = [n_phases] if args.no_curriculum else list(range(1, n_phases + 1))
     total_all_steps = sum(
-        _phase_total_steps(p - 1, len(train_np) // (args.batch_size[p - 1] * n_devices))
+        _phase_total_steps(p - 1, len(train_np) // (args.batch_size[p - 1] * n_devices * jax.process_count()))
         for p in all_phases)
     global_pbar = tqdm(total=total_all_steps, initial=step, desc="total", dynamic_ncols=True, position=1, leave=True)
     last_global_step = step
@@ -2398,17 +3143,22 @@ def main():
         layer_drop_prob_phase = args.layer_drop_prob[phase - 1]
         feedback_p_phase = args.feedback_p[phase - 1]
 
-        def loss_fn(diff_model, static_model, flat_bytes, rng, cascade_rng, feedback_rng, phase=phase):
+        n_extra_max = max(cfg.level_refine_passes[i] - 1 for i in range(n_levels))
+        use_refine_drop = cfg.level_refine_drop > 0 and n_extra_max > 0
+
+        def loss_fn(diff_model, static_model, flat_bytes, rng, cascade_rng, feedback_rng, refine_active, phase=phase):
             m = eqx.combine(diff_model, static_model)
             m = cast_pytree(m, compute_dtype)
-            return phase_forward(m, flat_bytes, phase, rng=rng,
-                                  level_gt_drop=level_gt_drop_phase, cascade_rng=cascade_rng,
-                                  encode_temperature=encode_temperature_phase,
-                                  layer_drop_prob=layer_drop_prob_phase,
-                                  label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
-                                  pixel_order=pixel_order,
-                                  feedback_p=feedback_p_phase, feedback_rng=feedback_rng,
-                                  feedback_detach=args.feedback_detach)
+            phase_forward_fn = phase_forward_additive_drop if args.additive_drop_loss else level_forward
+            return phase_forward_fn(m, flat_bytes, phase, rng=rng,
+                                     level_gt_drop=level_gt_drop_phase, cascade_rng=cascade_rng,
+                                     encode_temperature=encode_temperature_phase,
+                                     layer_drop_prob=layer_drop_prob_phase,
+                                     label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
+                                     pixel_order=pixel_order,
+                                     feedback_p=feedback_p_phase, feedback_rng=feedback_rng,
+                                     feedback_detach=args.feedback_detach,
+                                     refine_active=refine_active if use_refine_drop else None)
 
         steps_per_epoch_lr = len(train_iter)
         phase_total_steps = _phase_total_steps(phase - 1, steps_per_epoch_lr)
@@ -2428,10 +3178,10 @@ def main():
             optimizer = optax.chain(optax.clip_by_global_norm(args.grad_clip), optimizer)
         opt_state = optimizer.init(diff_model)
 
-        def train_step(diff_model, opt_state, rng, flat_bytes, static_model=static_model):
+        def train_step(diff_model, opt_state, rng, flat_bytes, refine_active, static_model=static_model):
             rng, level_rng, cascade_rng, feedback_rng = jax.random.split(rng, 4)
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-                diff_model, static_model, flat_bytes, level_rng, cascade_rng, feedback_rng)
+                diff_model, static_model, flat_bytes, level_rng, cascade_rng, feedback_rng, refine_active)
             grads = jax.lax.pmean(grads, axis_name="d")
             loss = jax.lax.pmean(loss, axis_name="d")
             aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
@@ -2444,7 +3194,10 @@ def main():
         train_step = jax.pmap(train_step, axis_name="d")
         p_diff_model = replicate(diff_model, n_devices)
         p_opt_state = replicate(opt_state, n_devices)
-        p_rng = jax.random.split(jax.random.fold_in(jax.random.PRNGKey(args.seed), phase), n_devices)
+        p_rng_key = jax.random.fold_in(jax.random.PRNGKey(args.seed), phase)
+        if jax.process_count() > 1:
+            p_rng_key = jax.random.fold_in(p_rng_key, jax.process_index())
+        p_rng = jax.random.split(p_rng_key, n_devices)
 
         start_phase_step = 0
         if resume_meta is not None and phase == resume_meta["phase"]:
@@ -2470,6 +3223,7 @@ def main():
         wa_stack = deque(maxlen=args.wa_stack_size)
         wa_dir = run_dir / "checkpoints" / "wa"
 
+        refine_drop_rng = np.random.default_rng(args.seed + 7919)
         pbar = tqdm(total=phase_total_steps, initial=start_phase_step, desc=active_desc, dynamic_ncols=True, position=0)
         jit_timed = False
         phase_step = start_phase_step
@@ -2486,16 +3240,22 @@ def main():
                 flat = jnp.array(flat)
                 if not jit_timed:
                     jit_t0 = time.monotonic()
-                p_diff_model, p_opt_state, p_rng, loss, aux = train_step(p_diff_model, p_opt_state, p_rng, flat)
+                # refine early exit: geometric stop before each extra pass; same draw on every device/host
+                u = refine_drop_rng.random(max(n_extra_max, 1))
+                refine_active = np.cumprod(u >= cfg.level_refine_drop) > 0
+                p_refine_active = jnp.broadcast_to(jnp.asarray(refine_active), (n_devices, refine_active.shape[0]))
+                p_diff_model, p_opt_state, p_rng, loss, aux = train_step(p_diff_model, p_opt_state, p_rng, flat,
+                                                                          p_refine_active)
                 step += 1
                 phase_step += 1
                 pbar.update(1)
-                loss0 = float(loss[0])
+                loss0 = float(local_array(loss)[0])
                 if not jit_timed:
                     logger(f"{active_desc}: first train_step (incl. jit compile) took "
                            f"{time.monotonic() - jit_t0:.1f}s")
                     jit_timed = True
-                bpb, acc, ntp_bpb, ntp_acc, util, train_mse, grad_norm = [float(a[0]) for a in aux]
+                _bpb, acc, _ntp_bpb, ntp_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, grad_norm = \
+                    [float(local_array(a)[0]) for a in aux]
                 lr = float(lr_schedule(step - 1))
                 lr_str = _fmt_lr(lr)
                 pbar.set_postfix(step=step, loss=f"{loss0:.2f}",
@@ -2503,11 +3263,13 @@ def main():
                                   lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
                     logger(f"l={phase - 1} e={epoch_num} s={step} loss={loss0:.2f} dec_acc={acc:.2f} "
-                           f"ntp_acc={ntp_acc:.2f} util={util:.2f} train_mse={train_mse:.1f} "
+                           f"e_ntp_acc={ntp_acc:.2f} util={util:.2f} mse={train_mse:.1f} "
+                           f"d_ntp_acc={aux_ntp_acc:.2f} "
                            f"lr={lr_str} grad_norm={grad_norm:.2f}",
-                           level=phase - 1, epoch=epoch_num, step=step, loss=loss0, dec_bpb=bpb,
-                           dec_acc=acc, ntp_bpb=ntp_bpb, ntp_acc=ntp_acc, util=util,
-                           train_mse=train_mse, lr=lr, grad_norm=grad_norm)
+                           level=phase - 1, epoch=epoch_num, step=step, loss=loss0,
+                           dec_acc=acc, e_ntp_acc=ntp_acc, util=util,
+                           mse=train_mse, d_ntp_acc=aux_ntp_acc,
+                           lr=lr, grad_norm=grad_norm)
 
                 if step % gen_eval_every_steps == 0:
                     snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
@@ -2529,14 +3291,14 @@ def main():
                     if args.wa_mode == "ema":
                         wa_ema = cur_diff_model if wa_ema is None else \
                             ema_update(wa_ema, cur_diff_model, args.wa_ema_decay)
-                        eqx.tree_serialise_leaves(wa_dir / f"ema_phase{phase}_step{step}.eqx", wa_ema)
+                        eqx.tree_serialise_leaves(wa_dir / "ema_latest.eqx", wa_ema)
                         if args.wa_verbose:
                             logger(f"wa (ema) snapshot saved at step {step}")
                     else:
                         wa_stack.append(cur_diff_model)
                         if len(wa_stack) == args.wa_stack_size:
                             avg = stack_average(list(wa_stack), weights=args.wa_wma_weights)
-                            eqx.tree_serialise_leaves(wa_dir / f"wma_phase{phase}_step{step}.eqx", avg)
+                            eqx.tree_serialise_leaves(wa_dir / "wma_latest.eqx", avg)
                             if args.wa_verbose:
                                 logger(f"wa (wma, n={len(wa_stack)}) average saved at step {step}")
 
@@ -2556,7 +3318,8 @@ def main():
     global_pbar.close()
     logger("=== all phases done, running final top-down cascade eval ===")
     run_val_eval(model, n_levels - 1, tag="final")
-    run_gen_eval_both(model, top=n_levels - 2, tag="final")
+    for top in range(n_phases - 1, -1, -1):
+        run_gen_eval_both(model, top=top, tag=f"final_top{top}")
     logger("training done")
 
 

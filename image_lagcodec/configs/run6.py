@@ -38,10 +38,12 @@ decode_future = 4
 
 # level_refine_passes = 2
 # refine_remat = True  # remat only the refine passes (pass 1 follows remat=False)
-# cycle_refine_passes = 1
-cond_depth = (2, 2, 2, 1)
-cond_window = (4, 4, 4, 4, -1)
-cond_drop = 0.5
+
+cycle_refine_passes = 3
+cyclic_revise_remat = True
+# cond_depth = (2, 2, 2, 1)
+# cond_window = (4, 4, 4, 4, -1)
+# cond_drop = 0.5
 
 additive_drop_loss = False
 weight_sharing = False
@@ -78,7 +80,7 @@ eval_gen_train = True
 # --- training ---
 batch_size = 2
 val_batch_size = 2
-level_steps = (10_000, 10_000, 10_000, 50_000)  # staged: each phase adds one level (no_freeze), last phase long
+level_steps = (5_000, 5_000, 5_000, 20_000)  # staged: each phase adds one level (no_freeze), last phase long
 seed = 0
 # warmup_steps = 2
 train_subset_n = None

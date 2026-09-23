@@ -27,7 +27,7 @@ entropy_weight = 0.1
 strides = (4, 4)
 decoder_ncodes = (128, 32)  # n_blocks/2 per level -- exactly 2 groups/passes
 interleave_decode = True  # the only mechanism with real cross-group (pass-to-pass) dependency
-cond_depth = (2, 1)
+cond_depth = (1, 1)
 
 additive_drop_loss = False
 weight_sharing = False

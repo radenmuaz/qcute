@@ -36,19 +36,25 @@ gcloud compute tpus queued-resources ssh tpu34 --project raden-tpu --zone us-cen
 ```
 gcloud compute tpus queued-resources create tpu64 --node-id tpunode64 --project raden-tpu --zone europe-west4-a --accelerator-type v6e-64 --runtime-version v2-alpha-tpuv6e --spot
 
+gcloud compute tpus queued-resources create tpu32 --node-id tpunode32 --project raden-tpu --zone europe-west4-a --accelerator-type v6e-32 --runtime-version v2-alpha-tpuv6e --spot
+
 gcloud compute tpus queued-resources describe tpu1 --project raden-tpu --zone europe-west4-a
 
-gcloud compute tpus queued-resources delete tpu64 --project raden-tpu  --zone europe-west4-a --force --async
+gcloud compute tpus queued-resources delete tpu32 --project raden-tpu  --zone europe-west4-a --force --async
 
 gcloud compute tpus queued-resources ssh tpu1--project raden-tpu --zone europe-west4-a
 ```
 
 ```
-gcloud compute tpus queued-resources create tpu1 --node-id tpunode1 --project raden-tpu --zone us-east1-d --accelerator-type v6e-1 --runtime-version v2-alpha-tpuv6e --spot# --network-tier=STANDARD
+gcloud compute tpus queued-resources create tpu64 --node-id tpunode64 --project raden-tpu --zone us-east1-d --accelerator-type v6e-64 --runtime-version v2-alpha-tpuv6e --spot
+# --network-tier=STANDARD
+
+gcloud compute tpus queued-resources create tpu32 --node-id tpunode64 --project raden-tpu --zone us-east1-d --accelerator-type v6e-32 --runtime-version v2-alpha-tpuv6e --spot
+# --network-tier=STANDARD
 
 gcloud compute tpus queued-resources describe tpu3--project raden-tpu --zone us-east1-d
 
-gcloud compute tpus queued-resources delete tpu3 --project raden-tpu  --zone us-east1-d --force --async
+gcloud compute tpus queued-resources delete tpu32 --project raden-tpu  --zone us-east1-d --force --async
 
 gcloud compute tpus queued-resources ssh tpu2 --project raden-tpu --zone us-east1-d
 ```

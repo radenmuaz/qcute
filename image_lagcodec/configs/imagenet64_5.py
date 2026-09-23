@@ -74,7 +74,7 @@ traversal = "zorder"
 eval_gen_train = False
 
 # --- training ---
-batch_size = 16
+batch_size = 8
 val_batch_size = 4
 level_epochs = (0, 2)
 seed = 0

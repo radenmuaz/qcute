@@ -312,10 +312,9 @@ class Attention(eqx.Module):
         use_qknorm: per-head RMSNorm on q/k before RoPE+scores (stabilizes attention logit scale);
         can be disabled. window (chat 2026-09-15): None (default) -- unbounded causal attention,
         unchanged. int -- causal sliding window of that many positions back (splash_attention's
-        native LocalMask, genuinely block-sparse) -- see splash_attention()'s docstring. Only
-        __call__ (the dense/batched form) respects this; step/chunk_step (KV-cached decode) are
-        unaffected -- windowing is an ENCODER-side (self.blocks, full self-attention) concern,
-        not currently wired into the decoder's incremental generation path. use_sink (chat
+        native LocalMask, genuinely block-sparse, in __call__; a plain query>=pos-window bound in
+        step/chunk_step -- no splash kernel there, just a narrower dense mask, since step/chunk_step
+        were never on splash to begin with, see their own docstrings). use_sink (chat
         2026-09-15): learned per-head attention-sink logit (one scalar per query head, init 0),
         using splash_attention's NATIVE `sinks` kernel arg -- a bias folded directly into the
         softmax max/sum, NOT an extra K/V token (cheaper: no extra sequence position, no extra
@@ -387,7 +386,10 @@ class Attention(eqx.Module):
         v_full = jnp.repeat(cache_v, n_rep, axis=1) if n_rep > 1 else cache_v
         scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
         logits = jnp.einsum("bhd,bhtd->bht", q, k_full) * scale
-        valid = jnp.arange(T_max) <= pos
+        idx = jnp.arange(T_max)
+        valid = idx <= pos
+        if self.window is not None:
+            valid = valid & (idx >= pos - self.window)
         logits = jnp.where(valid[None, None, :], logits, -1e9)
         attn = jax.nn.softmax(logits, axis=-1)
         y = jnp.einsum("bht,bhtd->bhd", attn, v_full)  # (Bc,H,hd)
@@ -425,7 +427,10 @@ class Attention(eqx.Module):
         v_full = jnp.repeat(cache_v, n_rep, axis=1) if n_rep > 1 else cache_v
         scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
         logits = jnp.einsum("bhtd,bhsd->bhts", q, k_full) * scale  # (Bc,H,T,T_max)
-        valid = jnp.arange(T_max)[None, :] <= pos_ids[:, None]  # (T,T_max)
+        idx = jnp.arange(T_max)[None, :]
+        valid = idx <= pos_ids[:, None]  # (T,T_max)
+        if self.window is not None:
+            valid = valid & (idx >= pos_ids[:, None] - self.window)
         logits = jnp.where(valid[None, None], logits, -1e9)
         attn = jax.nn.softmax(logits, axis=-1)
         y = jnp.einsum("bhts,bhsd->bhtd", attn, v_full)  # (Bc,H,T,hd)

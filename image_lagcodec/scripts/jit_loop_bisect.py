@@ -74,7 +74,7 @@ def report(tag, out):
 
 
 if NIMG <= 4:
-    report("eager", free_loop(L0, st["ctx"], st["rope"], st["min_valid"], st["rope_bos"], *static))
+    report("eager", free_loop(L0, st["ctx"], st["rope"], st["key_valid"], st["rope_bos"], *static))
 report(f"jit_args_B{NIMG}", jax.jit(lambda lvl, c, r, m, rb: free_loop(lvl, c, r, m, rb, *static))(
-    L0, st["ctx"], st["rope"], st["min_valid"], st["rope_bos"]))
-report(f"jit_closure_B{NIMG}", jax.jit(lambda: free_loop(L0, st["ctx"], st["rope"], st["min_valid"], st["rope_bos"], *static))())
+    L0, st["ctx"], st["rope"], st["key_valid"], st["rope_bos"]))
+report(f"jit_closure_B{NIMG}", jax.jit(lambda: free_loop(L0, st["ctx"], st["rope"], st["key_valid"], st["rope_bos"], *static))())
