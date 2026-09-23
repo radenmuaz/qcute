@@ -47,10 +47,9 @@ level_refine_temperature = 1.0
 level_refine_gt_drop = 0.8
 level_refine_drop = 0.5  # stop before each extra pass w.p. 0.5 -> 1..level_refine_passes passes per step
 level_refine_passes = 3
-refine_quantize_drop = 0.5
-multipass_detach = False  # required for refine_quantize_drop to have any effect (run7.py's reference left this
-# field commented out for exactly this reason -- multipass_detach=True ignores it); set here since the intent
-# was clearly to activate it, not leave it dead
+# refine_quantize_drop = 0.5  # disabled -- multipass_detach=False (needed for it) keeps more graph alive
+# through the refine passes for backward, a real memory contributor at this scale; back to run7.py's own
+# (commented-out) pattern, multipass_detach stays at its True default
 
 additive_drop_loss = False
 weight_sharing = False
