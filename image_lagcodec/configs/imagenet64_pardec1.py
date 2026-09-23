@@ -17,10 +17,10 @@ d_model = (256, 256)  # was (512, 512) -- halved encoder dim
 n_layers = (2, 2)  # was (4, 4) -- halved encoder depth
 n_heads = (8, 8)
 n_kv_heads = (None, None)
-decoder_d_model = (1024, 1024)
+decoder_d_model = (512, 512)  # was 1024 -- OOM'd twice at 613G vs 30.75G, halved per explicit fallback
 decoder_n_layers = (8, 8)
-decoder_n_heads = (16, 16)  # head_dim=64
-decoder_n_kv_heads = (16, 16)  # plain MHA, avoids relying on encoder-ratio auto-GQA resolution
+decoder_n_heads = (8, 8)  # was 16 -- halved with d_model to keep head_dim=64
+decoder_n_kv_heads = (8, 8)  # plain MHA, avoids relying on encoder-ratio auto-GQA resolution
 code_vocab = (256, 256)
 pq_chunks = (3, 3)
 pq_dim = (128, 128)
