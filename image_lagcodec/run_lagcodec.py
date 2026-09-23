@@ -2150,7 +2150,19 @@ class EncDecLevel(eqx.Module):
             else:
                 return self._token_generate_diffusion(h_pos, rng, greedy, temperature)
 
+        def token_step(carry, _):
+            cache_k, cache_v, pos, rng, x_input = carry
+            h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
+            pos = pos + 1
+            val, rng = token_predict(h, rng)
+            x_input = self._dec_embed_target(val)
+            return (cache_k, cache_v, pos, rng, x_input), val
+
         def one_group(carry, own_g, extra_g):
+            # inner per-token loop is a lax.scan (not Python-unrolled) -- a G*K-1 unrolled trace compiles too
+            # slowly at real scale (same class of issue fixed in decode_generate/decode_generate_interleave's
+            # OUTER groups loop earlier; this is the analogous fix for the INNER per-token loop, needed once
+            # G itself is large, e.g. decoder_ncodes=n_blocks single-group "lazy" configs, 2026-09-23).
             cache_k, cache_v, pos, rng = carry
             bos_in = jnp.broadcast_to(self.bos_embed, (B, 1, D))
             if has_extra:
@@ -2160,18 +2172,17 @@ class EncDecLevel(eqx.Module):
             h_chunk, cache_k, cache_v = self_chunk_step(prefill, cache_k, cache_v, pos)
             pos = pos + prefill.shape[1]
             h = h_chunk[:, -1, :]
-            val, rng = token_predict(h, rng)
-            vals = [val]
-            x_input = self._dec_embed_target(val)
-            for _ in range(G * self.K - 1):
-                h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
-                pos = pos + 1
-                val, rng = token_predict(h, rng)
-                vals.append(val)
-                x_input = self._dec_embed_target(val)
+            val0, rng = token_predict(h, rng)
+            x_input = self._dec_embed_target(val0)
+
+            (cache_k, cache_v, pos, rng, x_input), vals_rest = jax.lax.scan(
+                token_step, (cache_k, cache_v, pos, rng, x_input), None, length=G * self.K - 1)
+            vals_rest = jnp.moveaxis(vals_rest, 0, 1)  # (B, G*K-1, *out_extra)
+            all_vals = jnp.concatenate([val0[:, None], vals_rest], axis=1)
+
             _, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
             pos = pos + 1
-            return (cache_k, cache_v, pos, rng), jnp.stack(vals, axis=1)
+            return (cache_k, cache_v, pos, rng), all_vals
 
         def group_step(carry, xs):
             # xs: (chunk_groups, B, G, D) / (chunk_groups, B, ?, D) -- chunk_groups own-groups unrolled in a
