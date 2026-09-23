@@ -37,13 +37,16 @@ decoder_ncodes = 32  # was 4 -- OOM'd twice (613G, 380G vs 30.75G); fewer/bigger
 # batched rows (n_groups=1024/32=32, B2=8*32=256, was B2=2048) -- the actual driver of the blowup
 # interleave_decode NOT set (pardec instead) -- cond_window is pardec-only, meaningless under interleave_decode
 attn_lookahead = 0
-attn_window = (256, 256)  # was 1024 -- 4th OOM was only 1.3G short (26.18G vs 24.88G free); this is the
-# encoder's own unbounded self-attention over n_blocks=1024, untouched by earlier cuts
+attn_window = (1024, 1024)  # symmetric base (new 2026-09-23 encoder_attn_window/decoder_attn_window feature) --
+# now bounds BOTH encoder and decoder self-attention by default, incl. the decoder's own refine-pass
+# attention (previously unbounded -- likely the real culprit, not the encoder-only cut that had zero effect)
 cond_depth = (2, 1)
 cond_window = 16  # was (4, -1) -- widened; level1's cond_window has no effect anyway (cond_depth=1 there)
 cond_drop = 0.5
 
-level_refine_window = 4  # was 16 -- groups of Kspan tokens; draft = previous pass output
+level_refine_window = 1  # was 4 -- 5th OOM was identical (26.18G/24.88G) after cutting attn_window, proving
+# it wasn't the bottleneck; Pp=level_refine_window*decoder_ncodes*stride=1*32*4=128 (was 512) -- much smaller
+# per-row redraft length in the decoder's own (unbounded dec_attn_window) refine-pass attention
 level_refine_gumbel = True
 level_refine_temperature = 1.0
 level_refine_gt_drop = 0.8
