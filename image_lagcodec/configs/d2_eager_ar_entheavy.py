@@ -18,24 +18,24 @@ decoder_d_model = (512, 512)
 decoder_n_layers = (8, 8)
 decoder_n_heads = (8, 8)
 decoder_n_kv_heads = (8, 8)  # plain MHA (head_dim=64), avoids relying on encoder-ratio auto-GQA resolution
-code_vocab = (16, 16)
-pq_chunks = (6, 6)
-pq_dim = (64, 64)
+code_vocab = (256, 256)
+pq_chunks = (3, 3)
+pq_dim = (256, 256)
 mlp_mult = 4
 rope_base = 10000.0
 
 ntp_weight = 1.0
 mtp_weight = 0.0
 mse_weight = 0.0
-entropy_weight = 0.1
+entropy_weight = 1.0
 
 strides = (4, 4)
-decoder_ncodes = 4
+decoder_ncodes = 1
 interleave_decode = True  # true single flat causal AR chain -- the axis under test vs d2_lazy_bigdec's pardec fallback
 attn_window = 1024  # symmetric base (encoder_attn_window/decoder_attn_window feature, 2026-09-23) -- bounds
 # both encoder and decoder self-attention; the decoder side matters here too (dec_blocks' own window,
 # baked in at construction, used identically regardless of decode mechanism)
-ncodes_window = 4
+ncodes_window = 0
 attn_lookahead = 0
 cond_depth = (1, 1)  # matches d2_lazy_bigdec exactly -- held constant for a clean 1:1 comparison
 # cond_drop = 0.5  # no effect with cond_depth<=1

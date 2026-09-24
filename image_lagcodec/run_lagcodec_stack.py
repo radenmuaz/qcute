@@ -21,7 +21,7 @@ import numpy as np
 import optax
 from tqdm import tqdm
 
-from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, apply_rope, apply_xsa, init_matrix,
+from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, SwiGLU, apply_rope, apply_xsa, init_matrix,
                                         init_vector, make_lr_schedule, rmsnorm, rope_cos_sin,
                                         rope_cos_sin_pos, rotate_half, sinkgd, splash_future_attention,
                                         warmup_const_schedule)
@@ -97,6 +97,11 @@ class Config:
     decoder_attn_window: tuple = None
     attn_lookahead: tuple = 0
     use_sink: bool = False
+    code_head_attn_pool: tuple = False  # per-level: False (default) = code_head reads the naive
+    # position-(K-1) hidden state (unchanged original behavior). True = code_head instead reads a
+    # dedicated windowed cross-attn pooling layer (trainable query, K/V = encoder_attn_window's
+    # worth of causal history ending at the block, own params from code_head/ntp_head) -- see
+    # CodePoolAttention. Easy to toggle back off per level; the old path is untouched either way.
 
     remat: bool = False
     remat_level: bool = False
@@ -210,6 +215,7 @@ class Config:
         bcast_opt("encoder_attn_window", int)
         bcast_opt("decoder_attn_window", int)
         bcast("attn_lookahead", int)
+        bcast("code_head_attn_pool", bool)
         if self.pq_dim is None:
             self.pq_dim = self.d_model
         else:
@@ -782,6 +788,19 @@ def run_block(blk: Block, x: jnp.ndarray, remat: bool, rng=None, drop_prob: floa
     return out
 
 
+def run_enc_block(blk, x: jnp.ndarray, remat: bool, uncond_kvs, rng=None, drop_prob: float = 0.0) -> jnp.ndarray:
+    """Same as run_block, but blk may be an EncDecBlock (weight_sharing=True): uncond_kvs=None means
+    blk is a plain self-attn-only Block (weight_sharing=False, unchanged behavior); uncond_kvs=(a
+    tuple of Nones, one per cond_depth rung) means blk is EncDecBlock run in encoder/uncond mode
+    (every cross-attn rung gets the learned sink no-op, see CrossAttention.project_kv)."""
+    call = (lambda x: blk(x, uncond_kvs, causal=True)) if uncond_kvs is not None else blk
+    out = eqx.filter_checkpoint(call)(x) if remat else call(x)
+    if rng is not None and drop_prob > 0.0:
+        keep = jax.random.bernoulli(rng, p=1.0 - drop_prob)
+        out = jnp.where(keep, out, x)
+    return out
+
+
 def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False) -> jnp.ndarray:
     B, T, D = x.shape
     hd = D // attn.n_heads
@@ -809,130 +828,16 @@ def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False) 
     return y @ attn.out
 
 
-def pardec_step(attn: Attention, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray,
-                 cache_pos, rope_pos: jnp.ndarray, key_valid: jnp.ndarray, T_max: int) -> tuple:
-    Bc, D = x_new.shape
-    hd = D // attn.n_heads
-    qkv = x_new @ attn.qkv
-    q, k, v = jnp.split(qkv, [D, D + attn.n_kv_heads * hd], axis=-1)
-    q, k, v = q.reshape(Bc, attn.n_heads, hd), k.reshape(Bc, attn.n_kv_heads, hd), v.reshape(Bc, attn.n_kv_heads, hd)
-    if attn.use_qknorm:
-        q, k = rmsnorm(q, attn.q_norm), rmsnorm(k, attn.k_norm)
-    cos, sin = rope_cos_sin_pos(rope_pos, hd, attn.rope_base)
-    q = (q * cos[:, None, :] + rotate_half(q) * sin[:, None, :]).astype(q.dtype)
-    k = (k * cos[:, None, :] + rotate_half(k) * sin[:, None, :]).astype(k.dtype)
-    cache_k = jax.lax.dynamic_update_slice(cache_k, k[:, :, None, :].astype(cache_k.dtype), (0, 0, cache_pos, 0))
-    cache_v = jax.lax.dynamic_update_slice(cache_v, v[:, :, None, :].astype(cache_v.dtype), (0, 0, cache_pos, 0))
-    n_rep = attn.n_heads // attn.n_kv_heads
-    k_full = jnp.repeat(cache_k, n_rep, axis=1) if n_rep > 1 else cache_k
-    v_full = jnp.repeat(cache_v, n_rep, axis=1) if n_rep > 1 else cache_v
-    scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
-    logits = jnp.einsum("bhd,bhtd->bht", q, k_full) * scale
-    idx = jnp.arange(T_max)
-    valid = (idx[None, None, :] <= cache_pos) & key_valid[:, None, :]
-    logits = jnp.where(valid, logits, -1e9)
-    attn_w = jax.nn.softmax(logits, axis=-1)
-    y = jnp.einsum("bht,bhtd->bhd", attn_w, v_full)
-    if attn.use_xsa:
-        v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
-        y = apply_xsa(y, v_self)
-    y = y.reshape(Bc, D)
-    return y @ attn.out, cache_k, cache_v
 
 
-def pardec_chunk_step(attn: Attention, x_chunk: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray,
-                       cache_pos_start, rope_pos_ids: jnp.ndarray, key_valid: jnp.ndarray,
-                       T_max: int) -> tuple:
-    Bc, T, D = x_chunk.shape
-    hd = D // attn.n_heads
-    qkv = x_chunk @ attn.qkv
-    q, k, v = jnp.split(qkv, [D, D + attn.n_kv_heads * hd], axis=-1)
-    q = q.reshape(Bc, T, attn.n_heads, hd).transpose(0, 2, 1, 3)
-    k = k.reshape(Bc, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
-    v = v.reshape(Bc, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
-    if attn.use_qknorm:
-        q, k = rmsnorm(q, attn.q_norm), rmsnorm(k, attn.k_norm)
-    cos, sin = rope_cos_sin_pos(rope_pos_ids, hd, attn.rope_base)
-    cos_b, sin_b = cos[:, None, :, :], sin[:, None, :, :]
-    q = (q * cos_b + rotate_half(q) * sin_b).astype(q.dtype)
-    k = (k * cos_b + rotate_half(k) * sin_b).astype(k.dtype)
-    cache_k = jax.lax.dynamic_update_slice(cache_k, k.astype(cache_k.dtype), (0, 0, cache_pos_start, 0))
-    cache_v = jax.lax.dynamic_update_slice(cache_v, v.astype(cache_v.dtype), (0, 0, cache_pos_start, 0))
-    n_rep = attn.n_heads // attn.n_kv_heads
-    k_full = jnp.repeat(cache_k, n_rep, axis=1) if n_rep > 1 else cache_k
-    v_full = jnp.repeat(cache_v, n_rep, axis=1) if n_rep > 1 else cache_v
-    scale = 1.0 / jnp.sqrt(hd).astype(jnp.float32)
-    logits = jnp.einsum("bhtd,bhsd->bhts", q, k_full) * scale
-    pos_ids_abs = cache_pos_start + jnp.arange(T)
-    idx = jnp.arange(T_max)
-    causal = idx[None, :] <= pos_ids_abs[:, None]
-    valid = causal[None] & key_valid[:, None, :]
-    logits = jnp.where(valid[:, None], logits, -1e9)
-    attn_w = jax.nn.softmax(logits, axis=-1)
-    y = jnp.einsum("bhts,bhsd->bhtd", attn_w, v_full)
-    if attn.use_xsa:
-        v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
-        y = apply_xsa(y, v_self)
-    y = y.transpose(0, 2, 1, 3).reshape(Bc, T, D)
-    return y @ attn.out, cache_k, cache_v
 
 
-def pardec_block_step(blk: Block, x_new, cache_k, cache_v, cache_pos, rope_pos, key_valid, T_max):
-    attn_out, ck, cv = pardec_step(blk.attn, blk.norm1(x_new), cache_k, cache_v, cache_pos,
-                                    rope_pos, key_valid, T_max)
-    x = x_new + attn_out
-    x = x + blk.mlp(blk.norm2(x))
-    return x, ck, cv
 
 
-def pardec_block_chunk_step(blk: Block, x_chunk, cache_k, cache_v, cache_pos_start, rope_pos_ids,
-                             key_valid, T_max):
-    attn_out, ck, cv = pardec_chunk_step(blk.attn, blk.norm1(x_chunk), cache_k, cache_v,
-                                          cache_pos_start, rope_pos_ids, key_valid, T_max)
-    x = x_chunk + attn_out
-    x = x + blk.mlp(blk.norm2(x))
-    return x, ck, cv
 
 
-def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: jnp.ndarray,
-                                 key_valid: jnp.ndarray) -> jnp.ndarray:
-    Bc, T, D = x.shape
-    hd = D // attn.n_heads
-    qkv = x @ attn.qkv
-    q, k, v = jnp.split(qkv, [D, D + attn.n_kv_heads * hd], axis=-1)
-    q = q.reshape(Bc, T, attn.n_heads, hd).transpose(0, 2, 1, 3)
-    k = k.reshape(Bc, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
-    v = v.reshape(Bc, T, attn.n_kv_heads, hd).transpose(0, 2, 1, 3)
-    if attn.use_qknorm:
-        q, k = rmsnorm(q, attn.q_norm), rmsnorm(k, attn.k_norm)
-    cos, sin = rope_cos_sin_pos(rope_pos_ids, hd, attn.rope_base)
-    cos_b, sin_b = cos[:, None], sin[:, None]
-    q = (q * cos_b + rotate_half(q) * sin_b).astype(q.dtype)
-    k = (k * cos_b + rotate_half(k) * sin_b).astype(k.dtype)
-    rep = attn.n_heads // attn.n_kv_heads
-    if rep > 1:
-        k, v = jnp.repeat(k, rep, axis=1), jnp.repeat(v, rep, axis=1)
-    scale = 1.0 / math.sqrt(hd)
-    scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale
-    idx = jnp.arange(T)
-    causal = idx[None, :] <= idx[:, None]
-    mask = causal[None] & key_valid[:, None, :]
-    scores = jnp.where(mask[:, None], scores, -1e9)
-    weights = jax.nn.softmax(scores, axis=-1)
-    y = jnp.einsum("bhts,bhsd->bhtd", weights, v)
-    if attn.use_xsa:
-        y = apply_xsa(y, v)
-    y = y.transpose(0, 2, 1, 3).reshape(Bc, T, D)
-    return y @ attn.out
 
 
-def run_block_pardec(blk: Block, x: jnp.ndarray, rope_pos_ids: jnp.ndarray, key_valid: jnp.ndarray,
-                      remat: bool) -> jnp.ndarray:
-    def f(x):
-        x = x + dense_self_attention_pardec(blk.attn, blk.norm1(x), rope_pos_ids, key_valid)
-        x = x + blk.mlp(blk.norm2(x))
-        return x
-    return jax.checkpoint(f)(x) if remat else f(x)
 
 
 # TODO (decode_future for interleave_decode, started 2026-09-24, PAUSED/INCOMPLETE -- not wired up
@@ -1028,6 +933,211 @@ def token_ar_generate(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks
     return idx, rng
 
 
+# ---------------------------------------------------------------------------
+# Cross-attention decoder (replaces interleave_decode's flat self-attn sequence -- pardec pruned).
+# Canonical pre-norm self-attn -> cross-attn (repeated once per cond_depth source) -> mlp per layer,
+# separate QKV projections for self vs cross (no weight sharing between them). Cross-attn always
+# carries one learned (sink_k, sink_v) pair, concatenated in front of any real conditioning KV --
+# with zero real conditioning (encoder/uncond mode, not yet wired up) this reduces to softmax over
+# a single key (weight 1.0), output = sink_v exactly: a genuinely LEARNED, NaN-safe no-op, not a
+# hardcoded zero (bias-only splash `sinks` can't do this -- it has no value contribution).
+# ---------------------------------------------------------------------------
+
+class CrossAttention(eqx.Module):
+    wq: jnp.ndarray
+    wk: jnp.ndarray
+    wv: jnp.ndarray
+    out: jnp.ndarray
+    sink_k: jnp.ndarray
+    sink_v: jnp.ndarray
+    q_norm: jnp.ndarray
+    k_norm: jnp.ndarray
+    n_heads: int = eqx.field(static=True)
+    n_kv_heads: int = eqx.field(static=True)
+    use_qknorm: bool = eqx.field(static=True)
+
+    def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, init_scheme: str = "llama",
+                 use_qknorm: bool = True, n_layers: int = None):
+        hd = d_model // n_heads
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        self.wq = init_matrix(k1, (d_model, n_heads * hd), init_scheme)
+        self.wk = init_matrix(k2, (d_model, n_kv_heads * hd), init_scheme)
+        self.wv = init_matrix(k3, (d_model, n_kv_heads * hd), init_scheme)
+        self.out = init_matrix(k4, (n_heads * hd, d_model), init_scheme, residual_out=True, n_layers=n_layers)
+        self.sink_k = jnp.zeros((n_kv_heads, hd))
+        self.sink_v = jnp.zeros((n_kv_heads, hd))
+        self.q_norm = jnp.ones((hd,))
+        self.k_norm = jnp.ones((hd,))
+        self.n_heads, self.n_kv_heads, self.use_qknorm = n_heads, n_kv_heads, use_qknorm
+
+    def project_kv(self, kv_source: jnp.ndarray = None, B: int = None) -> tuple:
+        """Projects the conditioning source to (k,v) ONCE, with the learned sink concatenated and
+        GQA repeat already applied -- call this once per generation call (own/coarser code
+        sequences are fixed for the whole call) and reuse the result across every incremental
+        step, instead of re-projecting the same fixed sequence on every single step (the naive
+        __call__-every-step approach is O(gen_length) redundant work for a O(1) quantity)."""
+        hd = self.wk.shape[-1] // self.n_kv_heads
+        if kv_source is not None:
+            B, Tkv, D = kv_source.shape
+            k = (kv_source @ self.wk).reshape(B, Tkv, self.n_kv_heads, hd).transpose(0, 2, 1, 3)
+            v = (kv_source @ self.wv).reshape(B, Tkv, self.n_kv_heads, hd).transpose(0, 2, 1, 3)
+            if self.use_qknorm:
+                k = rmsnorm(k, self.k_norm)
+            sink_k = jnp.broadcast_to(self.sink_k[None, :, None, :], (B, self.n_kv_heads, 1, hd))
+            sink_v = jnp.broadcast_to(self.sink_v[None, :, None, :], (B, self.n_kv_heads, 1, hd))
+            k = jnp.concatenate([sink_k, k], axis=2)
+            v = jnp.concatenate([sink_v, v], axis=2)
+        else:
+            assert B is not None, "project_kv needs B when kv_source is None (uncond/sink-only)"
+            k = jnp.broadcast_to(self.sink_k[None, :, None, :], (B, self.n_kv_heads, 1, hd))
+            v = jnp.broadcast_to(self.sink_v[None, :, None, :], (B, self.n_kv_heads, 1, hd))
+        n_rep = self.n_heads // self.n_kv_heads
+        if n_rep > 1:
+            k, v = jnp.repeat(k, n_rep, axis=1), jnp.repeat(v, n_rep, axis=1)
+        return k, v
+
+    def attend(self, x_q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
+        """x_q: (B,Tq,D). k,v: pre-projected via project_kv (already sink-concatenated, GQA-repeated)."""
+        B, Tq, D = x_q.shape
+        hd = D // self.n_heads
+        q = (x_q @ self.wq).reshape(B, Tq, self.n_heads, hd).transpose(0, 2, 1, 3)
+        if self.use_qknorm:
+            q = rmsnorm(q, self.q_norm)
+        scale = 1.0 / math.sqrt(hd)
+        logits = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale
+        weights = jax.nn.softmax(logits, axis=-1)
+        y = jnp.einsum("bhts,bhsd->bhtd", weights, v)
+        y = y.transpose(0, 2, 1, 3).reshape(B, Tq, D)
+        return y @ self.out
+
+    def __call__(self, x_q: jnp.ndarray, kv_source: jnp.ndarray = None) -> jnp.ndarray:
+        """x_q: (B,Tq,D). kv_source: (B,Tkv,D) real conditioning, or None (uncond -- sink only).
+        Convenience wrapper (project_kv + attend) for training/dense calls, where the source isn't
+        reused across steps so there's nothing to precompute -- see project_kv/attend for the
+        generation path, which reuses one projection across many steps instead."""
+        k, v = self.project_kv(kv_source, B=x_q.shape[0])
+        return self.attend(x_q, k, v)
+
+
+class EncDecBlock(eqx.Module):
+    """One canonical enc-dec transformer decoder layer: self-attn -> cross-attn (repeated once per
+    cond_depth conditioning source, e.g. own code, then coarser levels) -> mlp, pre-norm + residual
+    at every sublayer. cond_depth is a static count fixed at construction (matches the level's own
+    cfg.cond_depth); cond_kvs passed to __call__ must be a same-length tuple, entries may be None
+    (per-source uncond/sink-only -- not currently exercised, kept for a future encoder/weight-
+    sharing generalization)."""
+    self_attn: Attention
+    cross: tuple
+    norm1: RMSNorm
+    cross_norms: tuple
+    norm2: RMSNorm
+    mlp: SwiGLU
+    cond_depth: int = eqx.field(static=True)
+
+    def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, cond_depth: int, rope_base: float,
+                 mlp_mult: int, init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True,
+                 use_sink: bool = False, window: int = None, n_layers: int = None):
+        assert cond_depth >= 1, f"EncDecBlock needs cond_depth>=1 (got {cond_depth})"
+        keys = jax.random.split(key, 2 + cond_depth)
+        self.self_attn = Attention(keys[0], d_model, n_heads, n_kv_heads, rope_base, n_layers=n_layers,
+                                    init_scheme=init_scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
+                                    window=window, use_sink=use_sink)
+        self.cross = tuple(CrossAttention(keys[1 + i], d_model, n_heads, n_kv_heads, init_scheme=init_scheme,
+                                           use_qknorm=use_qknorm, n_layers=n_layers) for i in range(cond_depth))
+        self.norm1 = RMSNorm(d_model)
+        self.cross_norms = tuple(RMSNorm(d_model) for _ in range(cond_depth))
+        self.norm2 = RMSNorm(d_model)
+        self.mlp = SwiGLU(keys[-1], d_model, mlp_mult, n_layers=n_layers, init_scheme=init_scheme)
+        self.cond_depth = cond_depth
+
+    def __call__(self, x: jnp.ndarray, cond_kvs: tuple, causal: bool = True) -> jnp.ndarray:
+        assert len(cond_kvs) == self.cond_depth
+        x = x + self.self_attn(self.norm1(x), causal=causal)
+        for ca, cn, kv in zip(self.cross, self.cross_norms, cond_kvs):
+            x = x + ca(cn(x), kv)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+    def project_cond_kvs(self, cond_kvs: tuple, B: int) -> tuple:
+        """Projects every cross-attn source ONCE via CrossAttention.project_kv -- call before a
+        generation loop and reuse the (k,v) tuples across every step (see EncDecBlock.step)."""
+        assert len(cond_kvs) == self.cond_depth
+        return tuple(ca.project_kv(kv, B=B) for ca, kv in zip(self.cross, cond_kvs))
+
+    def step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray, pos, T_max: int,
+              cond_kv_proj: tuple) -> tuple:
+        """Single-step incremental form: x_new (Bc,D), self-attn KV-cached (cache_k/v (Bc,n_kv_heads,
+        T_max,hd)) same as the plain self-attn-only Block.step; cross-attn reuses cond_kv_proj (from
+        project_cond_kvs, computed ONCE for the whole generation call) instead of re-projecting the
+        same fixed own/coarser code sequence on every single step."""
+        assert len(cond_kv_proj) == self.cond_depth
+        attn_out, ck, cv = self.self_attn.step(self.norm1(x_new), cache_k, cache_v, pos, T_max)
+        x = x_new + attn_out
+        x3 = x[:, None, :]
+        for ca, cn, (k, v) in zip(self.cross, self.cross_norms, cond_kv_proj):
+            x3 = x3 + ca.attend(cn(x3), k, v)
+        x = x3[:, 0, :]
+        x = x + self.mlp(self.norm2(x))
+        return x, ck, cv
+
+
+class CodePoolAttention(eqx.Module):
+    """Windowed causal cross-attention pooling for code_head (Config.code_head_attn_pool): a
+    trainable query (one per head, reused identically at every block) attends over up to `window`
+    positions of the encoder's own last-layer hidden states ending at that block's own last real
+    position -- replacing the naive "just grab position K-1" pick with a learned, block-specialized
+    summary, decoupled from whatever ntp_head needs from that same position. Dense (not
+    splash-native), same tradeoff as CrossAttention -- a real optimization target if this becomes a
+    bottleneck at long sequence lengths, not attempted here."""
+    query: jnp.ndarray
+    wk: jnp.ndarray
+    wv: jnp.ndarray
+    out: jnp.ndarray
+    k_norm: jnp.ndarray
+    n_heads: int = eqx.field(static=True)
+    n_kv_heads: int = eqx.field(static=True)
+    window: int = eqx.field(static=True)
+    use_qknorm: bool = eqx.field(static=True)
+
+    def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, window: int = None,
+                 init_scheme: str = "llama", use_qknorm: bool = True):
+        hd = d_model // n_heads
+        k1, k2, k3 = jax.random.split(key, 3)
+        self.query = jnp.zeros((n_heads, hd))
+        self.wk = init_matrix(k1, (d_model, n_kv_heads * hd), init_scheme)
+        self.wv = init_matrix(k2, (d_model, n_kv_heads * hd), init_scheme)
+        self.out = init_matrix(k3, (n_heads * hd, d_model), init_scheme)
+        self.k_norm = jnp.ones((hd,))
+        self.n_heads, self.n_kv_heads, self.window, self.use_qknorm = n_heads, n_kv_heads, window, use_qknorm
+
+    def __call__(self, h: jnp.ndarray, K: int) -> jnp.ndarray:
+        """h: (B,T,D), T a multiple of K (caller truncates). Returns (B, T//K, D), one pooled
+        vector per K-sized block."""
+        B, T, D = h.shape
+        hd = D // self.n_heads
+        n_blocks = T // K
+        k = (h @ self.wk).reshape(B, T, self.n_kv_heads, hd).transpose(0, 2, 1, 3)
+        v = (h @ self.wv).reshape(B, T, self.n_kv_heads, hd).transpose(0, 2, 1, 3)
+        if self.use_qknorm:
+            k = rmsnorm(k, self.k_norm)
+        n_rep = self.n_heads // self.n_kv_heads
+        if n_rep > 1:
+            k, v = jnp.repeat(k, n_rep, axis=1), jnp.repeat(v, n_rep, axis=1)
+        q = jnp.broadcast_to(self.query[None, :, None, :], (B, self.n_heads, n_blocks, hd))
+        scale = 1.0 / math.sqrt(hd)
+        logits = jnp.einsum("bhqd,bhtd->bhqt", q, k) * scale
+        block_end = (jnp.arange(n_blocks) + 1) * K - 1  # each block's own last real position
+        kv_idx = jnp.arange(T)
+        mask = kv_idx[None, :] <= block_end[:, None]
+        if self.window is not None:
+            mask = mask & (kv_idx[None, :] > block_end[:, None] - self.window)
+        logits = jnp.where(mask[None, None], logits, -1e9)
+        weights = jax.nn.softmax(logits, axis=-1)
+        y = jnp.einsum("bhqt,bhtd->bhqd", weights, v)
+        y = y.transpose(0, 2, 1, 3).reshape(B, n_blocks, D)
+        return y @ self.out
+
+
 class EncDecLevel(eqx.Module):
     blocks: list
     ln_f: RMSNorm
@@ -1035,6 +1145,7 @@ class EncDecLevel(eqx.Module):
     own_input_proj: jnp.ndarray
     ntp_head: jnp.ndarray
     code_head: jnp.ndarray
+    code_pool_attn: CodePoolAttention
     bos_embed: jnp.ndarray
     ctx_embed: jnp.ndarray
     ctx_proj: jnp.ndarray
@@ -1065,6 +1176,7 @@ class EncDecLevel(eqx.Module):
     mtp_heads_out_head: list
     has_decoder: bool = eqx.field(static=True)
     weight_sharing: bool = eqx.field(static=True)
+    code_head_attn_pool: bool = eqx.field(static=True)
     pq_chunks: int = eqx.field(static=True)
     code_vocab: int = eqx.field(static=True)
     in_pq_chunks: int = eqx.field(static=True)
@@ -1144,6 +1256,7 @@ class EncDecLevel(eqx.Module):
         self.in_code_vocab = 256 if is_byte_level else cfg.code_vocab[level - 1]
         self.has_decoder = has_decoder
         self.weight_sharing = weight_sharing
+        self.code_head_attn_pool = cfg.code_head_attn_pool[level]
         self.token_head_type = cfg.token_head_type[level]
         self.token_dim = cfg.token_dim[level] if level < len(cfg.token_dim) else None
         self.token_mask_prob = cfg.token_mask_prob
@@ -1164,11 +1277,27 @@ class EncDecLevel(eqx.Module):
         enc_window_val = cfg.encoder_attn_window[level] if cfg.encoder_attn_window[level] is not None else cfg.attn_window[level]
         enc_window = None if enc_window_val == -1 else enc_window_val
         enc_lookahead = cfg.attn_lookahead[level]
-        self.blocks = [Block(k, D_enc, n_heads_enc, n_kv_heads_enc, cfg.mlp_mult[level], cfg.rope_base[level],
-                             n_layers=n_layers_enc, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
-                             window=enc_window, lookahead=enc_lookahead, use_sink=cfg.use_sink) for k in block_keys]
+        if weight_sharing:
+            # encoder/decoder share one block stack -- must be EncDecBlock (self+cross+mlp) so the
+            # SAME weights work in decode mode (real cross-attn KV) too, not just plain self-attn.
+            # In encode mode every cross-attn rung gets kv_source=None (learned sink no-op, see
+            # CrossAttention.project_kv) -- see encode()/encoder_hidden() for where that's passed.
+            self.blocks = [EncDecBlock(k, D_enc, n_heads_enc, n_kv_heads_enc, cfg.cond_depth[level],
+                                        cfg.rope_base[level], cfg.mlp_mult[level], init_scheme=scheme,
+                                        use_xsa=use_xsa, use_qknorm=use_qknorm, use_sink=cfg.use_sink,
+                                        window=enc_window, n_layers=n_layers_enc) for k in block_keys]
+        else:
+            self.blocks = [Block(k, D_enc, n_heads_enc, n_kv_heads_enc, cfg.mlp_mult[level], cfg.rope_base[level],
+                                 n_layers=n_layers_enc, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
+                                 window=enc_window, lookahead=enc_lookahead, use_sink=cfg.use_sink) for k in block_keys]
         self.ln_f = RMSNorm(D_enc)
         self.code_head = init_matrix(keys[2], (D_enc, self.pq_chunks * self.code_vocab), scheme)
+        if cfg.code_head_attn_pool[level]:
+            self.code_pool_attn = CodePoolAttention(jax.random.fold_in(key, 9007), D_enc, n_heads_enc,
+                                                      n_kv_heads_enc, window=enc_window, init_scheme=scheme,
+                                                      use_qknorm=use_qknorm)
+        else:
+            self.code_pool_attn = None
         self.ntp_head = init_matrix(keys[3], (D_enc, ntp_out), scheme)
         self.bos_embed = init_vector(keys[4], D_dec, scheme)
         self.ctx_embed = init_matrix(keys[5], (self.code_vocab, self.pq_dim), scheme)
@@ -1213,9 +1342,14 @@ class EncDecLevel(eqx.Module):
             dec_block_keys = jax.random.split(keys[6], n_layers_dec)
             dec_window_val = cfg.decoder_attn_window[level] if cfg.decoder_attn_window[level] is not None else cfg.attn_window[level]
             dec_window = None if dec_window_val == -1 else dec_window_val
-            self.dec_blocks = [Block(k, D_dec, self.n_heads, self.n_kv_heads, cfg.mlp_mult[level], cfg.rope_base[level],
-                                     n_layers=n_layers_dec, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
-                                     window=dec_window) for k in dec_block_keys]
+            # Cross-attention decoder (pardec pruned, interleave's flat self-attn sequence replaced):
+            # self-attn -> cond_depth cross-attn sublayers (own code, then coarser levels) -> mlp per
+            # layer. weight_sharing=True (encoder/uncond mode via this same block class) NOT YET
+            # implemented -- only this has_decoder-and-not-weight_sharing path is wired up.
+            self.dec_blocks = [EncDecBlock(k, D_dec, self.n_heads, self.n_kv_heads, self.cond_depth,
+                                            cfg.rope_base[level], cfg.mlp_mult[level], init_scheme=scheme,
+                                            use_xsa=use_xsa, use_qknorm=use_qknorm, window=dec_window,
+                                            n_layers=n_layers_dec) for k in dec_block_keys]
             self.dec_ln_f = RMSNorm(D_dec)
             self.dec_target_embed = init_matrix(keys[7], (own_vocab, self.pq_dim), scheme)
             self.dec_target_proj = init_matrix(keys[22], (self.in_pq_chunks * self.pq_dim, D_dec), scheme)
@@ -1291,16 +1425,21 @@ class EncDecLevel(eqx.Module):
             layer_drop_prob = (0.0,) * n_blk
         elif isinstance(layer_drop_prob, (int, float)):
             layer_drop_prob = (layer_drop_prob,) * n_blk
+        uncond_kvs = (None,) * self.cond_depth if self.weight_sharing else None
         def _enc_stack(h):
             for i, blk in enumerate(self.blocks):
-                h = run_block(blk, h, self.remat and not self.remat_level, rng=layer_rngs[i], drop_prob=layer_drop_prob[i])
+                h = run_enc_block(blk, h, self.remat and not self.remat_level, uncond_kvs,
+                                   rng=layer_rngs[i], drop_prob=layer_drop_prob[i])
             return h
         h = jax.checkpoint(_enc_stack)(h) if self.remat_level else _enc_stack(h)
         h = self.ln_f(h)
         M, L, D = h.shape
         n_blocks = L // self.K
-        h_blocks = h[:, :n_blocks * self.K, :].reshape(M, n_blocks, self.K, D)
-        pooled = h_blocks[:, :, self.K - 1, :]
+        if self.code_head_attn_pool:
+            pooled = self.code_pool_attn(h[:, :n_blocks * self.K, :], self.K)
+        else:
+            h_blocks = h[:, :n_blocks * self.K, :].reshape(M, n_blocks, self.K, D)
+            pooled = h_blocks[:, :, self.K - 1, :]
         logits = reshape_pq(pooled @ self.code_head, self.pq_chunks, self.code_vocab)
         if quant_rng is not None and self.quantize_mode == "gumbel":
             code_soft, code_idx = quantize_gumbel(logits, quant_rng, encode_temperature, self.quantize_drop)
@@ -1348,48 +1487,6 @@ class EncDecLevel(eqx.Module):
                     self.extra_ctx_up_stride[k], self.extra_ctx_n_blocks[k])
         return self.revision_embed, self.revision_proj, self.revision_up_stride, self.revision_n_blocks
 
-    def _pardec_ctx_rows(self, ctx_tok, extra_codes, G: int, n_groups: int, n_blocks: int, rng=None,
-                          drop_extras: bool = False) -> tuple:
-        # Shared by training and generation. Row order: [extras (coarsest first) | own-level window]. Slots that do
-        # not exist (before the sequence start, past the last real code, cond_drop) are zero-filled and marked
-        # invalid: they stay in the row for static shapes but are masked as keys (never attended).
-        B, _, D = ctx_tok.shape
-        n_blocks_p = n_groups * G
-        gidx = list(range(n_groups))
-        Bn = len(gidx)
-        B2 = B * Bn
-        # chunked visibility: group g sees parent codes up to end(g), the end of its chunk (0 = its own group)
-        chunk_groups = 1 if self.stream_chunks <= 0 else -(-n_groups // self.stream_chunks)
-        ends_all = [min((g // chunk_groups + 1) * chunk_groups, n_groups) * G for g in range(n_groups)]
-        ends = [ends_all[g] for g in gidx]
-        Wg = n_blocks_p if self.ncodes_window < 0 else min(self.ncodes_window * G + chunk_groups * G, n_blocks_p)
-        padded = jnp.pad(ctx_tok, ((0, 0), (Wg, n_blocks_p - n_blocks), (0, 0)))
-        own = jnp.stack([padded[:, e:e + Wg, :] for e in ends], axis=1).reshape(B2, Wg, D)
-        rope_own = jnp.stack([jnp.clip(jnp.arange(Wg) - Wg + e, 0, None) for e in ends], axis=0)
-        abs_idx = np.stack([np.arange(Wg) - Wg + e for e in ends])
-        valid_own = jnp.broadcast_to(jnp.asarray((abs_idx >= 0) & (abs_idx < n_blocks))[None],
-                                      (B, Bn, Wg)).reshape(B2, Wg)
-        parts, ropes, valids, extra_len = [], [], [], 0
-        for k, extra in enumerate(extra_codes or []):
-            if extra is None:
-                continue
-            embed_t, proj_t, up_stride, _ = self._extra_ctx_table(k)
-            w, r, v, Wj = causal_extra_ctx_windows(extra, embed_t, proj_t, up_stride, G, n_groups, B, D,
-                                                    self.cond_window, ends_all)
-            v = jnp.broadcast_to(jnp.asarray(v)[None], (B, Bn, Wj)).reshape(B2, Wj)
-            if drop_extras:
-                v = jnp.zeros_like(v)
-            elif self.cond_drop > 0 and rng is not None:
-                keep = jax.random.bernoulli(jax.random.fold_in(rng, k), p=1.0 - self.cond_drop, shape=(B, 1))
-                v = v & jnp.repeat(keep, Bn, axis=0)
-            parts.append(w)
-            ropes.append(r)
-            valids.append(v)
-            extra_len += Wj
-        ctx_flat = jnp.concatenate(list(reversed(parts)) + [own], axis=1)
-        rope = jnp.concatenate(list(reversed(ropes)) + [rope_own], axis=1)
-        valid = jnp.concatenate(list(reversed(valids)) + [valid_own], axis=1)
-        return ctx_flat, rope, valid, Wg, extra_len
 
     def _dec_head_w(self) -> jnp.ndarray:
         return self.ntp_head if self.weight_sharing else self.dec_head
@@ -1574,132 +1671,6 @@ class EncDecLevel(eqx.Module):
         mtp_loss = self._mtp_loss(h_t, target)
         return logits, target, mask, mtp_loss
 
-    def decode_logits_and_target_pardec(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
-                                         decoder_ncodes: int, rng=None, decode_past_override: int = None,
-                                         draft_override: jnp.ndarray = None,
-                                         draft_embed_override: jnp.ndarray = None,
-                                         draft_windowed_override: jnp.ndarray = None,
-                                         draft_valid_windowed: jnp.ndarray = None,
-                                         remat_override: bool = None,
-                                         extra_ctx_code_soft: list = None) -> tuple:
-        n_blocks_check = ctx_code_soft.shape[1]
-        if self.interleave_decode and decode_past_override is None:
-            logits, target_out, mask, mtp_loss = self.decode_logits_and_target_interleave(
-                target_seq, ctx_code_soft, decoder_ncodes, extra_ctx_code_soft, rng)
-            zero = jnp.array(0.0, dtype=logits.dtype)
-            return logits, target_out, mask, mtp_loss, zero, zero
-        if self.dense_decode or (decoder_ncodes >= n_blocks_check and decode_past_override is None
-                                  and not extra_ctx_code_soft and self.decode_future == 0):
-            logits, target_out, mask, mtp_loss = self.decode_logits_and_target(
-                target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
-            zero = jnp.array(0.0, dtype=logits.dtype)
-            return logits, target_out, mask, mtp_loss, zero, zero
-        blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
-        B = target_seq.shape[0]
-        D = self.bos_embed.shape[-1]
-        G = decoder_ncodes
-        n_blocks = ctx_code_soft.shape[1]
-        pad_blocks = (-n_blocks) % G
-        n_blocks_p = n_blocks + pad_blocks
-        n_groups = n_blocks_p // G
-        ctx_tok = code_embed_proj(ctx_code_soft, self.ctx_embed, self.ctx_proj)
-        target_p = target_seq
-        if pad_blocks > 0:
-            target_p = jnp.pad(target_p, ((0, 0), (0, pad_blocks * self.K), (0, 0)))
-        B2 = B * n_groups
-        ctx_flat, rope_ctx_g, valid_ctx, Wg, extra_len_total = self._pardec_ctx_rows(
-            ctx_tok, extra_ctx_code_soft, G, n_groups, n_blocks, rng)
-        per_group_len = Wg + 1 + G * self.K
-
-        target_windows = jnp.stack(
-            [target_p[:, g * G * self.K:(g + 1) * G * self.K] for g in range(n_groups)], axis=1)
-
-        Pp = self.decode_past if decode_past_override is None else decode_past_override
-        Pf = self.decode_future
-        Kspan = G * self.K
-        widened_len = Pp + Kspan + Pf
-        if Pf > 0:
-            tail_p = jnp.pad(target_p, ((0, 0), (0, Pf), (0, 0)))
-            real_tail_windows = jnp.stack(
-                [tail_p[:, g * Kspan:g * Kspan + Kspan + Pf] for g in range(n_groups)], axis=1)
-        else:
-            real_tail_windows = target_windows
-        real_tail_flat = real_tail_windows.reshape(B2, Kspan + Pf, *target_seq.shape[2:])
-        real_tail_te = self._dec_embed_target(real_tail_flat)
-
-        if Pp > 0:
-            # draft positions before the sequence's real start are zero-filled and masked as keys (key_valid)
-            if draft_windowed_override is not None:
-                draft_te = self._dec_embed_target(draft_windowed_override)
-                valid = draft_valid_windowed
-            elif draft_embed_override is not None:
-                draft_embed_p = jnp.pad(draft_embed_override, ((0, 0), (Pp, 0), (0, 0)))
-                draft_te = jnp.stack(
-                    [draft_embed_p[:, g * Kspan:g * Kspan + Pp, :] for g in range(n_groups)], axis=1
-                ).reshape(B2, Pp, D)
-                valid = _draft_past_valid_mask(n_groups, Pp, Kspan, n_blocks * self.K)
-            else:
-                if draft_override is None:
-                    draft_source = target_p
-                elif pad_blocks > 0:
-                    draft_source = jnp.pad(draft_override, ((0, 0), (0, pad_blocks * self.K)) +
-                                            ((0, 0),) * (draft_override.ndim - 2))
-                else:
-                    draft_source = draft_override
-                draft_p = jnp.pad(draft_source, ((0, 0), (Pp, 0)) + ((0, 0),) * (draft_source.ndim - 2))
-                draft_windows = jnp.stack([draft_p[:, g * Kspan:g * Kspan + Pp] for g in range(n_groups)], axis=1)
-                draft_flat = draft_windows.reshape(B2, Pp, *target_seq.shape[2:])
-                draft_te = self._dec_embed_target(draft_flat)
-                valid = _draft_past_valid_mask(n_groups, Pp, Kspan, n_blocks * self.K)
-            draft_valid_b2 = jnp.ones((B2, Pp), dtype=bool) if valid is None else jnp.broadcast_to(
-                jnp.asarray(valid)[None], (B, n_groups, Pp)).reshape(B2, Pp)
-            # an invalid slot is masked as a key, but as a query its hidden state still predicts the next token,
-            # so its input embedding is zeroed (a constant), never a real vocab embedding
-            draft_te = jnp.where(draft_valid_b2[:, :, None], draft_te, 0.0)
-            te_flat = jnp.concatenate([draft_te, real_tail_te], axis=1)
-        else:
-            draft_valid_b2 = jnp.ones((B2, 0), dtype=bool)
-            te_flat = real_tail_te
-        key_valid = jnp.concatenate([valid_ctx, jnp.ones((B2, 1), dtype=bool), draft_valid_b2,
-                                      jnp.ones((B2, Kspan + Pf), dtype=bool)], axis=1)
-        bos = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
-        xe = jnp.concatenate([ctx_flat, bos, te_flat], axis=1)
-        per_group_len = per_group_len + Pp + Pf + extra_len_total
-        remat = self.remat if remat_override is None else remat_override
-
-        rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])[:, None]
-        rope_draft = jnp.stack([(g + 1) * G - Pp + jnp.arange(Pp) for g in range(n_groups)], axis=0)
-        rope_real_tail = jnp.stack(
-            [(g + 1) * G + 1 + jnp.arange(widened_len - Pp) for g in range(n_groups)], axis=0)
-        rope_target = jnp.clip(jnp.concatenate([rope_draft, rope_real_tail], axis=1), 0, None)
-        rope_pos_ids_g = jnp.concatenate([rope_ctx_g, rope_bos, rope_target], axis=1)
-        rope_pos_ids = jnp.broadcast_to(rope_pos_ids_g[None], (B, n_groups, per_group_len)).reshape(B2, per_group_len)
-
-        def _pardec_stack(x):
-            for blk in blocks:
-                x = run_block_pardec(blk, x, rope_pos_ids, key_valid, remat and not self.remat_level)
-            return x
-        x = jax.checkpoint(_pardec_stack)(xe) if (self.remat_level and remat_override is not False) else _pardec_stack(xe)
-        h = ln_f(x)
-        pred_pos = Wg + extra_len_total + Pp + jnp.arange(G * self.K)
-        h_t = h[:, pred_pos, :]
-        h_t = h_t.reshape(B, n_groups * G * self.K, D)
-        target_out = target_windows.reshape(B, n_groups * G * self.K, *target_seq.shape[2:])
-        valid_len = n_blocks * self.K
-        h_t = h_t[:, :valid_len, :]
-        target_out = target_out[:, :valid_len]
-
-        if self.token_head_type == "linears":
-            logits, mask = self._token_logits_linears(h_t), None
-        elif self.token_head_type == "ar":
-            logits, mask = self._token_teacher_forced_ar(h_t, target_out), None
-        else:
-            assert rng is not None, "diffusion token head needs an rng even at eval (masking is inherent)"
-            logits, mask = self._token_teacher_forced_diffusion(h_t, target_out, rng)
-        mtp_loss = self._mtp_loss(h_t, target_out)
-        aux_loss, aux_acc = self._widened_aux_ntp(h, target_p, Wg, extra_len_total, Pp, Pf, Kspan,
-                                                    n_groups, B, n_blocks, rng)
-        return logits, target_out, mask, mtp_loss, aux_loss, aux_acc
 
     def _widened_aux_ntp(self, h, target_p, Wg, extra_len_total, Pp, Pf, Kspan, n_groups, B, n_blocks,
                           rng) -> tuple:
@@ -1750,6 +1721,148 @@ class EncDecLevel(eqx.Module):
         logits, target, mask, mtp_loss = self.decode_logits_and_target(target_seq, ctx_code_soft, decoder_ncodes, rng=rng)
         loss, acc = self._dec_loss_acc(logits, target, mask)
         return loss + self.mtp_weight * mtp_loss, acc
+
+    def _cond_kvs(self, ctx_code_soft: jnp.ndarray, extra_ctx_code_soft=None) -> tuple:
+        """own code (rung 1) + coarser levels (rungs 2..cond_depth), each embedded via its own
+        dedicated table (ctx_embed/ctx_proj for own, extra_ctx_embed/proj[k] for extras) -- same
+        tables interleave_decode already used, just delivered as cross-attn KV instead of being
+        concatenated into the self-attn sequence."""
+        own_kv = code_embed_proj(ctx_code_soft, self.ctx_embed, self.ctx_proj)
+        kvs = [own_kv]
+        for k in range(self.cond_depth - 1):
+            src = extra_ctx_code_soft[k] if extra_ctx_code_soft is not None and k < len(extra_ctx_code_soft) else None
+            if src is None:
+                kvs.append(None)  # curriculum: this coarser level isn't encoded yet
+            else:
+                embed_t, proj_t, _, _ = self._extra_ctx_table(k)
+                kvs.append(code_embed_proj(src, embed_t, proj_t))
+        return tuple(kvs)
+
+    def decode_logits_and_target_stack(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
+                                        extra_ctx_code_soft=None, rng=None) -> tuple:
+        """Cross-attention decoder training forward (replaces interleave_decode's flat self-attn
+        sequence): self-attn over the target stream only (one bos, standard shifted NTP) + cross-
+        attn to own code and any coarser levels (cond_depth sources total, see _cond_kvs), per
+        EncDecBlock layer. Deep supervision: every stack level exposes an NTP prediction at EVERY
+        conditioning depth (1..cond_depth, same shared trunk/head, same target_seq) -- depth=1 uses
+        only the own-code rung (coarser rungs forced to sink no-op), depth=cond_depth is the full
+        (main) prediction, used for the returned logits/mtp_loss AND for generation parity. Partial
+        depths (1..cond_depth-1) are auxiliary training signal only, averaged into aux_loss/aux_acc
+        (previously always zero post-pardec-prune)."""
+        blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
+        B = target_seq.shape[0]
+        D = self.bos_embed.shape[-1]
+        te = self._dec_embed_target(target_seq)
+        bos = jnp.broadcast_to(self.bos_embed, (B, 1, D))
+        x_in = jnp.concatenate([bos, te[:, :-1]], axis=1)
+        cond_kvs_full = self._cond_kvs(ctx_code_soft, extra_ctx_code_soft)
+
+        def _run_depth(depth):
+            kvs = tuple(cond_kvs_full[j] if j < depth else None for j in range(self.cond_depth))
+            def _stack(x):
+                for blk in blocks:
+                    x = blk(x, kvs, causal=True)
+                return x
+            x = jax.checkpoint(_stack)(x_in) if self.remat_level else _stack(x_in)
+            h = ln_f(x)
+            if self.token_head_type == "linears":
+                logits, mask = self._token_logits_linears(h), None
+            elif self.token_head_type == "ar":
+                logits, mask = self._token_teacher_forced_ar(h, target_seq), None
+            else:
+                assert rng is not None, "diffusion token head needs an rng even at eval (masking is inherent)"
+                logits, mask = self._token_teacher_forced_diffusion(h, target_seq, rng)
+            return h, logits, mask
+
+        h_full, logits, mask = _run_depth(self.cond_depth)
+        mtp_loss = self._mtp_loss(h_full, target_seq)
+
+        if self.cond_depth > 1:
+            aux_losses, aux_accs = [], []
+            for depth in range(1, self.cond_depth):
+                _, logits_d, mask_d = _run_depth(depth)
+                loss_d, acc_d = self._dec_loss_acc(logits_d, target_seq, mask_d)
+                aux_losses.append(loss_d)
+                aux_accs.append(acc_d)
+            aux_loss = jnp.mean(jnp.stack(aux_losses))
+            aux_acc = jnp.mean(jnp.stack(aux_accs))
+        else:
+            aux_loss = jnp.array(0.0, dtype=h_full.dtype)
+            aux_acc = jnp.array(0.0, dtype=h_full.dtype)
+        return logits, target_seq, mask, mtp_loss, aux_loss, aux_acc
+
+    def decode_logits_and_target_dispatch(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
+                                           decoder_ncodes: int, rng=None, extra_ctx_code_soft=None) -> tuple:
+        """Post-pardec-prune, post-interleave entry point: cross-attention decoder is now the only
+        mechanism (decoder_ncodes unused, kept in the signature for call-site compatibility).
+        aux_loss/aux_acc: deep-supervision partial-depth NTP loss (see decode_logits_and_target_stack),
+        zero when cond_depth==1 (nothing to supervise short of the one real depth)."""
+        return self.decode_logits_and_target_stack(
+            target_seq, ctx_code_soft, extra_ctx_code_soft=extra_ctx_code_soft, rng=rng)
+
+    def decode_generate_stack(self, ctx_idx: jnp.ndarray, extra_ctx_idx: list = None, greedy: bool = True,
+                               temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
+        """Cross-attention decoder incremental generation (replaces decode_generate_interleave):
+        self-attn KV-cache over JUST bos+generated-target (own/coarser codes are cross-attn KV,
+        precomputed once, never enter the self-attn cache at all -- unlike interleave_decode, no
+        decoder_ncodes-sized chunking is needed here, own code isn't part of the self-attn stream)."""
+        blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
+        B, n_blocks, _ = ctx_idx.shape
+        D = self.bos_embed.shape[-1]
+        hd = D // self.n_heads
+        out_extra = (self.in_pq_chunks,)
+        L_total = n_blocks * self.K
+        cond_kvs = self._cond_kvs(ctx_idx, extra_ctx_idx)
+        # project every cross-attn source ONCE for the whole call (own/coarser code sequences are
+        # fixed length, don't grow with generation) -- one list of projected (k,v) tuples per layer,
+        # reused by every incremental step instead of re-projecting on each of the L_total steps.
+        cond_kv_proj_per_layer = [blk.project_cond_kvs(cond_kvs, B) for blk in blocks]
+
+        def self_step(x_new, ck, cv, pos):
+            new_ck, new_cv = [], []
+            x = x_new
+            for i, blk in enumerate(blocks):
+                x, ck_i, cv_i = blk.step(x, ck[i], cv[i], pos, L_total, cond_kv_proj_per_layer[i])
+                new_ck.append(ck_i)
+                new_cv.append(cv_i)
+            return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
+
+        def token_predict(h_pos, rng):
+            if self.token_head_type == "linears":
+                logits = self._token_logits_linears(h_pos)
+                return sample_idx(logits, rng, greedy, temperature, self.gen_top_k)
+            elif self.token_head_type == "ar":
+                return self._token_generate_ar(h_pos, rng, greedy, temperature)
+            else:
+                return self._token_generate_diffusion(h_pos, rng, greedy, temperature)
+
+        def token_step(carry, _):
+            cache_k, cache_v, pos, rng, x_input = carry
+            h, cache_k, cache_v = self_step(x_input, cache_k, cache_v, pos)
+            pos = pos + 1
+            val, rng = token_predict(h, rng)
+            x_input = self._dec_embed_target(val)
+            return (cache_k, cache_v, pos, rng, x_input), val
+
+        cache_k0 = jnp.zeros((len(blocks), B, self.n_kv_heads, L_total, hd))
+        cache_v0 = jnp.zeros_like(cache_k0)
+        bos_in = jnp.broadcast_to(self.bos_embed, (B, D))
+        h0, cache_k, cache_v = self_step(bos_in, cache_k0, cache_v0, jnp.array(0))
+        val0, rng = token_predict(h0, jax.random.PRNGKey(seed))
+        x_input = self._dec_embed_target(val0)
+
+        (cache_k, cache_v, pos, rng, x_input), vals_rest = jax.lax.scan(
+            token_step, (cache_k, cache_v, jnp.array(1), rng, x_input), None, length=L_total - 1)
+        vals_rest = jnp.moveaxis(vals_rest, 0, 1)
+        all_vals = jnp.concatenate([val0[:, None], vals_rest], axis=1)
+        return all_vals.reshape(B, L_total, *out_extra).astype(jnp.int32)
+
+    def decode_generate_dispatch(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
+                                  temperature: float = 1.0, seed: int = 0, extra_ctx_idx: list = None) -> jnp.ndarray:
+        """Generation counterpart of decode_logits_and_target_dispatch (decoder_ncodes unused, kept
+        for call-site compatibility)."""
+        return self.decode_generate_stack(ctx_idx, extra_ctx_idx=extra_ctx_idx, greedy=greedy,
+                                           temperature=temperature, seed=seed)
 
     def _interleave_reveal_schedule(self, n_groups: int, G: int, up_stride: int, extra_n_blocks: int) -> list:
         # static (Python-level, no tracing): for each own-group g, how many NEW extra-level codes become
@@ -1933,128 +2046,6 @@ class EncDecLevel(eqx.Module):
         out = vals_all.reshape(B, n_groups * G * self.K, *out_extra).astype(jnp.int32)
         return out[:, :n_blocks * self.K]
 
-    def decode_generate_pardec(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
-                                temperature: float = 1.0, seed: int = 0, decode_past_override: int = None,
-                                draft_override_flat: jnp.ndarray = None, draft_valid_flat: jnp.ndarray = None,
-                                extra_ctx_idx: list = None, gen_decode_future: bool = False) -> jnp.ndarray:
-        # gen_decode_future=True (default False, not used anywhere yet): also autoregressively generate
-        # each group's decode_future tail and return it as a second array, shape (B, n_groups, Pf,
-        # *out_extra) -- raw per-group future speculation. Caller decides how to use it (e.g. feed to
-        # this level's own encode() as a lookahead prefill); this function does not consume its own output.
-        if gen_decode_future:
-            assert self.decode_future > 0, "gen_decode_future=True needs decode_future>0 for this level"
-        n_blocks_check = ctx_idx.shape[1]
-        if self.interleave_decode and decode_past_override is None and not gen_decode_future:
-            return self.decode_generate_interleave(ctx_idx, decoder_ncodes, greedy, temperature, seed, extra_ctx_idx)
-        if self.dense_decode or (decoder_ncodes >= n_blocks_check and decode_past_override is None
-                                  and not extra_ctx_idx and not gen_decode_future):
-            return self.decode_generate(ctx_idx, decoder_ncodes, greedy, temperature, seed)
-        blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
-        B, n_blocks, _ = ctx_idx.shape
-        D = self.bos_embed.shape[-1]
-        hd = D // self.n_heads
-        out_extra = (self.in_pq_chunks,)
-        G = decoder_ncodes
-        pad_blocks = (-n_blocks) % G
-        n_blocks_p = n_blocks + pad_blocks
-        n_groups = n_blocks_p // G
-        Pp = self.decode_past if decode_past_override is None else decode_past_override
-        Pf = self.decode_future if gen_decode_future else 0
-        Kspan = G * self.K
-        ctx_tok = code_embed_proj(ctx_idx, self.ctx_embed, self.ctx_proj)
-        B2 = B * n_groups
-        ctx_tok_flat, rope_ctx_g, valid_ctx, Wg, extra_len_total = self._pardec_ctx_rows(
-            ctx_tok, extra_ctx_idx, G, n_groups, n_blocks, None, drop_extras=self.cond_drop >= 1.0)
-        rope_ctx_flat = jnp.broadcast_to(rope_ctx_g[None], (B, n_groups, rope_ctx_g.shape[1])).reshape(B2, -1)
-        if Pp > 0:
-            draft_valid = draft_valid_flat if draft_valid_flat is not None else jnp.broadcast_to(
-                jnp.asarray(_draft_past_valid_mask(n_groups, Pp, Kspan, n_blocks * self.K))[None],
-                (B, n_groups, Pp)).reshape(B2, Pp)
-        else:
-            draft_valid = jnp.ones((B2, 0), dtype=bool)
-        key_valid = jnp.concatenate([valid_ctx, jnp.ones((B2, 1), dtype=bool), draft_valid,
-                                      jnp.ones((B2, Kspan + Pf), dtype=bool)], axis=1)
-        per_group_len = Wg + extra_len_total + 1 + Pp + Kspan + Pf
-        rope_bos = jnp.array([(g + 1) * G for g in range(n_groups)])
-        rope_bos_flat = jnp.broadcast_to(rope_bos[None, :], (B, n_groups)).reshape(B2)
-
-        def self_step(x_new, ck, cv, pos, rope_pos_row):
-            new_ck, new_cv = [], []
-            x = x_new
-            for i, blk in enumerate(blocks):
-                x, ck_i, cv_i = pardec_block_step(blk, x, ck[i], cv[i], pos, rope_pos_row, key_valid, per_group_len)
-                new_ck.append(ck_i)
-                new_cv.append(cv_i)
-            return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
-
-        def self_chunk_step(x_chunk, ck, cv, pos_start, rope_pos_ids_chunk):
-            new_ck, new_cv = [], []
-            x = x_chunk
-            for i, blk in enumerate(blocks):
-                x, ck_i, cv_i = pardec_block_chunk_step(blk, x, ck[i], cv[i], pos_start,
-                                                          rope_pos_ids_chunk, key_valid, per_group_len)
-                new_ck.append(ck_i)
-                new_cv.append(cv_i)
-            return ln_f(x), jnp.stack(new_ck), jnp.stack(new_cv)
-
-        def token_predict(h_pos, rng):
-            if self.token_head_type == "linears":
-                logits = self._token_logits_linears(h_pos)
-                return sample_idx(logits, rng, greedy, temperature, self.gen_top_k)
-            elif self.token_head_type == "ar":
-                return self._token_generate_ar(h_pos, rng, greedy, temperature)
-            else:
-                return self._token_generate_diffusion(h_pos, rng, greedy, temperature)
-
-        cache_k = jnp.zeros((len(blocks), B2, self.n_kv_heads, per_group_len, hd))
-        cache_v = jnp.zeros_like(cache_k)
-        rng = jax.random.PRNGKey(seed)
-
-        total_steps = Pp + G * self.K + Pf
-        Ktot = G * self.K
-
-        def widened_pos(t):
-            return jnp.where(t < Pp, jnp.clip(rope_bos_flat - Pp + t, 0, None), rope_bos_flat + 1 + (t - Pp))
-
-        def embed_tok(val, t):
-            te = self._dec_embed_target(val)
-            if Pp == 0:
-                return te
-            tc = jnp.minimum(t, Pp - 1)
-            return jnp.where((t < Pp) & draft_valid[:, tc][:, None], te, jnp.where(t < Pp, 0.0, te))
-
-        @jax.jit
-        def run_pardec(ctx_tok_flat, cache_k, cache_v, rng):
-            bos_in = jnp.broadcast_to(self.bos_embed, (B2, 1, D))
-            chunk = jnp.concatenate([ctx_tok_flat, bos_in], axis=1)
-            chunk_rope = jnp.concatenate([rope_ctx_flat, rope_bos_flat[:, None]], axis=1)
-            h_chunk, cache_k, cache_v = self_chunk_step(chunk, cache_k, cache_v, jnp.array(0), chunk_rope)
-            val0, rng = token_predict(h_chunk[:, -1, :], rng)
-            x0 = embed_tok(val0 if draft_override_flat is None else draft_override_flat[:, 0], jnp.array(0))
-
-            def step(carry, t):
-                x_input, ck, cv, rng_c = carry
-                h, ck, cv = self_step(x_input, ck, cv, Wg + extra_len_total + t, widened_pos(t - 1))
-                val, rng_c = token_predict(h, rng_c)
-                if draft_override_flat is not None and Pp > 0:
-                    src = jnp.where(t < Pp, draft_override_flat[:, jnp.minimum(t, Pp - 1)], val)
-                else:
-                    src = val
-                return (embed_tok(src, t), ck, cv, rng_c), val
-
-            carry, vals_rest = jax.lax.scan(step, (x0, cache_k, cache_v, rng), jnp.arange(1, total_steps))
-            all_vals = jnp.concatenate([val0[None], vals_rest], axis=0)      # (total_steps, B2, ...)
-            vals_out = jnp.moveaxis(all_vals[Pp:Pp + Ktot], 0, 1)
-            future_out = jnp.moveaxis(all_vals[Pp + Ktot:], 0, 1) if Pf > 0 else None
-            return vals_out, future_out
-
-        vals_all, future_all = run_pardec(ctx_tok_flat, cache_k, cache_v, rng)
-        out = vals_all.reshape(B, n_groups * G * self.K, *out_extra).astype(jnp.int32)
-        out = out[:, :n_blocks * self.K]
-        if not gen_decode_future:
-            return out
-        future_out = future_all.reshape(B, n_groups, Pf, *out_extra).astype(jnp.int32)
-        return out, future_out
 
     def decode_generate_mtp_no_verify(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
                                        temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
@@ -2288,150 +2279,23 @@ class EncDecLevel(eqx.Module):
         return out[:, :n_blocks * self.K]
 
 
-def decode_logits_and_target_cyclic_revision(levelN, dec_target_iN, ctx_code_soft, decoder_ncodes,
-                                              levelT_code_soft, cycle_refine_passes, rng,
-                                              encode_temperature, extra_ctx_code_soft=None) -> tuple:
-    # levelN conditions on a growing stack of revisions of the (fixed) coarser level's own code:
-    # pass 1 sees just v1 = levelT_code_soft (levelT's real, already-encoded code -- cond_depth-style
-    # extra ctx, unfilled slots trainable-pad); after each pass, levelN's own decode gets re-encoded
-    # (via levelN's own encoder) into the next revision, filling one more slot each pass. levelN never
-    # sees its own target as input -- only ever a revised version of a DIFFERENT (coarser) level's code.
-    detach = levelN.cyclic_revise_detach
-    revision_stack = [levelT_code_soft] + [None] * (cycle_refine_passes - 1)
-    static_extra = list(extra_ctx_code_soft) if extra_ctx_code_soft else []
-    logits = target_out = mask = mtp_loss = aux_loss = aux_acc = None
-    rngs = [None] * cycle_refine_passes if rng is None else list(jax.random.split(rng, cycle_refine_passes))
-    for p in range(cycle_refine_passes):
-        logits, target_out, mask, mtp_loss, aux_loss, aux_acc = levelN.decode_logits_and_target_pardec(
-            dec_target_iN, ctx_code_soft, decoder_ncodes, rng=rngs[p],
-            extra_ctx_code_soft=static_extra + revision_stack,
-            remat_override=(levelN.cyclic_revise_remat if not detach else None))
-        if p < cycle_refine_passes - 1:
-            code_soft, code_idx = quantize_hard(logits)
-            re_input = code_idx if detach else code_soft
-            x_re = code_embed_proj(re_input, levelN.own_input_embed, levelN.own_input_proj)
-            enc_re = levelN.encode(x_re, code_idx, rng=None, encode_temperature=encode_temperature)
-            revision_stack[p + 1] = jax.lax.stop_gradient(enc_re["code_idx"]) if detach else enc_re["code_soft"]
-    return logits, target_out, mask, mtp_loss, aux_loss, aux_acc
 
 
-def decode_logits_and_target_multipass(level: EncDecLevel, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
-                                        decoder_ncodes: int, rng=None, multipass_detach: bool = True,
-                                        level_refine_gumbel: bool = False, level_refine_temperature: float = 1.0,
-                                        level_refine_gt_drop: float = 1.0, refine_quantize_drop: float = 0.0, refine_rng=None,
-                                        refine_remat: bool = None, extra_ctx_code_soft: list = None,
-                                        refine_active=None) -> tuple:
-    logits, target_out, mask, mtp_loss, aux_loss, aux_acc = level.decode_logits_and_target_pardec(
-        target_seq, ctx_code_soft, decoder_ncodes, rng=rng, extra_ctx_code_soft=extra_ctx_code_soft)
-    if level.level_refine_passes <= 1 or level.level_refine_window <= 0:
-        return logits, target_out, mask, mtp_loss, aux_loss, aux_acc
-    Kspan = decoder_ncodes * level.K
-    Pp = level.level_refine_window * Kspan
-    n_extra = level.level_refine_passes - 1
-    refine_rngs = [None] * n_extra if refine_rng is None else list(jax.random.split(refine_rng, n_extra))
-    state = (logits, target_out, mask, mtp_loss, aux_loss, aux_acc)
-
-    def _refine_pass(state, r_rng):
-        logits, target_out = state[0], state[1]
-        if level_refine_gumbel and r_rng is not None:
-            code_soft, idx = quantize_gumbel(logits, r_rng, level_refine_temperature, refine_quantize_drop)
-        else:
-            code_soft, idx = quantize_hard(logits, r_rng if refine_quantize_drop > 0 else None,
-                                            refine_quantize_drop, level_refine_temperature)
-        if level_refine_gt_drop < 1.0 and r_rng is not None:
-            # per-token: prob level_refine_gt_drop keeps the sampled own output, else the real target
-            own = jax.random.bernoulli(jax.random.fold_in(r_rng, 1), p=level_refine_gt_drop, shape=idx.shape)
-            gt_idx = target_out.astype(idx.dtype)
-            code_soft = jnp.where(own[..., None], code_soft, jax.nn.one_hot(gt_idx, code_soft.shape[-1], dtype=code_soft.dtype))
-            idx = jnp.where(own, idx, gt_idx)
-        if multipass_detach:
-            kwargs = dict(draft_override=jax.lax.stop_gradient(idx))
-        else:
-            kwargs = dict(draft_embed_override=level._dec_embed_target(code_soft))
-        out = level.decode_logits_and_target_pardec(
-            target_seq, ctx_code_soft, decoder_ncodes, rng=rng,
-            decode_past_override=Pp, remat_override=refine_remat,
-            extra_ctx_code_soft=extra_ctx_code_soft, **kwargs)
-        return jax.tree_util.tree_map(lambda n, o: n.astype(o.dtype), out, state)
-
-    for p_idx in range(n_extra):
-        if refine_active is None:
-            state = _refine_pass(state, refine_rngs[p_idx])
-        else:
-            state = jax.lax.cond(refine_active[p_idx], lambda st, r=refine_rngs[p_idx]: _refine_pass(st, r),
-                                 lambda st: st, state)
-    logits, target_out, mask, mtp_loss, aux_loss, aux_acc = state
-    return logits, target_out, mask, mtp_loss, aux_loss, aux_acc
 
 
-def _decode_generate_pardec_call(level, ctx_idx, decoder_ncodes, greedy, temperature, seed,
-                                  decode_past_override, draft_override_flat, extra_ctx_idx=None,
-                                  draft_valid_flat=None):
-    return level.decode_generate_pardec(ctx_idx, decoder_ncodes, greedy=greedy, temperature=temperature,
-                                         seed=seed, decode_past_override=decode_past_override,
-                                         draft_override_flat=draft_override_flat, extra_ctx_idx=extra_ctx_idx,
-                                         draft_valid_flat=draft_valid_flat)
 
 
-_decode_generate_pardec_jit = eqx.filter_jit(_decode_generate_pardec_call)
 
 
-def decode_generate_multipass(level: EncDecLevel, ctx_idx: jnp.ndarray, decoder_ncodes: int,
-                               greedy: bool = True, temperature: float = 1.0, seed: int = 0,
-                               extra_ctx_idx: list = None) -> jnp.ndarray:
-    pred = _decode_generate_pardec_jit(level, ctx_idx, decoder_ncodes, greedy, temperature, seed, None, None,
-                                        extra_ctx_idx)
-    if level.level_refine_passes <= 1 or level.level_refine_window <= 0:
-        return pred
-    B, n_blocks = ctx_idx.shape[0], ctx_idx.shape[1]
-    G = decoder_ncodes
-    pad_blocks = (-n_blocks) % G
-    n_groups = (n_blocks + pad_blocks) // G
-    Kspan = G * level.K
-    Pp = level.level_refine_window * Kspan
-    draft_valid_np = _draft_past_valid_mask(n_groups, Pp, Kspan, n_blocks * level.K)
-    for _ in range(level.level_refine_passes - 1):
-        pred_p = pred if pad_blocks == 0 else jnp.pad(
-            pred, ((0, 0), (0, pad_blocks * level.K)) + ((0, 0),) * (pred.ndim - 2))
-        draft_p = jnp.pad(pred_p, ((0, 0), (Pp, 0)) + ((0, 0),) * (pred_p.ndim - 2))
-        draft_windows = jnp.stack([draft_p[:, g * Kspan:g * Kspan + Pp] for g in range(n_groups)], axis=1)
-        draft_override_flat = draft_windows.reshape(B * n_groups, Pp, *pred.shape[2:])
-        draft_valid_flat = jnp.broadcast_to(jnp.asarray(draft_valid_np)[None], (B, n_groups, Pp)).reshape(
-            B * n_groups, Pp)
-        pred = _decode_generate_pardec_jit(level, ctx_idx, decoder_ncodes, greedy, temperature, seed,
-                                            Pp, draft_override_flat, extra_ctx_idx, draft_valid_flat)
-    return pred
 
 
-def cyclic_refine_generate(levels, phase, ctx_idx_top, decoder_ncodes_list, greedy, temperature, seed,
-                            encode_temperature, n_cycles):
-    # levelT generates once, via the standard single-pass path (matches training's "levelT decodes
-    # exactly once" design). levelN then re-decodes n_cycles times, conditioning on a growing stack
-    # of revisions of levelT's code (v1 = pred_T; each subsequent slot = a re-encode of levelN's own
-    # previous-cycle output) via the same extra_ctx mechanism cond_depth uses.
-    iT, iN = phase - 1, phase - 2
-    levelT, levelN = levels[iT], levels[iN]
-    GT = decoder_ncodes_list[iT]
-
-    pred_T = _decode_generate_pardec_jit(levelT, ctx_idx_top, GT, greedy, temperature, seed, None, None)
-
-    revision_stack = [pred_T] + [None] * (n_cycles - 1)
-    pred_N = None
-    for cyc in range(n_cycles):
-        pred_N = decode_generate_multipass(levelN, pred_T, decoder_ncodes_list[iN],
-                                            greedy=greedy, temperature=temperature, seed=seed,
-                                            extra_ctx_idx=list(revision_stack))
-        if cyc < n_cycles - 1:
-            x_re = code_embed_proj(pred_N, levelN.own_input_embed, levelN.own_input_proj)
-            enc_re = levelN.encode(x_re, pred_N, rng=None, encode_temperature=encode_temperature)
-            revision_stack[cyc + 1] = enc_re["code_idx"]
-    return pred_N
 
 
 def encoder_hidden(level: EncDecLevel, x: jnp.ndarray) -> jnp.ndarray:
     h = x
+    uncond_kvs = (None,) * level.cond_depth if level.weight_sharing else None
     for blk in level.blocks:
-        h = run_block(blk, h, False)
+        h = run_enc_block(blk, h, False, uncond_kvs)
     return level.ln_f(h)
 
 
@@ -2527,8 +2391,8 @@ def generate_from_prompt(model: HierEncDec, cfg: Config, prompt_bytes: jnp.ndarr
         for i in range(from_level, -1, -1):
             lv = levels[i]
             extra = [codes.get(j) for j in range(i + 1, i + lv.cond_depth)] if lv.cond_depth > 1 else None
-            cur = decode_generate_multipass(lv, cur, cfg.decoder_ncodes[i], greedy=decode_greedy,
-                                            temperature=decode_temperature, seed=decode_seed, extra_ctx_idx=extra)
+            cur = lv.decode_generate_dispatch(cur, cfg.decoder_ncodes[i], greedy=decode_greedy,
+                                              temperature=decode_temperature, seed=decode_seed, extra_ctx_idx=extra)
         return cur
 
     res = dict(sampled_tokens=tokens_L, emitted_codes=codes, emitted=cascade(codes[n - 1], n - 1))
@@ -2621,8 +2485,9 @@ def level_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     aux_ntp_losses, aux_ntp_accs = [], []
 
     def _aux_applies(level) -> bool:
-        return level.decode_future > 0 or level.decode_past > 0 or \
-            (level.level_refine_passes > 1 and level.level_refine_window > 0)
+        # deep supervision: a partial-depth (1..cond_depth-1) NTP loss exists whenever this level
+        # has more than one cross-attn source (own code + coarser levels).
+        return level.cond_depth > 1
 
     feedback_losses = []
     byte_mse = None
@@ -2632,25 +2497,14 @@ def level_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     feedback_rngs = [None] * phase if feedback_rng is None else list(jax.random.split(feedback_rng, phase))
 
     start_i = phase - 1
-    cyclic_iN = phase - 2 if (model.cfg.cycle_refine_passes > 1 and phase >= 2) else None
 
     for i in range(start_i, -1, -1):
         dec_target = flat_bytes if i == 0 else codes[i - 1]
         dec_rng = level_rngs[2 * i + 1]
         extra_ctx_i = [codes_soft[j] if j < phase else None for j in range(i + 1, i + levels[i].cond_depth)] \
             if levels[i].cond_depth > 1 else None
-        if i == cyclic_iN:
-            logits, target_i, mask_i, mtp_loss_i, aux_loss_i, aux_acc_i = decode_logits_and_target_cyclic_revision(
-                levels[i], dec_target, ctx, model.cfg.decoder_ncodes[i], codes_soft[i + 1],
-                model.cfg.cycle_refine_passes, dec_rng, encode_temperature, extra_ctx_code_soft=extra_ctx_i)
-        else:
-            logits, target_i, mask_i, mtp_loss_i, aux_loss_i, aux_acc_i = decode_logits_and_target_multipass(
-                levels[i], dec_target, ctx, model.cfg.decoder_ncodes[i], rng=dec_rng,
-                multipass_detach=model.cfg.multipass_detach, level_refine_gumbel=model.cfg.level_refine_gumbel,
-                level_refine_gt_drop=model.cfg.level_refine_gt_drop,
-                level_refine_temperature=model.cfg.level_refine_temperature,
-                refine_quantize_drop=model.cfg.refine_quantize_drop, refine_rng=dec_rng,
-                refine_remat=model.cfg.refine_remat, extra_ctx_code_soft=extra_ctx_i, refine_active=refine_active)
+        logits, target_i, mask_i, mtp_loss_i, aux_loss_i, aux_acc_i = levels[i].decode_logits_and_target_dispatch(
+            dec_target, ctx, model.cfg.decoder_ncodes[i], rng=dec_rng, extra_ctx_code_soft=extra_ctx_i)
         loss_i, acc_i = levels[i]._dec_loss_acc(logits, target_i, mask_i)
         loss_i = loss_i + levels[i].mtp_weight * mtp_loss_i
         dec_losses.append(loss_i)
@@ -2682,7 +2536,7 @@ def level_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
                         c, total = pseudo_ctx, 0.0
                         for j in range(i - 1, -1, -1):
                             dj = flat_bytes if j == 0 else codes[j - 1]
-                            lj, tj, mj, mtpj, _, _ = levels[j].decode_logits_and_target_pardec(
+                            lj, tj, mj, mtpj, _, _ = levels[j].decode_logits_and_target_dispatch(
                                 dj, c, model.cfg.decoder_ncodes[j])
                             lossj, _ = levels[j]._dec_loss_acc(lj, tj, mj)
                             total = total + lossj + levels[j].mtp_weight * mtpj
@@ -3476,28 +3330,16 @@ def main():
         recon_acc = recon_mse = None
 
         cascade_t0 = time.monotonic()
-        cyclic_fired_gen = cfg.cycle_refine_passes > 1 and top >= 1
-        if cyclic_fired_gen:
-            iN_gen = top - 1
-            cur_code = cyclic_refine_generate(m.levels, top + 1, codes[top], cfg.decoder_ncodes,
-                                               not sample, cfg.gen_temperature, g_kw["seed"], args.encode_temperature[phase - 1],
-                                               cfg.cycle_refine_passes)
-            loop_start = iN_gen - 1
-        else:
-            cur_code = codes[top]
-            loop_start = top
-        for i in range(loop_start, 0, -1):
+        cur_code = codes[top]
+        for i in range(top, 0, -1):
             extra_ctx_i = [codes[j] if j <= top else None for j in range(i + 1, i + m.levels[i].cond_depth)] \
                 if m.levels[i].cond_depth > 1 else None
-            cur_code = decode_generate_multipass(m.levels[i], cur_code, cfg.decoder_ncodes[i], **g_kw,
-                                                  extra_ctx_idx=extra_ctx_i)
-        if cyclic_fired_gen and iN_gen == 0:
-            cascade_recon = cur_code
-        else:
-            extra_ctx_0 = [codes[j] if j <= top else None for j in range(1, m.levels[0].cond_depth)] \
-                if m.levels[0].cond_depth > 1 else None
-            cascade_recon = decode_generate_multipass(m.levels[0], cur_code, cfg.decoder_ncodes[0], **g_kw,
-                                                        extra_ctx_idx=extra_ctx_0)
+            cur_code = m.levels[i].decode_generate_dispatch(cur_code, cfg.decoder_ncodes[i], **g_kw,
+                                                             extra_ctx_idx=extra_ctx_i)
+        extra_ctx_0 = [codes[j] if j <= top else None for j in range(1, m.levels[0].cond_depth)] \
+            if m.levels[0].cond_depth > 1 else None
+        cascade_recon = m.levels[0].decode_generate_dispatch(cur_code, cfg.decoder_ncodes[0], **g_kw,
+                                                              extra_ctx_idx=extra_ctx_0)
         gen_compile_s = None
         if not gen_jit_timed[0]:
             gen_compile_s = time.monotonic() - cascade_t0

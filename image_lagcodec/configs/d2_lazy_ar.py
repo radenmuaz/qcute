@@ -21,7 +21,7 @@ decoder_n_heads = (8, 8)
 decoder_n_kv_heads = (8, 8)  # plain MHA (head_dim=64), avoids relying on encoder-ratio auto-GQA resolution
 code_vocab = (256, 256)
 pq_chunks = (3, 3)
-pq_dim = (128, 128)
+pq_dim = (256, 256)
 mlp_mult = 4
 rope_base = 10000.0
 
@@ -33,7 +33,7 @@ entropy_weight = 0.1
 strides = (4, 4)
 decoder_ncodes = (256, 64)  # = n_blocks per level -- single group, waits for/sees the whole level, no padding
 interleave_decode = True  # true single flat causal AR chain (vs d2_lazy_bigdec's pardec single-group fallback)
-attn_window = 256  # symmetric base (encoder_attn_window/decoder_attn_window feature, 2026-09-23) -- bounds
+attn_window = 1024  # symmetric base (encoder_attn_window/decoder_attn_window feature, 2026-09-23) -- bounds
 # both encoder and decoder self-attention; the decoder side matters here too (dec_blocks' own window,
 # baked in at construction, used identically regardless of decode mechanism)
 ncodes_window = -1  # no effect either way: decoder_ncodes=n_blocks (single group) already sees everything

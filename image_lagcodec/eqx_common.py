@@ -145,6 +145,67 @@ def splash_cross_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray,
     return y[:, :, :T, :]
 
 
+class GroupFutureMask(splash_mask_lib._ComputableMask):
+    """image_lagcodec.run_lagcodec's decode_logits_and_target_interleave decode_future support:
+    within each per_group_len-sized row, the last (per_group_len-aux_start) positions hold a
+    real-token embedding of the NEXT group's own leading bytes (a genuine forward peek, purely so
+    THIS group's boundary hidden state gets a teacher-forced aux prediction target). Plain causal
+    self-attention would let every LATER group's real (non-aux) positions attend back through
+    that peek -- since it's their own target bytes, that's leakage into their own main
+    reconstruction, not just harmless aux context. This mask additionally blocks any query
+    outside a given aux-tail key's own row from attending to it; plain causal order is unchanged
+    everywhere else, including the aux tail's own within-row causal generation. Affine/periodic
+    in the raw index (per_group_len, aux_start are static ints), same style as LagCrossMask."""
+
+    per_group_len: int
+    aux_start: int
+
+    def __init__(self, shape, per_group_len: int, aux_start: int, shard_count: int = 1):
+        self.per_group_len, self.aux_start = per_group_len, aux_start
+
+        def fn(q_ids, kv_ids):
+            causal = kv_ids <= q_ids
+            is_aux = (kv_ids % per_group_len) >= aux_start
+            same_row = (q_ids // per_group_len) == (kv_ids // per_group_len)
+            return causal & (~is_aux | same_row)
+
+        super().__init__(shape=shape, mask_function=fn, shard_count=shard_count)
+
+    def __eq__(self, other):
+        if not isinstance(other, type(self)):
+            return NotImplemented
+        return (self.shape == other.shape and self.per_group_len == other.per_group_len
+                and self.aux_start == other.aux_start)
+
+    def __hash__(self):
+        return hash((type(self), self.shape, self.per_group_len, self.aux_start))
+
+
+def _splash_future_kernel(n_heads: int, padded_T: int, per_group_len: int, aux_start: int):
+    """Not cached -- see _splash_attn_kernel's docstring (same leaked-tracer hazard)."""
+    mask = splash_mask_lib.MultiHeadMask(
+        [GroupFutureMask((padded_T, padded_T), per_group_len, aux_start) for _ in range(n_heads)]
+    )
+    block = min(_SPLASH_BLOCK, padded_T)
+    block_sizes = splash_kernel_lib.BlockSizes(
+        block_q=block, block_kv=block, block_kv_compute=block,
+        block_q_dkv=block, block_kv_dkv=block, block_kv_dkv_compute=block,
+        block_q_dq=block, block_kv_dq=block,
+    )
+    return splash_kernel_lib.make_splash_mha_single_device(mask=mask, block_sizes=block_sizes)
+
+
+def splash_future_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, per_group_len: int,
+                             aux_start: int, sm_scale: float) -> jnp.ndarray:
+    """Self-attention (q/k/v the same sequence) with GroupFutureMask instead of a plain
+    CausalMask -- only needed when decode_future>0 under interleave_decode. Returns (B,Hq,T,hd)."""
+    B, Hq, T, hd = q.shape
+    q_p, k_p, v_p = _splash_pad(q, _SPLASH_BLOCK), _splash_pad(k, _SPLASH_BLOCK), _splash_pad(v, _SPLASH_BLOCK)
+    kernel = _splash_future_kernel(Hq, q_p.shape[-2], per_group_len, aux_start)
+    y = jax.vmap(kernel)(q_p * sm_scale, k_p, v_p)
+    return y[:, :, :T, :]
+
+
 def rmsnorm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     x = x * jax.lax.rsqrt(jnp.mean(x ** 2, axis=-1, keepdims=True) + eps)
     return x * weight
@@ -359,8 +420,17 @@ class Attention(eqx.Module):
         cos, sin = rope_cos_sin(T, hd, self.rope_base)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         scale = 1.0 / math.sqrt(hd)
+        # sink cast to q's dtype explicitly (chat 2026-09-24): when the SAME Attention instance is
+        # called from multiple distinct contexts within one gradient trace (e.g. weight_sharing=True
+        # sharing one block stack between an uncond encode pass and a multi-pass decode), sink's
+        # gradient was observed to come back in inconsistent dtypes across those call sites
+        # (float32 vs bfloat16) -- jax.value_and_grad then fails accumulating them for the same
+        # shared parameter (AssertionError comparing ShapedArrays of the two dtypes). Forcing a
+        # consistent dtype at the call site avoids relying on whatever internal promotion rule
+        # splash_attention's `sinks` kernel arg applies.
+        sink = self.sink.astype(q.dtype) if self.sink is not None else None
         y = splash_attention(q, k, v, causal=causal, sm_scale=scale, window=self.window,
-                             lookahead=self.lookahead, sink=self.sink)  # (B,H,T,hd)
+                             lookahead=self.lookahead, sink=sink)  # (B,H,T,hd)
         if self.use_xsa:
             n_rep = self.n_heads // self.n_kv_heads
             v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
