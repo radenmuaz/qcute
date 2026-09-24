@@ -1776,36 +1776,43 @@ class EncDecLevel(eqx.Module):
 
         h_full, logits, mask = _run_depth(self.cond_depth)
         mtp_loss = self._mtp_loss(h_full, target_seq)
+        _, full_acc = self._dec_loss_acc(logits, target_seq, mask)
 
         if self.cond_depth > 1:
-            aux_losses, aux_accs = [], []
+            aux_losses, depth_accs = [], []
             for depth in range(1, self.cond_depth):
                 _, logits_d, mask_d = _run_depth(depth)
                 loss_d, acc_d = self._dec_loss_acc(logits_d, target_seq, mask_d)
                 aux_losses.append(loss_d)
-                aux_accs.append(acc_d)
+                depth_accs.append(acc_d)
             aux_loss = jnp.mean(jnp.stack(aux_losses))
-            aux_acc = jnp.mean(jnp.stack(aux_accs))
+            depth_accs.append(full_acc)  # index i = depth (i+1)'s acc; last = full cond_depth
         else:
             aux_loss = jnp.array(0.0, dtype=h_full.dtype)
-            aux_acc = jnp.array(0.0, dtype=h_full.dtype)
-        return logits, target_seq, mask, mtp_loss, aux_loss, aux_acc
+            depth_accs = [full_acc]
+        return logits, target_seq, mask, mtp_loss, aux_loss, tuple(depth_accs)
 
     def decode_logits_and_target_dispatch(self, target_seq: jnp.ndarray, ctx_code_soft: jnp.ndarray,
                                            decoder_ncodes: int, rng=None, extra_ctx_code_soft=None) -> tuple:
         """Post-pardec-prune, post-interleave entry point: cross-attention decoder is now the only
         mechanism (decoder_ncodes unused, kept in the signature for call-site compatibility).
-        aux_loss/aux_acc: deep-supervision partial-depth NTP loss (see decode_logits_and_target_stack),
-        zero when cond_depth==1 (nothing to supervise short of the one real depth)."""
+        aux_loss: deep-supervision partial-depth NTP loss (see decode_logits_and_target_stack), zero
+        when cond_depth==1. depth_accs: tuple of length cond_depth, one accuracy per conditioning
+        depth (index 0 = depth-1/own-code-only, ..., last = full cond_depth/main task)."""
         return self.decode_logits_and_target_stack(
             target_seq, ctx_code_soft, extra_ctx_code_soft=extra_ctx_code_soft, rng=rng)
 
     def decode_generate_stack(self, ctx_idx: jnp.ndarray, extra_ctx_idx: list = None, greedy: bool = True,
-                               temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
+                               temperature: float = 1.0, seed: int = 0, gen_depth: int = None) -> jnp.ndarray:
         """Cross-attention decoder incremental generation (replaces decode_generate_interleave):
         self-attn KV-cache over JUST bos+generated-target (own/coarser codes are cross-attn KV,
         precomputed once, never enter the self-attn cache at all -- unlike interleave_decode, no
-        decoder_ncodes-sized chunking is needed here, own code isn't part of the self-attn stream)."""
+        decoder_ncodes-sized chunking is needed here, own code isn't part of the self-attn stream).
+        gen_depth (default None = full self.cond_depth): audit knob -- generate using only the
+        first gen_depth cross-attn sources (own code first, then coarser levels in order), the rest
+        forced to the learned sink no-op, same _run_depth mechanism training's deep supervision
+        uses. Lets you compare full-conditioning generation against reduced-conditioning generation
+        of the SAME image to see how much the coarser-level conditioning is actually buying you."""
         blocks, ln_f = self._dec_blocks(), self._dec_ln_f()
         B, n_blocks, _ = ctx_idx.shape
         D = self.bos_embed.shape[-1]
@@ -1813,6 +1820,10 @@ class EncDecLevel(eqx.Module):
         out_extra = (self.in_pq_chunks,)
         L_total = n_blocks * self.K
         cond_kvs = self._cond_kvs(ctx_idx, extra_ctx_idx)
+        if gen_depth is not None:
+            assert 1 <= gen_depth <= self.cond_depth, \
+                f"gen_depth={gen_depth} must be in [1, cond_depth={self.cond_depth}]"
+            cond_kvs = tuple(cond_kvs[j] if j < gen_depth else None for j in range(self.cond_depth))
         # project every cross-attn source ONCE for the whole call (own/coarser code sequences are
         # fixed length, don't grow with generation) -- one list of projected (k,v) tuples per layer,
         # reused by every incremental step instead of re-projecting on each of the L_total steps.
@@ -1858,11 +1869,13 @@ class EncDecLevel(eqx.Module):
         return all_vals.reshape(B, L_total, *out_extra).astype(jnp.int32)
 
     def decode_generate_dispatch(self, ctx_idx: jnp.ndarray, decoder_ncodes: int, greedy: bool = True,
-                                  temperature: float = 1.0, seed: int = 0, extra_ctx_idx: list = None) -> jnp.ndarray:
+                                  temperature: float = 1.0, seed: int = 0, extra_ctx_idx: list = None,
+                                  gen_depth: int = None) -> jnp.ndarray:
         """Generation counterpart of decode_logits_and_target_dispatch (decoder_ncodes unused, kept
-        for call-site compatibility)."""
+        for call-site compatibility). gen_depth: see decode_generate_stack -- reduced-conditioning
+        generation audit, default None = full cond_depth (normal generation)."""
         return self.decode_generate_stack(ctx_idx, extra_ctx_idx=extra_ctx_idx, greedy=greedy,
-                                           temperature=temperature, seed=seed)
+                                           temperature=temperature, seed=seed, gen_depth=gen_depth)
 
     def _interleave_reveal_schedule(self, n_groups: int, G: int, up_stride: int, extra_n_blocks: int) -> list:
         # static (Python-level, no tracing): for each own-group g, how many NEW extra-level codes become
@@ -2482,7 +2495,7 @@ def level_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
             target = out["code_idx"]
 
     dec_losses, dec_accs = [], []
-    aux_ntp_losses, aux_ntp_accs = [], []
+    aux_ntp_losses = []
 
     def _aux_applies(level) -> bool:
         # deep supervision: a partial-depth (1..cond_depth-1) NTP loss exists whenever this level
@@ -2492,6 +2505,7 @@ def level_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     feedback_losses = []
     byte_mse = None
     mse_loss = 0.0
+    level0_depth_accs = None
     ctx = codes_soft[phase - 1]
     cascade_rngs = [None] * phase if cascade_rng is None else list(jax.random.split(cascade_rng, phase))
     feedback_rngs = [None] * phase if feedback_rng is None else list(jax.random.split(feedback_rng, phase))
@@ -2503,16 +2517,17 @@ def level_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
         dec_rng = level_rngs[2 * i + 1]
         extra_ctx_i = [codes_soft[j] if j < phase else None for j in range(i + 1, i + levels[i].cond_depth)] \
             if levels[i].cond_depth > 1 else None
-        logits, target_i, mask_i, mtp_loss_i, aux_loss_i, aux_acc_i = levels[i].decode_logits_and_target_dispatch(
+        logits, target_i, mask_i, mtp_loss_i, aux_loss_i, depth_accs_i = levels[i].decode_logits_and_target_dispatch(
             dec_target, ctx, model.cfg.decoder_ncodes[i], rng=dec_rng, extra_ctx_code_soft=extra_ctx_i)
-        loss_i, acc_i = levels[i]._dec_loss_acc(logits, target_i, mask_i)
+        acc_i = depth_accs_i[-1]  # full cond_depth's acc, same as _dec_loss_acc(logits,...) would give
+        loss_i, _ = levels[i]._dec_loss_acc(logits, target_i, mask_i)
         loss_i = loss_i + levels[i].mtp_weight * mtp_loss_i
         dec_losses.append(loss_i)
         dec_accs.append(acc_i)
         if _aux_applies(levels[i]):
             aux_ntp_losses.append(aux_loss_i)
-            aux_ntp_accs.append(aux_acc_i)
         if i == 0:
+            level0_depth_accs = depth_accs_i
             pred_bytes = jnp.argmax(logits, axis=-1).astype(jnp.float32)
             byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)
             if model.cfg.mse_weight > 0:
@@ -2573,16 +2588,17 @@ def level_forward(model: HierEncDec, flat_bytes: jnp.ndarray, phase: int, rng=No
     feedback_loss_total = jnp.mean(jnp.stack(feedback_losses)) if feedback_losses else 0.0
     if aux_ntp_losses:
         aux_ntp_loss_total = jnp.mean(jnp.stack(aux_ntp_losses))
-        aux_ntp_acc_total = jnp.mean(jnp.stack(aux_ntp_accs))
     else:
         aux_ntp_loss_total = jnp.array(0.0)
-        aux_ntp_acc_total = jnp.array(0.0)
     loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
         + model.cfg.mse_weight * mse_loss + label_reg_weight * label_loss_total + feedback_loss_total \
         + model.cfg.ntp_weight * aux_ntp_loss_total
     bpb = dec_loss_total / jnp.log(2.0)
+    # level0_depth_accs (flattened into the tuple, not nested): length cond_depth[0], one acc per
+    # conditioning depth (index 0 = depth-1/own-code-only, ..., last = full cond_depth, same value
+    # as byte_acc above) -- callers must know cfg.cond_depth[0] to unpack the variable tail.
     return loss, (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
-                  jnp.mean(jnp.stack(utils)), byte_mse, aux_ntp_loss_total / jnp.log(2.0), aux_ntp_acc_total)
+                  jnp.mean(jnp.stack(utils)), byte_mse, aux_ntp_loss_total / jnp.log(2.0)) + level0_depth_accs
 
 
 def _zero_drop_model(model: HierEncDec) -> HierEncDec:
@@ -3378,7 +3394,8 @@ def main():
         m = cast_pytree(eval_model, compute_dtype)
         bs = args.val_batch_size[phase - 1]
         n = len(val_np)
-        sums = np.zeros(8, dtype=np.float64)
+        n_depth = cfg.cond_depth[0]  # level0_depth_accs' length, flattened onto the aux tuple's tail
+        sums = np.zeros(7 + n_depth, dtype=np.float64)
         total_loss = 0.0
         total_n = 0
         val_compile_s = None
@@ -3397,14 +3414,15 @@ def main():
             sums += bn * np.array([float(a) for a in aux_b])
             total_loss += bn * float(loss_b)
             total_n += bn
-        _bpb, acc, _ntp_bpb, ntp_acc, util, val_mse, _aux_ntp_bpb, aux_ntp_acc = (sums / total_n).tolist()
+        _bpb, acc, _ntp_bpb, e_acc, util, val_mse, _aux_ntp_bpb, *dec_accs_by_depth = (sums / total_n).tolist()
         loss = total_loss / total_n
         val_time_s = time.monotonic() - val_t0
+        depth_str = " ".join(f"val_dec_acc{i}={a:.2f}" for i, a in enumerate(dec_accs_by_depth))
         msg = (f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_mse={val_mse:.4f} "
-               f"val_e_ntp_acc={ntp_acc:.2f} val_d_ntp_acc={aux_ntp_acc:.2f} val_time={val_time_s:.1f}s")
+               f"val_e_acc={e_acc:.2f} {depth_str} val_time={val_time_s:.1f}s")
         rec = dict(tag=tag, val_loss=loss, val_dec_acc=acc,
-                    val_e_ntp_acc=ntp_acc, val_util=util, val_mse=val_mse,
-                    val_d_ntp_acc=aux_ntp_acc,
+                    val_e_acc=e_acc, val_util=util, val_mse=val_mse,
+                    **{f"val_dec_acc{i}": a for i, a in enumerate(dec_accs_by_depth)},
                     val_time_s=val_time_s)
         if val_compile_s is not None:
             msg += f" (first batch, incl. jit compile: {val_compile_s:.1f}s)"
@@ -3590,21 +3608,23 @@ def main():
                     logger(f"{active_desc}: first train_step (incl. jit compile) took "
                            f"{time.monotonic() - jit_t0:.1f}s")
                     jit_timed = True
-                _bpb, acc, _ntp_bpb, ntp_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, grad_norm = \
-                    [float(local_array(a)[0]) for a in aux]
+                aux_flat = [float(local_array(a)[0]) for a in aux]
+                _bpb, acc, _ntp_bpb, e_acc, util, train_mse, _aux_ntp_bpb, *dec_accs_by_depth = aux_flat[:-1]
+                grad_norm = aux_flat[-1]
                 lr = float(lr_schedule(step - 1))
                 lr_str = _fmt_lr(lr)
                 pbar.set_postfix(step=step, loss=f"{loss0:.2f}",
                                   acc=f"{acc:.2f}",
                                   lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
+                    depth_str = " ".join(f"dec_acc{i}={a:.2f}" for i, a in enumerate(dec_accs_by_depth))
                     logger(f"l={phase - 1} e={epoch_num} s={step} loss={loss0:.2f} dec_acc={acc:.2f} "
-                           f"e_ntp_acc={ntp_acc:.2f} util={util:.2f} mse={train_mse:.1f} "
-                           f"d_ntp_acc={aux_ntp_acc:.2f} "
+                           f"e_acc={e_acc:.2f} util={util:.2f} mse={train_mse:.1f} "
+                           f"{depth_str} "
                            f"lr={lr_str} grad_norm={grad_norm:.2f}",
                            level=phase - 1, epoch=epoch_num, step=step, loss=loss0,
-                           dec_acc=acc, e_ntp_acc=ntp_acc, util=util,
-                           mse=train_mse, d_ntp_acc=aux_ntp_acc,
+                           dec_acc=acc, e_acc=e_acc, util=util, mse=train_mse,
+                           **{f"dec_acc{i}": a for i, a in enumerate(dec_accs_by_depth)},
                            lr=lr, grad_norm=grad_norm)
 
                 if step % gen_eval_every_steps == 0:
