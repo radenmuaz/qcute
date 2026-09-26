@@ -22,7 +22,7 @@ n_layers = (4, 4)  # cheap encoder
 n_heads = (2, 2)
 n_kv_heads = (None, None)
 decoder_d_model = (1024, 1024)
-decoder_n_layers = (8, 8)
+decoder_n_layers = (4, 4)
 decoder_n_heads = (8, 8)
 decoder_n_kv_heads = (8, 8)
 
@@ -42,7 +42,7 @@ strides = (4, 4)
 # attn_window = (1024,1024)
 decoder_ncodes = (16, 16)  # was (32, 8) -- not powers of 4, gave rectangular (not square) patches
 # under z-order traversal; see module docstring
-ncodes_window = (16, 16)
+ncodes_window = (4, 4)
 attn_lookahead = 0
 decode_past = 0
 decode_future = 4
@@ -76,9 +76,9 @@ eval_gen_train = True
 
 
 # --- training ---
-batch_size = 4
-val_batch_size = 4
-level_steps = (int(1e4), int(5e4))
+batch_size = 8
+val_batch_size = 8
+level_steps = (int(2e4), int(5e4))
 seed = 0
 train_subset_n = None
 val_subset_n = None
@@ -94,10 +94,10 @@ warmup_steps = 1000
 optimizer = "adamw"
 optimizer_kwargs = dict(weight_decay=1e-5)
 
-wa_mode = "ema"
-wa_verbose = False
-wa_every_step = 200
-wa_ema_decay = 0.99
+# wa_mode = "ema"
+# wa_verbose = False
+# wa_every_step = 200
+# wa_ema_decay = 0.99
 
 # --- logging ---
 log_every = 100

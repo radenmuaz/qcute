@@ -17,14 +17,15 @@ img_size = 32
 # n_heads = (2, 2)
 # n_kv_heads = (None, None)
 
-d_model = (512, 512)
-n_layers = (8, 8)  # was (4, 4)
+d_model = (1024, 1024)  # was 512 -- widen instead of adding layers/depth
+n_layers = (4, 4)  # was 8 -- loss went flat (4.3-5.0, no downward trend after ~14k steps), trying
+# a smaller model in case 8 layers + weight_sharing was overparameterized/hard to optimize for this data scale
 n_heads = (2, 2)
 n_kv_heads = (None, None)
 
 code_vocab = (256, 256)
 pq_chunks = (3, 3)
-pq_dim = (256, 256)
+pq_dim = (64, 64)  # was 256
 mlp_mult = 4
 rope_base = 10000.0
 
@@ -44,9 +45,9 @@ level_refine_window = 1  # ignored
 cond_depth = (2, 1)  # level0: own code + level1's code (2 cross-attn sources); level1: own code only
 
 additive_drop_loss = False
-weight_sharing = True  # decoder is a strict superset of encoder (same self-attn+mlp, decoder adds
-# real cross-attn conditioning; encoder = same blocks with every cross-attn rung getting the
-# learned sink no-op) -- sharing follows directly from that, not just a memory-saving shortcut
+weight_sharing = False  # was True -- isolating whether weight_sharing itself is holding back
+# training (decoder forced to also be a valid uncond encoder via the sink no-op may be constraining
+# it more than helping); decoder gets its own independent blocks now
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
 encode_temperature = 1.0
@@ -63,15 +64,15 @@ remat_level = True
 
 byte_group = 3
 token_head_type = "ar"
-token_dim = (256, 256)
+token_dim = (64, 64)  # was 256
 token_n_heads = 2
 traversal = "zorder"
 eval_gen_train = True
 
 
 # --- training ---
-batch_size = 16
-val_batch_size = 16
+batch_size = 32  # was 16 -- doubled (smaller model now, should have HBM headroom)
+val_batch_size = 32
 level_steps = (int(2e3), int(5e4))
 seed = 0
 train_subset_n = None
