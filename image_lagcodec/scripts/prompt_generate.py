@@ -2,7 +2,11 @@
 Given the first `prompt_frac` of an image's bytes (a long real-byte warmup avoids the free-run collapsing), free-run
 the encoder of a top-two level (greedy and/or sampled), encode the completed sequence back to the top, and decode the
 emitted codes down the cascade. Writes samples_prompt_L{level}_p{P}_{mode}_{decode_from}.png into the run's log dir.
-Usage: python3 -m image_lagcodec.scripts.prompt_generate <run_name> [--levels 1,0] [--prompt_fracs 0.5,0.75]
+--prompt_fracs 0 means the SMALLEST currently-possible prompt: exactly one sample_level code's worth of real bytes
+(K0*K1*...*K_{sample_level-1}), i.e. as close to a true free rollout as the architecture allows today -- there is no
+learned BOS/anchor token yet for the encoder's own free-run, so at least one real code must be encoded first to seed
+it (see docs/status_image_lagcodec.md's note on this).
+Usage: python3 -m image_lagcodec.scripts.prompt_generate <run_name> [--levels 1,0] [--prompt_fracs 0,0.5,0.75]
        [--modes greedy,sample] [--temperature 0.9] [--top_k 40] [--decode_sample] [--n_img N] [--tag prompt]
 """
 import os
@@ -20,7 +24,7 @@ import equinox as eqx
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 import image_lagcodec.eqx_common as eqx_common
-from image_lagcodec.run_lagcodec import (
+from image_lagcodec.run_lagcodec_recursive import (
     Config, HierEncDec, dataset_from_config, images_to_positions, pixel_order_for, positions_to_image, load_config_module,
     CONFIG_FIELDS, save_compare_grid, pixel_mse, generate_from_prompt,
 )
@@ -55,7 +59,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run")
     ap.add_argument("--levels", default="1,0")
-    ap.add_argument("--prompt_fracs", default="0.5,0.75")
+    ap.add_argument("--prompt_fracs", default="0,0.5,0.75",
+                     help="0 = smallest possible prompt (one sample_level code's worth of real bytes), "
+                          "the closest approximation to a true free rollout this architecture supports today")
     ap.add_argument("--modes", default="greedy,sample")
     ap.add_argument("--temperature", type=float, default=0.9)
     ap.add_argument("--top_k", type=int, default=40)
@@ -86,8 +92,12 @@ def main():
     print(f"run={a.run} ckpt={ck.name} backend={jax.default_backend()} n_img={n_img} T0={T0}", flush=True)
 
     for L in [int(x) for x in a.levels.split(",")]:
+        ds = 1
+        for i in range(L):
+            ds *= model.levels[i].K
+        min_P = K0 * ds  # exactly one sample_level code's worth of real bytes -- the smallest legal prompt
         for frac in [float(x) for x in a.prompt_fracs.split(",")]:
-            P = max(K0, int(frac * T0) // K0 * K0)
+            P = min_P if frac <= 0 else max(min_P, int(frac * T0) // min_P * min_P)
             for mode in a.modes.split(","):
                 greedy = mode == "greedy"
                 t0 = time.monotonic()
@@ -104,7 +114,8 @@ def main():
                     gtb = np.asarray(fb)
                     cont = rec[:, P:]
                     top_freq = max(float((cont == v).mean()) for v in np.unique(cont)[:256]) if cont.size else 0.0
-                    print(f"[L{L} p={P} {mode:6s} {src:7s}] prompt_mse={pixel_mse(rec[:, :P].astype(np.float64), gtb[:, :P]):8.2f} "
+                    print(f"[L{L} p={P} (min_P={min_P}) {mode:6s} {src:7s}] "
+                          f"prompt_mse={pixel_mse(rec[:, :P].astype(np.float64), gtb[:, :P]):8.2f} "
                           f"cont_mse={pixel_mse(rec[:, P:].astype(np.float64), gtb[:, P:]):8.2f} "
                           f"most_common_byte_frac={top_freq:.3f} -> {name}", flush=True)
                 print(f"   ({time.monotonic() - t0:.0f}s)", flush=True)
