@@ -438,8 +438,13 @@ class Attention(eqx.Module):
         y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
         return y @ self.out
 
-    def step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray, pos, T_max: int) -> tuple:
-        """Single-step KV-cached form: x_new is (Bc,D), cache_k/v are (Bc,n_kv_heads,T_max,hd)."""
+    def step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray, pos, T_max: int,
+              extra_valid: jnp.ndarray = None) -> tuple:
+        """Single-step KV-cached form: x_new is (Bc,D), cache_k/v are (Bc,n_kv_heads,T_max,hd).
+        extra_valid (Bc,T_max) bool, optional: ANDed into the causal mask -- for cache slots that
+        are within the causal window (idx<=pos) but hold non-existent content (e.g. zero-padded
+        leading positions from a shorter-than-window real history), which plain idx<=pos can't
+        express since it only tracks recency, not per-batch-row validity."""
         Bc, D = x_new.shape
         hd = D // self.n_heads
         qkv = x_new @ self.qkv
@@ -460,7 +465,10 @@ class Attention(eqx.Module):
         valid = idx <= pos
         if self.window is not None:
             valid = valid & (idx >= pos - self.window)
-        logits = jnp.where(valid[None, None, :], logits, -1e9)
+        valid = jnp.broadcast_to(valid[None, None, :], (Bc, 1, T_max))
+        if extra_valid is not None:
+            valid = valid & extra_valid[:, None, :]
+        logits = jnp.where(valid, logits, -1e9)
         attn = jax.nn.softmax(logits, axis=-1)
         y = jnp.einsum("bht,bhtd->bhd", attn, v_full)  # (Bc,H,hd)
         if self.use_xsa:
@@ -533,8 +541,9 @@ class Block(eqx.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-    def step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray, pos, T_max: int) -> tuple:
-        attn_out, ck, cv = self.attn.step(self.norm1(x_new), cache_k, cache_v, pos, T_max)
+    def step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray, pos, T_max: int,
+              extra_valid: jnp.ndarray = None) -> tuple:
+        attn_out, ck, cv = self.attn.step(self.norm1(x_new), cache_k, cache_v, pos, T_max, extra_valid)
         x = x_new + attn_out
         x = x + self.mlp(self.norm2(x))
         return x, ck, cv

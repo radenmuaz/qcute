@@ -26,14 +26,14 @@ uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/config
 # --- model ---
 img_size = 32
 
-codelm_d_model = (256, 256, 256)
-codelm_n_layers = (4, 4, 4)
-codelm_n_heads = (2, 2, 2)
-codelm_n_kv_heads = (None, None, None)
+codelm_d_model = 512
+codelm_n_layers = 4
+codelm_n_heads = 2
+codelm_n_kv_heads = None
 
-code_vocab = (256, 256, 256)
-pq_chunks = (3, 3, 3)
-pq_dim = (64, 64, 64)
+code_vocab = 256
+pq_chunks = 3
+pq_dim = 64
 mlp_mult = 4
 rope_base = 10000.0
 
@@ -49,27 +49,29 @@ label_fn = "rgb_label_fn_jax"  # string, no import -- resolved via main()'s labe
 # bit-pack collapses 2 of 3 chunks to always-0)
 
 strides = (4, 4, 4)
-attn_window = (256, 256, 256)
+attn_window = 256
 decoder_ncodes = (16, 16, 16)
 ncodes_window = (4, 4, 4)  # dead (only fed the removed old dec_blocks path), kept declared/inert
 attn_lookahead = 0
 decode_past = 0
 decode_future = 4
-remat_level = True
+remat_level = True  # CodeLM's own remat granularity (whole-stack, wins over plain `remat` if both set)
 
 additive_drop_loss = False
 use_pardec_downsampler = True
-downsampler_d_model = (512, 512, 512)
-downsampler_n_layers = (4, 4, 4)
-downsampler_n_heads = (8, 8, 8)
-downsampler_n_kv_heads = (8, 8, 8)
-downsampler_window = (4, 4, 4)  # bounded, NOT -1 -- unbounded OOM'd even at tiny CPU test sizes
+downsampler_d_model = 512
+downsampler_n_layers = 4
+downsampler_n_heads = 8
+downsampler_n_kv_heads = 8
+downsampler_window = 4  # bounded, NOT -1 -- unbounded OOM'd even at tiny CPU test sizes
+downsampler_remat = True
 use_pardec_upsampler = True
-upsampler_d_model = (512, 512, 512)
-upsampler_n_layers = (4, 4, 4)
-upsampler_n_heads = (8, 8, 8)
-upsampler_n_kv_heads = (8, 8, 8)
-upsampler_window = (4, 4, 4)  # bounded, NOT -1 -- same OOM lesson as downsampler_window
+upsampler_d_model = 512
+upsampler_n_layers = 4
+upsampler_n_heads = 8
+upsampler_n_kv_heads = 8
+upsampler_window = 4  # bounded, NOT -1 -- same OOM lesson as downsampler_window
+upsampler_remat = True
 # use_codelm_bos left at default False for this run -- no scale/anchor-code training yet
 curriculum_mode = "no_freeze"  # asserted unconditionally regardless of this config
 quantize_mode = "gumbel"
@@ -86,7 +88,7 @@ precision = "bf16"
 
 byte_group = 3
 token_head_type = "ar"
-token_dim = (64, 64, 64)
+token_dim = 64
 token_n_heads = 2
 traversal = "zorder"
 eval_gen_train = True

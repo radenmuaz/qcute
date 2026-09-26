@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import math
 import pickle
@@ -11,7 +10,7 @@ import tarfile
 import time
 import warnings
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import equinox as eqx
@@ -23,8 +22,7 @@ from tqdm import tqdm
 
 from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, apply_rope, apply_xsa, init_matrix,
                                         init_vector, make_lr_schedule, rmsnorm, rope_cos_sin,
-                                        rope_cos_sin_pos, rotate_half, sinkgd, splash_future_attention,
-                                        warmup_const_schedule)
+                                        rope_cos_sin_pos, rotate_half, sinkgd)
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
@@ -205,6 +203,8 @@ class Config:
             elif isinstance(val, types):
                 setattr(self, name, (val,) * n)
 
+        bcast("code_vocab", int)
+        bcast("pq_chunks", int)
         bcast("mlp_mult", int)
         bcast("rope_base", (int, float))
         bcast("decoder_ncodes", int)
@@ -1086,7 +1086,6 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
 
     decode_past, decode_future = pardec.decode_past, pardec.decode_future
     target_len_per_group = output_group_size * oe
-    widened_len = decode_past + target_len_per_group + decode_future
     n_output_positions = n_context_positions * output_group_size // context_group_size
     target_len_per_group_padded = n_groups * output_group_size * oe - n_output_positions * oe
     target_padded = target_seq
@@ -1174,11 +1173,19 @@ def pardec_generate(pardec: PardecLM, context_h: jnp.ndarray, context_group_size
     cache_k0 = jnp.zeros((len(pardec.blocks), batch2, pardec.n_kv_heads, total_steps, hidden_dim_per_head))
     cache_v0 = jnp.zeros_like(cache_k0)
 
+    # extra_valid: own_window's leading entries are zero-padding wherever a group's real history
+    # is shorter than window_size (see pardec_context_windows' valid_mask) -- idx<=pos causal
+    # masking alone can't tell those apart from real keys, so pass this through explicitly (mirrors
+    # pardec_score's key_valid, which excludes exactly these positions). bos+target span is always
+    # real/self-authored, hence the trailing all-True padding.
+    extra_valid = jnp.concatenate(
+        [valid_mask, jnp.ones((batch2, total_steps - window_size), dtype=bool)], axis=1)
+
     def self_step(x_new, cache_k, cache_v, pos):
         new_cache_k, new_cache_v = [], []
         x = x_new
         for i, blk in enumerate(pardec.blocks):
-            x, ck_i, cv_i = blk.step(x, cache_k[i], cache_v[i], pos, total_steps)
+            x, ck_i, cv_i = blk.step(x, cache_k[i], cache_v[i], pos, total_steps, extra_valid)
             new_cache_k.append(ck_i)
             new_cache_v.append(cv_i)
         return pardec.ln_f(x), jnp.stack(new_cache_k), jnp.stack(new_cache_v)
@@ -1245,11 +1252,17 @@ def pardec_generate_gumbel(pardec: PardecLM, context_h: jnp.ndarray, context_gro
     cache_k0 = jnp.zeros((len(pardec.blocks), batch2, pardec.n_kv_heads, total_steps, hidden_dim_per_head))
     cache_v0 = jnp.zeros_like(cache_k0)
 
+    # see pardec_generate's identical comment: own_window's leading entries can be zero-padding
+    # (group's real history shorter than window_size) -- mask those out explicitly since idx<=pos
+    # causal masking alone can't distinguish them from real keys.
+    extra_valid = jnp.concatenate(
+        [valid_mask, jnp.ones((batch2, total_steps - window_size), dtype=bool)], axis=1)
+
     def self_step(x_new, cache_k, cache_v, pos):
         new_cache_k, new_cache_v = [], []
         x = x_new
         for i, blk in enumerate(pardec.blocks):
-            x, ck_i, cv_i = blk.step(x, cache_k[i], cache_v[i], pos, total_steps)
+            x, ck_i, cv_i = blk.step(x, cache_k[i], cache_v[i], pos, total_steps, extra_valid)
             new_cache_k.append(ck_i)
             new_cache_v.append(cv_i)
         return pardec.ln_f(x), jnp.stack(new_cache_k), jnp.stack(new_cache_v)
@@ -1311,6 +1324,8 @@ class CodeLM(eqx.Module):
     quantize_drop: float = eqx.field(static=True)
     use_codelm_bos: bool = eqx.field(static=True)
     codelm_bos_prob: float = eqx.field(static=True)
+    n_heads: int = eqx.field(static=True)  # needed for KV-cache sizing in _encoder_free_run
+    n_kv_heads: int = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config):
         # Single shared architecture: Config.__post_init__ asserts codelm_d_model/codelm_n_layers/
@@ -1329,6 +1344,7 @@ class CodeLM(eqx.Module):
         self.quantize_drop = cfg.quantize_drop
         self.use_codelm_bos = cfg.use_codelm_bos
         self.codelm_bos_prob = cfg.codelm_bos_prob
+        self.n_heads, self.n_kv_heads = n_heads_enc, n_kv_heads_enc
         pq_dim = cfg.pq_dim[0]
         own_vocab = self.code_vocab  # raw bytes and codes share one categorical structure (see above)
         ntp_out = self.pq_chunks * self.code_vocab
@@ -1518,7 +1534,15 @@ def _sample_tokens(logits: jnp.ndarray, rng, greedy: bool, temperature, top_k: i
 
 def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, temperature, greedy: bool,
                       top_k: int, use_bos: bool = False, rate_id: int = 0) -> jnp.ndarray:
-    # tokens (B,total_len,C) holds the prompt in [:P] (P may be traced); the rest is overwritten
+    # tokens (B,total_len,C) holds the prompt in [:P] (P may be traced); the rest is overwritten.
+    # Real incremental KV cache (was: full-buffer recompute every step, O(T^2)) -- same blk.step
+    # pattern as pardec_generate. Prefill scans the WHOLE fixed-length buffer once (positions >= P
+    # hold junk/placeholder embeddings at that point); each generated position's cache entry is
+    # then overwritten with its real embedding via a second self_step call at the same pos, before
+    # any later (strictly causal) position ever attends to it -- Block.step/Attention.step write
+    # via jax.lax.dynamic_update_slice at the given pos, so a repeat call at the same pos correctly
+    # replaces the placeholder rather than appending.
+    B, total_len, C = tokens.shape
     x = code_embed_proj(tokens, codelm.own_input_embed, codelm.own_input_proj)
     if use_bos:
         # position 0's discrete `tokens[:,0]` value is meaningless once its embedding is replaced --
@@ -1526,19 +1550,42 @@ def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, tempe
         # free-sampled with zero real content: a true unconditional/free rollout, not just a small
         # real prompt). Downstream re-encoding of the returned tokens is the caller's concern.
         x = x.at[:, 0, :].set(codelm.bos_embed[rate_id])
+    D = x.shape[-1]
+    hd = D // codelm.n_heads
+
+    def self_step(x_new, cache_k, cache_v, pos):
+        new_ck, new_cv = [], []
+        h = x_new
+        for i, blk in enumerate(codelm.blocks):
+            h, ck_i, cv_i = blk.step(h, cache_k[i], cache_v[i], pos, total_len)
+            new_ck.append(ck_i)
+            new_cv.append(cv_i)
+        return codelm.ln_f(h), jnp.stack(new_ck), jnp.stack(new_cv)
+
+    cache_k0 = jnp.zeros((len(codelm.blocks), B, codelm.n_kv_heads, total_len, hd))
+    cache_v0 = jnp.zeros_like(cache_k0)
+
+    def prefill_step(carry, x_t_and_pos):
+        cache_k, cache_v = carry
+        x_t, pos = x_t_and_pos
+        h, cache_k, cache_v = self_step(x_t, cache_k, cache_v, pos)
+        return (cache_k, cache_v), h
+
+    positions = jnp.arange(total_len)
+    (cache_k, cache_v), h_all = jax.lax.scan(
+        prefill_step, (cache_k0, cache_v0), (jnp.swapaxes(x, 0, 1), positions))
+    h_prev0 = jax.lax.dynamic_index_in_dim(h_all, P - 1, axis=0, keepdims=False)
 
     def body(t, carry):
-        tokens, x = carry
-        # exact training-time encoder forward over the whole fixed-length buffer; the encoder is causal, so
-        # positions <= t-1 never see the not-yet-generated (junk) positions after them
-        h = encoder_hidden(codelm, x)
-        lg = encoder_ntp_logits(codelm, jax.lax.dynamic_index_in_dim(h, t - 1, axis=1, keepdims=False))
+        tokens, cache_k, cache_v, h_prev = carry
+        lg = encoder_ntp_logits(codelm, h_prev)
         tok = _sample_tokens(lg, jax.random.fold_in(rng, t), greedy, temperature, top_k)
         tokens = tokens.at[:, t].set(tok.astype(tokens.dtype))
-        x = x.at[:, t].set(code_embed_proj(tok, codelm.own_input_embed, codelm.own_input_proj))
-        return tokens, x
+        x_new = code_embed_proj(tok, codelm.own_input_embed, codelm.own_input_proj)
+        h_new, cache_k, cache_v = self_step(x_new, cache_k, cache_v, t)
+        return tokens, cache_k, cache_v, h_new
 
-    tokens, _ = jax.lax.fori_loop(P, tokens.shape[1], body, (tokens, x))
+    tokens, _, _, _ = jax.lax.fori_loop(P, total_len, body, (tokens, cache_k, cache_v, h_prev0))
     return tokens
 
 
@@ -2608,7 +2655,7 @@ def main():
                 x = code_embed_proj(out["code_soft"], codelm.own_input_embed, codelm.own_input_proj)
                 target = out["code_idx"]
 
-        recon_acc = recon_mse = None
+        recon_acc = None
 
         cascade_t0 = time.monotonic()
         cur_code = codes[top]
