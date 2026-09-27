@@ -36,22 +36,19 @@ label_fn = "rgb_label_fn_jax"
 
 strides = (4, 4, 4)
 attn_window = 256
-decoder_ncodes = (16, 16, 16)
-ncodes_window = (4, 4, 4)
+upsampler_ncodes = (16, 16, 16)
 attn_lookahead = 0
-decode_past = 0
-decode_future = 4
+upsampler_decode_past = 0
+upsampler_decode_future = 4
 remat_level = True
 
 additive_drop_loss = False
-use_pardec_downsampler = True
 downsampler_d_model = 512
 downsampler_n_layers = 4
 downsampler_n_heads = 8
 downsampler_n_kv_heads = 8
 downsampler_window = 4
 downsampler_remat = True
-use_pardec_upsampler = True
 upsampler_d_model = 512
 upsampler_n_layers = 4
 upsampler_n_heads = 8
