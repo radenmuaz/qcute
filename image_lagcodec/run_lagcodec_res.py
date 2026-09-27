@@ -592,6 +592,59 @@ def rgb_label_fn_jax(flat_bytes: jnp.ndarray, cfg: Config, pixel_order: np.ndarr
     return jnp.round(jnp.clip(flat_rgb, 0, 255)).astype(jnp.int32)
 
 
+# ---------------------------------------------------------------------------
+# TODO(modality-generalization): everything below is a STUB, not wired into main()/Config/
+# load_dataset/label_fn_registry -- CodeLM/Downsampler/Upsampler only ever see (pq_chunks,
+# code_vocab)-shaped tokens and don't know or care what modality produced them, so extending
+# beyond images only needs new load_fn/label_fn/byte_pq_fn implementations (the existing
+# label_fn/byte_pq_fn hooks, already string-registry-resolved in main()) plus a `modality: str`
+# Config field bundling {load_fn, pixel_order_fn, label_fn default, byte_pq_fn default} together
+# so e.g. --dataset text doesn't also require manually wiring 3 unrelated flags. traversal="raster"
+# always for both (text/audio are already 1D sequential -- no z-order locality to exploit, and the
+# zorder power-of-4-stride assert doesn't meaningfully apply to non-spatial data).
+# ---------------------------------------------------------------------------
+
+def load_text(data_root: Path) -> tuple:
+    # TODO: raw UTF-8 byte stream loader (byte_group=1, code_vocab=256, pq_chunks=1) -- mirrors
+    # load_cifar10's (train, val) tuple-of-(data, labels) shape, labels can be dummy/unused.
+    raise NotImplementedError("load_text: TODO, see modality-generalization stub section")
+
+
+def load_audio(data_root: Path, sample_rate: int = 16000, bit_depth: int = 16) -> tuple:
+    # TODO: raw PCM byte stream loader (byte_group=2 for 16-bit samples, or mu-law-compress to
+    # 8-bit first and treat as byte_group=1 like text -- avoids a 65536-wide softmax head).
+    raise NotImplementedError("load_audio: TODO, see modality-generalization stub section")
+
+
+def bpe_label_fn(flat_bytes: jnp.ndarray, cfg: Config, pixel_order, n_blocks: int,
+                  pq_chunks: int, code_vocab: int, bpe_merge_table=None) -> jnp.ndarray:
+    # TODO: text's label_fn analogue to rgb_label_fn_jax -- for a K-byte (or K-token) block at this
+    # level, look up which BPE merge rule it resolves to under bpe_merge_table and return that
+    # merge's token id as the real, deterministic supervised target (same "teacher-forced
+    # classification against a real target" shape encode_pardec_downsampler already expects, no
+    # architecture change needed). "BPE of BPE" for higher levels falls out of the existing level
+    # structure for free: level0's bpe_merge_table merges raw UTF-8 BYTES into byte-level BPE
+    # tokens; level1's own (separate) bpe_merge_table merges the LEVEL-0 TOKEN STREAM (not raw
+    # bytes) into super-tokens, i.e. each level just needs its own merge table/vocab, exactly like
+    # pq_chunks/code_vocab are already per-run constants today -- would need the singleton
+    # uniform-across-levels assert relaxed for target vocab size specifically (not model weights,
+    # which stay shared/uniform regardless of what vocab the target happens to use per level).
+    raise NotImplementedError("bpe_label_fn: TODO, see modality-generalization stub section")
+
+
+def resample_label_fn(flat_bytes: jnp.ndarray, cfg: Config, pixel_order, n_blocks: int,
+                       pq_chunks: int, code_vocab: int) -> jnp.ndarray:
+    # TODO: audio's label_fn analogue -- unlike images' "pick position K-1"/pooled-resize target,
+    # naive strided downsampling of a waveform aliases (and can shift perceived pitch), so this
+    # MUST run a real anti-aliasing low-pass filter before decimating (e.g.
+    # scipy.signal.resample_poly(wave, up=1, down=K), computed once CPU-side per level, same timing
+    # as images_to_positions today) then requantize the band-limited result back to bytes as the
+    # real target. Correct polyphase resampling preserves pitch by construction -- pitch-shifting is
+    # exactly the artifact that naive strided/nearest-neighbor downsampling introduces, not a
+    # separate concern to solve on top.
+    raise NotImplementedError("resample_label_fn: TODO, see modality-generalization stub section")
+
+
 def default_label_fn_pil(images: np.ndarray, cfg: Config, pixel_order: np.ndarray, n_blocks: int,
                           pq_chunks: int, code_vocab: int) -> np.ndarray:
     from PIL import Image
@@ -1473,6 +1526,26 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndar
                 entropy_loss=entropy_loss, logits=logits)
 
 
+def encode_pardec_downsampler_generate(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndarray, K: int,
+                                        rate_id: int = 0, rng=None, greedy: bool = True,
+                                        temperature: float = 1.0, top_k: int = 0) -> dict:
+    # Generation-time counterpart of encode_pardec_downsampler: that function is TEACHER-FORCED
+    # (needs label_fn's real ground-truth target, via pardec_score), so it can't be used for actual
+    # free-run generation (generate_from_prompt's upward-encode loop, no ground truth available at
+    # inference). Mirrors _decode_generate_pardec_call's pattern for the upsampler direction, just
+    # using pardec_generate (autoregressive, no external target) instead of pardec_score. Caught
+    # 2026-09-26: generate_from_prompt was instead calling CodeLM.encode()'s own naive code_head
+    # path here, which use_pardec_downsampler=True training never touches/trains at all -- that's
+    # what made cascade generation garbage despite good training loss (loss trains the downsampler
+    # via encode_pardec_downsampler; generation was reading a permanently-untrained code_head).
+    h = encoder_hidden(codelm, x)
+    code_idx = pardec_generate(downsampler, h, context_group_size=K, output_group_size=1, rng=rng,
+                                greedy=greedy, temperature=temperature, top_k=top_k, rate_id=rate_id,
+                                output_expansion=1)
+    code_soft = jax.nn.one_hot(code_idx, codelm.code_vocab, dtype=h.dtype)
+    return dict(code_soft=code_soft, code_idx=code_idx)
+
+
 def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, target_seq: jnp.ndarray,
                                         ctx_code_soft: jnp.ndarray, decoder_ncodes: int, rng=None,
                                         **_unused) -> tuple:
@@ -1634,7 +1707,12 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
     tok = byte_pq_fn(prompt_bytes, codelm.pq_chunks, codelm.code_vocab)
     for i in range(sample_level):
         x = code_embed_proj(tok, codelm.own_input_embed, codelm.own_input_proj)
-        tok = codelm.encode(x, tok, model.K(i), rng=None, encode_temperature=encode_temperature, rate_id=i)["code_idx"]
+        if cfg.use_pardec_downsampler:
+            tok = encode_pardec_downsampler_generate(codelm, model.downsampler, x, model.K(i), rate_id=i,
+                                                       rng=jax.random.fold_in(rng, i), greedy=greedy,
+                                                       temperature=encode_temperature)["code_idx"]
+        else:
+            tok = codelm.encode(x, tok, model.K(i), rng=None, encode_temperature=encode_temperature, rate_id=i)["code_idx"]
         assert tok.shape[1] >= 1, "prompt too short to produce a single code at the sampling level"
     ds = 1
     for i in range(sample_level):
@@ -1644,7 +1722,12 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
 
     codes, x, tgt = {}, code_embed_proj(tokens_L, codelm.own_input_embed, codelm.own_input_proj), tokens_L
     for i in range(sample_level, n):
-        out = codelm.encode(x, tgt, model.K(i), rng=None, encode_temperature=encode_temperature, rate_id=i)
+        if cfg.use_pardec_downsampler:
+            out = encode_pardec_downsampler_generate(codelm, model.downsampler, x, model.K(i), rate_id=i,
+                                                       rng=jax.random.fold_in(rng, 1000 + i), greedy=greedy,
+                                                       temperature=encode_temperature)
+        else:
+            out = codelm.encode(x, tgt, model.K(i), rng=None, encode_temperature=encode_temperature, rate_id=i)
         codes[i] = out["code_idx"]
         if i < n - 1:
             x = code_embed_proj(out["code_soft"], codelm.own_input_embed, codelm.own_input_proj)
@@ -1892,8 +1975,12 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
     level_rngs = [None] * (2 * depth) if rng is None else list(jax.random.split(rng, 2 * depth))
     for d in range(depth):
         i = entry_level + d
-        out = codelm.encode(x, target, model.K(i), rng=level_rngs[2 * d],
-                             encode_temperature=encode_temperature, rate_id=i)
+        if model.cfg.use_pardec_downsampler:
+            out = encode_pardec_downsampler(codelm, model.downsampler, x, target, flat_bytes, model.cfg,
+                                             pixel_order, label_fn, model.K(i), rate_id=i, rng=level_rngs[2 * d])
+        else:
+            out = codelm.encode(x, target, model.K(i), rng=level_rngs[2 * d],
+                                 encode_temperature=encode_temperature, rate_id=i)
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
         enc_losses.append(out["ntp_loss"])
@@ -2074,7 +2161,16 @@ def plot_encoder_outs(model: "LagCodecModel", cfg: Config, imgs: np.ndarray, pix
     flat_raw = jnp.array(images_to_positions(imgs, cfg, pixel_order))
     flat = rgb_byte_pq_fn(flat_raw, codelm.pq_chunks, codelm.code_vocab) if level == 0 else flat_raw
     x = code_embed_proj(flat, codelm.own_input_embed, codelm.own_input_proj)
-    out = codelm.encode(x, flat, model.K(level), rng=None, rate_id=level)
+    # Must dispatch exactly like level_forward's own encode call (line ~1809) -- otherwise this
+    # diagnostic reads code_idx from CodeLM's own untrained code_head/quantize path while training
+    # actually optimizes the separate PardecLM-based encode_pardec_downsampler, silently plotting
+    # noise from a never-trained pathway (caught 2026-09-26: loss/label_mse looked fine in
+    # run.log, but this plot showed pure random-color noise for pred downsample).
+    if cfg.use_pardec_downsampler:
+        out = encode_pardec_downsampler(codelm, model.downsampler, x, flat, flat_raw, cfg,
+                                         pixel_order, label_fn, model.K(level), rate_id=level)
+    else:
+        out = codelm.encode(x, flat, model.K(level), rng=None, rate_id=level)
     code_idx = np.asarray(out["code_idx"])
     util = float(out["util"])
     M, n_blocks, C = code_idx.shape
@@ -2234,7 +2330,11 @@ def main():
     p.add_argument("--dataset", type=str, default="cifar", choices=["cifar", "imagenet64", "imagenet256"],
                     help="cifar (default): downloads/caches under --data_root. imagenetN: reads "
                          "pre-built shards from --data_root (scripts/imagenet/download_imagenetN.py; "
-                         "does not download itself). Config.img_size must match (32 cifar, N imagenetN).")
+                         "does not download itself). Config.img_size must match (32 cifar, N imagenetN). "
+                         "TODO(modality-generalization): 'text'/'audio' choices + a modality: str "
+                         "Config field bundling {load_fn, pixel_order_fn, label_fn/byte_pq_fn "
+                         "defaults} -- see load_text/load_audio/bpe_label_fn/resample_label_fn stubs "
+                         "below rgb_label_fn_jax (not wired in yet).")
     p.add_argument("--data_root", type=str, default=str(REPO_ROOT / "datasets"))
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--batch_size", type=_tuple_arg, default=(16,),
@@ -2647,8 +2747,12 @@ def main():
         eval_rngs = ([None] * (top + 1) if not cfg.gumbel_at_inference
                      else list(jax.random.split(jax.random.fold_in(jax.random.PRNGKey(0), hash(tag) % (2**31)), top + 1)))
         for i in range(top + 1):
-            out = codelm.encode(x, target, m.K(i), rng=eval_rngs[i],
-                                 encode_temperature=args.encode_temperature[phase - 1], rate_id=i)
+            if cfg.use_pardec_downsampler:
+                out = encode_pardec_downsampler(codelm, m.downsampler, x, target, flat_prompt, cfg,
+                                                 pixel_order, label_fn, m.K(i), rate_id=i, rng=eval_rngs[i])
+            else:
+                out = codelm.encode(x, target, m.K(i), rng=eval_rngs[i],
+                                     encode_temperature=args.encode_temperature[phase - 1], rate_id=i)
             codes.append(out["code_idx"])
             codes_soft.append(out["code_soft"])
             if i < top:
