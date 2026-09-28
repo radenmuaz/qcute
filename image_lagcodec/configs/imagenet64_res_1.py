@@ -31,8 +31,8 @@ entropy_weight = 1.0
 label_reg_weight = 1.0
 
 label_fn = "rgb_label_fn_jax"
-# bos_rate_mode = "relative"
-bos_rate_mode = "absolute"
+bos_rate_mode = "relative"
+# bos_rate_mode = "absolute"
 strides = (4, 4, 4)
 attn_window = 1024
 upsampler_ncodes = (16, 16, 16)
@@ -84,18 +84,18 @@ eval_gen_train = True
 # --- training ---
 batch_size = 8       # per DEVICE; tpu34 = 2 hosts x 4 devices -> global batch 64 (16 OOMs: 20.4G program vs 16G free)
 val_batch_size = 8
-level_epochs = (1, 1, 5)
+# level_epochs = (1, 1, 5)
 # Approximate step equivalents (tpu34 v4-16: batch_size 8 x 4 local devices x 2 hosts = global batch 64;
 # ImageNet64 train = 1,281,167 imgs -> 1 epoch = 1,281,167 / 64 = 20,018 steps):
 #   (1, 1, 5) epochs  ~=  (20018, 20018, 100090) steps  (140,126 total)
 # To schedule by steps instead, comment out level_epochs above and uncomment (level_epochs and
 # level_steps are mutually exclusive; steps-per-epoch scales with batch_size / n devices / n hosts):
-# level_steps = (20000, 20000, 100000)
+level_steps = (20000, 20000, 100000)
 seed = 0
 train_subset_n = None
 val_subset_n = 512
-gen_eval_every_epoch = 0.25   # ~= every 5,005 steps at global batch 64
-# gen_eval_every_step = 5000   # uncomment (and comment gen_eval_every_epoch) to eval by steps
+# gen_eval_every_epoch = 0.25   # ~= every 5,005 steps at global batch 64
+gen_eval_every_step = 5000   # uncomment (and comment gen_eval_every_epoch) to eval by steps
 epoch_verbose = False
 
 grad_clip = 1.0

@@ -80,8 +80,8 @@ precision = "bf16"
 
 byte_group = 3
 token_head_type = "ar"
-codelm_token_head = "linear"   # CodeLM NTP/free-run head: parallel linear
-pardec_token_head = "linear"    # downsampler/upsampler digit head: parallel linear (like original lagcodec)
+codelm_token_head = "ar"   # CodeLM NTP/free-run head: autoregressive digits
+pardec_token_head = "ar"    # downsampler/upsampler digit head: autoregressive digits
 token_dim = 64
 token_n_heads = 2
 traversal = "zorder"

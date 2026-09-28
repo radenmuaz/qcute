@@ -33,8 +33,8 @@ entropy_weight = 1.0
 label_reg_weight = 1.0
 
 label_fn = "rgb_label_fn_jax"
-# bos_rate_mode = "relative"
-bos_rate_mode = "absolute"  # relative dedups bos rows by effective stride, assuming levels sharing
+bos_rate_mode = "relative"
+# bos_rate_mode = "absolute"  # relative dedups bos rows by effective stride, assuming levels sharing
 # a stride share genuine structure -- but with label_reg_weight=0.0 here (no label supervision
 # forcing a canonical/regular code structure per level, downsampler code is whatever the
 # reconstruction loss + entropy alone shape it into), that assumption doesn't hold: levels 0 and 1

@@ -68,13 +68,9 @@ rsync -avz --delete \
 
 rsync -avz --delete -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -i ~/.ssh/google_compute_engine" --filter=':- .gitignore' --exclude=".git/" /Users/muaz/code/qcute/ muaz@35.186.15.67:~/qcute/
 
-rsync -avz --delete -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -i ~/.ssh/google_compute_engine" --filter=':- .gitignore' --exclude=".git/" /Users/muaz/code/qcute/ muaz@107.167.160.20:~/qcute/
+rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu34-%r@%h:%p -i ~/.ssh/google_compute_engine" --filter=':- ../.gitignore' --exclude=".git/" . muaz@35.186.86.22:~/qcute/
 
-rsync -avz --delete \
-  -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -i ~/.ssh/google_compute_engine" \
-  --filter=':- .gitignore' --exclude=".git/" \
-  /Users/muaz/code/qcute/ muaz@35.186.33.7:~/qcute/
-
+rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu34-%r@%h:%p -i ~/.ssh/google_compute_engine" --filter=':- ../.gitignore' --exclude=".git/" . muaz@35.186.115.139:~/qcute/
 
 
 
