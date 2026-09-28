@@ -1,6 +1,9 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_full1.py
+uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_full2_overfit100.py
 """
+# Fork of cifar_res_full2_overfit.py -- train_subset_n=100 (was 2000), gen_eval_every_step=1000
+# (was 2000).
+
 # --- model ---
 img_size = 32
 
@@ -17,12 +20,12 @@ rope_base = 10000.0
 
 ntp_weight = 1.0
 mse_weight = 0.0
-entropy_weight = 0.1
-label_reg_weight = 1.0
+entropy_weight = 1.0
+label_reg_weight = 0.0
 
 label_fn = "rgb_label_fn_jax"
-bos_rate_mode = "relative"
-# bos_rate_mode = "absolute"
+# bos_rate_mode = "relative"
+bos_rate_mode = "absolute"
 strides = (4, 4)              # single level only -- no cascade
 attn_window = 1024
 upsampler_ncodes = (16, 16)
@@ -45,9 +48,9 @@ upsampler_n_kv_heads = 8
 upsampler_window = 4
 upsampler_remat = True
 
-use_codelm_bos = False   # ON for this ablation (was False in cifar_res_full1.py)
-# use_codelm_bos = True   # ON for this ablation (was False in cifar_res_full1.py)
-# codelm_bos_prob = 1.0   # always substitute -- no probabilistic drop back to real content
+use_codelm_bos = False
+# use_codelm_bos = True
+# codelm_bos_prob = 1.0
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
 encode_temperature = 1.0
@@ -72,11 +75,11 @@ eval_gen_train = True
 # --- training ---
 batch_size = 8
 val_batch_size = 8
-level_steps = (int(10e3),int(20e3))  # single phase, full original 70k budget (was split 10k/10k/50k across 3 levels)
+level_steps = (int(10e3),int(20e3))
 seed = 0
-train_subset_n = None
-val_subset_n = None
-gen_eval_every_step = 4000
+train_subset_n = 100  # was 2000
+val_subset_n = 100
+gen_eval_every_step = 1000  # was 2000
 epoch_verbose = False
 
 grad_clip = 1.0

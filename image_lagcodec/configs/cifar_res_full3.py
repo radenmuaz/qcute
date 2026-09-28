@@ -1,6 +1,14 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_full1.py
+uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_full3.py
 """
+# Fork of cifar_res_full1.py -- single-variable ablation: share_across_levels=False (one
+# independent CodeLM/Downsampler/Upsampler PER LEVEL, own weights, no weight tying across levels)
+# instead of the singleton-shared default. Everything else (upsampler_ncodes=16 included) identical
+# to cifar_res_full1.py -- isolates whether the periodic every-8th-column/row decode artifact
+# (see audit_gen_dots.py findings 2026-09-28: present in BOTH fully-teacher-forced and rollout
+# decode, CPU==TPU, so not exposure bias or a JIT bug) is a weight-sharing/rate_id-conditioning
+# side effect rather than (or in addition to) the upsampler_ncodes=16 group-boundary hypothesis.
+
 # --- model ---
 img_size = 32
 
@@ -23,6 +31,9 @@ label_reg_weight = 1.0
 label_fn = "rgb_label_fn_jax"
 bos_rate_mode = "relative"
 # bos_rate_mode = "absolute"
+share_across_levels = False  # ON for this ablation -- one independent CodeLM/Downsampler/Upsampler
+# per level (own weights each), not the singleton shared-across-levels default. bos_rate_mode is
+# moot in this mode (rate_id always 0, see LagCodecModel.bos_rate_id/codelm_bos_rate_id).
 strides = (4, 4)              # single level only -- no cascade
 attn_window = 1024
 upsampler_ncodes = (16, 16)
@@ -45,9 +56,9 @@ upsampler_n_kv_heads = 8
 upsampler_window = 4
 upsampler_remat = True
 
-use_codelm_bos = False   # ON for this ablation (was False in cifar_res_full1.py)
-# use_codelm_bos = True   # ON for this ablation (was False in cifar_res_full1.py)
-# codelm_bos_prob = 1.0   # always substitute -- no probabilistic drop back to real content
+use_codelm_bos = False
+# use_codelm_bos = True
+# codelm_bos_prob = 1.0
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
 encode_temperature = 1.0
@@ -72,7 +83,7 @@ eval_gen_train = True
 # --- training ---
 batch_size = 8
 val_batch_size = 8
-level_steps = (int(10e3),int(20e3))  # single phase, full original 70k budget (was split 10k/10k/50k across 3 levels)
+level_steps = (int(10e3),int(20e3))
 seed = 0
 train_subset_n = None
 val_subset_n = None

@@ -1,5 +1,5 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_full2.py
+uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_1_lreg_ent_ar.py
 """
 # Fork of cifar_res_full1.py -- diagnostic ablation for the "generation too blurry" observation
 # (cifar_res_full1's finished-run samples were structurally correct but blurry/regression-to-mean,
@@ -30,7 +30,7 @@ rope_base = 10000.0
 ntp_weight = 1.0
 mse_weight = 0.0
 entropy_weight = 1.0
-label_reg_weight = 0.0
+label_reg_weight = 1.0
 
 label_fn = "rgb_label_fn_jax"
 # bos_rate_mode = "relative"
@@ -67,11 +67,11 @@ use_codelm_bos = False   # ON for this ablation (was False in cifar_res_full1.py
 # codelm_bos_prob = 1.0   # always substitute -- no probabilistic drop back to real content
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
-encode_temperature = 1.0
+encode_temperature = 0.1
 gumbel_at_inference = False
 mse_softmax_tau = 1.0
-level_gt_drop = 0.9
-quantize_drop = 0.9
+level_gt_drop = 0.5
+quantize_drop = 0.5
 
 init_scheme = "llama"
 use_xsa = True
@@ -80,6 +80,8 @@ precision = "bf16"
 
 byte_group = 3
 token_head_type = "ar"
+codelm_token_head = "ar"   # CodeLM NTP/free-run head: autoregressive digits
+pardec_token_head = "ar"    # downsampler/upsampler digit head: autoregressive digits
 token_dim = 64
 token_n_heads = 2
 traversal = "zorder"
@@ -89,7 +91,7 @@ eval_gen_train = True
 # --- training ---
 batch_size = 8
 val_batch_size = 8
-level_steps = (int(10e3),int(20e3))  # single phase, full original 70k budget (was split 10k/10k/50k across 3 levels)
+level_steps = (int(20e3),int(20e3))  # single phase, full original 70k budget (was split 10k/10k/50k across 3 levels)
 seed = 0
 train_subset_n = None
 val_subset_n = None
@@ -103,7 +105,7 @@ lr_min = 1e-5
 lr_min_step = int(20e3)
 warmup_steps = 1000
 optimizer = "adamw"
-optimizer_kwargs = dict(weight_decay=1e-5)
+optimizer_kwargs = dict(weight_decay=0)
 
 # --- logging ---
 log_every = 100

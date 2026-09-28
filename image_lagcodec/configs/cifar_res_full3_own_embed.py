@@ -1,6 +1,11 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_full1.py
+uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_full3_own_embed.py
 """
+# Fork of cifar_res_full3.py -- context_source="own_embed" (downsampler and upsampler each get
+# their OWN plain per-position embedding table as context, no self-attention, no CodeLM pass at
+# all) on top of share_across_levels=False. See cifar_res_full5.py's docstring for hypothesis
+# background.
+
 # --- model ---
 img_size = 32
 
@@ -23,6 +28,8 @@ label_reg_weight = 1.0
 label_fn = "rgb_label_fn_jax"
 bos_rate_mode = "relative"
 # bos_rate_mode = "absolute"
+share_across_levels = False
+context_source = "own_embed"  # ON for this ablation
 strides = (4, 4)              # single level only -- no cascade
 attn_window = 1024
 upsampler_ncodes = (16, 16)
@@ -45,9 +52,9 @@ upsampler_n_kv_heads = 8
 upsampler_window = 4
 upsampler_remat = True
 
-use_codelm_bos = False   # ON for this ablation (was False in cifar_res_full1.py)
-# use_codelm_bos = True   # ON for this ablation (was False in cifar_res_full1.py)
-# codelm_bos_prob = 1.0   # always substitute -- no probabilistic drop back to real content
+use_codelm_bos = False
+# use_codelm_bos = True
+# codelm_bos_prob = 1.0
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
 encode_temperature = 1.0
@@ -72,7 +79,7 @@ eval_gen_train = True
 # --- training ---
 batch_size = 8
 val_batch_size = 8
-level_steps = (int(10e3),int(20e3))  # single phase, full original 70k budget (was split 10k/10k/50k across 3 levels)
+level_steps = (int(10e3),int(20e3))
 seed = 0
 train_subset_n = None
 val_subset_n = None

@@ -1,6 +1,14 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_full1.py
+uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_full4.py
 """
+# Fork of cifar_res_full3.py -- ALSO reduces upsampler_ncodes 16->4 (context_group_size=
+# output_group_size=4 instead of 16, so level0's own decode groups become 4*K0=16 raw pixels =
+# 4x4 blocks instead of 8x8). cifar_res_full3 (share_across_levels=False) still showed the same
+# periodic every-8th-column/row dot artifact after pulling its logs/samples 2026-09-28 -- disabling
+# weight sharing alone did NOT fix it, so this isolates the OTHER candidate: upsampler_ncodes'
+# group-boundary size itself. If the artifact's period shrinks from 8 to ~4 (or disappears), that
+# confirms the group-tail decode hypothesis from audit_gen_dots.py.
+
 # --- model ---
 img_size = 32
 
@@ -23,9 +31,10 @@ label_reg_weight = 1.0
 label_fn = "rgb_label_fn_jax"
 bos_rate_mode = "relative"
 # bos_rate_mode = "absolute"
+share_across_levels = False
 strides = (4, 4)              # single level only -- no cascade
 attn_window = 1024
-upsampler_ncodes = (16, 16)
+upsampler_ncodes = (4, 4)  # was (16, 16) in cifar_res_full3.py -- the variable under test here
 attn_lookahead = 0
 upsampler_decode_past = 0
 upsampler_decode_future = 4
@@ -45,9 +54,9 @@ upsampler_n_kv_heads = 8
 upsampler_window = 4
 upsampler_remat = True
 
-use_codelm_bos = False   # ON for this ablation (was False in cifar_res_full1.py)
-# use_codelm_bos = True   # ON for this ablation (was False in cifar_res_full1.py)
-# codelm_bos_prob = 1.0   # always substitute -- no probabilistic drop back to real content
+use_codelm_bos = False
+# use_codelm_bos = True
+# codelm_bos_prob = 1.0
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
 encode_temperature = 1.0
@@ -72,7 +81,7 @@ eval_gen_train = True
 # --- training ---
 batch_size = 8
 val_batch_size = 8
-level_steps = (int(10e3),int(20e3))  # single phase, full original 70k budget (was split 10k/10k/50k across 3 levels)
+level_steps = (int(10e3),int(20e3))
 seed = 0
 train_subset_n = None
 val_subset_n = None

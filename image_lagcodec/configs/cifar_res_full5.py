@@ -1,6 +1,17 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_full1.py
+uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_full5.py
 """
+# Fork of cifar_res_full1.py -- tests context_source="own_embed" (downsampler/upsampler each get a
+# plain per-position embedding table as context, NO self-attention/contextualization at all,
+# bypassing CodeLM's own causal block stack entirely) instead of the default "codelm" (CodeLM's
+# contextualized hidden states). This is the last untested candidate for the periodic every-8th-
+# row/col decode artifact (audit_gen_dots.py, 2026-09-28) after ruling out weight sharing
+# (cifar_res_full3), label antialiasing (cifar_res_full2 has label_reg_weight=0, still showed it),
+# group size (old cifar_parfullcausal2.py used the same decoder_ncodes=16 with no bug), and the
+# window/RoPE/mask construction itself (verified identical to the old pre-refactor code). The old
+# run_lagcodec.py used a dedicated ctx_embed table for decode context, not a shared contextualized
+# encoder -- this config isolates that exact difference.
+
 # --- model ---
 img_size = 32
 
@@ -23,6 +34,7 @@ label_reg_weight = 1.0
 label_fn = "rgb_label_fn_jax"
 bos_rate_mode = "relative"
 # bos_rate_mode = "absolute"
+context_source = "own_embed"  # ON for this ablation -- see module docstring
 strides = (4, 4)              # single level only -- no cascade
 attn_window = 1024
 upsampler_ncodes = (16, 16)
@@ -45,9 +57,9 @@ upsampler_n_kv_heads = 8
 upsampler_window = 4
 upsampler_remat = True
 
-use_codelm_bos = False   # ON for this ablation (was False in cifar_res_full1.py)
-# use_codelm_bos = True   # ON for this ablation (was False in cifar_res_full1.py)
-# codelm_bos_prob = 1.0   # always substitute -- no probabilistic drop back to real content
+use_codelm_bos = False
+# use_codelm_bos = True
+# codelm_bos_prob = 1.0
 curriculum_mode = "no_freeze"
 quantize_mode = "gumbel"
 encode_temperature = 1.0
@@ -72,7 +84,7 @@ eval_gen_train = True
 # --- training ---
 batch_size = 8
 val_batch_size = 8
-level_steps = (int(10e3),int(20e3))  # single phase, full original 70k budget (was split 10k/10k/50k across 3 levels)
+level_steps = (int(10e3),int(20e3))
 seed = 0
 train_subset_n = None
 val_subset_n = None

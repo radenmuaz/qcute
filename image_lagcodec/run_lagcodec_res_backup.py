@@ -1,3 +1,18 @@
+"""
+TODO (multi-res generalization, not implemented -- proposal only, 2026-09-27):
+Currently `strides` is a flat tuple, one fixed K per level (e.g. (4,4)). To let each level support
+SEVERAL stride options (e.g. level0 in {4,16,32}, level1 in {4,16}) instead of one linear cascade:
+  1. strides: tuple[int] -> tuple[tuple[int]], one set of allowed K per level.
+  2. No new weight sets needed -- K is already a runtime arg to pardec_score/pardec_generate/
+     encode_pardec_downsampler, not baked into weight shapes.
+  3. Generalize bos_rate_map's dedup key from level_idx to (level_idx, stride_choice).
+  4. Extend sample_multires_entry/level_forward_multires to also sample a stride PER visited level,
+     not just which levels are visited.
+  5. n_blocks_for_level must depend on the specific sampled stride path, not a fixed cumulative
+     product.
+  6. generate_from_prompt's cascade must record which K encoded each level and replay the SAME K
+     on the matching decode step.
+"""
 from __future__ import annotations
 
 import argparse
@@ -68,11 +83,11 @@ class Config:
     # into one group/call. Inverse of upsampler_ncodes in spirit (that one EXPANDS one context group
     # into upsampler_ncodes output codes; this one CONTRACTS downsampler_ncodes context groups into
     # downsampler_ncodes output codes scored/generated together) but same underlying mechanism.
-    use_pardec_downsampler: bool = False  # False (default) = old naive-pick/code_head path in
-    # encode(); True = encode_pardec_downsampler (teacher-forced against label_fn, requires
-    # label_reg_weight>0 -- that's now the ONLY loss training the downsampler, not an aux term)
-    upsampler_d_model: tuple = 1024  # PardecLM instance used by decode_logits_and_target_pardec/
-    upsampler_n_layers: tuple = 4    # decode_generate_pardec when use_pardec_upsampler=True -- own
+    # Downsampler/upsampler always route through the PardecLM-based path (encode_pardec_downsampler/
+    # decode_logits_and_target_multipass) -- the old naive code_head/dec_blocks alternatives were
+    # removed 2026-09-27 (use_pardec_downsampler/use_pardec_upsampler flags deleted).
+    upsampler_d_model: tuple = 1024  # PardecLM instance used by decode_logits_and_target_multipass/
+    upsampler_n_layers: tuple = 4    # decode_generate_multipass -- own
     upsampler_n_heads: tuple = 8     # dedicated capacity (mirrors downsampler_*), NOT reused from
     upsampler_n_kv_heads: tuple = 8  # own dedicated capacity; context_hidden_dim = codelm_d_model
     # (CodeLM's own dim) -- same as downsampler's, no separate ctx dimension for the upsampler
@@ -91,12 +106,25 @@ class Config:
     # this field's own default anyway, since the downsampler never consumed it).
     upsampler_remat: tuple = None  # None falls back to cfg.remat (remat granularity has no natural
     # own-module default, same reasoning as downsampler_remat)
-    use_pardec_upsampler: bool = False  # False (default) = old hand-rolled dec_blocks/ctx_embed
-    # pardec decode path in decode_logits_and_target_pardec/decode_generate_pardec. True =
-    # PardecLM-based path (pardec_score/pardec_generate, context_group_size=output_group_size=
-    # upsampler_ncodes, output_expansion=K) -- shares the exact same machinery as the downsampler,
-    # just expanding instead of contracting; decode_past is scoring-only here (pardec_generate's own
-    # documented limitation)
+    share_across_levels: bool = True  # True (default, current/original behavior) = exactly ONE
+    # CodeLM/Downsampler/Upsampler instance for the whole model, called at every level -- "which
+    # level" communicated only via rate_id into each module's own bos_embed table (see
+    # LagCodecModel.codelm_for/bos_rate_id). This is the ONLY JAX-correct way to get true weight
+    # tying: one leaf position in the pytree, reused n times inside a single traced loss -- storing
+    # the SAME instance at multiple tuple positions instead would NOT tie weights under jax.grad
+    # (each tuple position is an independent pytree leaf for autodiff, so gradients would diverge
+    # after one optimizer step even though the initial values were equal). False = one fully
+    # independent CodeLM/Downsampler/Upsampler PER LEVEL (own weights, own architecture -- may use
+    # different codelm_d_model/n_layers/etc per level, singleton_uniform_fields assert skipped),
+    # each with its own private bos_embed (n_rates=codelm_bos_rates[level] if use_codelm_bos else 1,
+    # rate_id always 0) since level identity is already structural, not via a shared index.
+    bos_rate_mode: str = "relative"  # only matters when share_across_levels=True (rate_id is always
+    # 0 in the False/per-level-instance case). "relative" (default): rate_id keys off the level's
+    # own EFFECTIVE stride value (see bos_rate_map), so levels with the SAME stride share the SAME
+    # bos row -- e.g. strides=(4,4,4) collapses to n_rates=1 (one rate detected), strides=
+    # (3,16,16,-1) collapses (3,16,16,1) to n_rates=3 (levels 1&2 share a row). "absolute": rate_id
+    # IS the raw level index (old behavior) -- n_rates=n always, one row per level even if two
+    # levels happen to share the same stride.
     share_downsampler_upsampler_lm: bool = False  # False (default) = fully separate downsampler/
     # upsampler PardecLM instances (current behavior, unchanged). True = the two SHARE the same
     # blocks/ln_f (the core transformer LM) -- everything else (context_proj, bos_embed,
@@ -304,28 +332,31 @@ class Config:
                 and len(self.upsampler_window) == n
                 and len(self.upsampler_decode_past) == n and len(self.upsampler_decode_future) == n
                 and len(self.upsampler_remat) == n)
-        # SINGLETON model: exactly one CodeLM, one Downsampler, one Upsampler for the whole model
-        # (see LagCodecModel) -- every field that determines a weight SHAPE must therefore be uniform
-        # across ALL n levels (index 0 is what LagCodecModel actually builds from). Runtime-only
-        # grouping fields (upsampler_ncodes, downsampler_ncodes, decode_past/future, ...) are
-        # exempt -- those vary per level as plain call-time arguments.
-        singleton_uniform_fields = (
-            "codelm_d_model", "codelm_n_layers", "codelm_n_heads", "codelm_n_kv_heads",
-            "code_vocab", "pq_chunks", "pq_dim", "mlp_mult", "rope_base", "attn_lookahead",
-            "attn_window", "encoder_attn_window", "decoder_attn_window", "use_sink", "use_xsa",
-            "use_qknorm", "init_scheme", "quantize_mode", "quantize_drop", "remat", "remat_level",
-            "downsampler_d_model", "downsampler_n_layers", "downsampler_n_heads", "downsampler_n_kv_heads",
-            "downsampler_window", "downsampler_decode_past", "downsampler_decode_future", "downsampler_remat",
-            "upsampler_d_model", "upsampler_n_layers", "upsampler_n_heads", "upsampler_n_kv_heads",
-            "upsampler_window", "upsampler_decode_past", "upsampler_decode_future", "upsampler_remat",
-            "token_dim", "token_n_heads", "token_head_type", "byte_group",
-        )
-        for f in singleton_uniform_fields:
-            vals = getattr(self, f, None)
-            if isinstance(vals, tuple) and len(vals) == n:
-                assert len(set(vals)) <= 1, \
-                    f"singleton CodeLM/Downsampler/Upsampler needs uniform '{f}' across ALL levels " \
-                    f"(one shared module for the whole model, not one per level), got {vals}"
+        # share_across_levels=True (default): exactly one CodeLM, one Downsampler, one Upsampler for
+        # the whole model (see LagCodecModel) -- every field that determines a weight SHAPE must
+        # therefore be uniform across ALL n levels (index 0 is what LagCodecModel actually builds
+        # from). share_across_levels=False: one independent CodeLM/Downsampler/Upsampler per level,
+        # so these fields may legitimately differ per level -- assert skipped entirely in that mode.
+        # Runtime-only grouping fields (upsampler_ncodes, downsampler_ncodes, decode_past/future,
+        # ...) are exempt in EITHER mode -- those vary per level as plain call-time arguments.
+        if self.share_across_levels:
+            singleton_uniform_fields = (
+                "codelm_d_model", "codelm_n_layers", "codelm_n_heads", "codelm_n_kv_heads",
+                "code_vocab", "pq_chunks", "pq_dim", "mlp_mult", "rope_base", "attn_lookahead",
+                "attn_window", "encoder_attn_window", "decoder_attn_window", "use_sink", "use_xsa",
+                "use_qknorm", "init_scheme", "quantize_mode", "quantize_drop", "remat", "remat_level",
+                "downsampler_d_model", "downsampler_n_layers", "downsampler_n_heads", "downsampler_n_kv_heads",
+                "downsampler_window", "downsampler_decode_past", "downsampler_decode_future", "downsampler_remat",
+                "upsampler_d_model", "upsampler_n_layers", "upsampler_n_heads", "upsampler_n_kv_heads",
+                "upsampler_window", "upsampler_decode_past", "upsampler_decode_future", "upsampler_remat",
+                "token_dim", "token_n_heads", "token_head_type", "byte_group",
+            )
+            for f in singleton_uniform_fields:
+                vals = getattr(self, f, None)
+                if isinstance(vals, tuple) and len(vals) == n:
+                    assert len(set(vals)) <= 1, \
+                        f"share_across_levels=True needs uniform '{f}' across ALL levels " \
+                        f"(one shared module for the whole model, not one per level), got {vals}"
         assert len(self.token_head_type) == n
         assert len(self.pq_dim) == n
         assert all(t in ("linears", "ar") for t in self.token_head_type)
@@ -338,6 +369,7 @@ class Config:
         assert self.byte_group in (1, 3), "byte_group must be 1 (per-byte) or 3 (per-pixel RGB)"
         assert total_bytes_of(self) % self.byte_group == 0
         assert self.traversal in ("raster", "zorder")
+        assert self.bos_rate_mode in ("relative", "absolute")
         assert self.strides[-1] == -1 or self.strides[-1] >= 1, \
             "top level's stride is either -1 (don't-care, legacy: top level stays untrained/wasted " \
             "-- see top_level_trainable) or a real stride >=1 (top level becomes fully trainable: " \
@@ -1333,10 +1365,36 @@ def pardec_generate_gumbel(pardec: PardecLM, context_h: jnp.ndarray, context_gro
     return code_softs[:, :n_output_positions], code_idxs[:, :n_output_positions]
 
 
+def bos_rate_map(cfg: "Config") -> tuple:
+    # Only meaningful when cfg.share_across_levels=True (the False/per-level-instance case always
+    # uses rate_id=0, level identity already being structural -- see LagCodecModel.bos_rate_id).
+    # Returns a length-n tuple: level_idx -> rate_id, the row of bos_embed that level reads/writes.
+    n = len(cfg.strides)
+    if cfg.bos_rate_mode == "absolute":
+        return tuple(range(n))
+    # "relative": dedup by EFFECTIVE stride value (K()'s own -1-means-1 convention), first-occurrence
+    # order -- levels sharing the same real stride share the same bos row. strides=(4,4,4) -> effective
+    # (4,4,4) -> one unique value -> (0,0,0), n_rates=1. strides=(3,16,16,-1) -> effective (3,16,16,1)
+    # -> (0,1,1,2), n_rates=3 (levels 1&2 share a row, level 3's stride=1 gets its own).
+    seen = {}
+    out = []
+    for i in range(n):
+        k = cfg.strides[i] if cfg.strides[i] != -1 else 1
+        if k not in seen:
+            seen[k] = len(seen)
+        out.append(seen[k])
+    return tuple(out)
+
+
+def bos_n_rates(cfg: "Config") -> int:
+    return len(set(bos_rate_map(cfg)))
+
+
 class CodeLM(eqx.Module):
     # The "encoder" of the seq2seq framing (CodeLM=encoder, downsampler/upsampler=two separate
-    # decoders). SINGLETON: exactly one CodeLM for the whole model, shared across all levels --
-    # NOT one per level. A level's raw byte input (level 0) and a level's code input (level>0)
+    # decoders). cfg.share_across_levels=True (default): exactly one CodeLM instance for the whole
+    # model, shared across all levels via LagCodecModel.codelm_for/bos_rate_id -- NOT one per level.
+    # A level's raw byte input (level 0) and a level's code input (level>0)
     # already share the same categorical structure by construction (byte_group==pq_chunks,
     # 256==code_vocab, enforced uniform in Config.__post_init__), which is what makes one shared
     # embedding/code_head/ntp_head correct for every level. K (stride) is a runtime grouping
@@ -1364,25 +1422,26 @@ class CodeLM(eqx.Module):
     n_heads: int = eqx.field(static=True)  # needed for KV-cache sizing in _encoder_free_run
     n_kv_heads: int = eqx.field(static=True)
 
-    def __init__(self, key, cfg: Config):
-        # Single shared architecture: Config.__post_init__ asserts codelm_d_model/codelm_n_layers/
-        # codelm_n_heads/codelm_n_kv_heads/pq_chunks/code_vocab/pq_dim/mlp_mult/rope_base/
-        # attn_lookahead/attn_window are uniform across ALL levels -- index 0 is the representative
-        # value. codelm_* are CodeLM's own fully independent fields (no fallback to anything else).
-        D_enc = cfg.codelm_d_model[0]
-        n_layers_enc = cfg.codelm_n_layers[0]
-        n_heads_enc = cfg.codelm_n_heads[0]
-        n_kv_heads_enc = cfg.codelm_n_kv_heads[0]
+    def __init__(self, key, cfg: Config, level_idx: int = 0):
+        # level_idx: which per-level config tuple entry to read architecture from. share_across_levels
+        # =True (default): always 0 (Config.__post_init__ asserts codelm_* uniform across ALL levels
+        # in that mode, so index 0 is representative of every level). share_across_levels=False: the
+        # caller (LagCodecModel) builds one CodeLM per level, each with its own level_idx -- may then
+        # have genuinely different d_model/n_layers/etc per level.
+        D_enc = cfg.codelm_d_model[level_idx]
+        n_layers_enc = cfg.codelm_n_layers[level_idx]
+        n_heads_enc = cfg.codelm_n_heads[level_idx]
+        n_kv_heads_enc = cfg.codelm_n_kv_heads[level_idx]
         self.remat = cfg.remat
         self.remat_level = cfg.remat_level
-        self.attn_lookahead = cfg.attn_lookahead[0]
-        self.pq_chunks, self.code_vocab = cfg.pq_chunks[0], cfg.code_vocab[0]
+        self.attn_lookahead = cfg.attn_lookahead[level_idx]
+        self.pq_chunks, self.code_vocab = cfg.pq_chunks[level_idx], cfg.code_vocab[level_idx]
         self.quantize_mode = cfg.quantize_mode
         self.quantize_drop = cfg.quantize_drop
         self.use_codelm_bos = cfg.use_codelm_bos
         self.codelm_bos_prob = cfg.codelm_bos_prob
         self.n_heads, self.n_kv_heads = n_heads_enc, n_kv_heads_enc
-        pq_dim = cfg.pq_dim[0]
+        pq_dim = cfg.pq_dim[level_idx]
         own_vocab = self.code_vocab  # raw bytes and codes share one categorical structure (see above)
         ntp_out = self.pq_chunks * self.code_vocab
         keys = jax.random.split(key, 4)
@@ -1391,17 +1450,27 @@ class CodeLM(eqx.Module):
         self.own_input_embed = init_matrix(keys[0], (own_vocab, pq_dim), scheme)
         self.own_input_proj = init_matrix(keys[1], (self.pq_chunks * pq_dim, D_enc), scheme)
         block_keys = jax.random.split(jax.random.fold_in(key, 8801), n_layers_enc)
-        enc_window_val = cfg.encoder_attn_window[0] if cfg.encoder_attn_window[0] is not None else cfg.attn_window[0]
+        enc_window_val = (cfg.encoder_attn_window[level_idx] if cfg.encoder_attn_window[level_idx] is not None
+                           else cfg.attn_window[level_idx])
         enc_window = None if enc_window_val == -1 else enc_window_val
-        self.blocks = [Block(k, D_enc, n_heads_enc, n_kv_heads_enc, cfg.mlp_mult[0], cfg.rope_base[0],
+        self.blocks = [Block(k, D_enc, n_heads_enc, n_kv_heads_enc, cfg.mlp_mult[level_idx], cfg.rope_base[level_idx],
                              n_layers=n_layers_enc, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm,
                              window=enc_window, lookahead=self.attn_lookahead, use_sink=cfg.use_sink) for k in block_keys]
         self.ln_f = RMSNorm(D_enc)
         self.code_head = init_matrix(keys[2], (D_enc, self.pq_chunks * self.code_vocab), scheme)
         self.ntp_head = init_matrix(keys[3], (D_enc, ntp_out), scheme)
-        n_levels = len(cfg.strides)
-        n_bos_rates = n_levels if cfg.use_codelm_bos else 1  # rate_id IS the level index -- derived,
-        # not a separate manual knob, since there's exactly one CodeLM and n_levels is already known
+        # CodeLM's own bos is ALWAYS absolute (one row per level index), regardless of
+        # cfg.bos_rate_mode -- unlike downsampler/upsampler's bos (which anchors a group's
+        # contraction/expansion RATE, so dedup-by-rate is sound), CodeLM's bos anchors "which level
+        # am I generating" for encoder_free_run's pure-unconditional rollout. Two levels sharing the
+        # same effective stride (e.g. both K=4) are still semantically distinct free-run targets
+        # (different resolution/content statistics), so collapsing them onto one shared row would
+        # conflate two different anchors -- level IDENTITY, not rate, is what this needs to encode.
+        # share_across_levels=False: this instance already belongs to exactly one level structurally,
+        # so it only needs its own private row(s) (n_rates=codelm_bos_rates[level_idx], rate_id
+        # always 0 at call time -- see LagCodecModel.codelm_bos_rate_id).
+        n_bos_rates = (len(cfg.strides) if cfg.share_across_levels else cfg.codelm_bos_rates[level_idx]) \
+            if cfg.use_codelm_bos else 1
         bos_keys = jax.random.split(jax.random.fold_in(key, 8901), n_bos_rates)
         self.bos_embed = jnp.stack([init_vector(k, D_enc, scheme) for k in bos_keys], axis=0)
 
@@ -1474,36 +1543,37 @@ def codelm_bos_substitute(codelm: CodeLM, x: jnp.ndarray, rate_id: int, rng, gro
     # before running it through CodeLM's blocks -- easy to forget per call site, so every caller
     # should route through here instead of reimplementing it inline.
     #
-    # REPEAT-PER-GROUP mode (active as of 2026-09-27, testing the weight-sharing hypothesis for
-    # "train mse low but gen bad": with a SHARED CodeLM across all levels, a group only knew which
-    # level it belonged to via PardecLM's own per-group bos_embed[rate_id] row -- CodeLM's OWN
-    # context representation h never got a matching per-group anchor, only a global one at absolute
-    # sequence position 0). Substitutes bos at the start of EVERY group (positions
-    # 0, group_size, 2*group_size, ...) in x, not just position 0 -- so CodeLM's own context gets a
-    # level anchor at every group boundary regardless of how far it is from the true sequence start
-    # or how bounded downsampler_window/upsampler_window/attn_window are.
-    #
-    # OLD (bos-once, commented out, not deleted -- toggle back by swapping which block runs):
+    # REPEAT-PER-GROUP mode (tried 2026-09-27, testing the weight-sharing hypothesis for "train mse
+    # low but gen bad": with a SHARED CodeLM across all levels, a group only knew which level it
+    # belonged to via PardecLM's own per-group bos_embed[rate_id] row -- CodeLM's OWN context
+    # representation h never got a matching per-group anchor, only a global one at absolute sequence
+    # position 0). REVERTED same day: user confirmed via real training run (cifar_res_full2) this did
+    # NOT fix the bad-generation symptom, and separately confirmed use_codelm_bos=False entirely
+    # (run_lagcodec_res_v1.py, pre-bos-substitution code) DID work -- so bos substitution itself (in
+    # either form) is implicated, not just its once-vs-per-group granularity. Kept as a comment, not
+    # deleted, in case it's revisited:
     # if codelm.use_codelm_bos and rng is not None:
-    #     B = x.shape[0]
+    #     B, T = x.shape[0], x.shape[1]
     #     do_sub = jax.random.bernoulli(jax.random.fold_in(rng, 424242), p=codelm.codelm_bos_prob, shape=(B,))
-    #     x0 = jnp.where(do_sub[:, None], codelm.bos_embed[rate_id], x[:, 0, :])
-    #     x = x.at[:, 0, :].set(x0)
+    #     bos_row = codelm.bos_embed[rate_id]
+    #     for s in range(0, T, group_size):
+    #         xs = jnp.where(do_sub[:, None], bos_row, x[:, s, :])
+    #         x = x.at[:, s, :].set(xs)
     # return x
+    #
+    # ACTIVE (bos-once at position 0 -- original pre-repeat-per-group behavior, restored):
     if codelm.use_codelm_bos and rng is not None:
-        B, T = x.shape[0], x.shape[1]
+        B = x.shape[0]
         do_sub = jax.random.bernoulli(jax.random.fold_in(rng, 424242), p=codelm.codelm_bos_prob, shape=(B,))
-        bos_row = codelm.bos_embed[rate_id]
-        for s in range(0, T, group_size):
-            xs = jnp.where(do_sub[:, None], bos_row, x[:, s, :])
-            x = x.at[:, s, :].set(xs)
+        x0 = jnp.where(do_sub[:, None], codelm.bos_embed[rate_id], x[:, 0, :])
+        x = x.at[:, 0, :].set(x0)
     return x
 
 
 def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndarray, target_idx: jnp.ndarray,
                                flat_bytes: jnp.ndarray, cfg: "Config", pixel_order, label_fn,
                                K: int, rate_id: int = 0, rng=None, downsampler_ncodes: int = 1,
-                               encode_temperature: float = 1.0) -> dict:
+                               encode_temperature: float = 1.0, codelm_rate_id: int = None) -> dict:
     # CodeLM forward (same as CodeLM.encode()'s first half), then the SHARED downsampler PardecLM
     # teacher-forced against label_fn's real downsampled-image target (context_group_size=K,
     # output_group_size=1 -- one code per K-block, genuinely autoregressive over context).
@@ -1518,7 +1588,12 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndar
     # upsampler needs no change since it already just consumes whatever code_soft it's given.
     # Returns the SAME dict shape as CodeLM.encode() so level_forward's surrounding loss code
     # doesn't change.
-    x = codelm_bos_substitute(codelm, x, rate_id, rng, group_size=K * downsampler_ncodes)
+    # codelm_rate_id: CodeLM's own bos anchor index -- ALWAYS absolute (one row per level, see
+    # LagCodecModel.codelm_bos_rate_id), independent of `rate_id` below (the downsampler's OWN bos,
+    # which follows cfg.bos_rate_mode). Defaults to `rate_id` for standalone/test callers that don't
+    # distinguish the two.
+    codelm_rate_id = rate_id if codelm_rate_id is None else codelm_rate_id
+    x = codelm_bos_substitute(codelm, x, codelm_rate_id, rng, group_size=K * downsampler_ncodes)
     h = x
     def _enc_stack(h):
         for blk in codelm.blocks:
@@ -1565,7 +1640,7 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndar
 def encode_pardec_downsampler_generate(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndarray, K: int,
                                         rate_id: int = 0, rng=None, greedy: bool = True,
                                         temperature: float = 1.0, top_k: int = 0,
-                                        downsampler_ncodes: int = 1) -> dict:
+                                        downsampler_ncodes: int = 1, codelm_rate_id: int = None) -> dict:
     # Generation-time counterpart of encode_pardec_downsampler: that function is TEACHER-FORCED
     # (needs label_fn's real ground-truth target, via pardec_score), so it can't be used for actual
     # free-run generation (generate_from_prompt's upward-encode loop, no ground truth available at
@@ -1576,8 +1651,11 @@ def encode_pardec_downsampler_generate(codelm: CodeLM, downsampler: PardecLM, x:
     # what made cascade generation garbage despite good training loss (loss trains the downsampler
     # via encode_pardec_downsampler; generation was reading a permanently-untrained code_head).
     # Same bos substitution as encode_pardec_downsampler/CodeLM.encode() -- keeps generation-time
-    # distribution consistent with whatever codelm_bos_prob training actually used.
-    x = codelm_bos_substitute(codelm, x, rate_id, rng, group_size=K * downsampler_ncodes)
+    # distribution consistent with whatever codelm_bos_prob training actually used. codelm_rate_id:
+    # see encode_pardec_downsampler's own docstring -- CodeLM's bos is always absolute, independent
+    # of `rate_id` (the downsampler's own bos, which follows cfg.bos_rate_mode).
+    codelm_rate_id = rate_id if codelm_rate_id is None else codelm_rate_id
+    x = codelm_bos_substitute(codelm, x, codelm_rate_id, rng, group_size=K * downsampler_ncodes)
     h = encoder_hidden(codelm, x)
     code_idx = pardec_generate(downsampler, h, context_group_size=K * downsampler_ncodes,
                                 output_group_size=downsampler_ncodes, rng=rng,
@@ -1596,25 +1674,29 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
     # is the shared feature extractor for both. Run this level's own code through CodeLM's own
     # embed table + block stack (same as encoder_hidden/CodeLM.encode()'s first half) to get real
     # contextualized hidden states, not a separate dedicated ctx_embed/ctx_proj lookup shortcut.
-    codelm = model.codelm
+    codelm = model.codelm_for(level_idx)
+    codelm_rate_id = model.codelm_bos_rate_id(level_idx)  # CodeLM's own bos: always absolute
+    rate_id = model.bos_rate_id(level_idx)  # upsampler's own bos: follows cfg.bos_rate_mode
     x_ctx = code_embed_proj(ctx_code_soft, codelm.own_input_embed, codelm.own_input_proj)
-    x_ctx = codelm_bos_substitute(codelm, x_ctx, level_idx, rng, group_size=upsampler_ncodes)
+    x_ctx = codelm_bos_substitute(codelm, x_ctx, codelm_rate_id, rng, group_size=upsampler_ncodes)
     h_ctx = encoder_hidden(codelm, x_ctx)
     logits, target_out, aux_loss, aux_acc = pardec_score(
-        model.upsampler, target_seq, h_ctx, context_group_size=upsampler_ncodes, output_group_size=upsampler_ncodes,
-        rate_id=level_idx, output_expansion=model.K(level_idx))
+        model.upsampler_for(level_idx), target_seq, h_ctx, context_group_size=upsampler_ncodes,
+        output_group_size=upsampler_ncodes, rate_id=rate_id, output_expansion=model.K(level_idx))
     return logits, target_out, None, aux_loss, aux_acc
 
 
 def _decode_generate_pardec_call(model, level_idx, ctx_idx, upsampler_ncodes, greedy, temperature, seed):
-    codelm = model.codelm
+    codelm = model.codelm_for(level_idx)
+    codelm_rate_id = model.codelm_bos_rate_id(level_idx)  # CodeLM's own bos: always absolute
+    rate_id = model.bos_rate_id(level_idx)  # upsampler's own bos: follows cfg.bos_rate_mode
     rng = jax.random.PRNGKey(seed)
     x_ctx = code_embed_proj(ctx_idx, codelm.own_input_embed, codelm.own_input_proj)
-    x_ctx = codelm_bos_substitute(codelm, x_ctx, level_idx, rng, group_size=upsampler_ncodes)
+    x_ctx = codelm_bos_substitute(codelm, x_ctx, codelm_rate_id, rng, group_size=upsampler_ncodes)
     h_ctx = encoder_hidden(codelm, x_ctx)
-    return pardec_generate(model.upsampler, h_ctx, context_group_size=upsampler_ncodes,
+    return pardec_generate(model.upsampler_for(level_idx), h_ctx, context_group_size=upsampler_ncodes,
                             output_group_size=upsampler_ncodes, rng=rng, greedy=greedy, temperature=temperature,
-                            top_k=model.cfg.gen_top_k, rate_id=level_idx, output_expansion=model.K(level_idx))
+                            top_k=model.cfg.gen_top_k, rate_id=rate_id, output_expansion=model.K(level_idx))
 
 
 _decode_generate_pardec_jit = eqx.filter_jit(_decode_generate_pardec_call)
@@ -1741,21 +1823,21 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
     code) and, when available, "sampled" (the free-run tokens themselves)."""
     n = len(cfg.strides)
     assert n - 2 <= sample_level <= n - 1, f"sample_level {sample_level} must be one of the top two levels of {n}"
-    codelm = model.codelm
+    codelm0 = model.codelm_for(0)
     byte_pq_fn = byte_pq_fn or rgb_byte_pq_fn
     K0 = model.K(0)
     B, P, _ = prompt_bytes.shape
     assert P % K0 == 0, f"prompt length {P} must be a multiple of the level-0 stride {K0}"
-    tok = byte_pq_fn(prompt_bytes, codelm.pq_chunks, codelm.code_vocab)
+    tok = byte_pq_fn(prompt_bytes, codelm0.pq_chunks, codelm0.code_vocab)
     for i in range(sample_level):
-        x = code_embed_proj(tok, codelm.own_input_embed, codelm.own_input_proj)
-        if cfg.use_pardec_downsampler:
-            tok = encode_pardec_downsampler_generate(codelm, model.downsampler, x, model.K(i), rate_id=i,
-                                                       rng=jax.random.fold_in(rng, i), greedy=greedy,
-                                                       temperature=encode_temperature,
-                                                       downsampler_ncodes=cfg.downsampler_ncodes[i])["code_idx"]
-        else:
-            tok = codelm.encode(x, tok, model.K(i), rng=None, encode_temperature=encode_temperature, rate_id=i)["code_idx"]
+        codelm_i = model.codelm_for(i)
+        x = code_embed_proj(tok, codelm_i.own_input_embed, codelm_i.own_input_proj)
+        tok = encode_pardec_downsampler_generate(codelm_i, model.downsampler_for(i), x, model.K(i),
+                                                   rate_id=model.bos_rate_id(i),
+                                                   codelm_rate_id=model.codelm_bos_rate_id(i),
+                                                   rng=jax.random.fold_in(rng, i), greedy=greedy,
+                                                   temperature=encode_temperature,
+                                                   downsampler_ncodes=cfg.downsampler_ncodes[i])["code_idx"]
         assert tok.shape[1] >= 1, "prompt too short to produce a single code at the sampling level"
     ds = 1
     for i in range(sample_level):
@@ -1768,22 +1850,24 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
     # random mix exactly; False (real content) is kept as the closer default since that's what an
     # actual prompted continuation naturally has.
     use_bos = cfg.use_codelm_bos and cfg.codelm_bos_prob >= 1.0
-    tokens_L = encoder_free_run(codelm, tok, total_positions // ds, model.K(sample_level), rng, greedy,
-                                 temperature, top_k, use_bos=use_bos, rate_id=sample_level)
+    codelm_L = model.codelm_for(sample_level)
+    tokens_L = encoder_free_run(codelm_L, tok, total_positions // ds, model.K(sample_level), rng, greedy,
+                                 temperature, top_k, use_bos=use_bos,
+                                 rate_id=model.codelm_bos_rate_id(sample_level))
 
-    codes, x, tgt = {}, code_embed_proj(tokens_L, codelm.own_input_embed, codelm.own_input_proj), tokens_L
+    codes, x = {}, code_embed_proj(tokens_L, codelm_L.own_input_embed, codelm_L.own_input_proj)
     for i in range(sample_level, n):
-        if cfg.use_pardec_downsampler:
-            out = encode_pardec_downsampler_generate(codelm, model.downsampler, x, model.K(i), rate_id=i,
-                                                       rng=jax.random.fold_in(rng, 1000 + i), greedy=greedy,
-                                                       temperature=encode_temperature,
-                                                       downsampler_ncodes=cfg.downsampler_ncodes[i])
-        else:
-            out = codelm.encode(x, tgt, model.K(i), rng=None, encode_temperature=encode_temperature, rate_id=i)
+        codelm_i = model.codelm_for(i)
+        out = encode_pardec_downsampler_generate(codelm_i, model.downsampler_for(i), x, model.K(i),
+                                                   rate_id=model.bos_rate_id(i),
+                                                   codelm_rate_id=model.codelm_bos_rate_id(i),
+                                                   rng=jax.random.fold_in(rng, 1000 + i), greedy=greedy,
+                                                   temperature=encode_temperature,
+                                                   downsampler_ncodes=cfg.downsampler_ncodes[i])
         codes[i] = out["code_idx"]
         if i < n - 1:
-            x = code_embed_proj(out["code_soft"], codelm.own_input_embed, codelm.own_input_proj)
-            tgt = out["code_idx"]
+            codelm_next = model.codelm_for(i + 1)
+            x = code_embed_proj(out["code_soft"], codelm_next.own_input_embed, codelm_next.own_input_proj)
 
     def cascade(cur, from_level):
         for i in range(from_level, -1, -1):
@@ -1800,57 +1884,101 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
 
 
 class LagCodecModel(eqx.Module):
-    # SINGLETON model: exactly one CodeLM, one Downsampler, one Upsampler total -- NOT one per
-    # level. "Which level" is communicated to each shared module via rate_id (a bos_embed row),
-    # not via separate weights -- see CodeLM/PardecLM. Architecture (d_model, n_layers, pq_chunks,
-    # code_vocab, pq_dim, ...) must therefore be uniform across ALL levels (enforced in
-    # Config.__post_init__); only runtime grouping (K, upsampler_ncodes, downsampler_ncodes,
-    # decode_past/future, ...) may still vary per level, passed as plain call-time arguments.
-    codelm: CodeLM
-    downsampler: PardecLM
-    upsampler: PardecLM
+    # cfg.share_across_levels=True (default, original behavior): codelms/downsamplers/upsamplers
+    # each hold exactly ONE instance (tuple of length 1), reused at every level via codelm_for/
+    # downsampler_for/upsampler_for + bos_rate_id -- "which level" communicated only via rate_id (a
+    # bos_embed row), not via separate weights. This is the only JAX-correct way to tie weights (one
+    # pytree leaf position, called n times inside a single traced loss -- see train_step's comment).
+    # cfg.share_across_levels=False: one independent CodeLM/Downsampler/Upsampler PER LEVEL (own
+    # weights, own architecture -- singleton_uniform_fields assert is skipped in this mode so
+    # per-level d_model/n_layers/etc may genuinely differ), tuples have length n = len(strides).
+    codelms: tuple
+    downsamplers: tuple
+    upsamplers: tuple
     cfg: Config = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config):
         self.cfg = cfg
         n = len(cfg.strides)
-        keys = jax.random.split(key, 4)
-        self.codelm = CodeLM(keys[0], cfg)
-        # CodeLM is the shared feature extractor for BOTH decode heads: Downsampler's context is
-        # CodeLM's hidden states from this level's own INPUT; Upsampler's context is CodeLM's
-        # hidden states from re-running this level's own CODE through the exact same embed table +
-        # block stack (see decode_logits_and_target_multipass/_decode_generate_pardec_call) -- no
-        # special-cased separate ctx_embed/ctx_proj shortcut for the Upsampler. Both therefore share
-        # the same context_hidden_dim = CodeLM's own D_enc.
-        D_enc = cfg.codelm_d_model[0]
-        pq_dim, code_vocab, pq_chunks = cfg.pq_dim[0], cfg.code_vocab[0], cfg.pq_chunks[0]
-        scheme, use_xsa, use_qknorm = cfg.init_scheme, cfg.use_xsa, cfg.use_qknorm
+        n_instances = 1 if cfg.share_across_levels else n
+        codelms, downsamplers, upsamplers = [], [], []
+        for j in range(n_instances):
+            level_idx = j  # share=True: n_instances==1, so level_idx is always 0 (the representative
+            # index singleton_uniform_fields already enforces uniformity against); share=False:
+            # level_idx==j, this instance's own dedicated level.
+            codelms.append(CodeLM(jax.random.fold_in(key, 100 + j), cfg, level_idx=level_idx))
+            # CodeLM is the shared feature extractor for BOTH decode heads: Downsampler's context is
+            # CodeLM's hidden states from this level's own INPUT; Upsampler's context is CodeLM's
+            # hidden states from re-running this level's own CODE through the exact same embed table
+            # + block stack (see decode_logits_and_target_multipass/_decode_generate_pardec_call) --
+            # no special-cased separate ctx_embed/ctx_proj shortcut for the Upsampler. Both therefore
+            # share the same context_hidden_dim = this instance's own CodeLM D_enc.
+            D_enc = cfg.codelm_d_model[level_idx]
+            pq_dim, code_vocab, pq_chunks = cfg.pq_dim[level_idx], cfg.code_vocab[level_idx], cfg.pq_chunks[level_idx]
+            scheme, use_xsa, use_qknorm = cfg.init_scheme, cfg.use_xsa, cfg.use_qknorm
+            # n_rates: share=True needs one bos row per DISTINCT rate (bos_rate_map/bos_n_rates,
+            # dedup by effective stride in "relative" mode, one per level index in "absolute");
+            # share=False instances are already level-dedicated, so they only need their own row.
+            n_rates = bos_n_rates(cfg) if cfg.share_across_levels else 1
 
-        downsampler_remat = cfg.remat if cfg.downsampler_remat[0] is None else cfg.downsampler_remat[0]
-        self.downsampler = PardecLM(
-            jax.random.fold_in(keys[1], 9101), context_hidden_dim=D_enc, hidden_dim=cfg.downsampler_d_model[0],
-            n_heads=cfg.downsampler_n_heads[0], n_kv_heads=cfg.downsampler_n_kv_heads[0],
-            n_layers=cfg.downsampler_n_layers[0], mlp_mult=cfg.mlp_mult[0], rope_base=cfg.rope_base[0],
-            output_expansion=1, context_window_groups=cfg.downsampler_window[0],
-            output_vocab=code_vocab, output_chunks=pq_chunks, pq_dim=pq_dim,
-            token_dim=cfg.token_dim[0], token_n_heads=cfg.token_n_heads[0],
-            decode_past=cfg.downsampler_decode_past[0], decode_future=cfg.downsampler_decode_future[0],
-            n_rates=n, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, remat=downsampler_remat)
+            downsampler_remat = cfg.remat if cfg.downsampler_remat[level_idx] is None else cfg.downsampler_remat[level_idx]
+            downsampler = PardecLM(
+                jax.random.fold_in(key, 9101 + j), context_hidden_dim=D_enc, hidden_dim=cfg.downsampler_d_model[level_idx],
+                n_heads=cfg.downsampler_n_heads[level_idx], n_kv_heads=cfg.downsampler_n_kv_heads[level_idx],
+                n_layers=cfg.downsampler_n_layers[level_idx], mlp_mult=cfg.mlp_mult[level_idx], rope_base=cfg.rope_base[level_idx],
+                output_expansion=1, context_window_groups=cfg.downsampler_window[level_idx],
+                output_vocab=code_vocab, output_chunks=pq_chunks, pq_dim=pq_dim,
+                token_dim=cfg.token_dim[level_idx], token_n_heads=cfg.token_n_heads[level_idx],
+                decode_past=cfg.downsampler_decode_past[level_idx], decode_future=cfg.downsampler_decode_future[level_idx],
+                n_rates=n_rates, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, remat=downsampler_remat)
+            downsamplers.append(downsampler)
 
-        upsampler_remat = cfg.remat if cfg.upsampler_remat[0] is None else cfg.upsampler_remat[0]
-        K0 = cfg.strides[0] if cfg.strides[0] != -1 else 1  # output_expansion default -- overridden
-        # per-call via decode_logits_and_target_multipass/decode_generate_multipass's model.K(level_idx)
-        self.upsampler = PardecLM(
-            jax.random.fold_in(keys[3], 9201), context_hidden_dim=D_enc, hidden_dim=cfg.upsampler_d_model[0],
-            n_heads=cfg.upsampler_n_heads[0], n_kv_heads=cfg.upsampler_n_kv_heads[0],
-            n_layers=cfg.upsampler_n_layers[0], mlp_mult=cfg.mlp_mult[0], rope_base=cfg.rope_base[0],
-            output_expansion=K0, context_window_groups=cfg.upsampler_window[0],
-            output_vocab=code_vocab, output_chunks=pq_chunks, pq_dim=pq_dim,
-            token_dim=cfg.token_dim[0], token_n_heads=cfg.token_n_heads[0],
-            decode_past=cfg.upsampler_decode_past[0], decode_future=cfg.upsampler_decode_future[0],
-            n_rates=n, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, remat=upsampler_remat,
-            shared_blocks=self.downsampler.blocks if cfg.share_downsampler_upsampler_lm else None,
-            shared_ln_f=self.downsampler.ln_f if cfg.share_downsampler_upsampler_lm else None)
+            upsampler_remat = cfg.remat if cfg.upsampler_remat[level_idx] is None else cfg.upsampler_remat[level_idx]
+            K_default = cfg.strides[level_idx] if cfg.strides[level_idx] != -1 else 1  # output_expansion
+            # default -- overridden per-call via decode_logits_and_target_multipass/
+            # decode_generate_multipass's model.K(level_idx) regardless of mode
+            upsampler = PardecLM(
+                jax.random.fold_in(key, 9201 + j), context_hidden_dim=D_enc, hidden_dim=cfg.upsampler_d_model[level_idx],
+                n_heads=cfg.upsampler_n_heads[level_idx], n_kv_heads=cfg.upsampler_n_kv_heads[level_idx],
+                n_layers=cfg.upsampler_n_layers[level_idx], mlp_mult=cfg.mlp_mult[level_idx], rope_base=cfg.rope_base[level_idx],
+                output_expansion=K_default, context_window_groups=cfg.upsampler_window[level_idx],
+                output_vocab=code_vocab, output_chunks=pq_chunks, pq_dim=pq_dim,
+                token_dim=cfg.token_dim[level_idx], token_n_heads=cfg.token_n_heads[level_idx],
+                decode_past=cfg.upsampler_decode_past[level_idx], decode_future=cfg.upsampler_decode_future[level_idx],
+                n_rates=n_rates, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, remat=upsampler_remat,
+                shared_blocks=downsampler.blocks if cfg.share_downsampler_upsampler_lm else None,
+                shared_ln_f=downsampler.ln_f if cfg.share_downsampler_upsampler_lm else None)
+            upsamplers.append(upsampler)
+
+        self.codelms = tuple(codelms)
+        self.downsamplers = tuple(downsamplers)
+        self.upsamplers = tuple(upsamplers)
+
+    def codelm_for(self, level_idx: int) -> CodeLM:
+        return self.codelms[0] if self.cfg.share_across_levels else self.codelms[level_idx]
+
+    def downsampler_for(self, level_idx: int) -> "PardecLM":
+        return self.downsamplers[0] if self.cfg.share_across_levels else self.downsamplers[level_idx]
+
+    def upsampler_for(self, level_idx: int) -> "PardecLM":
+        return self.upsamplers[0] if self.cfg.share_across_levels else self.upsamplers[level_idx]
+
+    def bos_rate_id(self, level_idx: int) -> int:
+        # Downsampler/upsampler's OWN bos (anchors a group's contraction/expansion RATE).
+        # share_across_levels=True: rate_id comes from bos_rate_map (relative: dedup by effective
+        # stride; absolute: the raw level index). False: each instance already owns exactly one
+        # level structurally, always row(s) 0.
+        return bos_rate_map(self.cfg)[level_idx] if self.cfg.share_across_levels else 0
+
+    def codelm_bos_rate_id(self, level_idx: int) -> int:
+        # CodeLM's OWN bos (anchors "which level am I generating" for encoder_free_run's pure-
+        # unconditional rollout) -- ALWAYS absolute (one row per level index), regardless of
+        # cfg.bos_rate_mode. Two levels sharing the same effective stride are still semantically
+        # distinct free-run targets (different resolution/content statistics), so this must NOT dedup
+        # by rate the way bos_rate_id does for downsampler/upsampler (see CodeLM.__init__'s own
+        # comment on n_bos_rates). share_across_levels=False: each instance already owns exactly one
+        # level structurally, always row(s) 0.
+        return level_idx if self.cfg.share_across_levels else 0
 
     def K(self, level: int) -> int:
         return self.cfg.strides[level] if self.cfg.strides[level] != -1 else 1
@@ -1871,28 +1999,26 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
                    level_gt_drop=None, cascade_rng=None, encode_temperature: float = 1.0,
                    layer_drop_prob=None, label_reg_weight: float = 0.0, label_fn=None,
                    pixel_order=None, byte_pq_fn=None) -> tuple:
-    codelm = model.codelm
+    codelm0 = model.codelm_for(0)
     byte_pq_fn = byte_pq_fn or rgb_byte_pq_fn
     # flat_bytes stays raw (fed to label_fn as-is, which interprets literal byte/pixel values);
     # tok0 is the SAME raw bytes converted into CodeLM's own (pq_chunks, code_vocab) categorical
     # representation via byte_pq_fn -- user-settable, defaults to rgb_byte_pq_fn. Level 0's own
     # input/NTP-target and levels>0's own input/NTP-target now share this exact representation,
     # which is what lets a single shared CodeLM process every level.
-    tok0 = byte_pq_fn(flat_bytes, codelm.pq_chunks, codelm.code_vocab)
-    x = code_embed_proj(tok0, codelm.own_input_embed, codelm.own_input_proj)
+    tok0 = byte_pq_fn(flat_bytes, codelm0.pq_chunks, codelm0.code_vocab)
+    x = code_embed_proj(tok0, codelm0.own_input_embed, codelm0.own_input_proj)
     target = tok0
     codes, codes_soft = [], []
     enc_losses, enc_accs, utils, entropy_losses, label_losses = [], [], [], [], []
     label_mses, label_mse_losses = [], []
     level_rngs = [None] * (2 * phase) if rng is None else list(jax.random.split(rng, 2 * phase))
     for i in range(phase):
-        if model.cfg.use_pardec_downsampler:
-            out = encode_pardec_downsampler(codelm, model.downsampler, x, target, flat_bytes, model.cfg,
-                                             pixel_order, label_fn, model.K(i), rate_id=i, rng=level_rngs[2 * i],
-                                             downsampler_ncodes=model.cfg.downsampler_ncodes[i])
-        else:
-            out = codelm.encode(x, target, model.K(i), rng=level_rngs[2 * i],
-                                 encode_temperature=encode_temperature, layer_drop_prob=layer_drop_prob, rate_id=i)
+        codelm = model.codelm_for(i)
+        out = encode_pardec_downsampler(codelm, model.downsampler_for(i), x, target, flat_bytes, model.cfg,
+                                         pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
+                                         codelm_rate_id=model.codelm_bos_rate_id(i),
+                                         rng=level_rngs[2 * i], downsampler_ncodes=model.cfg.downsampler_ncodes[i])
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
         enc_losses.append(out["ntp_loss"])
@@ -1917,12 +2043,13 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
             pred_label_soft = jnp.sum(label_probs_i * label_values_i, axis=-1)
             label_mse_losses.append(jnp.mean((pred_label_soft - label_tgt.astype(jnp.float32)) ** 2))
         if i < phase - 1:
-            x = code_embed_proj(out["code_soft"], codelm.own_input_embed, codelm.own_input_proj)
+            codelm_next = model.codelm_for(i + 1)
+            x = code_embed_proj(out["code_soft"], codelm_next.own_input_embed, codelm_next.own_input_proj)
             target = out["code_idx"]
 
     dec_losses, dec_accs = [], []
     aux_ntp_losses, aux_ntp_accs = [], []
-    aux_applies = model.upsampler.decode_future > 0 or model.upsampler.decode_past > 0
+    aux_applies = any(u.decode_future > 0 or u.decode_past > 0 for u in model.upsamplers)
 
     byte_mse = None
     mse_loss = 0.0
@@ -2007,32 +2134,30 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
     # in spirit (though the aux tuple shape differs slightly, see below). entry_level>0's input is
     # NOT produced by running the model's own (real) encoder up to that depth -- it's synthesized
     # directly from the real image via the same resize+quantize label_fn already uses for aux
-    # targets, standing in for "a native input at this level's resolution". Every level reuses the
-    # SAME shared CodeLM/downsampler/upsampler (see LagCodecModel) -- this is what actually trains
-    # those shared parameters across every resolution they need to work at, not just the one fixed
-    # depth level_forward always uses.
-    codelm = model.codelm
+    # targets, standing in for "a native input at this level's resolution". With
+    # cfg.share_across_levels=True, every level reuses the SAME shared CodeLM/downsampler/upsampler
+    # (see LagCodecModel) -- this is what actually trains those shared parameters across every
+    # resolution they need to work at, not just the one fixed depth level_forward always uses.
+    codelm_entry = model.codelm_for(entry_level)
     byte_pq_fn = byte_pq_fn or rgb_byte_pq_fn
     if entry_level == 0:
-        entry_code = byte_pq_fn(flat_bytes, codelm.pq_chunks, codelm.code_vocab)
+        entry_code = byte_pq_fn(flat_bytes, codelm_entry.pq_chunks, codelm_entry.code_vocab)
     else:
         n_blocks_entry = n_blocks_for_level(model.cfg, entry_level - 1)
         entry_code = label_fn(flat_bytes, model.cfg, pixel_order, n_blocks_entry,
                                model.cfg.pq_chunks[entry_level - 1], model.cfg.code_vocab[entry_level - 1])
-    x = code_embed_proj(entry_code, codelm.own_input_embed, codelm.own_input_proj)
+    x = code_embed_proj(entry_code, codelm_entry.own_input_embed, codelm_entry.own_input_proj)
     target = entry_code
     codes, codes_soft = [], []
     enc_losses, enc_accs, utils, entropy_losses, label_losses, label_mses = [], [], [], [], [], []
     level_rngs = [None] * (2 * depth) if rng is None else list(jax.random.split(rng, 2 * depth))
     for d in range(depth):
         i = entry_level + d
-        if model.cfg.use_pardec_downsampler:
-            out = encode_pardec_downsampler(codelm, model.downsampler, x, target, flat_bytes, model.cfg,
-                                             pixel_order, label_fn, model.K(i), rate_id=i, rng=level_rngs[2 * d],
-                                             downsampler_ncodes=model.cfg.downsampler_ncodes[i])
-        else:
-            out = codelm.encode(x, target, model.K(i), rng=level_rngs[2 * d],
-                                 encode_temperature=encode_temperature, rate_id=i)
+        codelm = model.codelm_for(i)
+        out = encode_pardec_downsampler(codelm, model.downsampler_for(i), x, target, flat_bytes, model.cfg,
+                                         pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
+                                         codelm_rate_id=model.codelm_bos_rate_id(i),
+                                         rng=level_rngs[2 * d], downsampler_ncodes=model.cfg.downsampler_ncodes[i])
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
         enc_losses.append(out["ntp_loss"])
@@ -2049,7 +2174,8 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
             pred_label_hard = jnp.argmax(enc_logits, axis=-1).astype(jnp.float32)
             label_mses.append(jnp.mean((pred_label_hard - label_tgt.astype(jnp.float32)) ** 2))
         if d < depth - 1:
-            x = code_embed_proj(out["code_soft"], codelm.own_input_embed, codelm.own_input_proj)
+            codelm_next = model.codelm_for(i + 1)
+            x = code_embed_proj(out["code_soft"], codelm_next.own_input_embed, codelm_next.own_input_proj)
             target = out["code_idx"]
 
     dec_losses, dec_accs = [], []
@@ -2209,21 +2335,36 @@ def plot_encoder_outs(model: "LagCodecModel", cfg: Config, imgs: np.ndarray, pix
     # or noise), not a generation audit.
     if cfg.pq_chunks[level] != 3 or cfg.code_vocab[level] != 256:
         return None
-    codelm = model.codelm
+    codelm = model.codelm_for(level)
     flat_raw = jnp.array(images_to_positions(imgs, cfg, pixel_order))
-    flat = rgb_byte_pq_fn(flat_raw, codelm.pq_chunks, codelm.code_vocab) if level == 0 else flat_raw
-    x = code_embed_proj(flat, codelm.own_input_embed, codelm.own_input_proj)
+    codelm0 = model.codelm_for(0)
+    tok0 = rgb_byte_pq_fn(flat_raw, codelm0.pq_chunks, codelm0.code_vocab)
+    # For level>0, `level`'s own real input is level (level-1)'s own REAL encoded code output, not
+    # the raw image re-fed directly (that was the bug, fixed 2026-09-28: feeding raw 1024-position
+    # bytes straight into level1's downsampler -- which was only ever trained on level0's own
+    # 256-length code sequence -- ran it wildly out-of-distribution, producing the "hot pixel dot"
+    # codegrid artifact). Chain through the real encode cascade (same pattern as level_forward's own
+    # encode loop) to get the genuine input this level actually sees during training/generation.
+    flat = tok0
+    x = code_embed_proj(tok0, codelm0.own_input_embed, codelm0.own_input_proj)
+    for i in range(level):
+        codelm_i = model.codelm_for(i)
+        out_i = encode_pardec_downsampler(codelm_i, model.downsampler_for(i), x, flat, flat_raw, cfg,
+                                           pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
+                                           codelm_rate_id=model.codelm_bos_rate_id(i),
+                                           downsampler_ncodes=cfg.downsampler_ncodes[i])
+        flat = out_i["code_idx"]
+        codelm_next = model.codelm_for(i + 1)
+        x = code_embed_proj(out_i["code_soft"], codelm_next.own_input_embed, codelm_next.own_input_proj)
     # Must dispatch exactly like level_forward's own encode call (line ~1809) -- otherwise this
     # diagnostic reads code_idx from CodeLM's own untrained code_head/quantize path while training
     # actually optimizes the separate PardecLM-based encode_pardec_downsampler, silently plotting
     # noise from a never-trained pathway (caught 2026-09-26: loss/label_mse looked fine in
     # run.log, but this plot showed pure random-color noise for pred downsample).
-    if cfg.use_pardec_downsampler:
-        out = encode_pardec_downsampler(codelm, model.downsampler, x, flat, flat_raw, cfg,
-                                         pixel_order, label_fn, model.K(level), rate_id=level,
-                                         downsampler_ncodes=cfg.downsampler_ncodes[level])
-    else:
-        out = codelm.encode(x, flat, model.K(level), rng=None, rate_id=level)
+    out = encode_pardec_downsampler(codelm, model.downsampler_for(level), x, flat, flat_raw, cfg,
+                                     pixel_order, label_fn, model.K(level), rate_id=model.bos_rate_id(level),
+                                     codelm_rate_id=model.codelm_bos_rate_id(level),
+                                     downsampler_ncodes=cfg.downsampler_ncodes[level])
     code_idx = np.asarray(out["code_idx"])
     util = float(out["util"])
     M, n_blocks, C = code_idx.shape
@@ -2358,12 +2499,12 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
 
 CONFIG_FIELDS = ("img_size", "codelm_d_model", "codelm_n_layers", "codelm_n_heads", "codelm_n_kv_heads",
                   "downsampler_d_model", "downsampler_n_layers", "downsampler_n_heads",
-                  "downsampler_n_kv_heads", "downsampler_window", "use_pardec_downsampler",
+                  "downsampler_n_kv_heads", "downsampler_window",
                   "downsampler_decode_past", "downsampler_decode_future", "downsampler_remat", "downsampler_ncodes",
                   "upsampler_d_model", "upsampler_n_layers", "upsampler_n_heads",
-                  "upsampler_n_kv_heads", "upsampler_window", "use_pardec_upsampler",
+                  "upsampler_n_kv_heads", "upsampler_window",
                   "upsampler_decode_past", "upsampler_decode_future", "upsampler_remat",
-                  "share_downsampler_upsampler_lm", "strides",
+                  "share_across_levels", "bos_rate_mode", "share_downsampler_upsampler_lm", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "upsampler_ncodes",
                   "sync", "gen_temperature", "gen_top_k",
                   "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
@@ -2510,11 +2651,6 @@ def main():
     p.add_argument("--downsampler_window", type=_tuple_arg, default=Config.downsampler_window,
                     help="downsampler PardecLM's context_window_groups, in GROUPS -- must stay "
                          "bounded (not -1) at output_group_size=1, unbounded OOMs")
-    p.add_argument("--use_pardec_downsampler", type=lambda x: x.lower() != "false",
-                    default=Config.use_pardec_downsampler,
-                    help="True = encode_pardec_downsampler (teacher-forced against label_fn) "
-                         "instead of the naive-pick/code_head path in encode(). Requires "
-                         "label_reg_weight>0 -- that becomes the downsampler's only loss")
     p.add_argument("--downsampler_decode_past", type=_tuple_arg, default=Config.downsampler_decode_past,
                     help="downsampler PardecLM's OWN decode_past (independent of decode_past/"
                          "upsampler_decode_past). Default 0 (previously always 0, unconfigurable)")
@@ -2537,12 +2673,6 @@ def main():
     p.add_argument("--upsampler_window", type=_tuple_arg, default=Config.upsampler_window,
                     help="upsampler PardecLM's context_window_groups, in GROUPS of upsampler_ncodes "
                          "codes -- must stay bounded (not -1), same OOM lesson as downsampler_window")
-    p.add_argument("--use_pardec_upsampler", type=lambda x: x.lower() != "false",
-                    default=Config.use_pardec_upsampler,
-                    help="True = PardecLM-based decode (pardec_score/pardec_generate, shared with "
-                         "the downsampler's machinery, output_expansion=K) instead of the old "
-                         "hand-rolled dec_blocks/ctx_embed pardec decode path. decode_past is "
-                         "scoring-only in this path")
     p.add_argument("--upsampler_decode_past", type=_tuple_arg, default=Config.upsampler_decode_past,
                     help="upsampler PardecLM's OWN decode_past, independent of the downsampler's own "
                          "downsampler_decode_past. Default 0")
@@ -2552,6 +2682,17 @@ def main():
     p.add_argument("--upsampler_remat", type=_opt_bool_tuple_arg, default=Config.upsampler_remat,
                     help="upsampler PardecLM's OWN remat, independent of the downsampler's. "
                          "'none' (default) falls back to --remat (previous shared behavior)")
+    p.add_argument("--share_across_levels", type=lambda x: x.lower() != "false",
+                    default=Config.share_across_levels,
+                    help="True (default): one shared CodeLM/Downsampler/Upsampler for the whole "
+                         "model, differentiated per level via rate_id/bos_embed (true JAX weight "
+                         "tying). False: one fully independent CodeLM/Downsampler/Upsampler PER "
+                         "LEVEL (own weights, may use different architecture per level).")
+    p.add_argument("--bos_rate_mode", type=str, default=Config.bos_rate_mode, choices=("relative", "absolute"),
+                    help="Only matters when share_across_levels=True. 'relative' (default): rate_id "
+                         "keys off each level's EFFECTIVE stride value, so levels sharing the same "
+                         "stride share the same bos row (e.g. strides=(4,4,4) -> n_rates=1). "
+                         "'absolute': rate_id is the raw level index, n_rates=n always (old behavior).")
     p.add_argument("--share_downsampler_upsampler_lm", type=lambda x: x.lower() != "false",
                     default=Config.share_downsampler_upsampler_lm,
                     help="False (default): fully separate downsampler/upsampler PardecLM weights. "
@@ -2764,25 +2905,24 @@ def main():
         tag = tag + ("_sample" if sample else "")
         g_kw = dict(greedy=not sample, temperature=cfg.gen_temperature, seed=1 if sample else 0)
         m = cast_pytree(eval_model, compute_dtype)
-        codelm = m.codelm
-        tok0 = rgb_byte_pq_fn(flat_prompt, codelm.pq_chunks, codelm.code_vocab)
-        x = code_embed_proj(tok0, codelm.own_input_embed, codelm.own_input_proj)
+        codelm0 = m.codelm_for(0)
+        tok0 = rgb_byte_pq_fn(flat_prompt, codelm0.pq_chunks, codelm0.code_vocab)
+        x = code_embed_proj(tok0, codelm0.own_input_embed, codelm0.own_input_proj)
         target = tok0
         codes, codes_soft = [], []
         eval_rngs = ([None] * (top + 1) if not cfg.gumbel_at_inference
                      else list(jax.random.split(jax.random.fold_in(jax.random.PRNGKey(0), hash(tag) % (2**31)), top + 1)))
         for i in range(top + 1):
-            if cfg.use_pardec_downsampler:
-                out = encode_pardec_downsampler(codelm, m.downsampler, x, target, flat_prompt, cfg,
-                                                 pixel_order, label_fn, m.K(i), rate_id=i, rng=eval_rngs[i],
-                                                 downsampler_ncodes=cfg.downsampler_ncodes[i])
-            else:
-                out = codelm.encode(x, target, m.K(i), rng=eval_rngs[i],
-                                     encode_temperature=args.encode_temperature[phase - 1], rate_id=i)
+            codelm_i = m.codelm_for(i)
+            out = encode_pardec_downsampler(codelm_i, m.downsampler_for(i), x, target, flat_prompt, cfg,
+                                             pixel_order, label_fn, m.K(i), rate_id=m.bos_rate_id(i),
+                                             codelm_rate_id=m.codelm_bos_rate_id(i),
+                                             rng=eval_rngs[i], downsampler_ncodes=cfg.downsampler_ncodes[i])
             codes.append(out["code_idx"])
             codes_soft.append(out["code_soft"])
             if i < top:
-                x = code_embed_proj(out["code_soft"], codelm.own_input_embed, codelm.own_input_proj)
+                codelm_next = m.codelm_for(i + 1)
+                x = code_embed_proj(out["code_soft"], codelm_next.own_input_embed, codelm_next.own_input_proj)
                 target = out["code_idx"]
 
         recon_acc = None
@@ -2965,10 +3105,13 @@ def main():
             grads = jax.lax.pmean(grads, axis_name="d")
             loss = jax.lax.pmean(loss, axis_name="d")
             aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
-            # no gradient tying needed: model.codelm/downsampler/upsampler are singleton modules --
-            # level_forward calling them at several different level indices within this one trace
-            # already gets correctly-summed gradients from JAX's autodiff, same as any other value
-            # used multiple times in one function.
+            # no gradient tying needed: with cfg.share_across_levels=True (default), codelm_for/
+            # downsampler_for/upsampler_for all resolve to the SAME singleton instance regardless of
+            # level index -- level_forward calling it at several different level indices within this
+            # one trace already gets correctly-summed gradients from JAX's autodiff, same as any
+            # other value used multiple times in one function. This is why LagCodecModel stores a
+            # length-1 tuple in that mode rather than the same instance repeated at N positions --
+            # duplicating it INTO the pytree would NOT tie weights (see Config.share_across_levels).
             grad_norm = optax.global_norm(grads)
             aux = aux + (grad_norm,)
             updates, opt_state = optimizer.update(grads, opt_state, diff_model)

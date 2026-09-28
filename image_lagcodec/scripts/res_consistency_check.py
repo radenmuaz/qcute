@@ -41,8 +41,8 @@ B = 2
 G = 4
 
 
-def build_cfg():
-    return R.Config(
+def build_cfg(**over):
+    kw = dict(
         codelm_d_model=(64, 64), codelm_n_layers=(2, 2), codelm_n_heads=(2, 2), codelm_n_kv_heads=(None, None),
         strides=(4, -1), code_vocab=(256, 256), pq_chunks=(3, 3), pq_dim=(16, 16), byte_group=3,
         token_head_type="linears", upsampler_ncodes=(G, G),
@@ -53,6 +53,8 @@ def build_cfg():
         upsampler_n_kv_heads=(2, 2), upsampler_window=(4, 4),
         label_reg_weight=1.0,
     )
+    kw.update(over)
+    return R.Config(**kw)
 
 
 def load_data(cfg):
@@ -63,13 +65,14 @@ def load_data(cfg):
     return flat, pixel_order
 
 
-def run_encoder_free_run_kv_check():
+def run_encoder_free_run_kv_check(head="linear"):
     """New KV-cache _encoder_free_run must exactly match a slow reference that recomputes the
     entire forward pass at every step (the OLD, correct-by-construction implementation)."""
-    cfg = build_cfg()
+    cfg = build_cfg(codelm_token_head=head)
     model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
     codelm = model.codelm_for(0)
     ok = True
+    print(f"[codelm_token_head={head}]")
     for (C, V, T, P) in [(3, 256, 24, 8), (3, 256, 16, 5)]:
         toks = jnp.array(np.random.RandomState(0).randint(0, V, (B, T, C)))
         prompt = toks[:, :P]
@@ -79,7 +82,7 @@ def run_encoder_free_run_kv_check():
         ref = prompt
         for t in range(P, T):
             h = R.encoder_hidden(codelm, R.code_embed_proj(ref, codelm.own_input_embed, codelm.own_input_proj))
-            nxt = jnp.argmax(R.encoder_ntp_logits(codelm, h[:, -1]), -1)[:, None].astype(ref.dtype)
+            nxt = R.codelm_sample_next(codelm, h[:, -1], jax.random.PRNGKey(0), True, 1.0)[:, None].astype(ref.dtype)
             ref = jnp.concatenate([ref, nxt], axis=1)
         same = bool(jnp.array_equal(got, ref))
         kept = bool(jnp.array_equal(got[:, :P], prompt))
@@ -91,12 +94,13 @@ def run_encoder_free_run_kv_check():
     return ok
 
 
-def run_pardec_dense_vs_kv_check():
+def run_pardec_dense_vs_kv_check(head="ar"):
     """pardec_score (dense, teacher-forced with the real target) vs pardec_generate (incremental
     KV-cache): greedy generation's argmax at each position must match dense scoring's argmax when
     dense is fed that SAME generated sequence as its target (self-consistency, the standard way to
     check a KV-cache decoder matches its own teacher-forced scoring path)."""
-    cfg = build_cfg()
+    cfg = build_cfg(pardec_token_head=head)
+    print(f"[pardec_token_head={head}]")
     model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
     flat, pixel_order = load_data(cfg)
     codelm = model.codelm_for(0)
@@ -139,8 +143,10 @@ def run_pardec_dense_vs_kv_check():
 
 if __name__ == "__main__":
     results = []
-    results.append(("encoder_free_run KV-cache", run_encoder_free_run_kv_check()))
-    results.append(("pardec dense-vs-KV-cache", run_pardec_dense_vs_kv_check()))
+    results.append(("encoder_free_run KV-cache (linear)", run_encoder_free_run_kv_check("linear")))
+    results.append(("encoder_free_run KV-cache (ar)", run_encoder_free_run_kv_check("ar")))
+    results.append(("pardec dense-vs-KV-cache (ar)", run_pardec_dense_vs_kv_check("ar")))
+    results.append(("pardec dense-vs-KV-cache (linear)", run_pardec_dense_vs_kv_check("linear")))
     print()
     for name, ok in results:
         print(f"{name}: {'PASS' if ok else 'FAIL'}")

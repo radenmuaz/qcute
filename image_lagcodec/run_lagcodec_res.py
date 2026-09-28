@@ -1,3 +1,18 @@
+"""
+TODO (multi-res generalization, not implemented -- proposal only, 2026-09-27):
+Currently `strides` is a flat tuple, one fixed K per level (e.g. (4,4)). To let each level support
+SEVERAL stride options (e.g. level0 in {4,16,32}, level1 in {4,16}) instead of one linear cascade:
+  1. strides: tuple[int] -> tuple[tuple[int]], one set of allowed K per level.
+  2. No new weight sets needed -- K is already a runtime arg to pardec_score/pardec_generate/
+     encode_pardec_downsampler, not baked into weight shapes.
+  3. Generalize bos_rate_map's dedup key from level_idx to (level_idx, stride_choice).
+  4. Extend sample_multires_entry/level_forward_multires to also sample a stride PER visited level,
+     not just which levels are visited.
+  5. n_blocks_for_level must depend on the specific sampled stride path, not a fixed cumulative
+     product.
+  6. generate_from_prompt's cascade must record which K encoded each level and replay the SAME K
+     on the matching decode step.
+"""
 from __future__ import annotations
 
 import argparse
@@ -110,6 +125,45 @@ class Config:
     # (3,16,16,-1) collapses (3,16,16,1) to n_rates=3 (levels 1&2 share a row). "absolute": rate_id
     # IS the raw level index (old behavior) -- n_rates=n always, one row per level even if two
     # levels happen to share the same stride.
+    context_source: str = "codelm"  # how the downsampler/upsampler get their CONTEXT (the hidden
+    # state they attend to, before context_proj). "codelm" (default, current/original behavior):
+    # re-run this level's own input through CodeLM's own causal self-attention block stack
+    # (encoder_hidden) -- context is CONTEXTUALIZED (every position has seen its own causal past via
+    # CodeLM's attention). "own_embed": skip CodeLM's block stack entirely -- context is a PLAIN
+    # per-position embedding (own_ctx_embed/own_ctx_proj, same shape as CodeLM's own_input_embed/
+    # own_input_proj) with NO cross-position mixing at all, downsampler and upsampler each get their
+    # OWN dedicated table. "shared_embed": same plain-embedding bypass, but downsampler and upsampler
+    # SHARE one table. Added 2026-09-28 to test the hypothesis that CodeLM's causal self-attention
+    # context (vs. the old pre-refactor run_lagcodec.py's dedicated, non-contextualized ctx_embed
+    # table) is responsible for the periodic every-8th-row/col decode artifact (see
+    # audit_gen_dots.py) -- weight-sharing, label-antialiasing and group-size (upsampler_ncodes) were
+    # all ruled out as the cause first. Purely additive; "codelm" is unchanged/default so no existing
+    # config's behavior changes.
+    pardec_token_head: str = "ar"  # how a PardecLM (downsampler AND upsampler) predicts the
+    # pq_chunks digits of one code. "ar" (default, current behavior): small autoregressive head,
+    # digit m conditioned on digits <m (teacher-forced digits in pardec_score, own digits in
+    # pardec_generate). "linear": ONE parallel linear head (output_head_linear) predicts all digits
+    # independently from the hidden state, like the original lagcodec code_head -- no digit-level
+    # dependence at all, so no digit-level teacher forcing/leak either. Incompatible with
+    # downsampler_rollout (the rollout self-feeds digits through the AR head).
+    codelm_token_head: str = "linear"  # CodeLM's own NTP head (its aux NTP loss AND encoder_free_run
+    # sampling). "linear" (default, current behavior): ntp_head predicts all pq_chunks digits of the
+    # next token in parallel/independently. "ar": a small autoregressive digit head (same design as
+    # the PardecLM AR head, token_dim/token_n_heads) -- digit m conditioned on digits <m of the SAME
+    # token (teacher-forced real digits in the NTP loss, own sampled digits in free-run generation).
+    # The AR head's params are only allocated in "ar" mode. Prefill (KV-cache build over the prompt)
+    # is head-independent; only the per-step next-token sampling changes.
+    downsampler_rollout: bool = False  # False (default, current behavior): the downsampler is
+    # TEACHER-FORCED on label_fn(image) digits inside pardec_score, and the code it emits is
+    # quantized from those teacher-forced logits (train/gen mismatch; a ground-truth leak into a
+    # latent when label_reg_weight=0). True: the downsampler instead SELF-FEEDS -- digits are
+    # sampled (straight-through gumbel / hard, per quantize_mode) and fed back through the AR head,
+    # exactly as at inference; label_fn is then only used for the optional label_reg aux loss.
+    # Needs downsampler_ncodes==1, downsampler_decode_past/future==0, pardec_token_head="ar".
+    # Warns when False while label_reg_weight==0.
+    downsampler_rollout_prob: float = 1.0  # probability (per train step, one draw per level) of
+    # using the rollout path instead of the teacher-forced one when downsampler_rollout=True.
+    # Eval (rng=None) always uses the rollout. Warns when !=1 while label_reg_weight==0.
     share_downsampler_upsampler_lm: bool = False  # False (default) = fully separate downsampler/
     # upsampler PardecLM instances (current behavior, unchanged). True = the two SHARE the same
     # blocks/ln_f (the core transformer LM) -- everything else (context_proj, bos_embed,
@@ -355,6 +409,31 @@ class Config:
         assert total_bytes_of(self) % self.byte_group == 0
         assert self.traversal in ("raster", "zorder")
         assert self.bos_rate_mode in ("relative", "absolute")
+        assert self.context_source in ("codelm", "own_embed", "shared_embed")
+        assert self.pardec_token_head in ("ar", "linear"), self.pardec_token_head
+        assert self.codelm_token_head in ("ar", "linear"), self.codelm_token_head
+        assert 0.0 <= self.downsampler_rollout_prob <= 1.0, self.downsampler_rollout_prob
+        if self.downsampler_rollout:
+            if self.pardec_token_head != "ar":
+                raise ValueError("downsampler_rollout is incompatible with pardec_token_head='linear' "
+                                 "(the rollout self-feeds digits through the AR token head)")
+            assert all(g == 1 for g in self.downsampler_ncodes), \
+                f"downsampler_rollout needs downsampler_ncodes==1 at every level, got {self.downsampler_ncodes}"
+            assert all(p == 0 for p in self.downsampler_decode_past) \
+                and all(f == 0 for f in self.downsampler_decode_future), \
+                "downsampler_rollout needs downsampler_decode_past/future==0 (they embed real label tokens)"
+        _ds_leak = (self.pardec_token_head == "ar" or any(g > 1 for g in self.downsampler_ncodes)
+                    or any(pst > 0 for pst in self.downsampler_decode_past))
+        if self.label_reg_weight == 0 and _ds_leak:
+            if not self.downsampler_rollout:
+                warnings.warn("label_reg_weight=0 but downsampler_rollout=False: the downsampler is "
+                              "teacher-forced on label_fn(image) digits/codes even though nothing supervises "
+                              "it toward them (ground-truth leak into a latent + train/gen mismatch). "
+                              "Consider downsampler_rollout=True.")
+            elif self.downsampler_rollout_prob != 1.0:
+                warnings.warn(f"label_reg_weight=0 with downsampler_rollout_prob="
+                              f"{self.downsampler_rollout_prob}!=1: that fraction of steps still "
+                              "teacher-forces the downsampler on label_fn digits/codes (ground-truth leak).")
         assert self.strides[-1] == -1 or self.strides[-1] >= 1, \
             "top level's stride is either -1 (don't-care, legacy: top level stays untrained/wasted " \
             "-- see top_level_trainable) or a real stride >=1 (top level becomes fully trainable: " \
@@ -972,6 +1051,33 @@ def token_ar_generate(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks
     return idx, rng
 
 
+def token_ar_rollout(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks: int,
+                     h: jnp.ndarray, rng, quant_fn) -> tuple:
+    # Differentiable SELF-FED digit rollout (downsampler_rollout): like token_ar_generate, but each
+    # digit is drawn with quant_fn(logits, rng) -> (code_soft, idx) (straight-through gumbel/hard)
+    # and fed back through member_embed via its soft one-hot, so gradients flow through the digits.
+    # Returns (code_soft (...,chunks,V), idx (...,chunks), logits (...,chunks,V)).
+    lead = h.shape[:-1]
+    D = h.shape[-1]
+    N = int(np.prod(lead)) if lead else 1
+    collected = [(h.reshape(N, D) @ in_proj)[:, None, :]]
+    softs, idxs, lgs = [], [], []
+    for m in range(chunks):
+        rng, k_ = jax.random.split(rng)
+        seq_in = jnp.concatenate(collected, axis=1)
+        h1 = seq_in + dense_self_attention(attn, norm1(seq_in), causal=True)
+        logit_m = ln_f(h1)[:, -1, :] @ out_head
+        soft_m, idx_m = quant_fn(logit_m, k_)
+        softs.append(soft_m)
+        idxs.append(idx_m)
+        lgs.append(logit_m)
+        if m < chunks - 1:
+            collected.append((soft_m.astype(member_embed.dtype) @ member_embed)[:, None, :])
+    V = lgs[0].shape[-1]
+    return (jnp.stack(softs, axis=1).reshape(*lead, chunks, V), jnp.stack(idxs, axis=1).reshape(*lead, chunks),
+            jnp.stack(lgs, axis=1).reshape(*lead, chunks, V))
+
+
 class PardecLM(eqx.Module):
     # Shared pardec LM: downsampler and upsampler are both instances of this, independent weights,
     # differing only in output_expansion/vocab. Context = CodeLM's cached hidden states (via
@@ -999,6 +1105,17 @@ class PardecLM(eqx.Module):
     # docstring, so the finer per-chunk AR head above isn't used there; scoring/real generation
     # still use the AR head).
     output_head_linear: jnp.ndarray
+    own_ctx_embed: jnp.ndarray  # (ctx_vocab, ctx_pq_dim) -- ALWAYS allocated (inert when
+    # cfg.context_source=="codelm") so toggling that flag alone never changes checkpoint structure.
+    # Same shape convention as CodeLM's own_input_embed/own_input_proj -- own_ctx_proj outputs
+    # context_hidden_dim (CodeLM's own D_enc), NOT hidden_dim directly, so the existing context_proj
+    # step (context_hidden_dim -> hidden_dim, see pardec_context_windows) still applies uniformly
+    # regardless of context_source, no downstream code needs to change. Used directly (no self-
+    # attention/block stack at all) as the context when cfg.context_source in ("own_embed",
+    # "shared_embed") -- see pardec_context_hidden. "shared_embed": downsampler and upsampler
+    # literally reuse the SAME array (shared_ctx_embed/shared_ctx_proj), mirroring
+    # share_downsampler_upsampler_lm's pattern.
+    own_ctx_proj: jnp.ndarray  # (ctx_pq_chunks * ctx_pq_dim, context_hidden_dim)
     n_heads: int = eqx.field(static=True)
     n_kv_heads: int = eqx.field(static=True)
     n_rates: int = eqx.field(static=True)
@@ -1014,6 +1131,7 @@ class PardecLM(eqx.Module):
     # AFTER each group's own target span, scored separately as a widened-lookahead NTP aux signal
     # (see pardec_score) -- 0 = off
     remat: bool = eqx.field(static=True)
+    token_head: str = eqx.field(static=True)  # "ar" | "linear", see Config.pardec_token_head
 
     def __init__(self, key, context_hidden_dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int,
                  n_layers: int, mlp_mult: int, rope_base: float, output_expansion: int,
@@ -1021,7 +1139,10 @@ class PardecLM(eqx.Module):
                  token_dim: int, token_n_heads: int, decode_past: int = 0, decode_future: int = 0,
                  n_rates: int = 1, init_scheme: str = "llama", use_xsa: bool = True,
                  use_qknorm: bool = True, remat: bool = False, window: int = None,
-                 shared_blocks: list = None, shared_ln_f: RMSNorm = None):
+                 shared_blocks: list = None, shared_ln_f: RMSNorm = None,
+                 ctx_vocab: int = None, ctx_pq_chunks: int = None, ctx_pq_dim: int = None,
+                 shared_ctx_embed: jnp.ndarray = None, shared_ctx_proj: jnp.ndarray = None,
+                 token_head: str = "ar"):
         # shared_blocks/shared_ln_f (both None by default): when given, REUSE these instead of
         # building a fresh transformer stack -- the LM weight-sharing option (see
         # cfg.share_downsampler_upsampler_lm): downsampler and upsampler can share the SAME
@@ -1059,6 +1180,13 @@ class PardecLM(eqx.Module):
         self.token_dim, self.token_n_heads = token_dim, token_n_heads
         self.decode_past, self.decode_future = decode_past, decode_future
         self.remat = remat
+        self.token_head = token_head
+        if shared_ctx_embed is not None:
+            self.own_ctx_embed, self.own_ctx_proj = shared_ctx_embed, shared_ctx_proj
+        else:
+            ctx_keys = jax.random.split(jax.random.fold_in(key, 8003), 2)
+            self.own_ctx_embed = init_matrix(ctx_keys[0], (ctx_vocab, ctx_pq_dim), init_scheme)
+            self.own_ctx_proj = init_matrix(ctx_keys[1], (ctx_pq_chunks * ctx_pq_dim, context_hidden_dim), init_scheme)
 
 
 def pardec_context_windows(pardec: PardecLM, context_h_padded: jnp.ndarray, context_group_size: int,
@@ -1089,7 +1217,11 @@ def pardec_context_windows(pardec: PardecLM, context_h_padded: jnp.ndarray, cont
 
 def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarray,
                   context_group_size: int, output_group_size: int, rate_id: int = 0,
-                  output_expansion: int = None) -> tuple:
+                  output_expansion: int = None, return_hidden: bool = False) -> tuple:
+    # return_hidden=True: return ONLY the per-position predicted hidden states (before the token
+    # head), (batch, n_output_positions*oe, hidden_dim). Causal masking means they do not depend on
+    # the target rows at/after their position, so downsampler_rollout passes a dummy target and
+    # feeds them to token_ar_rollout instead (needs decode_past==0).
     # Teacher-forced scoring (basic pardec, see PardecLM). context_h = CodeLM's cached hidden
     # states, already contextualized (replaces ctx_code_soft/ctx_embed). target_seq is at the
     # OUTPUT's own granularity, length = n_context_positions*output_group_size//context_group_size*output_expansion.
@@ -1165,9 +1297,14 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
     valid_len = n_output_positions * oe
     predicted_hidden = predicted_hidden[:, :valid_len, :]
     target_out = target_seq[:, :valid_len]
-    logits = token_ar_teacher_forced(pardec.token_in_proj, pardec.token_member_embed, pardec.token_norm1,
-                                      pardec.token_attn, pardec.token_ln_f, pardec.token_out_head,
-                                      pardec.token_dim, pardec.output_vocab, predicted_hidden, target_out)
+    if return_hidden:
+        return predicted_hidden
+    if pardec.token_head == "linear":
+        logits = reshape_pq(predicted_hidden @ pardec.output_head_linear, pardec.output_chunks, pardec.output_vocab)
+    else:
+        logits = token_ar_teacher_forced(pardec.token_in_proj, pardec.token_member_embed, pardec.token_norm1,
+                                          pardec.token_attn, pardec.token_ln_f, pardec.token_out_head,
+                                          pardec.token_dim, pardec.output_vocab, predicted_hidden, target_out)
 
     # decode_future aux NTP loss: standard shifted next-token prediction OVER the widened lookahead
     # span itself (predict future token k from the hidden state produced by processing future token
@@ -1188,9 +1325,14 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
                              for g in range(n_groups)])
         aux_valid = jnp.asarray(abs_idx < valid_len).reshape(1, n_groups * decode_future, 1)
         aux_valid = jnp.broadcast_to(aux_valid, aux_target.shape).astype(jnp.float32)
-        aux_logits = token_ar_teacher_forced(pardec.token_in_proj, pardec.token_member_embed, pardec.token_norm1,
-                                              pardec.token_attn, pardec.token_ln_f, pardec.token_out_head,
-                                              pardec.token_dim, pardec.output_vocab, aux_predicted_hidden, aux_target)
+        if pardec.token_head == "linear":
+            aux_logits = reshape_pq(aux_predicted_hidden @ pardec.output_head_linear,
+                                    pardec.output_chunks, pardec.output_vocab)
+        else:
+            aux_logits = token_ar_teacher_forced(pardec.token_in_proj, pardec.token_member_embed,
+                                                  pardec.token_norm1, pardec.token_attn, pardec.token_ln_f,
+                                                  pardec.token_out_head, pardec.token_dim, pardec.output_vocab,
+                                                  aux_predicted_hidden, aux_target)
         logp_aux = jax.nn.log_softmax(aux_logits, axis=-1)
         nll_aux = -jnp.take_along_axis(logp_aux, aux_target[..., None], axis=-1)[..., 0]
         denom = jnp.maximum(jnp.sum(aux_valid), 1.0)
@@ -1260,9 +1402,13 @@ def pardec_generate(pardec: PardecLM, context_h: jnp.ndarray, context_group_size
 
     def gen_step(carry, _):
         cache_k, cache_v, pos, rng, x_input, hidden = carry
-        val, rng = token_ar_generate(pardec.token_in_proj, pardec.token_member_embed, pardec.token_norm1,
-                                      pardec.token_attn, pardec.token_ln_f, pardec.token_out_head,
-                                      pardec.output_chunks, hidden, rng, greedy, temperature, top_k)
+        if pardec.token_head == "linear":
+            val, rng = sample_idx(reshape_pq(hidden @ pardec.output_head_linear, pardec.output_chunks,
+                                             pardec.output_vocab), rng, greedy, temperature, top_k)
+        else:
+            val, rng = token_ar_generate(pardec.token_in_proj, pardec.token_member_embed, pardec.token_norm1,
+                                          pardec.token_attn, pardec.token_ln_f, pardec.token_out_head,
+                                          pardec.output_chunks, hidden, rng, greedy, temperature, top_k)
         x_next = code_embed_proj(val, pardec.target_embed, pardec.target_proj)
         hidden_next, cache_k, cache_v = self_step(x_next, cache_k, cache_v, pos)
         return (cache_k, cache_v, pos + 1, rng, x_next, hidden_next), val
@@ -1406,6 +1552,14 @@ class CodeLM(eqx.Module):
     codelm_bos_prob: float = eqx.field(static=True)
     n_heads: int = eqx.field(static=True)  # needed for KV-cache sizing in _encoder_free_run
     n_kv_heads: int = eqx.field(static=True)
+    token_head: str = eqx.field(static=True)  # "linear" | "ar", see Config.codelm_token_head
+    token_dim: int = eqx.field(static=True)
+    tok_in_proj: jnp.ndarray = None  # AR digit head params, None unless token_head=="ar"
+    tok_member_embed: jnp.ndarray = None
+    tok_norm1: RMSNorm = None
+    tok_attn: Attention = None
+    tok_ln_f: RMSNorm = None
+    tok_out_head: jnp.ndarray = None
 
     def __init__(self, key, cfg: Config, level_idx: int = 0):
         # level_idx: which per-level config tuple entry to read architecture from. share_across_levels
@@ -1458,6 +1612,18 @@ class CodeLM(eqx.Module):
             if cfg.use_codelm_bos else 1
         bos_keys = jax.random.split(jax.random.fold_in(key, 8901), n_bos_rates)
         self.bos_embed = jnp.stack([init_vector(k, D_enc, scheme) for k in bos_keys], axis=0)
+        self.token_head = cfg.codelm_token_head
+        self.token_dim = cfg.token_dim[level_idx]
+        if self.token_head == "ar":
+            tk = jax.random.split(jax.random.fold_in(key, 8951), 4)
+            td, tnh = cfg.token_dim[level_idx], cfg.token_n_heads[level_idx]
+            self.tok_in_proj = init_matrix(tk[0], (D_enc, td), scheme)
+            self.tok_member_embed = init_matrix(tk[1], (self.code_vocab, td), scheme)
+            self.tok_norm1 = RMSNorm(td)
+            self.tok_attn = Attention(tk[2], td, tnh, tnh, cfg.rope_base[level_idx], n_layers=1,
+                                       init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
+            self.tok_ln_f = RMSNorm(td)
+            self.tok_out_head = init_matrix(tk[3], (td, self.code_vocab), scheme)
 
     def encode(self, x: jnp.ndarray, target_idx: jnp.ndarray, K: int, rng=None, encode_temperature: float = 1.0,
                layer_drop_prob=None, rate_id: int = 0, force_bos: bool = False) -> dict:
@@ -1504,8 +1670,8 @@ class CodeLM(eqx.Module):
 
         ntp_shift = 1 + self.attn_lookahead
         if L > ntp_shift:
-            ntp_logits = reshape_pq(h[:, :-ntp_shift, :] @ self.ntp_head, self.pq_chunks, self.code_vocab)
             tgt = target_idx[:, ntp_shift:]
+            ntp_logits = codelm_ntp_logits_tf(self, h[:, :-ntp_shift, :], tgt)
             logp = jax.nn.log_softmax(ntp_logits, axis=-1)
             ntp_loss = -jnp.mean(jnp.take_along_axis(logp, tgt[..., None], axis=-1))
             ntp_acc = jnp.mean(jnp.argmax(ntp_logits, -1) == tgt)
@@ -1555,7 +1721,31 @@ def codelm_bos_substitute(codelm: CodeLM, x: jnp.ndarray, rate_id: int, rng, gro
     return x
 
 
-def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndarray, target_idx: jnp.ndarray,
+def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cfg: "Config",
+                           rate_id: int, rng, group_size: int) -> jnp.ndarray:
+    # Single source of truth for how the downsampler/upsampler get their CONTEXT, per
+    # cfg.context_source (see Config field docstring). `raw` is the pre-embedding representation of
+    # this level's own input (hard idx for raw bytes/a previous level's code_idx, or the SOFT
+    # code_soft when called from a training path that needs gradient flow through it) -- the exact
+    # same value callers already use to build CodeLM's own `x` in the "codelm" mode, generalized so
+    # "own_embed"/"shared_embed" modes can bypass CodeLM's own embedding table entirely too.
+    if cfg.context_source == "codelm":
+        x = code_embed_proj(raw, codelm.own_input_embed, codelm.own_input_proj)
+        x = codelm_bos_substitute(codelm, x, rate_id, rng, group_size=group_size)
+        h = x
+        def _enc_stack(h):
+            for blk in codelm.blocks:
+                h = run_block(blk, h, codelm.remat and not codelm.remat_level)
+            return h
+        h = jax.checkpoint(_enc_stack)(h) if codelm.remat_level else _enc_stack(h)
+        return codelm.ln_f(h)
+    # "own_embed"/"shared_embed": plain per-position embedding, NO self-attention/contextualization
+    # at all -- CodeLM's own block stack is skipped entirely (codelm_bos is therefore also moot here,
+    # it only ever modulated CodeLM's own forward pass).
+    return code_embed_proj(raw, pardec.own_ctx_embed, pardec.own_ctx_proj)
+
+
+def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.ndarray, target_idx: jnp.ndarray,
                                flat_bytes: jnp.ndarray, cfg: "Config", pixel_order, label_fn,
                                K: int, rate_id: int = 0, rng=None, downsampler_ncodes: int = 1,
                                encode_temperature: float = 1.0, codelm_rate_id: int = None) -> dict:
@@ -1576,19 +1766,12 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndar
     # codelm_rate_id: CodeLM's own bos anchor index -- ALWAYS absolute (one row per level, see
     # LagCodecModel.codelm_bos_rate_id), independent of `rate_id` below (the downsampler's OWN bos,
     # which follows cfg.bos_rate_mode). Defaults to `rate_id` for standalone/test callers that don't
-    # distinguish the two.
+    # distinguish the two. `raw` is `target_idx` in the level-0 byte case or the previous level's own
+    # code_soft/code_idx -- see pardec_context_hidden for how cfg.context_source dispatches it.
     codelm_rate_id = rate_id if codelm_rate_id is None else codelm_rate_id
-    x = codelm_bos_substitute(codelm, x, codelm_rate_id, rng, group_size=K * downsampler_ncodes)
-    h = x
-    def _enc_stack(h):
-        for blk in codelm.blocks:
-            h = run_block(blk, h, codelm.remat and not codelm.remat_level)
-        return h
-    h = jax.checkpoint(_enc_stack)(h) if codelm.remat_level else _enc_stack(h)
-    h = codelm.ln_f(h)
+    h = pardec_context_hidden(codelm, downsampler, raw, cfg, codelm_rate_id, rng, group_size=K * downsampler_ncodes)
     M, L, D = h.shape
     n_blocks = L // K
-    label_tgt = label_fn(flat_bytes, cfg, pixel_order, n_blocks, codelm.pq_chunks, codelm.code_vocab)
     # context_group_size=K*downsampler_ncodes, output_group_size=downsampler_ncodes, rate_id=this
     # level's index -- the SAME shared downsampler weights are called with a different
     # (K, downsampler_ncodes, rate_id) triple per level, modulated via the downsampler's own
@@ -1596,12 +1779,45 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndar
     # code per K-block, computed one at a time. >1: downsampler_ncodes codes' worth of raw input
     # (downsampler_ncodes*K positions) batched into one group/call, producing downsampler_ncodes
     # codes together.
-    logits, _, _, _ = pardec_score(downsampler, label_tgt, h, context_group_size=K * downsampler_ncodes,
+    def _teacher_forced():
+        # teacher-forced on label_fn(image) digits (default path; see Config.downsampler_rollout)
+        label_tgt = label_fn(flat_bytes, cfg, pixel_order, n_blocks, codelm.pq_chunks, codelm.code_vocab)
+        lg, _, _, _ = pardec_score(downsampler, label_tgt, h, context_group_size=K * downsampler_ncodes,
                                     output_group_size=downsampler_ncodes, rate_id=rate_id)
-    if rng is not None and codelm.quantize_mode == "gumbel":
-        code_soft, code_idx = quantize_gumbel(logits, rng, encode_temperature, codelm.quantize_drop)
+        if rng is not None and codelm.quantize_mode == "gumbel":
+            cs, ci = quantize_gumbel(lg, rng, encode_temperature, codelm.quantize_drop)
+        else:
+            cs, ci = quantize_hard(lg, rng, codelm.quantize_drop, encode_temperature)
+        return lg, cs, ci
+
+    def _rollout():
+        # self-fed: hidden at each group's bos (causal => independent of the dummy target), then the
+        # AR digit head fed its OWN straight-through samples, exactly like inference.
+        hid = pardec_score(downsampler, jnp.zeros((M, n_blocks, codelm.pq_chunks), jnp.int32), h,
+                           context_group_size=K * downsampler_ncodes, output_group_size=downsampler_ncodes,
+                           rate_id=rate_id, return_hidden=True)
+        if rng is not None and codelm.quantize_mode == "gumbel":
+            qfn = lambda lg_m, k_: quantize_gumbel(lg_m, k_, encode_temperature, codelm.quantize_drop)
+        else:
+            qfn = lambda lg_m, k_: quantize_hard(lg_m, k_ if rng is not None else None, codelm.quantize_drop,
+                                                 encode_temperature)
+        cs, ci, lg = token_ar_rollout(downsampler.token_in_proj, downsampler.token_member_embed,
+                                       downsampler.token_norm1, downsampler.token_attn, downsampler.token_ln_f,
+                                       downsampler.token_out_head, downsampler.output_chunks, hid,
+                                       rng if rng is not None else jax.random.PRNGKey(0), qfn)
+        return lg, cs, ci
+
+    if not cfg.downsampler_rollout:
+        logits, code_soft, code_idx = _teacher_forced()
+    elif rng is None or cfg.downsampler_rollout_prob >= 1.0:
+        logits, code_soft, code_idx = _rollout()
+    elif cfg.downsampler_rollout_prob <= 0.0:
+        logits, code_soft, code_idx = _teacher_forced()
     else:
-        code_soft, code_idx = quantize_hard(logits, rng, codelm.quantize_drop, encode_temperature)
+        use_roll = jax.random.bernoulli(jax.random.fold_in(rng, 515151), p=cfg.downsampler_rollout_prob)
+        _canon = lambda t: (t[0].astype(h.dtype), t[1].astype(h.dtype), t[2].astype(jnp.int32))
+        logits, code_soft, code_idx = jax.lax.cond(
+            use_roll, lambda: _canon(_rollout()), lambda: _canon(_teacher_forced()))
 
     probs = jax.nn.softmax(logits, axis=-1)
     p_avg = jnp.mean(probs, axis=(0, 1))
@@ -1609,8 +1825,8 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndar
 
     ntp_shift = 1 + codelm.attn_lookahead
     if L > ntp_shift:
-        ntp_logits = reshape_pq(h[:, :-ntp_shift, :] @ codelm.ntp_head, codelm.pq_chunks, codelm.code_vocab)
         tgt = target_idx[:, ntp_shift:]
+        ntp_logits = codelm_ntp_logits_tf(codelm, h[:, :-ntp_shift, :], tgt)
         logp = jax.nn.log_softmax(ntp_logits, axis=-1)
         ntp_loss = -jnp.mean(jnp.take_along_axis(logp, tgt[..., None], axis=-1))
         ntp_acc = jnp.mean(jnp.argmax(ntp_logits, -1) == tgt)
@@ -1622,8 +1838,8 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndar
                 entropy_loss=entropy_loss, logits=logits)
 
 
-def encode_pardec_downsampler_generate(codelm: CodeLM, downsampler: PardecLM, x: jnp.ndarray, K: int,
-                                        rate_id: int = 0, rng=None, greedy: bool = True,
+def encode_pardec_downsampler_generate(codelm: CodeLM, downsampler: PardecLM, raw: jnp.ndarray, K: int,
+                                        cfg: "Config", rate_id: int = 0, rng=None, greedy: bool = True,
                                         temperature: float = 1.0, top_k: int = 0,
                                         downsampler_ncodes: int = 1, codelm_rate_id: int = None) -> dict:
     # Generation-time counterpart of encode_pardec_downsampler: that function is TEACHER-FORCED
@@ -1640,8 +1856,7 @@ def encode_pardec_downsampler_generate(codelm: CodeLM, downsampler: PardecLM, x:
     # see encode_pardec_downsampler's own docstring -- CodeLM's bos is always absolute, independent
     # of `rate_id` (the downsampler's own bos, which follows cfg.bos_rate_mode).
     codelm_rate_id = rate_id if codelm_rate_id is None else codelm_rate_id
-    x = codelm_bos_substitute(codelm, x, codelm_rate_id, rng, group_size=K * downsampler_ncodes)
-    h = encoder_hidden(codelm, x)
+    h = pardec_context_hidden(codelm, downsampler, raw, cfg, codelm_rate_id, rng, group_size=K * downsampler_ncodes)
     code_idx = pardec_generate(downsampler, h, context_group_size=K * downsampler_ncodes,
                                 output_group_size=downsampler_ncodes, rng=rng,
                                 greedy=greedy, temperature=temperature, top_k=top_k, rate_id=rate_id,
@@ -1655,16 +1870,15 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
                                         **_unused) -> tuple:
     # SHARED upsampler, modulated by (output_expansion=K(level_idx), rate_id=level_idx) -- not a
     # separate weight set per level. **_unused absorbs any stale kwargs from callers.
-    # No special-casing: the Upsampler's context is built EXACTLY like the Downsampler's -- CodeLM
-    # is the shared feature extractor for both. Run this level's own code through CodeLM's own
-    # embed table + block stack (same as encoder_hidden/CodeLM.encode()'s first half) to get real
-    # contextualized hidden states, not a separate dedicated ctx_embed/ctx_proj lookup shortcut.
+    # No special-casing: the Upsampler's context is built EXACTLY like the Downsampler's, per
+    # cfg.context_source (see pardec_context_hidden) -- "codelm" (default): run this level's own
+    # code through CodeLM's own embed table + block stack to get real contextualized hidden states.
+    # "own_embed"/"shared_embed": a dedicated ctx_embed/ctx_proj lookup shortcut, no CodeLM pass.
     codelm = model.codelm_for(level_idx)
     codelm_rate_id = model.codelm_bos_rate_id(level_idx)  # CodeLM's own bos: always absolute
     rate_id = model.bos_rate_id(level_idx)  # upsampler's own bos: follows cfg.bos_rate_mode
-    x_ctx = code_embed_proj(ctx_code_soft, codelm.own_input_embed, codelm.own_input_proj)
-    x_ctx = codelm_bos_substitute(codelm, x_ctx, codelm_rate_id, rng, group_size=upsampler_ncodes)
-    h_ctx = encoder_hidden(codelm, x_ctx)
+    h_ctx = pardec_context_hidden(codelm, model.upsampler_for(level_idx), ctx_code_soft, model.cfg,
+                                   codelm_rate_id, rng, group_size=upsampler_ncodes)
     logits, target_out, aux_loss, aux_acc = pardec_score(
         model.upsampler_for(level_idx), target_seq, h_ctx, context_group_size=upsampler_ncodes,
         output_group_size=upsampler_ncodes, rate_id=rate_id, output_expansion=model.K(level_idx))
@@ -1676,9 +1890,8 @@ def _decode_generate_pardec_call(model, level_idx, ctx_idx, upsampler_ncodes, gr
     codelm_rate_id = model.codelm_bos_rate_id(level_idx)  # CodeLM's own bos: always absolute
     rate_id = model.bos_rate_id(level_idx)  # upsampler's own bos: follows cfg.bos_rate_mode
     rng = jax.random.PRNGKey(seed)
-    x_ctx = code_embed_proj(ctx_idx, codelm.own_input_embed, codelm.own_input_proj)
-    x_ctx = codelm_bos_substitute(codelm, x_ctx, codelm_rate_id, rng, group_size=upsampler_ncodes)
-    h_ctx = encoder_hidden(codelm, x_ctx)
+    h_ctx = pardec_context_hidden(codelm, model.upsampler_for(level_idx), ctx_idx, model.cfg,
+                                   codelm_rate_id, rng, group_size=upsampler_ncodes)
     return pardec_generate(model.upsampler_for(level_idx), h_ctx, context_group_size=upsampler_ncodes,
                             output_group_size=upsampler_ncodes, rng=rng, greedy=greedy, temperature=temperature,
                             top_k=model.cfg.gen_top_k, rate_id=rate_id, output_expansion=model.K(level_idx))
@@ -1700,7 +1913,32 @@ def encoder_hidden(codelm: CodeLM, x: jnp.ndarray) -> jnp.ndarray:
 
 
 def encoder_ntp_logits(codelm: CodeLM, h: jnp.ndarray) -> jnp.ndarray:
+    # linear head only: an AR head needs the token's earlier digits, use codelm_ntp_logits_tf /
+    # codelm_sample_next for that.
+    assert codelm.token_head == "linear", "encoder_ntp_logits is linear-head only"
     return reshape_pq(h @ codelm.ntp_head, codelm.pq_chunks, codelm.code_vocab)
+
+
+def codelm_ntp_logits_tf(codelm: CodeLM, h: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+    # Teacher-forced NTP logits (..., chunks, V): h (..., D) predicts `target` (..., chunks), the
+    # NEXT token. Linear: parallel head. AR: digit m conditioned on the real digits <m of `target`.
+    if codelm.token_head == "linear":
+        return reshape_pq(h @ codelm.ntp_head, codelm.pq_chunks, codelm.code_vocab)
+    return token_ar_teacher_forced(codelm.tok_in_proj, codelm.tok_member_embed, codelm.tok_norm1,
+                                    codelm.tok_attn, codelm.tok_ln_f, codelm.tok_out_head,
+                                    codelm.token_dim, codelm.code_vocab, h, target)
+
+
+def codelm_sample_next(codelm: CodeLM, h_prev: jnp.ndarray, rng, greedy: bool, temperature,
+                       top_k: int = 0) -> jnp.ndarray:
+    # Sample the next token (B, chunks) from the last hidden state h_prev (B, D).
+    if codelm.token_head == "linear":
+        return _sample_tokens(reshape_pq(h_prev @ codelm.ntp_head, codelm.pq_chunks, codelm.code_vocab),
+                              rng, greedy, temperature, top_k)
+    idx, _ = token_ar_generate(codelm.tok_in_proj, codelm.tok_member_embed, codelm.tok_norm1,
+                                codelm.tok_attn, codelm.tok_ln_f, codelm.tok_out_head,
+                                codelm.pq_chunks, h_prev, rng, greedy, temperature, top_k)
+    return idx
 
 
 def _sample_tokens(logits: jnp.ndarray, rng, greedy: bool, temperature, top_k: int = 0) -> jnp.ndarray:
@@ -1760,8 +1998,7 @@ def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, tempe
 
     def body(t, carry):
         tokens, cache_k, cache_v, h_prev = carry
-        lg = encoder_ntp_logits(codelm, h_prev)
-        tok = _sample_tokens(lg, jax.random.fold_in(rng, t), greedy, temperature, top_k)
+        tok = codelm_sample_next(codelm, h_prev, jax.random.fold_in(rng, t), greedy, temperature, top_k)
         tokens = tokens.at[:, t].set(tok.astype(tokens.dtype))
         x_new = code_embed_proj(tok, codelm.own_input_embed, codelm.own_input_proj)
         h_new, cache_k, cache_v = self_step(x_new, cache_k, cache_v, t)
@@ -1816,8 +2053,7 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
     tok = byte_pq_fn(prompt_bytes, codelm0.pq_chunks, codelm0.code_vocab)
     for i in range(sample_level):
         codelm_i = model.codelm_for(i)
-        x = code_embed_proj(tok, codelm_i.own_input_embed, codelm_i.own_input_proj)
-        tok = encode_pardec_downsampler_generate(codelm_i, model.downsampler_for(i), x, model.K(i),
+        tok = encode_pardec_downsampler_generate(codelm_i, model.downsampler_for(i), tok, model.K(i), cfg,
                                                    rate_id=model.bos_rate_id(i),
                                                    codelm_rate_id=model.codelm_bos_rate_id(i),
                                                    rng=jax.random.fold_in(rng, i), greedy=greedy,
@@ -1840,10 +2076,10 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
                                  temperature, top_k, use_bos=use_bos,
                                  rate_id=model.codelm_bos_rate_id(sample_level))
 
-    codes, x = {}, code_embed_proj(tokens_L, codelm_L.own_input_embed, codelm_L.own_input_proj)
+    codes, raw = {}, tokens_L
     for i in range(sample_level, n):
         codelm_i = model.codelm_for(i)
-        out = encode_pardec_downsampler_generate(codelm_i, model.downsampler_for(i), x, model.K(i),
+        out = encode_pardec_downsampler_generate(codelm_i, model.downsampler_for(i), raw, model.K(i), cfg,
                                                    rate_id=model.bos_rate_id(i),
                                                    codelm_rate_id=model.codelm_bos_rate_id(i),
                                                    rng=jax.random.fold_in(rng, 1000 + i), greedy=greedy,
@@ -1851,8 +2087,7 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
                                                    downsampler_ncodes=cfg.downsampler_ncodes[i])
         codes[i] = out["code_idx"]
         if i < n - 1:
-            codelm_next = model.codelm_for(i + 1)
-            x = code_embed_proj(out["code_soft"], codelm_next.own_input_embed, codelm_next.own_input_proj)
+            raw = out["code_soft"]
 
     def cascade(cur, from_level):
         for i in range(from_level, -1, -1):
@@ -1915,7 +2150,8 @@ class LagCodecModel(eqx.Module):
                 output_vocab=code_vocab, output_chunks=pq_chunks, pq_dim=pq_dim,
                 token_dim=cfg.token_dim[level_idx], token_n_heads=cfg.token_n_heads[level_idx],
                 decode_past=cfg.downsampler_decode_past[level_idx], decode_future=cfg.downsampler_decode_future[level_idx],
-                n_rates=n_rates, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, remat=downsampler_remat)
+                n_rates=n_rates, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, remat=downsampler_remat,
+                ctx_vocab=code_vocab, ctx_pq_chunks=pq_chunks, ctx_pq_dim=pq_dim, token_head=cfg.pardec_token_head)
             downsamplers.append(downsampler)
 
             upsampler_remat = cfg.remat if cfg.upsampler_remat[level_idx] is None else cfg.upsampler_remat[level_idx]
@@ -1932,7 +2168,10 @@ class LagCodecModel(eqx.Module):
                 decode_past=cfg.upsampler_decode_past[level_idx], decode_future=cfg.upsampler_decode_future[level_idx],
                 n_rates=n_rates, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, remat=upsampler_remat,
                 shared_blocks=downsampler.blocks if cfg.share_downsampler_upsampler_lm else None,
-                shared_ln_f=downsampler.ln_f if cfg.share_downsampler_upsampler_lm else None)
+                shared_ln_f=downsampler.ln_f if cfg.share_downsampler_upsampler_lm else None,
+                ctx_vocab=code_vocab, ctx_pq_chunks=pq_chunks, ctx_pq_dim=pq_dim, token_head=cfg.pardec_token_head,
+                shared_ctx_embed=downsampler.own_ctx_embed if cfg.context_source == "shared_embed" else None,
+                shared_ctx_proj=downsampler.own_ctx_proj if cfg.context_source == "shared_embed" else None)
             upsamplers.append(upsampler)
 
         self.codelms = tuple(codelms)
@@ -1992,15 +2231,14 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     # input/NTP-target and levels>0's own input/NTP-target now share this exact representation,
     # which is what lets a single shared CodeLM process every level.
     tok0 = byte_pq_fn(flat_bytes, codelm0.pq_chunks, codelm0.code_vocab)
-    x = code_embed_proj(tok0, codelm0.own_input_embed, codelm0.own_input_proj)
-    target = tok0
+    raw, target = tok0, tok0
     codes, codes_soft = [], []
     enc_losses, enc_accs, utils, entropy_losses, label_losses = [], [], [], [], []
     label_mses, label_mse_losses = [], []
     level_rngs = [None] * (2 * phase) if rng is None else list(jax.random.split(rng, 2 * phase))
     for i in range(phase):
         codelm = model.codelm_for(i)
-        out = encode_pardec_downsampler(codelm, model.downsampler_for(i), x, target, flat_bytes, model.cfg,
+        out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, model.cfg,
                                          pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                          codelm_rate_id=model.codelm_bos_rate_id(i),
                                          rng=level_rngs[2 * i], downsampler_ncodes=model.cfg.downsampler_ncodes[i])
@@ -2028,8 +2266,7 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
             pred_label_soft = jnp.sum(label_probs_i * label_values_i, axis=-1)
             label_mse_losses.append(jnp.mean((pred_label_soft - label_tgt.astype(jnp.float32)) ** 2))
         if i < phase - 1:
-            codelm_next = model.codelm_for(i + 1)
-            x = code_embed_proj(out["code_soft"], codelm_next.own_input_embed, codelm_next.own_input_proj)
+            raw = out["code_soft"]
             target = out["code_idx"]
 
     dec_losses, dec_accs = [], []
@@ -2131,15 +2368,14 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
         n_blocks_entry = n_blocks_for_level(model.cfg, entry_level - 1)
         entry_code = label_fn(flat_bytes, model.cfg, pixel_order, n_blocks_entry,
                                model.cfg.pq_chunks[entry_level - 1], model.cfg.code_vocab[entry_level - 1])
-    x = code_embed_proj(entry_code, codelm_entry.own_input_embed, codelm_entry.own_input_proj)
-    target = entry_code
+    raw, target = entry_code, entry_code
     codes, codes_soft = [], []
     enc_losses, enc_accs, utils, entropy_losses, label_losses, label_mses = [], [], [], [], [], []
     level_rngs = [None] * (2 * depth) if rng is None else list(jax.random.split(rng, 2 * depth))
     for d in range(depth):
         i = entry_level + d
         codelm = model.codelm_for(i)
-        out = encode_pardec_downsampler(codelm, model.downsampler_for(i), x, target, flat_bytes, model.cfg,
+        out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, model.cfg,
                                          pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                          codelm_rate_id=model.codelm_bos_rate_id(i),
                                          rng=level_rngs[2 * d], downsampler_ncodes=model.cfg.downsampler_ncodes[i])
@@ -2159,8 +2395,7 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
             pred_label_hard = jnp.argmax(enc_logits, axis=-1).astype(jnp.float32)
             label_mses.append(jnp.mean((pred_label_hard - label_tgt.astype(jnp.float32)) ** 2))
         if d < depth - 1:
-            codelm_next = model.codelm_for(i + 1)
-            x = code_embed_proj(out["code_soft"], codelm_next.own_input_embed, codelm_next.own_input_proj)
+            raw = out["code_soft"]
             target = out["code_idx"]
 
     dec_losses, dec_accs = [], []
@@ -2323,14 +2558,28 @@ def plot_encoder_outs(model: "LagCodecModel", cfg: Config, imgs: np.ndarray, pix
     codelm = model.codelm_for(level)
     flat_raw = jnp.array(images_to_positions(imgs, cfg, pixel_order))
     codelm0 = model.codelm_for(0)
-    flat = rgb_byte_pq_fn(flat_raw, codelm0.pq_chunks, codelm0.code_vocab) if level == 0 else flat_raw
-    x = code_embed_proj(flat, codelm.own_input_embed, codelm.own_input_proj)
+    tok0 = rgb_byte_pq_fn(flat_raw, codelm0.pq_chunks, codelm0.code_vocab)
+    # For level>0, `level`'s own real input is level (level-1)'s own REAL encoded code output, not
+    # the raw image re-fed directly (that was the bug, fixed 2026-09-28: feeding raw 1024-position
+    # bytes straight into level1's downsampler -- which was only ever trained on level0's own
+    # 256-length code sequence -- ran it wildly out-of-distribution, producing the "hot pixel dot"
+    # codegrid artifact). Chain through the real encode cascade (same pattern as level_forward's own
+    # encode loop) to get the genuine input this level actually sees during training/generation.
+    flat, raw = tok0, tok0
+    for i in range(level):
+        codelm_i = model.codelm_for(i)
+        out_i = encode_pardec_downsampler(codelm_i, model.downsampler_for(i), raw, flat, flat_raw, cfg,
+                                           pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
+                                           codelm_rate_id=model.codelm_bos_rate_id(i),
+                                           downsampler_ncodes=cfg.downsampler_ncodes[i])
+        flat = out_i["code_idx"]
+        raw = out_i["code_soft"]
     # Must dispatch exactly like level_forward's own encode call (line ~1809) -- otherwise this
     # diagnostic reads code_idx from CodeLM's own untrained code_head/quantize path while training
     # actually optimizes the separate PardecLM-based encode_pardec_downsampler, silently plotting
     # noise from a never-trained pathway (caught 2026-09-26: loss/label_mse looked fine in
     # run.log, but this plot showed pure random-color noise for pred downsample).
-    out = encode_pardec_downsampler(codelm, model.downsampler_for(level), x, flat, flat_raw, cfg,
+    out = encode_pardec_downsampler(codelm, model.downsampler_for(level), raw, flat, flat_raw, cfg,
                                      pixel_order, label_fn, model.K(level), rate_id=model.bos_rate_id(level),
                                      codelm_rate_id=model.codelm_bos_rate_id(level),
                                      downsampler_ncodes=cfg.downsampler_ncodes[level])
@@ -2473,7 +2722,8 @@ CONFIG_FIELDS = ("img_size", "codelm_d_model", "codelm_n_layers", "codelm_n_head
                   "upsampler_d_model", "upsampler_n_layers", "upsampler_n_heads",
                   "upsampler_n_kv_heads", "upsampler_window",
                   "upsampler_decode_past", "upsampler_decode_future", "upsampler_remat",
-                  "share_across_levels", "bos_rate_mode", "share_downsampler_upsampler_lm", "strides",
+                  "share_across_levels", "bos_rate_mode", "context_source", "pardec_token_head", "codelm_token_head", "downsampler_rollout",
+                  "downsampler_rollout_prob", "share_downsampler_upsampler_lm", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "upsampler_ncodes",
                   "sync", "gen_temperature", "gen_top_k",
                   "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
@@ -2662,6 +2912,25 @@ def main():
                          "keys off each level's EFFECTIVE stride value, so levels sharing the same "
                          "stride share the same bos row (e.g. strides=(4,4,4) -> n_rates=1). "
                          "'absolute': rate_id is the raw level index, n_rates=n always (old behavior).")
+    p.add_argument("--context_source", type=str, default=Config.context_source,
+                    choices=("codelm", "own_embed", "shared_embed"),
+                    help="How downsampler/upsampler get their context. 'codelm' (default): CodeLM's "
+                         "own contextualized hidden states (encoder_hidden). 'own_embed': a plain "
+                         "per-position embedding table, no self-attention, own table per module. "
+                         "'shared_embed': same, but downsampler and upsampler share one table.")
+    p.add_argument("--pardec_token_head", type=str, default=Config.pardec_token_head, choices=("ar", "linear"),
+                    help="'ar' (default): AR digit head. 'linear': one parallel linear head for all digits "
+                         "(incompatible with --downsampler_rollout).")
+    p.add_argument("--codelm_token_head", type=str, default=Config.codelm_token_head, choices=("linear", "ar"),
+                    help="CodeLM's own NTP/free-run head: 'linear' (default, parallel digits) or 'ar' "
+                         "(small autoregressive digit head).")
+    p.add_argument("--downsampler_rollout", type=lambda x: x.lower() != "false",
+                    default=Config.downsampler_rollout,
+                    help="True: downsampler self-feeds its own (straight-through) digits instead of being "
+                         "teacher-forced on label_fn digits. Warns when False and label_reg_weight==0.")
+    p.add_argument("--downsampler_rollout_prob", type=float, default=Config.downsampler_rollout_prob,
+                    help="probability per step of using the rollout when --downsampler_rollout is on "
+                         "(warns if !=1 and label_reg_weight==0).")
     p.add_argument("--share_downsampler_upsampler_lm", type=lambda x: x.lower() != "false",
                     default=Config.share_downsampler_upsampler_lm,
                     help="False (default): fully separate downsampler/upsampler PardecLM weights. "
@@ -2876,22 +3145,20 @@ def main():
         m = cast_pytree(eval_model, compute_dtype)
         codelm0 = m.codelm_for(0)
         tok0 = rgb_byte_pq_fn(flat_prompt, codelm0.pq_chunks, codelm0.code_vocab)
-        x = code_embed_proj(tok0, codelm0.own_input_embed, codelm0.own_input_proj)
-        target = tok0
+        raw, target = tok0, tok0
         codes, codes_soft = [], []
         eval_rngs = ([None] * (top + 1) if not cfg.gumbel_at_inference
                      else list(jax.random.split(jax.random.fold_in(jax.random.PRNGKey(0), hash(tag) % (2**31)), top + 1)))
         for i in range(top + 1):
             codelm_i = m.codelm_for(i)
-            out = encode_pardec_downsampler(codelm_i, m.downsampler_for(i), x, target, flat_prompt, cfg,
+            out = encode_pardec_downsampler(codelm_i, m.downsampler_for(i), raw, target, flat_prompt, cfg,
                                              pixel_order, label_fn, m.K(i), rate_id=m.bos_rate_id(i),
                                              codelm_rate_id=m.codelm_bos_rate_id(i),
                                              rng=eval_rngs[i], downsampler_ncodes=cfg.downsampler_ncodes[i])
             codes.append(out["code_idx"])
             codes_soft.append(out["code_soft"])
             if i < top:
-                codelm_next = m.codelm_for(i + 1)
-                x = code_embed_proj(out["code_soft"], codelm_next.own_input_embed, codelm_next.own_input_proj)
+                raw = out["code_soft"]
                 target = out["code_idx"]
 
         recon_acc = None
