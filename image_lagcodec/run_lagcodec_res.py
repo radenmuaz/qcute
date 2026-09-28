@@ -1314,7 +1314,9 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
     # extra future tokens were embedded as input/keys but nothing ever queried FROM those positions,
     # and causal masking means they can't influence any earlier (real) prediction either.
     if decode_future > 0:
-        aux_pred_positions = window_size + decode_past + target_len_per_group - 1 + jnp.arange(decode_future)
+        # hidden at row idx W+dp+T+k (the embedding of target T-1+k) predicts future_k = target T+k;
+        # the old '-1' made k=0 share the hidden that must predict target T-1 (fixed 2026-09-28)
+        aux_pred_positions = window_size + decode_past + target_len_per_group + jnp.arange(decode_future)
         aux_predicted_hidden = hidden[:, aux_pred_positions, :]
         aux_predicted_hidden = aux_predicted_hidden.reshape(batch, n_groups * decode_future, hidden_dim)
         aux_target = real_tail_windows[:, :, target_len_per_group:, :].reshape(

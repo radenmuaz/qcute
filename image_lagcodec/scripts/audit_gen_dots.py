@@ -88,11 +88,56 @@ def periodic_stats(gen: np.ndarray, gt: np.ndarray, period: int = 8) -> dict:
                 col_mean=col_mean.tolist(), row_mean=row_mean.tolist())
 
 
+def _absdiff(a, b):
+    return np.abs(a.astype(int) - b.astype(int)).sum(-1)
+
+
+def layout_analysis(name, pred_pos, gt_pos, pred_img, gt_img, cfg):
+    """pred_pos/gt_pos: (B, P, 3) in traversal-position space; *_img: (B, H, W, 3) raster."""
+    B, P, _ = gt_pos.shape
+    print(f"\n--- layout analysis [{name}] ---")
+    m = {}
+    for sft in range(-8, 9):
+        a, b = (pred_pos[:, :P - sft], gt_pos[:, sft:]) if sft >= 0 else (pred_pos[:, -sft:], gt_pos[:, :P + sft])
+        m[sft] = float((_absdiff(a, b) <= 6).mean())
+    print("position-shift match rate (pred[p] ~ gt[p+s], tol 6):", " ".join(f"{k:+d}:{v:.3f}" for k, v in m.items()))
+    err = _absdiff(pred_pos, gt_pos).mean(0)
+    for size in (4, 16, 64):
+        prof = np.array([err[np.arange(P) % size == r].mean() for r in range(size)])
+        print(f"mean err by position index mod {size}:", np.array2string(prof, precision=0, max_line_width=200))
+    # outliers: top 2% error pixels; where does their color occur in the ground truth image nearby?
+    e_img = _absdiff(pred_img, gt_img)
+    thr = np.quantile(e_img, 0.98)
+    ys, xs, bs = np.where(e_img.transpose(1, 2, 0) >= thr)[0], np.where(e_img.transpose(1, 2, 0) >= thr)[1], np.where(e_img.transpose(1, 2, 0) >= thr)[2]
+    H, W = gt_img.shape[1:3]
+    hist, exact = {}, 0
+    for y, x, b in zip(ys, xs, bs):
+        best, bd = None, 10 ** 9
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                yy, xx = y + dy, x + dx
+                if (dy or dx) and 0 <= yy < H and 0 <= xx < W:
+                    d = int(np.abs(pred_img[b, y, x].astype(int) - gt_img[b, yy, xx].astype(int)).sum())
+                    if d < bd:
+                        bd, best = d, (dy, dx)
+        if bd <= 12:
+            exact += 1
+            hist[best] = hist.get(best, 0) + 1
+    top = sorted(hist.items(), key=lambda kv: -kv[1])[:6]
+    print(f"top-2% error pixels: {len(ys)}; {exact} have a near-exact colour match at a nearby GT pixel; "
+          f"most common (dy,dx) offsets: {top}")
+    print(f"error by raster row mod 8: {np.array2string(np.array([e_img[:, r::8].mean() for r in range(8)]), precision=0)}"
+          f"  col mod 8: {np.array2string(np.array([e_img[:, :, r::8].mean() for r in range(8)]), precision=0)}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run_dir", type=str, required=True)
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--top", type=int, default=None,
+                   help="highest level to encode/decode through (default: last level). Use 0 for phase-1 "
+                        "checkpoints where levels >0 are still untrained.")
     args = p.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -115,26 +160,23 @@ def main():
     (train_np, _), (val_np, _) = R.load_dataset(dataset, data_root, cfg.img_size)
     imgs = val_np[:args.batch]
     flat_raw = jnp.array(R.images_to_positions(imgs, cfg, pixel_order))
-    n = len(cfg.strides)
+    n = len(cfg.strides) if args.top is None else args.top + 1
 
     codelm0 = model.codelm_for(0)
     tok0 = R.rgb_byte_pq_fn(flat_raw, codelm0.pq_chunks, codelm0.code_vocab)
 
     # --- REAL teacher-forced encode through all levels (ground-truth codes/code_soft per level) ---
     codes, codes_soft = [], []
-    x, target = R.code_embed_proj(tok0, codelm0.own_input_embed, codelm0.own_input_proj), tok0
+    raw, target = tok0, tok0
     for i in range(n):
         codelm_i = model.codelm_for(i)
-        out = R.encode_pardec_downsampler(codelm_i, model.downsampler_for(i), x, target, flat_raw, cfg,
+        out = R.encode_pardec_downsampler(codelm_i, model.downsampler_for(i), raw, target, flat_raw, cfg,
                                            pixel_order, R.rgb_label_fn_jax, model.K(i), rate_id=model.bos_rate_id(i),
                                            codelm_rate_id=model.codelm_bos_rate_id(i),
                                            downsampler_ncodes=cfg.downsampler_ncodes[i])
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
-        if i < n - 1:
-            codelm_next = model.codelm_for(i + 1)
-            x = R.code_embed_proj(out["code_soft"], codelm_next.own_input_embed, codelm_next.own_input_proj)
-            target = out["code_idx"]
+        raw, target = out["code_soft"], out["code_idx"]
 
     # --- (a) FULLY TEACHER-FORCED cascade decode: every level sees REAL ctx/target, argmax logits ---
     cur_tf = codes[n - 1]
@@ -160,6 +202,10 @@ def main():
           f"edge_col(every 8th)={stats_tf['edge_col_mean']:.2f} other_col={stats_tf['other_col_mean']:.2f}")
     print(f"[rollout cascade]        mse={stats_gen['mse']:.2f} "
           f"edge_col(every 8th)={stats_gen['edge_col_mean']:.2f} other_col={stats_gen['other_col_mean']:.2f}")
+
+    gt_pos = np.asarray(flat_raw)
+    layout_analysis("teacher-forced", bytes_tf, gt_pos, img_tf, gt, cfg)
+    layout_analysis("rollout", bytes_gen, gt_pos, img_gen, gt, cfg)
 
     backend = jax.default_backend()
     png_path = run_dir / f"audit_gen_dots_{backend}.png"

@@ -17,9 +17,9 @@ uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/config
 img_size = 32
 
 codelm_d_model = 512
-codelm_n_layers = 4
-codelm_n_heads = 2
-codelm_n_kv_heads = None
+codelm_n_layers = 8
+codelm_n_heads = 4
+codelm_n_kv_heads = 4
 
 code_vocab = 256
 pq_chunks = 3
@@ -45,22 +45,22 @@ attn_window = 1024
 upsampler_ncodes = (16, 16)
 attn_lookahead = 0
 upsampler_decode_past = 0
-upsampler_decode_future = 4
+upsampler_decode_future = 0   # was 4: aux-loss off-by-one made the last token of each group unpredictable (fixed in code, kept off)
 remat_level = True
 
 additive_drop_loss = False
-downsampler_d_model = 1024
+downsampler_d_model = 512
 downsampler_n_layers = 4
-downsampler_n_heads = 8
-downsampler_n_kv_heads = 8
+downsampler_n_heads = 4
+downsampler_n_kv_heads = 4
 downsampler_window = 4
-downsampler_remat = True
+# downsampler_remat = True   # enable only if OOM
 upsampler_d_model = 1024
-upsampler_n_layers = 4
+upsampler_n_layers = 8
 upsampler_n_heads = 8
 upsampler_n_kv_heads = 8
 upsampler_window = 4
-upsampler_remat = True
+# upsampler_remat = True   # enable only if OOM
 
 use_codelm_bos = False   # ON for this ablation (was False in cifar_res_full1.py)
 # use_codelm_bos = True   # ON for this ablation (was False in cifar_res_full1.py)
