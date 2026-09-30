@@ -26,22 +26,14 @@ ssh -o ControlMaster=auto -o ControlPersist=yes -o ControlPath=~/.ssh/controlmas
 rsync -avz --exclude="checkpoints/" \
   -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -i ~/.ssh/google_compute_engine" \
   muaz@35.186.98.243:~/qcute/image_lagcodec/logs/<run_name>/ \
-  image_lagcodec/logs/<run_name>/
+  image_lagcodec/logs/
 
 rsync -avz --exclude="checkpoints/" \
   -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -i ~/.ssh/google_compute_engine" \
   muaz@35.186.15.67:~/qcute/image_lagcodec/logs/<run_name>/ \
-  image_lagcodec/logs/<run_name>/
+  image_lagcodec/logs/
 
-rsync -avz --exclude="checkpoints/" \
-  -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu3-%r@%h:%p -i ~/.ssh/google_compute_engine" \
-  muaz@107.167.160.20:~/qcute/image_lagcodec/logs/<run_name>/ \
-  image_lagcodec/logs/<run_name>/
-
-rsync -avz --exclude="checkpoints/" \
-  -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu4-%r@%h:%p -i ~/.ssh/google_compute_engine" \
-  muaz@35.186.33.7:~/qcute/image_lagcodec/logs/<run_name>/ \
-  image_lagcodec/logs/<run_name>/
+rsync -avz --exclude="checkpoints/" -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu34a-%r@%h:%p -i ~/.ssh/google_compute_engine" muaz@35.186.86.22:~/qcute/image_lagcodec/logs/<run_name>/ image_lagcodec/logs/
 
 ## pull example
 rsync -avz --exclude="checkpoints/" -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -i ~/.ssh/google_compute_engine" muaz@35.186.98.243:~/qcute/image_lagcodec/logs/1_baseline/ image_lagcodec/logs/
@@ -57,6 +49,7 @@ rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu1-%r@%h:%p -i ~/.ssh/
 rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu2-%r@%h:%p -i ~/.ssh/google_compute_engine" --filter=':- ../.gitignore' --exclude=".git/" image_lagcodec/ muaz@35.186.15.67:~/qcute/image_lagcodec/
 
 rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu34-%r@%h:%p -i ~/.ssh/google_compute_engine" --filter=':- ../.gitignore' --exclude=".git/" image_lagcodec/ muaz@35.186.86.22:~/qcute/image_lagcodec/
+
 rsync -avz -e "ssh -o ControlPath=~/.ssh/controlmasters/tpu34-%r@%h:%p -i ~/.ssh/google_compute_engine" --filter=':- ../.gitignore' --exclude=".git/" image_lagcodec/ muaz@35.186.115.139:~/qcute/image_lagcodec/
 
 

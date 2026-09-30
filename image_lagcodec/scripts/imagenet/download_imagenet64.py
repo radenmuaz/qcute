@@ -16,8 +16,8 @@ Non-RGB images (CMYK/L/RGBA) are resized in their native mode then converted to 
 step, exactly matching the reference's order (see center_crop_resize's docstring). Images that
 fail to decode are skipped and counted, not silently dropped without a trace.
 
-    uv run python image_gen_jax_1/scripts/download_imagenet64.py --split train --out_dir /dev/shm/imagenet64
-    uv run python image_gen_jax_1/scripts/download_imagenet64.py --split validation --out_dir /dev/shm/imagenet64
+uv run python image_lagcodec/scripts/imagenet/download_imagenet64.py --split train --out_dir /dev/shm/imagenet64
+uv run python image_lagcodec/scripts/imagenet/download_imagenet64.py --split validation --out_dir /dev/shm/imagenet64
 """
 from __future__ import annotations
 

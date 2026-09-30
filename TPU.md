@@ -60,7 +60,7 @@ gcloud compute tpus queued-resources ssh tpu2 --project raden-tpu --zone us-east
 ```
 
 ```
-gcloud compute tpus queued-resources create tpu3 --node-id tpunode --project raden-tpu --zone europe-west4-b --accelerator-type v5litepod-1 --runtime-version v2-alpha-tpuv5-lite --spot
+gcloud compute tpus queued-resources create tpu64 --node-id tpunode64 --project raden-tpu --zone europe-west4-b --accelerator-type v5litepod-64 --runtime-version v2-alpha-tpuv5-lite --spot
 
 gcloud compute tpus queued-resources describe tpu3--project raden-tpu --zone europe-west4-b
 

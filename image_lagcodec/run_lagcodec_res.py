@@ -2331,8 +2331,8 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
         + model.cfg.mse_weight * mse_loss + label_reg_weight * label_loss_total \
         + model.cfg.ntp_weight * aux_ntp_loss_total + model.cfg.label_mse_weight * label_mse_loss_total
-    bpb = dec_loss_total / jnp.log(2.0)
-    return loss, (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
+    # bpb = dec_loss_total / jnp.log(2.0)
+    return loss, (dec_loss_total, byte_acc, ntp_loss_total, jnp.mean(jnp.stack(enc_accs)),
                   jnp.mean(jnp.stack(utils)), byte_mse, aux_ntp_loss_total / jnp.log(2.0), aux_ntp_acc_total,
                   label_mse_total)
 
@@ -3228,22 +3228,24 @@ def main():
             sums += bn * np.array([float(a) for a in aux_b])
             total_loss += bn * float(loss_b)
             total_n += bn
-        _bpb, acc, _ntp_bpb, ntp_acc, util, val_mse, _aux_ntp_bpb, aux_ntp_acc, val_label_mse = \
+        dec_loss, dec_acc, enc_loss, enc_acc, util, val_mse, _aux_ntp_bpb, aux_ntp_acc, val_label_mse = \
             (sums / total_n).tolist()
         loss = total_loss / total_n
         val_time_s = time.monotonic() - val_t0
-        msg = (f"[{tag}] VAL loss={loss:.2f} val_dec_acc={acc:.2f} val_mse={val_mse:.4f} "
-               f"val_e_ntp_acc={ntp_acc:.2f} val_d_ntp_acc={aux_ntp_acc:.2f} "
+        msg = (f"[{tag}] VAL loss={loss:.2f} val_dec_loss={dec_loss:.2f} val_dec_acc={dec_acc:.2f} val_mse={val_mse:.4f} "
+               f"val_enc_acc={enc_acc:.2f} val_d_ntp_acc={aux_ntp_acc:.2f} "
                f"val_label_mse={val_label_mse:.2f} val_time={val_time_s:.1f}s")
-        rec = dict(tag=tag, val_loss=loss, val_dec_acc=acc,
-                    val_e_ntp_acc=ntp_acc, val_util=util, val_mse=val_mse,
+        rec = dict(tag=tag, val_loss=loss,
+                   val_dec_loss=dec_loss, val_dec_acc=dec_acc,
+                    val_enc_loss=enc_loss, val_enc_acc=enc_acc,
+                    val_util=util, val_mse=val_mse,
                     val_d_ntp_acc=aux_ntp_acc, val_label_mse=val_label_mse,
                     val_time_s=val_time_s)
         if val_compile_s is not None:
             msg += f" (first batch, incl. jit compile: {val_compile_s:.1f}s)"
             rec["val_compile_s"] = val_compile_s
         logger(msg, **rec)
-        return loss, acc
+        return dec_loss, dec_acc
 
     if args.wa_mode == "wma" and args.wa_wma_weights is not None:
         assert len(args.wa_wma_weights) == args.wa_stack_size, \
@@ -3415,30 +3417,40 @@ def main():
                     logger(f"{active_desc}: first train_step (incl. jit compile) took "
                            f"{time.monotonic() - jit_t0:.1f}s")
                     jit_timed = True
-                _bpb, acc, _ntp_bpb, ntp_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse, grad_norm = \
+                dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse, grad_norm = \
                     [float(local_array(a)[0]) for a in aux]
                 lr = float(lr_schedule(step - 1))
                 lr_str = _fmt_lr(lr)
                 pbar.set_postfix(step=step, loss=f"{loss0:.2f}",
-                                  acc=f"{acc:.2f}",
+                                  acc=f"{dec_acc:.2f}",
                                   lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
-                    logger(f"l={phase - 1} e={epoch_num} s={step} loss={loss0:.2f} dec_acc={acc:.2f} "
-                           f"e_ntp_acc={ntp_acc:.2f} util={util:.2f} mse={train_mse:.1f} "
-                           f"d_ntp_acc={aux_ntp_acc:.2f} label_mse={label_mse:.2f} "
+                    logger(f"l={phase - 1} e={epoch_num} s={step} "
+                           f"loss={loss0:.2f} "
+                           f"dec_loss={dec_loss:.2f} dec_acc={dec_acc:.2f} "
+                           f"enc_loss={enc_loss:.2f} enc_acc={enc_acc:.2f} "
+                           f"util={util:.2f} mse={train_mse:.1f} "
+                        #    f"d_ntp_acc={aux_ntp_acc:.2f}"
+                           f"label_mse={label_mse:.2f} "
                            f"lr={lr_str} grad_norm={grad_norm:.2f}",
                            level=phase - 1, epoch=epoch_num, step=step, loss=loss0,
-                           dec_acc=acc, e_ntp_acc=ntp_acc, util=util,
-                           mse=train_mse, d_ntp_acc=aux_ntp_acc, label_mse=label_mse,
+                           dec_loss=dec_loss, dec_acc=dec_acc,
+                           enc_acc=enc_acc, util=util,
+                           mse=train_mse,
+                        #    d_ntp_acc=aux_ntp_acc, 
+                           label_mse=label_mse,
                            lr=lr, grad_norm=grad_norm)
 
                 if step % gen_eval_every_steps == 0:
                     snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
                     run_val_eval(snapshot, phase, tag=f"level{phase - 1}_step{step}")
                     run_gen_eval_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{step}")
-                    plot_encoder_outs(snapshot, cfg, val_np[:args.val_batch_size[phase - 1]], pixel_order,
+                    try:
+                        plot_encoder_outs(snapshot, cfg, val_np[:args.val_batch_size[phase - 1]], pixel_order,
                                        run_dir / f"samples_level{phase - 1}_step{step}_codegrid.png",
                                        level=phase - 1, label_fn=label_fn)
+                    except Exception as e:
+                        print(e)
 
                 if step % ckpt_every_steps == 0:
                     ckpt_model = eqx.combine(to_host(unreplicate(p_diff_model)), static_model)
