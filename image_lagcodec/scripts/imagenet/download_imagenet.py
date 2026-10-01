@@ -23,8 +23,8 @@ worker_id)` slice (same mechanism as prep_imagenet64_parallel.py) and writing it
 worker-prefixed shard files -- no collisions, network I/O (the actual bottleneck here, no
 decode/resize work) parallelizes roughly linearly with worker count.
 
-    uv run python summformer_jax/image_gen/scripts/download_imagenet.py --split train --out_dir /dev/shm/imagenet_raw --num_workers 8
-    uv run python summformer_jax/image_gen/scripts/download_imagenet.py --split validation --out_dir /dev/shm/imagenet_raw --num_workers 4
+uv run python image_lagcodec/scripts/imagenet/download_imagenet.py--split train --out_dir /dev/shm/imagenet_raw --num_workers 8
+uv run python image_lagcodec/scripts/imagenet/download_imagenet.py --split validation --out_dir /dev/shm/imagenet_raw --num_workers 4
 """
 from __future__ import annotations
 

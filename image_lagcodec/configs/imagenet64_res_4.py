@@ -1,18 +1,19 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/imagenet64_res_2s.py
+uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/imagenet64_res_4.py
 """
 # --- data ---
 img_size = 64
 dataset = "imagenet64"
 data_root = "/dev/shm/imagenet64"
-multihost = True
-# multihost = False
+# multihost = True
+multihost = False
 
 # --- model ---
 # remat_level = True
+share_across_levels = False
 # share_downsampler_upsampler_lm = True
 remat = True
-codelm_d_model = 512
+codelm_d_model = 256
 codelm_n_layers = 2
 codelm_n_heads = 2
 codelm_n_kv_heads = 2
@@ -23,7 +24,6 @@ pq_dim = 64
 mlp_mult = 4
 rope_base = 10000.0
 
-additive_drop_loss = False
 ntp_weight = 0.1
 mse_weight = 0.0
 entropy_weight = 0.0
@@ -35,10 +35,10 @@ bos_rate_mode = "absolute"
 strides = (4, 4, 4, 4,)
 # attn_window = 1024
 attn_window = 4096
-upsampler_ncodes = 4
+upsampler_ncodes = 1
 attn_lookahead = 0
 upsampler_decode_past = 0
-upsampler_decode_future = 0   # was 4: aux-loss off-by-one made the last token of each group unpredictable (fixed in code, kept off)
+upsampler_decode_future = 0
 
 
 downsampler_d_model = 128
@@ -55,23 +55,23 @@ downsampler_window = 1
 # upsampler_window = downsampler_window
 # upsampler_remat = downsampler_remat
 
-downsampler_d_model = 1024
-downsampler_n_layers = 16
-downsampler_n_heads = 8
-downsampler_n_kv_heads = 8
-downsampler_window = 2
-# # downsampler_remat = True
-# upsampler_d_model = 768
-# upsampler_n_layers = 12
-# upsampler_n_heads = 8
-# upsampler_n_kv_heads = 8
-# upsampler_window = 2
+# downsampler_d_model = 1024
+# downsampler_n_layers = 4
+# downsampler_n_heads = 8
+# downsampler_n_kv_heads = 8
+# downsampler_window = 2
+# downsampler_remat = True
+upsampler_d_model = 1024
+upsampler_n_layers = 4
+upsampler_n_heads = 4
+upsampler_n_kv_heads = 4
+upsampler_window = 1
 # upsampler_remat = True
 
-use_codelm_bos = True
-codelm_bos_prob = 0.5
+use_codelm_bos = False
+# codelm_bos_prob = 0.8
 curriculum_mode = "no_freeze"
-quantize_mode = "gumbel"
+quantize_mode = "argmax"
 encode_temperature = 1.0
 gumbel_at_inference = False
 mse_softmax_tau = 1.0
@@ -94,7 +94,7 @@ eval_gen_train = True
 
 
 # --- training ---
-batch_size = 1       # per DEVICE; tpu34 = 2 hosts x 4 devices -> global batch 64 (16 OOMs: 20.4G program vs 16G free)
+batch_size = 2       # per DEVICE; tpu34 = 2 hosts x 4 devices -> global batch 64 (16 OOMs: 20.4G program vs 16G free)
 val_batch_size = 2
 # level_epochs = (1, 1, 5)
 # Approximate step equivalents (tpu34 v4-16: batch_size 8 x 4 local devices x 2 hosts = global batch 64;
@@ -102,21 +102,21 @@ val_batch_size = 2
 #   (1, 1, 5) epochs  ~=  (20018, 20018, 100090) steps  (140,126 total)
 # To schedule by steps instead, comment out level_epochs above and uncomment (level_epochs and
 # level_steps are mutually exclusive; steps-per-epoch scales with batch_size / n devices / n hosts):
-level_steps = (100_000, 100_000, 100_000, 1_000_000)
+level_steps = (0, 0, 0, 1_000_000)
 seed = 0
 train_subset_n = None
 val_subset_n = 512
 # gen_eval_every_epoch = 0.25   # ~= every 5,005 steps at global batch 64
-gen_eval_every_step = 20_000   # uncomment (and comment gen_eval_every_epoch) to eval by steps
+gen_eval_every_step = 10_000   # uncomment (and comment gen_eval_every_epoch) to eval by steps
 epoch_verbose = False
 
 grad_clip = 1.0
 lr = 5e-4
 lr_schedule = "cosine"
 lr_min = 1e-5
-lr_min_step = int(50e3)
+# lr_min_step = int(100e3)
 # lr_min_step = int(200e3)
-warmup_steps = 1000
+warmup_steps = 10_000
 optimizer = "adamw"
 optimizer_kwargs = dict(weight_decay=1e-5)
 

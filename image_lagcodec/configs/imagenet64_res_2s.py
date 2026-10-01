@@ -1,30 +1,21 @@
 """
-export XLA_PYTHON_CLIENT_PREALLOCATE=
-export XLA_PYTHON_CLIENT_ALLOCATOR=
-export XLA_PYTHON_CLIENT_MEM_FRACTION=
-export LIBTPU_INIT_ARGS=
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_ALLOCATOR=platform
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.50
-export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=true"
-export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_data_parallel_all_reduce_opt=true"
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/imagenet64_res_1.py
+uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/imagenet64_res_2s.py
 """
 # --- data ---
 img_size = 64
 dataset = "imagenet64"
 data_root = "/dev/shm/imagenet64"
-multihost = True
-# multihost = False
+# multihost = True
+multihost = False
 
 # --- model ---
-remat_level = True
+# remat_level = True
 # share_downsampler_upsampler_lm = True
-# remat = True
-codelm_d_model = 768
-codelm_n_layers = 12
-codelm_n_heads = 8
-codelm_n_kv_heads = 8
+remat = True
+codelm_d_model = 512
+codelm_n_layers = 4
+codelm_n_heads = 2
+codelm_n_kv_heads = 2
 
 code_vocab = 256
 pq_chunks = 3
@@ -39,20 +30,21 @@ entropy_weight = 0.0
 label_reg_weight = 0.1
 
 label_fn = "rgb_label_fn_jax"
-bos_rate_mode = "relative"
-# bos_rate_mode = "absolute"
-strides = (4, 4, 4, 4, 4)
-attn_window = 1024
-upsampler_ncodes = 1
+# bos_rate_mode = "relative"
+bos_rate_mode = "absolute"
+strides = (4, 4, 4, 4,)
+# attn_window = 1024
+attn_window = 4096
+upsampler_ncodes = 4
 attn_lookahead = 0
 upsampler_decode_past = 0
 upsampler_decode_future = 0   # was 4: aux-loss off-by-one made the last token of each group unpredictable (fixed in code, kept off)
 
 
-downsampler_d_model = 512
-downsampler_n_layers = 8
-downsampler_n_heads = 4
-downsampler_n_kv_heads = 4
+downsampler_d_model = 128
+downsampler_n_layers = 1
+downsampler_n_heads = 1
+downsampler_n_kv_heads = 1
 downsampler_window = 1
 # downsampler_remat = True
 
@@ -63,18 +55,18 @@ downsampler_window = 1
 # upsampler_window = downsampler_window
 # upsampler_remat = downsampler_remat
 
-# downsampler_d_model = 1024
-# downsampler_n_layers = 16
-# downsampler_n_heads = 8
-# downsampler_n_kv_heads = 8
-# downsampler_window = 2
+downsampler_d_model = 1024
+downsampler_n_layers = 16
+downsampler_n_heads = 8
+downsampler_n_kv_heads = 8
+downsampler_window = 2
 # # downsampler_remat = True
-upsampler_d_model = 1024
-upsampler_n_layers = 16
-upsampler_n_heads = 8
-upsampler_n_kv_heads = 8
-upsampler_window = 2
-# # upsampler_remat = True
+# upsampler_d_model = 768
+# upsampler_n_layers = 12
+# upsampler_n_heads = 8
+# upsampler_n_kv_heads = 8
+# upsampler_window = 2
+# upsampler_remat = True
 
 use_codelm_bos = True
 codelm_bos_prob = 0.5
@@ -102,7 +94,7 @@ eval_gen_train = True
 
 
 # --- training ---
-batch_size = 2       # per DEVICE; tpu34 = 2 hosts x 4 devices -> global batch 64 (16 OOMs: 20.4G program vs 16G free)
+batch_size = 1       # per DEVICE; tpu34 = 2 hosts x 4 devices -> global batch 64 (16 OOMs: 20.4G program vs 16G free)
 val_batch_size = 2
 # level_epochs = (1, 1, 5)
 # Approximate step equivalents (tpu34 v4-16: batch_size 8 x 4 local devices x 2 hosts = global batch 64;
@@ -110,7 +102,7 @@ val_batch_size = 2
 #   (1, 1, 5) epochs  ~=  (20018, 20018, 100090) steps  (140,126 total)
 # To schedule by steps instead, comment out level_epochs above and uncomment (level_epochs and
 # level_steps are mutually exclusive; steps-per-epoch scales with batch_size / n devices / n hosts):
-level_steps = (100_000, 100_000, 100_000, 100_000, 1_000_000)
+level_steps = (100_000, 100_000, 100_000, 1_000_000)
 seed = 0
 train_subset_n = None
 val_subset_n = 512
