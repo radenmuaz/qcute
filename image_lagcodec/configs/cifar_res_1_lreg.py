@@ -54,13 +54,13 @@ downsampler_n_layers = 4
 downsampler_n_heads = 4
 downsampler_n_kv_heads = 4
 downsampler_window = 4
-# downsampler_remat = True   # enable only if OOM
+downsampler_remat = True
 upsampler_d_model = 1024
 upsampler_n_layers = 8
 upsampler_n_heads = 8
 upsampler_n_kv_heads = 8
 upsampler_window = 4
-# upsampler_remat = True   # enable only if OOM
+upsampler_remat = True
 
 use_codelm_bos = False   # ON for this ablation (was False in cifar_res_full1.py)
 # use_codelm_bos = True   # ON for this ablation (was False in cifar_res_full1.py)

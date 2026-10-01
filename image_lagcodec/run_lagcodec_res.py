@@ -19,6 +19,7 @@ import argparse
 import json
 import math
 import pickle
+import random
 import shutil
 import sys
 import tarfile
@@ -2350,9 +2351,57 @@ def sample_multires_entry(py_rng, n_levels: int) -> tuple:
     return entry_level, depth
 
 
+def sample_level_range(py_rng, probs: tuple) -> tuple:
+    # cfg.level_select_prob-driven sampler: `probs` has length n-1 (one Bernoulli per transition,
+    # the last level never needs its own "stop" flip -- there's nowhere left to walk). Reused for
+    # BOTH the start-walk and the end-walk (two independent passes over the same tuple), per the
+    # design discussion 2026-10-01: sound and simpler than sample_multires_entry's
+    # randrange(1, n_levels-entry_level), which is an EMPTY range (ValueError) whenever
+    # entry_level==n_levels-1 and had to pre-exclude that case entirely, artificially disallowing
+    # "train the top level alone". Each flip here is an independent, always-valid Bernoulli draw;
+    # reaching a boundary without a "stop" draw just forces the decision there, so every (s, e) pair
+    # with 0<=s<=e<n -- INCLUDING s==e at any level, including n-1 -- is reachable by construction,
+    # never by exclusion. Returns (entry_level, depth) to match sample_multires_entry's own
+    # call-site convention (depth = e - s + 1), not (s, e) directly.
+    n = len(probs) + 1
+    s = n - 1
+    for i in range(n - 1):
+        if py_rng.random() < probs[i]:
+            s = i
+            break
+    e = n - 1
+    for j in range(s, n - 1):
+        if py_rng.random() < probs[j]:
+            e = j
+            break
+    return s, e - s + 1
+
+
+def _encode_chain_upto(model, flat_bytes, upto_level, cfg, label_fn, pixel_order, byte_pq_fn, rng):
+    # Runs the REAL encoder chain through levels 0..upto_level-1 (upto_level steps), returning the
+    # resulting (code_idx, code_soft) -- level `upto_level`'s own real native input, as the shared
+    # encoder actually produces it end-to-end, not label_fn's resize-based shortcut. Used only by
+    # level_forward_multires's entry_gt_drop blend below; the caller stop_gradients the result (no
+    # update onto these levels from this particular usage -- see Config.multires_entry_gt_drop).
+    codelm0 = model.codelm_for(0)
+    tok0 = byte_pq_fn(flat_bytes, codelm0.pq_chunks, codelm0.code_vocab)
+    raw, target = tok0, tok0
+    level_rngs = [None] * upto_level if rng is None else list(jax.random.split(rng, upto_level))
+    code_idx = code_soft = None
+    for i in range(upto_level):
+        codelm = model.codelm_for(i)
+        out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, cfg,
+                                         pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
+                                         codelm_rate_id=model.codelm_bos_rate_id(i), rng=level_rngs[i],
+                                         downsampler_ncodes=cfg.downsampler_ncodes[i])
+        code_idx, code_soft = out["code_idx"], out["code_soft"]
+        raw, target = code_soft, code_idx
+    return code_idx, code_soft
+
+
 def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_level: int, depth: int,
                             rng=None, encode_temperature: float = 1.0, label_reg_weight: float = 0.0,
-                            label_fn=None, pixel_order=None, byte_pq_fn=None) -> tuple:
+                            label_fn=None, pixel_order=None, byte_pq_fn=None, entry_gt_drop: float = None) -> tuple:
     # Same idea as level_forward, but the encode cascade starts at entry_level (not always 0) and
     # runs only `depth` further steps. entry_level=0 is equivalent to level_forward(..., phase=depth)
     # in spirit (though the aux tuple shape differs slightly, see below). entry_level>0's input is
@@ -2366,11 +2415,35 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
     byte_pq_fn = byte_pq_fn or rgb_byte_pq_fn
     if entry_level == 0:
         entry_code = byte_pq_fn(flat_bytes, codelm_entry.pq_chunks, codelm_entry.code_vocab)
+        raw, target = entry_code, entry_code
     else:
         n_blocks_entry = n_blocks_for_level(model.cfg, entry_level - 1)
-        entry_code = label_fn(flat_bytes, model.cfg, pixel_order, n_blocks_entry,
-                               model.cfg.pq_chunks[entry_level - 1], model.cfg.code_vocab[entry_level - 1])
-    raw, target = entry_code, entry_code
+        label_shortcut = label_fn(flat_bytes, model.cfg, pixel_order, n_blocks_entry,
+                                   model.cfg.pq_chunks[entry_level - 1], model.cfg.code_vocab[entry_level - 1])
+        # entry_gt_drop (forked from level_gt_drop's own real-vs-rollout mixing, for this entry_level
+        # construction specifically -- see Config.multires_entry_gt_drop): with probability
+        # entry_gt_drop, use the REAL encoder chain's own output (the model's actual, exposure-
+        # biased input at this level) instead of label_fn's idealized resize-based shortcut. The
+        # chain is stop_gradient'd -- "no update onto levels before the selected entry_level" (this
+        # step's gradient only trains the [entry_level, entry_level+depth) range actually run below,
+        # matching entry_gt_drop=None's existing default behavior exactly).
+        if entry_gt_drop is not None and rng is not None:
+            rng, chain_rng, blend_rng = jax.random.split(rng, 3)
+            chain_idx, chain_soft = _encode_chain_upto(model, flat_bytes, entry_level, model.cfg, label_fn,
+                                                        pixel_order, byte_pq_fn, chain_rng)
+            chain_idx = jax.lax.stop_gradient(chain_idx)
+            chain_soft = jax.lax.stop_gradient(chain_soft)
+            use_real = jax.random.bernoulli(blend_rng, p=entry_gt_drop, shape=(flat_bytes.shape[0],))
+            label_soft = jax.nn.one_hot(label_shortcut, model.cfg.code_vocab[entry_level - 1], dtype=chain_soft.dtype)
+            hard_bcast = use_real.reshape((-1,) + (1,) * (label_shortcut.ndim - 1))
+            soft_bcast = use_real.reshape((-1,) + (1,) * (label_soft.ndim - 1))
+            target = jnp.where(hard_bcast, chain_idx, label_shortcut)
+            raw = jnp.where(soft_bcast, chain_soft, label_soft)
+        else:
+            raw, target = label_shortcut, label_shortcut
+    entry_code = target  # the entry level's own hard representation, used below as the final
+    # (shallowest) decode step's target -- whichever branch set `target` above (label shortcut, or
+    # the entry_gt_drop blend of label shortcut vs real chain).
     codes, codes_soft = [], []
     enc_losses, enc_accs, utils, entropy_losses, label_losses, label_mses = [], [], [], [], [], []
     level_rngs = [None] * (2 * depth) if rng is None else list(jax.random.split(rng, 2 * depth))
@@ -2603,7 +2676,10 @@ def plot_encoder_outs(model: "LagCodecModel", cfg: Config, imgs: np.ndarray, pix
     panels, titles = [gt], ["ground truth"]
     label_mse = None
     if label_fn is not None:
-        label_tgt = np.asarray(label_fn(flat, cfg, pixel_order, n_blocks, cfg.pq_chunks[level], cfg.code_vocab[level]))
+        # label_fn ALWAYS resizes from the true raw image (flat_raw), regardless of level -- `flat`
+        # is this level's own chained input (level-1's code for level>0, not the raw image), so
+        # passing it here crashed for level>0 (wrong length, e.g. 256 instead of img_size**2).
+        label_tgt = np.asarray(label_fn(flat_raw, cfg, pixel_order, n_blocks, cfg.pq_chunks[level], cfg.code_vocab[level]))
         panels.append(to_grid(label_tgt))
         titles.append("target downsample")
         label_mse = float(np.mean((code_idx.astype(np.float64) - label_tgt.astype(np.float64)) ** 2))
@@ -2968,6 +3044,22 @@ def main():
                          "scalar broadcasts to every phase); each phase entry may itself be a "
                          "scalar (same prob for every level transition) or a tuple (one prob per "
                          "level, config.py only -- not expressible on the CLI)")
+    p.add_argument("--level_select_prob", type=_float_tuple_arg, default=None,
+                    help="If set (length n_levels-1, NOT per-phase -- one flat tuple), enables "
+                         "any-level training for every active phase: each step independently samples "
+                         "(entry_level, depth) via sample_level_range, reusing this one tuple for both "
+                         "the start-walk and the end-walk (see sample_level_range's own docstring for "
+                         "why this is sound -- every (entry_level, depth) pair including a single "
+                         "level alone at any index, including the top, is reachable by construction), "
+                         "instead of level_forward's fixed-phase cascade (level 0 up through "
+                         "phase-1). None (default): unchanged fixed-phase behavior.")
+    p.add_argument("--multires_entry_gt_drop", type=_float_tuple_arg, default=None,
+                    help="Forked from --level_gt_drop, for --level_select_prob's any-level training "
+                         "specifically (length n_levels, indexed by entry_level -- index 0 is unused, "
+                         "entry_level=0 never needs this). With this probability, entry_level>0's own "
+                         "input is the REAL (stop_gradient'd) encoder chain's output instead of "
+                         "label_fn's resize-based shortcut -- see level_forward_multires's own "
+                         "entry_gt_drop param. None (default): always the label_fn shortcut.")
     p.add_argument("--layer_drop_prob", type=_float_tuple_arg, default=(0.0,),
                     help="stochastic-depth drop probability per transformer layer -- bare scalar "
                          "broadcasts to every phase uniformly; a flat tuple (length n_phases) "
@@ -3083,6 +3175,14 @@ def main():
     n_phases = n_levels if top_level_trainable else n_levels - 1
     n_positions = n_positions_of(cfg)
     pixel_order = pixel_order_for(cfg)
+    if args.level_select_prob is not None:
+        assert len(args.level_select_prob) == n_levels - 1, \
+            f"--level_select_prob needs {n_levels - 1} entries (n_levels-1 transitions), " \
+            f"got {len(args.level_select_prob)}"
+    if args.multires_entry_gt_drop is not None:
+        assert len(args.multires_entry_gt_drop) == n_levels, \
+            f"--multires_entry_gt_drop needs {n_levels} entries (indexed by entry_level), " \
+            f"got {len(args.multires_entry_gt_drop)}"
 
     def _bcast_per_phase(name):
         val = getattr(args, name)
@@ -3277,7 +3377,23 @@ def main():
         phase_complete = resume_meta["phase_step"] >= phase_steps_resume
         phase_iter = [p for p in phase_iter if p > resume_phase] if phase_complete \
             else [p for p in phase_iter if p >= resume_phase]
+    # level_select_prob's any-level training (see sample_level_range): ONE persistent python Random
+    # across the whole run (not re-seeded per phase), so distinct phases don't replay the same
+    # (entry_level, depth) sequence. Plain python random, not jax -- (entry_level, depth) must be
+    # static ints chosen BEFORE jax.jit traces each step, same constraint `phase` already has.
+    multires_py_rng = random.Random(args.seed)
     for phase in phase_iter:
+        # --level_steps[phase-1]==0 (or --level_epochs[phase-1]==0): skip this phase ENTIRELY before
+        # any setup work (BatchIterator, jit) -- e.g. cifar_res_4.py's level_steps=(0,)*4+(100000,)
+        # trains only the last phase. (epoch-based 0 already skips the inner step loop today, but
+        # still pays for the BatchIterator/pmap setup; the explicit level_steps=0 case is the one
+        # that matters for cheaply skipping many phases, so only that one is special-cased here.)
+        if args.level_steps is not None and args.level_steps[phase - 1] == 0:
+            logger(f"level{phase - 1}: level_steps=0, skipping phase entirely")
+            continue
+        if args.level_epochs is not None and args.level_epochs[phase - 1] == 0:
+            logger(f"level{phase - 1}: level_epochs=0, skipping phase entirely")
+            continue
         train_iter = BatchIterator(train_np, train_labels[:len(train_np)], args.batch_size[phase - 1],
                                     n_devices, shuffle=True, seed=args.seed, cfg=cfg)
         recon_prompt = val_np[:args.val_batch_size[phase - 1]]
@@ -3359,6 +3475,41 @@ def main():
             return diff_model, opt_state, rng, loss, aux
 
         train_step = jax.pmap(train_step, axis_name="d")
+
+        # --level_select_prob: any-level training (see sample_level_range/level_forward_multires).
+        # (entry_level, depth) must be static per trace (same constraint `phase` already has), so
+        # each distinct pair gets its own pmap'd closure, built lazily and cached -- repeat pairs
+        # reuse the already-compiled step, same amortization `phase` itself already relies on.
+        multires_active = args.level_select_prob is not None
+        multires_step_cache = {}
+
+        def _build_multires_step(entry_level, depth, static_model=static_model):
+            entry_gt_drop_sd = (args.multires_entry_gt_drop[entry_level]
+                                 if args.multires_entry_gt_drop is not None and entry_level > 0 else None)
+
+            def loss_fn_sd(diff_model, static_model, flat_bytes, rng, cascade_rng):
+                m = eqx.combine(diff_model, static_model)
+                m = cast_pytree(m, compute_dtype)
+                return level_forward_multires(m, flat_bytes, entry_level=entry_level, depth=depth, rng=rng,
+                                               encode_temperature=encode_temperature_phase,
+                                               label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
+                                               pixel_order=pixel_order, entry_gt_drop=entry_gt_drop_sd)
+
+            def train_step_sd(diff_model, opt_state, rng, flat_bytes, static_model=static_model):
+                rng, level_rng, cascade_rng = jax.random.split(rng, 3)
+                (loss, aux), grads = jax.value_and_grad(loss_fn_sd, has_aux=True)(
+                    diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+                grads = jax.lax.pmean(grads, axis_name="d")
+                loss = jax.lax.pmean(loss, axis_name="d")
+                aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
+                grad_norm = optax.global_norm(grads)
+                aux = aux + (grad_norm,)
+                updates, opt_state = optimizer.update(grads, opt_state, diff_model)
+                diff_model = eqx.apply_updates(diff_model, updates)
+                return diff_model, opt_state, rng, loss, aux
+
+            return jax.pmap(train_step_sd, axis_name="d")
+
         p_diff_model = replicate(diff_model, n_devices)
         p_opt_state = replicate(opt_state, n_devices)
         p_rng_key = jax.random.fold_in(jax.random.PRNGKey(args.seed), phase)
@@ -3379,9 +3530,11 @@ def main():
             logger(f"resumed phase {phase}: optimizer/rng/dataloader state restored, "
                    f"continuing from phase_step {start_phase_step}")
 
-        active_desc = f"level{phase - 1}"
+        active_desc = f"level{phase - 1}" if not multires_active else f"anylevel(phase{phase})"
         logger(f"=== starting {active_desc} for {phase_total_steps / steps_per_epoch_lr:.3g} "
-               f"epochs ({phase_total_steps} steps) ===")
+               f"epochs ({phase_total_steps} steps) ===" +
+               (f" -- any-level training active, level_select_prob={args.level_select_prob}"
+                if multires_active else ""))
 
         steps_per_epoch = len(train_iter)
         gen_eval_every_steps = _every_steps(args.gen_eval_every_step, args.gen_eval_every_epoch, steps_per_epoch)
@@ -3408,7 +3561,15 @@ def main():
                 flat = jnp.array(flat)
                 if not jit_timed:
                     jit_t0 = time.monotonic()
-                p_diff_model, p_opt_state, p_rng, loss, aux = train_step(p_diff_model, p_opt_state, p_rng, flat)
+                if multires_active:
+                    s_lvl, d_lvl = sample_level_range(multires_py_rng, args.level_select_prob)
+                    step_fn = multires_step_cache.get((s_lvl, d_lvl))
+                    if step_fn is None:
+                        step_fn = _build_multires_step(s_lvl, d_lvl)
+                        multires_step_cache[(s_lvl, d_lvl)] = step_fn
+                    p_diff_model, p_opt_state, p_rng, loss, aux = step_fn(p_diff_model, p_opt_state, p_rng, flat)
+                else:
+                    p_diff_model, p_opt_state, p_rng, loss, aux = train_step(p_diff_model, p_opt_state, p_rng, flat)
                 step += 1
                 phase_step += 1
                 pbar.update(1)
