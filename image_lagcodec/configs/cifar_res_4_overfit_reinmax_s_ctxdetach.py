@@ -1,12 +1,16 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_4_anylevel.py
+uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_4_overfit_reinmax_s_ctxdetach.py
 """
-# Fork of cifar_res_4.py -- tests the new any-level training feature (sample_level_range /
-# level_forward_multires's entry_gt_drop, wired into main() 2026-10-01). level_steps=(0,)*4+(100000,)
-# already skips phases 1-4 entirely (the new level_steps==0 skip), so only phase 5 (all 5 levels)
-# runs, with level_select_prob active: each step independently samples (entry_level, depth) via the
-# two-walk sampler, instead of the fixed level_forward cascade. multires_entry_gt_drop blends the
-# entry_level>0 input between label_fn's resize shortcut and the real (stop_gradient'd) encoder chain.
+# Fork of cifar_res_4_overfit_reinmax_s.py -- tests ctx_stop_gradient + decoder_scheduled_sampling_prob
+# (added 2026-10-02): level_forward's decode-cascade `ctx` (real_ctx/pseudo_ctx) is a straight-through
+# estimator by default, so gradient leaks ACROSS levels through it (a level's reconstruction loss
+# trains the level ABOVE's upsampler, on top of that level's own loss) -- unlike level 0's target
+# (raw bytes), which was never differentiable. ctx_stop_gradient=True cuts that cross-level gradient
+# path entirely, matching level 0's treatment. decoder_scheduled_sampling_prob adds a per-level
+# probability of replacing level_gt_drop's real/pseudo ctx mixture with a cheap "parallel scheduled
+# sampling" ctx: one teacher-forced pardec_score pass's hard argmax, DETACHED (needs
+# ctx_stop_gradient=True, asserted in Config.__post_init__) -- approximates true scheduled sampling
+# without a sequential rollout.
 # --- model ---
 img_size = 32
 
@@ -26,7 +30,7 @@ rope_base = 10000.0
 ntp_weight = 1.0
 mse_weight = 0.0
 entropy_weight = 0.0
-label_reg_weight = 0.1
+label_reg_weight = 1.0
 
 label_fn = "rgb_label_fn_jax"
 # bos_rate_mode = "relative"
@@ -55,16 +59,21 @@ upsampler_window = 2
 
 # use_codelm_bos = False
 use_codelm_bos = True
-codelm_bos_prob = 0.8
+codelm_bos_prob = 1.0
 curriculum_mode = "no_freeze"
-level_select_prob = (0.9, 0.8, 0.7, 0.6)  # length n_levels-1=4
-multires_entry_gt_drop = (0.0, 0.5, 0.5, 0.5, 0.5)  # length n_levels=5, index 0 unused
-quantize_mode = "gumbel"
-encode_temperature = 0.01
+# level_select_prob = (0.9, 0.8, 0.7, 0.6)  # length n_levels-1=4
+# multires_entry_gt_drop = (0.0, 0.5, 0.5, 0.5, 0.5)  # length n_levels=5, index 0 unused
+quantize_mode = "reinmax_limit"
+encode_temperature = 1.0
 gumbel_at_inference = False
 mse_softmax_tau = 1.0
-level_gt_drop = 0.95
-quantize_drop = 0.95
+level_gt_drop = 1.0
+quantize_drop = 0.0
+
+# new this fork: cut cross-level gradient leak through decode-cascade ctx, and mix in cheap
+# parallel-scheduled-sampling ctx 30% of the time (requires ctx_stop_gradient=True)
+ctx_stop_gradient = True
+decoder_scheduled_sampling_prob = 0.3
 
 init_scheme = "llama"
 use_xsa = True
@@ -79,17 +88,18 @@ token_dim = 64
 token_n_heads = 2
 traversal = "zorder"
 eval_gen_train = True
+gen_eval_all_levels = True
 
 
 # --- training ---
 batch_size = 4
 val_batch_size = 8
-level_steps = (0,)*4 + (int(100e3),)
-# level_steps = (int(10e3),)*4 + (int(100e3),) 
+# level_steps = (0,)*4 + (int(100e3),)
+level_steps = (int(1e3),)*4 + (int(100e3),)
 seed = 0
-train_subset_n = None
-val_subset_n = None
-gen_eval_every_step = 10000
+train_subset_n = 100
+val_subset_n = 100
+gen_eval_every_step = 5000
 epoch_verbose = False
 
 grad_clip = 1.0
@@ -107,10 +117,10 @@ wa_verbose = False
 # wa_mode = "ema"
 # wa_ema_decay = 0.9
 
-wa_every_step = 1000
-wa_mode = "wma"
-wa_stack_size = 3
-wa_wma_weights = (1.0,1.0,1.0)
+# wa_every_step = 1000
+# wa_mode = "wma"
+# wa_stack_size = 3
+# wa_wma_weights = (1.0,1.0,1.0)
 
 # wa_stack_size = 5
 # wa_wma_weights = (5.0, 4.0, 3.0, 2.0, 1.0)

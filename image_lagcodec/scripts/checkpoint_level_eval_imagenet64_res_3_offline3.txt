@@ -1,0 +1,73 @@
+Reproduce:
+  scp image_lagcodec/scripts/checkpoint_level_eval.py <node>:~/qcute/image_lagcodec/scripts/
+  ssh <node> 'cd ~/qcute && JAX_PLATFORMS=cpu .venv/bin/python -m image_lagcodec.scripts.checkpoint_level_eval \
+      imagenet64_res_3 --n_train 4 --n_val 4 --levels 0,1,2,3 --tag offline3 --mode both'
+
+Run captured: imagenet64_res_3, checkpoint phase_4_step170000, 2026-10-02, tpu34a, CPU backend.
+Compares two reconstruction modes per level top=0..3:
+  - generate: self-generated at every level AND every AR digit timestep (real inference path).
+  - teacher_force: real label_fn-targeted encode, decode-cascade ctx CHAINS level i's own predicted
+    code (argmax of one parallel teacher-forced pardec_score call) down to level i-1, but every
+    digit-level AR step within a level is teacher-forced against the real target (never self-fed).
+    Prints a per-level agree_with_gt trace (fraction of codes matching ground truth at that level)
+    to localize where the cascade diverges.
+
+=== raw output ===
+run=imagenet64_res_3 ckpt=phase_4_step170000 backend=cpu n_levels=4 levels=[0, 1, 2, 3] n_train=4 n_val=4 mode=both
+[generate val top=0] byte_acc=0.1256 mse=160.73 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_generate_top0_val.png time=25s
+  [teacher_force val top=0] level=0 agree_with_gt=0.2291
+[teacher_force val top=0] byte_acc=0.2291 mse=58.00 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_teacherforce_top0_val.png time=35s
+[generate train top=0] byte_acc=0.0775 mse=518.31 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_generate_top0_train.png time=10s
+  [teacher_force train top=0] level=0 agree_with_gt=0.1554
+[teacher_force train top=0] byte_acc=0.1554 mse=196.71 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_teacherforce_top0_train.png time=5s
+[generate val top=1] byte_acc=0.0720 mse=598.70 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_generate_top1_val.png time=21s
+  [teacher_force val top=1] level=1 agree_with_gt=0.1987
+  [teacher_force val top=1] level=0 agree_with_gt=0.2255
+[teacher_force val top=1] byte_acc=0.2255 mse=66.30 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_teacherforce_top1_val.png time=30s
+[generate train top=1] byte_acc=0.0463 mse=1214.14 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_generate_top1_train.png time=15s
+  [teacher_force train top=1] level=1 agree_with_gt=0.1283
+  [teacher_force train top=1] level=0 agree_with_gt=0.1553
+[teacher_force train top=1] byte_acc=0.1553 mse=201.62 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_teacherforce_top1_train.png time=6s
+[generate val top=2] byte_acc=0.0383 mse=1095.64 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_generate_top2_val.png time=22s
+  [teacher_force val top=2] level=2 agree_with_gt=0.0752
+  [teacher_force val top=2] level=1 agree_with_gt=0.2054
+  [teacher_force val top=2] level=0 agree_with_gt=0.2257
+[teacher_force val top=2] byte_acc=0.2257 mse=63.17 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_teacherforce_top2_val.png time=29s
+[generate train top=2] byte_acc=0.0242 mse=2466.44 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_generate_top2_train.png time=17s
+  [teacher_force train top=2] level=2 agree_with_gt=0.0462
+  [teacher_force train top=2] level=1 agree_with_gt=0.1310
+  [teacher_force train top=2] level=0 agree_with_gt=0.1550
+[teacher_force train top=2] byte_acc=0.1550 mse=204.12 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_teacherforce_top2_train.png time=7s
+[generate val top=3] byte_acc=0.0221 mse=1959.03 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_generate_top3_val.png time=24s
+  [teacher_force val top=3] level=3 agree_with_gt=0.0286
+  [teacher_force val top=3] level=2 agree_with_gt=0.0648
+  [teacher_force val top=3] level=1 agree_with_gt=0.1991
+  [teacher_force val top=3] level=0 agree_with_gt=0.2261
+[teacher_force val top=3] byte_acc=0.2261 mse=65.84 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_teacherforce_top3_val.png time=30s
+[generate train top=3] byte_acc=0.0091 mse=3143.71 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_generate_top3_train.png time=18s
+  [teacher_force train top=3] level=3 agree_with_gt=0.0182
+  [teacher_force train top=3] level=2 agree_with_gt=0.0423
+  [teacher_force train top=3] level=1 agree_with_gt=0.1274
+  [teacher_force train top=3] level=0 agree_with_gt=0.1546
+[teacher_force train top=3] byte_acc=0.1546 mse=206.34 saved=/home/muaz/qcute/image_lagcodec/logs/imagenet64_res_3/samples_offline3_teacherforce_top3_train.png time=7s
+
+=== generate vs teacher_force MSE ===
+top=0 val: generate_mse=160.73 teacher_force_mse=58.00 ratio=2.77x
+top=0 train: generate_mse=518.31 teacher_force_mse=196.71 ratio=2.63x
+top=1 val: generate_mse=598.70 teacher_force_mse=66.30 ratio=9.03x
+top=1 train: generate_mse=1214.14 teacher_force_mse=201.62 ratio=6.02x
+top=2 val: generate_mse=1095.64 teacher_force_mse=63.17 ratio=17.34x
+top=2 train: generate_mse=2466.44 teacher_force_mse=204.12 ratio=12.08x
+top=3 val: generate_mse=1959.03 teacher_force_mse=65.84 ratio=29.76x
+top=3 train: generate_mse=3143.71 teacher_force_mse=206.34 ratio=15.24x
+
+=== interpretation ===
+teacher_force_mse stays nearly flat across depth (58 -> 66 -> 63 -> 66, val) even though per-level
+code agreement with ground truth is low at the top (top=3's own level: 2.9% val, barely above
+1/256=0.39% chance) -- lower levels' decoders recover gracefully from an imperfect upstream code
+when their OWN digit-level AR steps are teacher-forced. generate_mse instead degrades severely and
+monotonically with depth (2.8x -> 30x worse than teacher_force). Since training only ever exercises
+pardec_score (parallel teacher-forced) and never pardec_generate's own sequential digit-by-digit
+self-feeding, this points at within-level digit-AR generation (never trained via its own sampling
+procedure) as the dominant compounding-error source -- not primarily cross-level code propagation,
+which this probe shows is comparatively robust.

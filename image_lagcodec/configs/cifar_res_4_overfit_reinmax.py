@@ -1,12 +1,10 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_4_anylevel.py
+uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_4_overfit_reinmax.py
 """
-# Fork of cifar_res_4.py -- tests the new any-level training feature (sample_level_range /
-# level_forward_multires's entry_gt_drop, wired into main() 2026-10-01). level_steps=(0,)*4+(100000,)
-# already skips phases 1-4 entirely (the new level_steps==0 skip), so only phase 5 (all 5 levels)
-# runs, with level_select_prob active: each step independently samples (entry_level, depth) via the
-# two-walk sampler, instead of the fixed level_forward cascade. multires_entry_gt_drop blends the
-# entry_level>0 input between label_fn's resize shortcut and the real (stop_gradient'd) encoder chain.
+# Fork of cifar_res_4_overfit_zgr.py -- same 100-sample overfit smoke test, but
+# quantize_mode="reinmax_limit" (closed-form asymptotic limit of the MVE estimator, no linalg
+# solve -- O(K^2) per digit position vs ZGR's O(K), see quantize_reinmax_limit's docstring)
+# instead of "zgr", isolating the quantizer gradient estimator as the only changed variable.
 # --- model ---
 img_size = 32
 
@@ -26,7 +24,7 @@ rope_base = 10000.0
 ntp_weight = 1.0
 mse_weight = 0.0
 entropy_weight = 0.0
-label_reg_weight = 0.1
+label_reg_weight = 1.0
 
 label_fn = "rgb_label_fn_jax"
 # bos_rate_mode = "relative"
@@ -57,14 +55,14 @@ upsampler_window = 2
 use_codelm_bos = True
 codelm_bos_prob = 0.8
 curriculum_mode = "no_freeze"
-level_select_prob = (0.9, 0.8, 0.7, 0.6)  # length n_levels-1=4
-multires_entry_gt_drop = (0.0, 0.5, 0.5, 0.5, 0.5)  # length n_levels=5, index 0 unused
-quantize_mode = "gumbel"
-encode_temperature = 0.01
+# level_select_prob = (0.9, 0.8, 0.7, 0.6)  # length n_levels-1=4
+# multires_entry_gt_drop = (0.0, 0.5, 0.5, 0.5, 0.5)  # length n_levels=5, index 0 unused
+quantize_mode = "reinmax_limit"
+encode_temperature = 1.0
 gumbel_at_inference = False
 mse_softmax_tau = 1.0
-level_gt_drop = 0.95
-quantize_drop = 0.95
+level_gt_drop = 1.0
+quantize_drop = 0.0
 
 init_scheme = "llama"
 use_xsa = True
@@ -79,17 +77,18 @@ token_dim = 64
 token_n_heads = 2
 traversal = "zorder"
 eval_gen_train = True
+gen_eval_all_levels = True
 
 
 # --- training ---
 batch_size = 4
 val_batch_size = 8
 level_steps = (0,)*4 + (int(100e3),)
-# level_steps = (int(10e3),)*4 + (int(100e3),) 
+# level_steps = (int(10e3),)*4 + (int(100e3),)
 seed = 0
-train_subset_n = None
-val_subset_n = None
-gen_eval_every_step = 10000
+train_subset_n = 100
+val_subset_n = 100
+gen_eval_every_step = 5000
 epoch_verbose = False
 
 grad_clip = 1.0
@@ -107,10 +106,10 @@ wa_verbose = False
 # wa_mode = "ema"
 # wa_ema_decay = 0.9
 
-wa_every_step = 1000
-wa_mode = "wma"
-wa_stack_size = 3
-wa_wma_weights = (1.0,1.0,1.0)
+# wa_every_step = 1000
+# wa_mode = "wma"
+# wa_stack_size = 3
+# wa_wma_weights = (1.0,1.0,1.0)
 
 # wa_stack_size = 5
 # wa_wma_weights = (5.0, 4.0, 3.0, 2.0, 1.0)
