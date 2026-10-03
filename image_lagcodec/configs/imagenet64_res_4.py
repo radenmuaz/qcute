@@ -100,7 +100,7 @@ quantize_drop = 0.0
 ctx_stop_gradient = True
 # mixes in a cheap "parallel scheduled sampling" ctx (one teacher-forced pass's detached argmax)
 # instead of level_gt_drop's real/pseudo mixture, 30% of decode steps. Requires ctx_stop_gradient=True.
-decoder_scheduled_sampling_prob = 0.3
+# removed 2026-10-03, redundant with level_gt_drop: decoder_scheduled_sampling_prob = 0.3
 # upsampler_rollout: trains the upsampler's own digit-AR head self-fed (token_ar_rollout) instead of
 # always teacher-forced -- a checkpoint_level_eval.py probe on imagenet64_res_3's own checkpoint
 # found teacher-forced reconstruction stays near-flat in MSE across cascade depth while full

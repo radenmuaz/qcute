@@ -141,8 +141,109 @@ def run_pardec_dense_vs_kv_check(head="ar"):
     return ok2
 
 
+def run_pardec_refine_check(head="ar", window=1):
+    """Level-refine draft slot: (a) pardec_generate with a draft must reproduce itself under dense
+    pardec_score with the same draft; (b) a group's own span in the draft source must not affect that
+    group's logits (draft = preceding groups only, no target leak)."""
+    cfg = build_cfg(pardec_token_head=head)
+    print(f"[refine pardec_token_head={head} window={window}]")
+    model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+    flat, _ = load_data(cfg)
+    codelm = model.codelm_for(0)
+    up = model.upsampler_for(0)
+    tok0 = R.rgb_byte_pq_fn(flat, codelm.pq_chunks, codelm.code_vocab)
+    x = R.code_embed_proj(tok0, codelm.own_input_embed, codelm.own_input_proj)
+    ctx_code_soft = codelm.encode(x, tok0, model.K(0), rng=None)["code_soft"]
+    h_ctx = R.encoder_hidden(codelm, R.code_embed_proj(ctx_code_soft, codelm.own_input_embed, codelm.own_input_proj))
+    kw = dict(context_group_size=G, output_group_size=G, output_expansion=model.K(0))
+    Kspan = G * model.K(0)
+    Pp = window * Kspan
+    draft = R.pardec_generate(up, h_ctx, rng=jax.random.PRNGKey(0), greedy=True, **kw)
+
+    gen2 = R.pardec_generate(up, h_ctx, rng=jax.random.PRNGKey(0), greedy=True, draft_seq=draft, draft_len=Pp, **kw)
+    dl, _, _, _ = R.pardec_score(up, gen2, h_ctx, draft_seq=draft, draft_len=Pp, **kw)
+    da = jnp.argmax(dl, axis=-1)
+    n = min(da.shape[1], gen2.shape[1])
+    ok_a = bool(jnp.array_equal(da[:, :n], gen2[:, :n]))
+    print(f"REFINE dense-vs-KV-cache with draft: consistent={ok_a} mismatches={int((da[:, :n] != gen2[:, :n]).sum())} "
+          f"(draft changed {int((gen2 != draft).any(-1).sum())}/{gen2.shape[0] * gen2.shape[1]} positions vs pass 1)")
+
+    g = 2
+    pert = draft.at[:, g * Kspan:(g + 1) * Kspan].set((draft[:, g * Kspan:(g + 1) * Kspan] + 1) % 256)
+    l0, _, _, _ = R.pardec_score(up, tok0, h_ctx, draft_seq=draft, draft_len=Pp, **kw)
+    l1, _, _, _ = R.pardec_score(up, tok0, h_ctx, draft_seq=pert, draft_len=Pp, **kw)
+    diff = jnp.abs(l0 - l1).max(axis=tuple(range(2, l0.ndim)))  # (B, L)
+    own = float(diff[:, g * Kspan:(g + 1) * Kspan].max())
+    before = float(diff[:, :g * Kspan].max())
+    after = float(diff[:, (g + 1) * Kspan:(g + 1 + window) * Kspan].max())
+    ok_b = own == 0.0 and before == 0.0 and after > 0.0
+    print(f"REFINE no-leak: perturbing group {g}'s own draft span -> own-group logit change={own:.2e} "
+          f"earlier={before:.2e} next {window} group(s)={after:.2e}  {'OK' if ok_b else 'LEAK/BROKEN'}")
+    return ok_a and ok_b
+
+
+def run_pardec_refine_fixed_check(head="ar", window=1):
+    """'fixed' level-refine layout (draft_fill='mask'): (a) dense-vs-KV-cache for pass 1 (all-mask slot)
+    and pass 2 (draft slot); (b) no leak of a group's own span; (c) position check: group 0's window is
+    entirely before the image, so its pass-2 logits must equal its pass-1 (all-mask) logits; groups whose
+    window is fully inside the image must match the 'zero' (variable-layout) refine pass exactly."""
+    cfg = build_cfg(pardec_token_head=head)
+    print(f"[refine FIXED pardec_token_head={head} window={window}]")
+    model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+    flat, _ = load_data(cfg)
+    codelm = model.codelm_for(0)
+    up = model.upsampler_for(0)
+    tok0 = R.rgb_byte_pq_fn(flat, codelm.pq_chunks, codelm.code_vocab)
+    x = R.code_embed_proj(tok0, codelm.own_input_embed, codelm.own_input_proj)
+    ctx_code_soft = codelm.encode(x, tok0, model.K(0), rng=None)["code_soft"]
+    h_ctx = R.encoder_hidden(codelm, R.code_embed_proj(ctx_code_soft, codelm.own_input_embed, codelm.own_input_proj))
+    kw = dict(context_group_size=G, output_group_size=G, output_expansion=model.K(0))
+    Kspan = G * model.K(0)
+    Pp = window * Kspan
+    oks = []
+
+    def kv_vs_dense(label, draft):
+        gen = R.pardec_generate(up, h_ctx, rng=jax.random.PRNGKey(0), greedy=True, draft_seq=draft, draft_len=Pp,
+                                draft_fill="mask", **kw)
+        dl, _, _, _ = R.pardec_score(up, gen, h_ctx, draft_seq=draft, draft_len=Pp, draft_fill="mask", **kw)
+        da = jnp.argmax(dl, axis=-1)
+        n = min(da.shape[1], gen.shape[1])
+        ok = bool(jnp.array_equal(da[:, :n], gen[:, :n]))
+        print(f"FIXED {label} dense-vs-KV-cache: consistent={ok} mismatches={int((da[:, :n] != gen[:, :n]).sum())}")
+        oks.append(ok)
+        return gen
+
+    pass1 = kv_vs_dense("pass 1 (all-mask slot)", None)
+    kv_vs_dense("pass 2 (draft slot)", pass1)
+
+    g = 2
+    pert = pass1.at[:, g * Kspan:(g + 1) * Kspan].set((pass1[:, g * Kspan:(g + 1) * Kspan] + 1) % 256)
+    l0, _, _, _ = R.pardec_score(up, tok0, h_ctx, draft_seq=pass1, draft_len=Pp, draft_fill="mask", **kw)
+    l1, _, _, _ = R.pardec_score(up, tok0, h_ctx, draft_seq=pert, draft_len=Pp, draft_fill="mask", **kw)
+    diff = jnp.abs(l0 - l1).max(axis=tuple(range(2, l0.ndim)))
+    own, before = float(diff[:, g * Kspan:(g + 1) * Kspan].max()), float(diff[:, :g * Kspan].max())
+    after = float(diff[:, (g + 1) * Kspan:(g + 1 + window) * Kspan].max())
+    ok_b = own == 0.0 and before == 0.0 and after > 0.0
+    print(f"FIXED no-leak: own-group change={own:.2e} earlier={before:.2e} next={after:.2e}  {'OK' if ok_b else 'LEAK/BROKEN'}")
+    oks.append(ok_b)
+
+    p1, _, _, _ = R.pardec_score(up, tok0, h_ctx, draft_len=Pp, draft_fill="mask", **kw)
+    zero_l, _, _, _ = R.pardec_score(up, tok0, h_ctx, draft_seq=pass1, draft_len=Pp, draft_fill="zero", **kw)
+    g0 = float(jnp.abs(l0[:, :Kspan] - p1[:, :Kspan]).max())
+    inside = float(jnp.abs(l0[:, window * Kspan:] - zero_l[:, window * Kspan:]).max())
+    ok_c = g0 == 0.0 and inside < 1e-5
+    print(f"FIXED positions: group0 pass2-vs-pass1 diff={g0:.2e} (expect 0); groups>={window} fixed-vs-variable "
+          f"refine diff={inside:.2e} (expect ~0)  {'OK' if ok_c else 'OFF-BY-ONE/BROKEN'}")
+    oks.append(ok_c)
+    return all(oks)
+
+
 if __name__ == "__main__":
     results = []
+    results.append(("pardec refine FIXED (ar)", run_pardec_refine_fixed_check("ar")))
+    results.append(("pardec refine FIXED (linear, window 2)", run_pardec_refine_fixed_check("linear", window=2)))
+    results.append(("pardec refine draft (ar)", run_pardec_refine_check("ar")))
+    results.append(("pardec refine draft (linear, window 2)", run_pardec_refine_check("linear", window=2)))
     results.append(("encoder_free_run KV-cache (linear)", run_encoder_free_run_kv_check("linear")))
     results.append(("encoder_free_run KV-cache (ar)", run_encoder_free_run_kv_check("ar")))
     results.append(("pardec dense-vs-KV-cache (ar)", run_pardec_dense_vs_kv_check("ar")))

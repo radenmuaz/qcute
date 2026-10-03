@@ -195,7 +195,9 @@ class Config:
     upsampler_ncodes: tuple = 1
     sync: tuple = False
     precision: str = "bf16"
-    curriculum_mode: str = "freeze"
+    # "freeze": in phase p, levels < p-1 (codelm/downsampler/upsampler) are frozen; only the newly
+    # added top level trains. Needs share_across_levels=False (per-level weights to freeze).
+    curriculum_mode: str = "no_freeze"
     quantize_mode: str = "argmax"
     quantize_drop: float = 0.0
     gumbel_at_inference: bool = False
@@ -272,9 +274,17 @@ class Config:
     # visibility at every eval checkpoint, not just at the very end. Multiplies gen-eval cost by phase
     # (each lower top re-does its own full encode+cascade), so left off by default.
     gen_eval_all_levels: bool = False
+    # sanity reconstruction, run alongside the normal gen-eval: SAME cross-level ctx cascade as
+    # training (honors cfg.level_gt_drop as-is -- 1.0 means ctx between levels is still the model's
+    # own encoded prediction, not real codes, matching what training actually conditions on), but
+    # every digit-level AR step is forced teacher-forced (pardec_score, never pardec_generate/
+    # token_ar_rollout) regardless of upsampler_rollout -- isolates whether decode works at all once
+    # digit-level self-feeding is removed, on both train and val images. Saves
+    # samples_{tag}_tfsanity.png. Added 2026-10-03.
+    gen_eval_teacher_force_sanity: bool = False
 
     # level_forward's decode-cascade `ctx` (the context fed from level i to level i-1's decode --
-    # real_ctx/pseudo_ctx/the scheduled-sampling ctx below) is a straight-through estimator output by
+    # real_ctx/pseudo_ctx) is a straight-through estimator output by
     # default: forward is hard, but gradient flows BACKWARD through it into whatever produced it --
     # the encoder for the initial ctx/real_ctx, or the level-ABOVE's upsampler for pseudo_ctx. True:
     # stop_gradient's `ctx` every time it's (re)built, so each level's decode loss only trains that
@@ -282,14 +292,25 @@ class Config:
     # through this path -- matches level 0's target (raw bytes), which was never differentiable to
     # begin with. Unrelated to level_gt_drop (which controls the VALUE distribution -- real vs
     # self-fed -- not whether gradient flows through whichever value is chosen).
-    ctx_stop_gradient: bool = False
-    # Per-level probability of replacing level_gt_drop's real/pseudo ctx mixture with a "parallel
-    # scheduled sampling" ctx: take the level's OWN just-computed teacher-forced logits (one parallel
-    # pardec_score call, not a sequential multi-step rollout -- cheap approximation of true scheduled
-    # sampling), argmax them, and feed that back DETACHED as the next level's context. Requires
-    # ctx_stop_gradient=True (asserted below) -- the whole point is a hard, gradient-free self-fed
-    # signal, and that requirement makes the detach explicit/load-bearing rather than incidental.
-    decoder_scheduled_sampling_prob: float = 0.0
+    # "pseudo": detach ONLY the predicted ctx (upper upsampler's quantized logits); the real encoder
+    # ctx (top code, real_ctx) keeps its gradient -- the encoders' only reconstruction signal.
+    ctx_stop_gradient: bool | str = False
+    # level refine (upsampler, per level): passes>1 re-decodes each group with a draft of its
+    # level_refine_window preceding groups = argmax of the previous pass (detached). Same at
+    # generation (draft = previous generated pass). Loss is averaged over all passes.
+    level_refine_passes: tuple = 1
+    level_refine_window: tuple = 0
+    # training only, per draft position: prob of drafting the model's own prediction; else the real
+    # target (1.0 = always own, like level_gt_drop). Eval/no-rng always drafts own prediction.
+    level_refine_gt_drop: float = 1.0
+    # "fixed": every pass has the same row [cond|bos|draft slot|targets]; pass 1's slot (and any slot
+    # before the image start) holds a learned mask token. "variable": pass 1 has no slot, so targets
+    # sit Pp positions closer to bos than in refine passes; out-of-image slots zeroed + masked.
+    level_refine_layout: str = "fixed"
+    # training draft from the previous pass's logits (always detached): "argmax" (matches greedy gen) or
+    # "sample" (gumbel-max at level_refine_draft_temperature, matches sampled gen). Eval/no-rng: argmax.
+    level_refine_draft_mode: str = "argmax"
+    level_refine_draft_temperature: float = 1.0
 
     def __post_init__(self):
         if self.remat and self.remat_level:
@@ -337,6 +358,8 @@ class Config:
         bcast("upsampler_decode_past", int)
         bcast("upsampler_decode_future", int)
         bcast("upsampler_window", int)
+        bcast("level_refine_passes", int)
+        bcast("level_refine_window", int)
         bcast_opt("upsampler_remat", bool)
         bcast("token_head_type", str)
         bcast("token_dim", int)
@@ -347,7 +370,6 @@ class Config:
         bcast("attn_lookahead", int)
         bcast("codelm_bos_rates", int)
         bcast("pq_dim", int)
-        bcast("decoder_scheduled_sampling_prob", (int, float))
 
         assert len(self.codelm_d_model) == n and len(self.codelm_n_layers) == n and len(self.codelm_n_heads) == n \
             and len(self.codelm_n_kv_heads) == n and len(self.code_vocab) == n and len(self.pq_chunks) == n
@@ -509,16 +531,23 @@ class Config:
         assert n_positions % math.prod(self.strides[:-1]) == 0
         assert self.precision in ("bf16", "fp32")
         assert self.curriculum_mode in ("freeze", "no_freeze")
-        assert self.curriculum_mode == "no_freeze", \
-            "run_lagcodec_zorder requires curriculum_mode='no_freeze' -- a level conditioned on " \
-            "cascade-simulated ctx must stay trainable to adapt to it (see module docstring)"
+        if self.curriculum_mode == "freeze":
+            assert not self.share_across_levels, \
+                "curriculum_mode='freeze' needs share_across_levels=False (shared weights can't be frozen per level)"
         assert self.quantize_mode in ("argmax", "gumbel", "zgr", "reinmax_limit")
         assert self.gen_eval_encode_mode in ("generate", "teacher_force")
-        if any(p > 0 for p in self.decoder_scheduled_sampling_prob):
-            assert self.ctx_stop_gradient, \
-                "decoder_scheduled_sampling_prob>0 needs ctx_stop_gradient=True -- scheduled sampling's " \
-                "whole point is a hard, gradient-free self-fed ctx; set ctx_stop_gradient=True explicitly " \
-                "rather than relying on argmax's incidental non-differentiability"
+        if not isinstance(self.ctx_stop_gradient, str):
+            self.ctx_stop_gradient = bool(self.ctx_stop_gradient)
+        assert self.ctx_stop_gradient in (False, True, "pseudo"), self.ctx_stop_gradient
+        for i, (rp, rw) in enumerate(zip(self.level_refine_passes, self.level_refine_window)):
+            assert rp >= 1 and rw >= 0, f"level {i}: level_refine_passes={rp} (>=1), level_refine_window={rw} (>=0)"
+            assert rp == 1 or rw > 0, f"level {i}: level_refine_passes={rp} needs level_refine_window>0"
+            assert rp == 1 or self.upsampler_decode_past[i] == 0, \
+                f"level {i}: level refine and upsampler_decode_past share one slot"
+        assert 0.0 <= self.level_refine_gt_drop <= 1.0, self.level_refine_gt_drop
+        assert self.level_refine_layout in ("fixed", "variable"), self.level_refine_layout
+        assert self.level_refine_draft_mode in ("argmax", "sample"), self.level_refine_draft_mode
+        assert self.level_refine_draft_temperature > 0.0, self.level_refine_draft_temperature
         assert self.init_scheme in ("llama", "zero")
         resolved_kv = []
         for i in range(n):
@@ -989,6 +1018,21 @@ def _draft_past_valid_mask(n_groups: int, Pp: int, Kspan: int, valid_len: int) -
     return (abs_idx >= 0) & (abs_idx < valid_len)
 
 
+def group_draft_windows(src: jnp.ndarray, n_groups: int, Kspan: int, Pp: int, valid_len: int) -> tuple:
+    # per group g: the Pp tokens of `src` just BEFORE the group (positions g*Kspan-Pp..g*Kspan-1),
+    # never the group's own span. Shared by pardec_score and pardec_generate so they can't diverge.
+    B = src.shape[0]
+    tail = n_groups * Kspan - src.shape[1]
+    if tail > 0:
+        src = jnp.pad(src, ((0, 0), (0, tail)) + ((0, 0),) * (src.ndim - 2))
+    padded = jnp.pad(src, ((0, 0), (Pp, 0)) + ((0, 0),) * (src.ndim - 2))
+    win = jnp.stack([padded[:, g * Kspan:g * Kspan + Pp] for g in range(n_groups)], axis=1)
+    win = win.reshape(B * n_groups, Pp, *src.shape[2:])
+    valid = _draft_past_valid_mask(n_groups, Pp, Kspan, valid_len)
+    valid_flat = jnp.broadcast_to(jnp.asarray(valid)[None], (B, n_groups, Pp)).reshape(B * n_groups, Pp)
+    return win, valid_flat
+
+
 def reshape_pq(logits: jnp.ndarray, pq_chunks: int, code_vocab: int) -> jnp.ndarray:
     return logits.reshape(*logits.shape[:-1], pq_chunks, code_vocab)
 
@@ -1265,6 +1309,7 @@ class PardecLM(eqx.Module):
     # literally reuse the SAME array (shared_ctx_embed/shared_ctx_proj), mirroring
     # share_downsampler_upsampler_lm's pattern.
     own_ctx_proj: jnp.ndarray  # (ctx_pq_chunks * ctx_pq_dim, context_hidden_dim)
+    draft_mask_embed: jnp.ndarray  # (hidden_dim,) level-refine 'fixed' layout: fills a draft slot with no draft
     n_heads: int = eqx.field(static=True)
     n_kv_heads: int = eqx.field(static=True)
     n_rates: int = eqx.field(static=True)
@@ -1320,9 +1365,10 @@ class PardecLM(eqx.Module):
         self.token_attn = Attention(keys[7], token_dim, token_n_heads, token_n_heads, rope_base, n_layers=1,
                                      init_scheme=init_scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
         self.token_ln_f = RMSNorm(token_dim)
-        self.token_out_head = init_matrix(jax.random.fold_in(key, 8001), (token_dim, output_vocab), init_scheme)
-        self.output_head_linear = init_matrix(jax.random.fold_in(key, 8002),
+        self.token_out_head = init_matrix(jax.random.fold_in(key, 0), (token_dim, output_vocab), init_scheme)
+        self.output_head_linear = init_matrix(jax.random.fold_in(key, 1),
                                                (hidden_dim, output_chunks * output_vocab), init_scheme)
+        self.draft_mask_embed = init_vector(jax.random.fold_in(key, 3), hidden_dim, init_scheme)
         self.n_heads, self.n_kv_heads = n_heads, n_kv_heads
         self.output_expansion, self.context_window_groups = output_expansion, context_window_groups
         self.output_vocab, self.output_chunks = output_vocab, output_chunks
@@ -1333,7 +1379,7 @@ class PardecLM(eqx.Module):
         if shared_ctx_embed is not None:
             self.own_ctx_embed, self.own_ctx_proj = shared_ctx_embed, shared_ctx_proj
         else:
-            ctx_keys = jax.random.split(jax.random.fold_in(key, 8003), 2)
+            ctx_keys = jax.random.split(jax.random.fold_in(key, 2), 2)
             self.own_ctx_embed = init_matrix(ctx_keys[0], (ctx_vocab, ctx_pq_dim), init_scheme)
             self.own_ctx_proj = init_matrix(ctx_keys[1], (ctx_pq_chunks * ctx_pq_dim, context_hidden_dim), init_scheme)
 
@@ -1366,7 +1412,12 @@ def pardec_context_windows(pardec: PardecLM, context_h_padded: jnp.ndarray, cont
 
 def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarray,
                   context_group_size: int, output_group_size: int, rate_id: int = 0,
-                  output_expansion: int = None, return_hidden: bool = False) -> tuple:
+                  output_expansion: int = None, return_hidden: bool = False,
+                  draft_seq: jnp.ndarray = None, draft_len: int = 0, draft_fill: str = "zero") -> tuple:
+    # draft_seq/draft_len (level refine): fill the decode_past slot with each group's draft_len
+    # preceding tokens of draft_seq (a previous pass's own prediction) instead of real targets.
+    # draft_fill: "zero" = out-of-image slots zeroed + masked as keys (variable layout);
+    # "mask" = those slots (or ALL slots when draft_seq is None) hold pardec.draft_mask_embed.
     # return_hidden=True: return ONLY the per-position predicted hidden states (before the token
     # head), (batch, n_output_positions*oe, hidden_dim). Causal masking means they do not depend on
     # the target rows at/after their position, so downsampler_rollout passes a dummy target and
@@ -1388,7 +1439,12 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
         pardec, context_h_padded, context_group_size, n_groups, n_context_positions)
     hidden_dim = own_window.shape[-1]
 
-    decode_past, decode_future = pardec.decode_past, pardec.decode_future
+    refine = draft_seq is not None or draft_len > 0
+    assert draft_fill in ("zero", "mask"), draft_fill
+    assert draft_seq is not None or draft_len == 0 or draft_fill == "mask", "an empty draft slot needs draft_fill='mask'"
+    assert not (refine and pardec.decode_past > 0), "draft_seq (level refine) and decode_past>0 share one slot"
+    decode_past = draft_len if refine else pardec.decode_past
+    decode_future = pardec.decode_future
     target_len_per_group = output_group_size * oe
     n_output_positions = n_context_positions * output_group_size // context_group_size
     target_len_per_group_padded = n_groups * output_group_size * oe - n_output_positions * oe
@@ -1406,16 +1462,21 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
     real_tail_flat = real_tail_windows.reshape(batch * n_groups, target_len_per_group + decode_future, *target_seq.shape[2:])
     real_tail_embedded = code_embed_proj(real_tail_flat, pardec.target_embed, pardec.target_proj)
 
-    if decode_past > 0:
-        draft_padded = jnp.pad(target_padded, ((0, 0), (decode_past, 0), (0, 0)))
-        draft_windows = jnp.stack(
-            [draft_padded[:, g * target_len_per_group:g * target_len_per_group + decode_past]
-             for g in range(n_groups)], axis=1)
-        draft_flat = draft_windows.reshape(batch * n_groups, decode_past, *target_seq.shape[2:])
+    if decode_past > 0 and refine and draft_seq is None:
+        draft_embedded = jnp.broadcast_to(pardec.draft_mask_embed.astype(real_tail_embedded.dtype),
+                                          (batch * n_groups, decode_past, hidden_dim))
+        draft_valid_flat = jnp.ones((batch * n_groups, decode_past), dtype=bool)
+        target_embedded_flat = jnp.concatenate([draft_embedded, real_tail_embedded], axis=1)
+    elif decode_past > 0:
+        draft_flat, draft_valid_flat = group_draft_windows(draft_seq if refine else target_padded, n_groups,
+                                                           target_len_per_group, decode_past, n_output_positions * oe)
         draft_embedded = code_embed_proj(draft_flat, pardec.target_embed, pardec.target_proj)
-        draft_valid = _draft_past_valid_mask(n_groups, decode_past, target_len_per_group, n_output_positions * oe)
-        draft_valid_flat = jnp.broadcast_to(jnp.asarray(draft_valid)[None], (batch, n_groups, decode_past)).reshape(batch * n_groups, decode_past)
-        draft_embedded = jnp.where(draft_valid_flat[:, :, None], draft_embedded, 0.0)
+        if refine and draft_fill == "mask":
+            draft_embedded = jnp.where(draft_valid_flat[:, :, None], draft_embedded,
+                                       pardec.draft_mask_embed.astype(draft_embedded.dtype))
+            draft_valid_flat = jnp.ones_like(draft_valid_flat)
+        else:
+            draft_embedded = jnp.where(draft_valid_flat[:, :, None], draft_embedded, 0.0)
         target_embedded_flat = jnp.concatenate([draft_embedded, real_tail_embedded], axis=1)
     else:
         draft_valid_flat = jnp.ones((batch * n_groups, 0), dtype=bool)
@@ -1428,8 +1489,16 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
     key_valid = jnp.concatenate([valid_mask, jnp.ones((batch * n_groups, 1), dtype=bool), draft_valid_flat,
                                   jnp.ones((batch * n_groups, target_len_per_group + decode_future), dtype=bool)], axis=1)
     rope_bos = jnp.array(group_ends)[:, None]
-    rope_draft = jnp.stack([end - decode_past + jnp.arange(decode_past) for end in group_ends], axis=0)
-    rope_real_tail = jnp.stack([end + 1 + jnp.arange(target_len_per_group + decode_future) for end in group_ends], axis=0)
+    if refine:
+        # sequential after bos (window | bos | draft | targets), so pardec_generate's single position
+        # counter reproduces it exactly
+        rope_draft = jnp.stack([end + 1 + jnp.arange(decode_past) for end in group_ends], axis=0)
+        tail_start = 1 + decode_past
+    else:
+        rope_draft = jnp.stack([end - decode_past + jnp.arange(decode_past) for end in group_ends], axis=0)
+        tail_start = 1
+    rope_real_tail = jnp.stack([end + tail_start + jnp.arange(target_len_per_group + decode_future)
+                                for end in group_ends], axis=0)
     rope_target = jnp.clip(jnp.concatenate([rope_draft, rope_real_tail], axis=1), 0, None)
     rope_pos_ids_g = jnp.concatenate([rope_ids, rope_bos, rope_target], axis=1)
     rope_pos_ids = jnp.broadcast_to(rope_pos_ids_g[None], (batch, n_groups, per_group_len)).reshape(batch * n_groups, per_group_len)
@@ -1497,8 +1566,10 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
 
 def pardec_generate(pardec: PardecLM, context_h: jnp.ndarray, context_group_size: int,
                      output_group_size: int, rng, greedy: bool = True, temperature: float = 1.0,
-                     top_k: int = 0, rate_id: int = 0, output_expansion: int = None) -> jnp.ndarray:
+                     top_k: int = 0, rate_id: int = 0, output_expansion: int = None,
+                     draft_seq: jnp.ndarray = None, draft_len: int = 0, draft_fill: str = "zero") -> jnp.ndarray:
     # Generation counterpart of pardec_score: one growing KV cache per group, all groups batched.
+    # draft_seq/draft_len/draft_fill: same level-refine draft slot as pardec_score (prefilled after bos).
     # output_expansion: see pardec_score's docstring -- plain int, None falls back to
     # pardec.output_expansion, pass explicitly to call the SAME shared PardecLM at a different
     # stride/rate (paired with rate_id).
@@ -1514,7 +1585,25 @@ def pardec_generate(pardec: PardecLM, context_h: jnp.ndarray, context_group_size
     hidden_dim = own_window.shape[-1]
     batch2 = batch * n_groups
     target_len_per_group = output_group_size * oe
-    total_steps = window_size + 1 + target_len_per_group
+    assert draft_fill in ("zero", "mask"), draft_fill
+    assert draft_seq is not None or draft_len == 0 or draft_fill == "mask", "an empty draft slot needs draft_fill='mask'"
+    Pp = draft_len
+    total_steps = window_size + 1 + Pp + target_len_per_group
+    n_output_positions = n_context_positions * output_group_size // context_group_size
+    if Pp > 0 and draft_seq is None:
+        draft_emb = jnp.broadcast_to(pardec.draft_mask_embed.astype(own_window.dtype), (batch2, Pp, hidden_dim))
+        draft_valid_flat = jnp.ones((batch2, Pp), dtype=bool)
+    elif Pp > 0:
+        draft_flat, draft_valid_flat = group_draft_windows(draft_seq, n_groups, target_len_per_group, Pp,
+                                                           n_output_positions * oe)
+        draft_emb = code_embed_proj(draft_flat, pardec.target_embed, pardec.target_proj)
+        if draft_fill == "mask":
+            draft_emb = jnp.where(draft_valid_flat[:, :, None], draft_emb, pardec.draft_mask_embed.astype(draft_emb.dtype))
+            draft_valid_flat = jnp.ones_like(draft_valid_flat)
+        else:
+            draft_emb = jnp.where(draft_valid_flat[:, :, None], draft_emb, 0.0)
+    else:
+        draft_valid_flat = jnp.ones((batch2, 0), dtype=bool)
 
     hidden_dim_per_head = hidden_dim // pardec.n_heads
     cache_k0 = jnp.zeros((len(pardec.blocks), batch2, pardec.n_kv_heads, total_steps, hidden_dim_per_head))
@@ -1526,7 +1615,8 @@ def pardec_generate(pardec: PardecLM, context_h: jnp.ndarray, context_group_size
     # pardec_score's key_valid, which excludes exactly these positions). bos+target span is always
     # real/self-authored, hence the trailing all-True padding.
     extra_valid = jnp.concatenate(
-        [valid_mask, jnp.ones((batch2, total_steps - window_size), dtype=bool)], axis=1)
+        [valid_mask, jnp.ones((batch2, 1), dtype=bool), draft_valid_flat,
+         jnp.ones((batch2, target_len_per_group), dtype=bool)], axis=1)
 
     def self_step(x_new, cache_k, cache_v, pos):
         new_cache_k, new_cache_v = [], []
@@ -1551,6 +1641,15 @@ def pardec_generate(pardec: PardecLM, context_h: jnp.ndarray, context_group_size
     hidden, cache_k, cache_v = self_step(bos_in, cache_k, cache_v, pos)
     pos = pos + 1
 
+    if Pp > 0:
+        def draft_step(carry, x_t):
+            cache_k, cache_v, pos, _ = carry
+            h, cache_k, cache_v = self_step(x_t, cache_k, cache_v, pos)
+            return (cache_k, cache_v, pos + 1, h), None
+
+        (cache_k, cache_v, pos, hidden), _ = jax.lax.scan(
+            draft_step, (cache_k, cache_v, pos, hidden), jnp.swapaxes(draft_emb, 0, 1))
+
     def gen_step(carry, _):
         cache_k, cache_v, pos, rng, x_input, hidden = carry
         if pardec.token_head == "linear":
@@ -1568,7 +1667,6 @@ def pardec_generate(pardec: PardecLM, context_h: jnp.ndarray, context_group_size
     _, vals = jax.lax.scan(gen_step, init_carry, None, length=target_len_per_group)
     vals = jnp.moveaxis(vals, 0, 1)  # (batch2, target_len_per_group, output_chunks)
     vals = vals.reshape(batch, n_groups * target_len_per_group, *vals.shape[2:])
-    n_output_positions = n_context_positions * output_group_size // context_group_size
     valid_len = n_output_positions * oe
     return vals[:, :valid_len]
 
@@ -1739,7 +1837,7 @@ class CodeLM(eqx.Module):
         scheme, use_xsa, use_qknorm = cfg.init_scheme, cfg.use_xsa, cfg.use_qknorm
         self.own_input_embed = init_matrix(keys[0], (own_vocab, pq_dim), scheme)
         self.own_input_proj = init_matrix(keys[1], (self.pq_chunks * pq_dim, D_enc), scheme)
-        block_keys = jax.random.split(jax.random.fold_in(key, 8801), n_layers_enc)
+        block_keys = jax.random.split(jax.random.fold_in(key, 3), n_layers_enc)
         enc_window_val = (cfg.encoder_attn_window[level_idx] if cfg.encoder_attn_window[level_idx] is not None
                            else cfg.attn_window[level_idx])
         enc_window = None if enc_window_val == -1 else enc_window_val
@@ -1761,12 +1859,12 @@ class CodeLM(eqx.Module):
         # always 0 at call time -- see LagCodecModel.codelm_bos_rate_id).
         n_bos_rates = (len(cfg.strides) if cfg.share_across_levels else cfg.codelm_bos_rates[level_idx]) \
             if cfg.use_codelm_bos else 1
-        bos_keys = jax.random.split(jax.random.fold_in(key, 8901), n_bos_rates)
+        bos_keys = jax.random.split(jax.random.fold_in(key, 4), n_bos_rates)
         self.bos_embed = jnp.stack([init_vector(k, D_enc, scheme) for k in bos_keys], axis=0)
         self.token_head = cfg.codelm_token_head
         self.token_dim = cfg.token_dim[level_idx]
         if self.token_head == "ar":
-            tk = jax.random.split(jax.random.fold_in(key, 8951), 4)
+            tk = jax.random.split(jax.random.fold_in(key, 5), 4)
             td, tnh = cfg.token_dim[level_idx], cfg.token_n_heads[level_idx]
             self.tok_in_proj = init_matrix(tk[0], (D_enc, td), scheme)
             self.tok_member_embed = init_matrix(tk[1], (self.code_vocab, td), scheme)
@@ -1782,7 +1880,7 @@ class CodeLM(eqx.Module):
             x = x.at[:, 0, :].set(self.bos_embed[rate_id])
         elif self.use_codelm_bos and rng is not None:
             B = x.shape[0]
-            do_sub = jax.random.bernoulli(jax.random.fold_in(rng, 424242), p=self.codelm_bos_prob, shape=(B,))
+            do_sub = jax.random.bernoulli(jax.random.fold_in(rng, 6), p=self.codelm_bos_prob, shape=(B,))
             x0 = jnp.where(do_sub[:, None], self.bos_embed[rate_id], x[:, 0, :])
             x = x.at[:, 0, :].set(x0)
         h = x
@@ -1854,7 +1952,7 @@ def codelm_bos_substitute(codelm: CodeLM, x: jnp.ndarray, rate_id: int, rng, gro
     # deleted, in case it's revisited:
     # if codelm.use_codelm_bos and rng is not None:
     #     B, T = x.shape[0], x.shape[1]
-    #     do_sub = jax.random.bernoulli(jax.random.fold_in(rng, 424242), p=codelm.codelm_bos_prob, shape=(B,))
+    #     do_sub = jax.random.bernoulli(jax.random.fold_in(rng, 6), p=codelm.codelm_bos_prob, shape=(B,))
     #     bos_row = codelm.bos_embed[rate_id]
     #     for s in range(0, T, group_size):
     #         xs = jnp.where(do_sub[:, None], bos_row, x[:, s, :])
@@ -1864,7 +1962,7 @@ def codelm_bos_substitute(codelm: CodeLM, x: jnp.ndarray, rate_id: int, rng, gro
     # ACTIVE (bos-once at position 0 -- original pre-repeat-per-group behavior, restored):
     if codelm.use_codelm_bos and rng is not None:
         B = x.shape[0]
-        do_sub = jax.random.bernoulli(jax.random.fold_in(rng, 424242), p=codelm.codelm_bos_prob, shape=(B,))
+        do_sub = jax.random.bernoulli(jax.random.fold_in(rng, 7), p=codelm.codelm_bos_prob, shape=(B,))
         x0 = jnp.where(do_sub[:, None], codelm.bos_embed[rate_id], x[:, 0, :])
         x = x.at[:, 0, :].set(x0)
     return x
@@ -1880,7 +1978,15 @@ def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cf
     # "own_embed"/"shared_embed" modes can bypass CodeLM's own embedding table entirely too.
     if cfg.context_source == "codelm":
         x = code_embed_proj(raw, codelm.own_input_embed, codelm.own_input_proj)
-        x = codelm_bos_substitute(codelm, x, rate_id, rng, group_size=group_size)
+        # NOT bos-substituted (removed 2026-10-03): every caller of pardec_context_hidden
+        # (encode_pardec_downsampler[_generate], decode_logits_and_target_multipass,
+        # _decode_generate_pardec_call) always has real content available at position 0 -- none of
+        # them is the true "zero real content" unconditional case (that's _encoder_free_run's own,
+        # fully independent use_bos path). With codelm_bos_prob=1.0, substituting here permanently
+        # discarded real position-0 signal on every encode/decode-context call, train and eval alike
+        # -- root cause of total top-level codebook collapse (confirmed: cifar_overfit_3_1layer vs
+        # _nobos, identical except use_codelm_bos; bos run: 1 unique code across 8 train samples,
+        # gen_byte_acc=0.005 (chance); nobos run: gen_byte_acc=0.88, 7/8 train samples mse=0.00).
         h = x
         def _enc_stack(h):
             for blk in codelm.blocks:
@@ -1958,7 +2064,7 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
     elif cfg.downsampler_rollout_prob <= 0.0:
         logits, code_soft, code_idx = _teacher_forced()
     else:
-        use_roll = jax.random.bernoulli(jax.random.fold_in(rng, 515151), p=cfg.downsampler_rollout_prob)
+        use_roll = jax.random.bernoulli(jax.random.fold_in(rng, 8), p=cfg.downsampler_rollout_prob)
         _canon = lambda t: (t[0].astype(h.dtype), t[1].astype(h.dtype), t[2].astype(jnp.int32))
         logits, code_soft, code_idx = jax.lax.cond(
             use_roll, lambda: _canon(_rollout()), lambda: _canon(_teacher_forced()))
@@ -2011,7 +2117,9 @@ def encode_pardec_downsampler_generate(codelm: CodeLM, downsampler: PardecLM, ra
 
 def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, target_seq: jnp.ndarray,
                                         ctx_code_soft: jnp.ndarray, upsampler_ncodes: int, rng=None,
-                                        encode_temperature: float = 1.0, **_unused) -> tuple:
+                                        encode_temperature: float = 1.0, force_teacher_forced: bool = False,
+                                        return_passes: bool = False, **_unused) -> tuple:
+    # return_passes=True: list of every level-refine pass's 5-tuple (pass 1 first) instead of the last.
     # SHARED upsampler, modulated by (output_expansion=K(level_idx), rate_id=level_idx) -- not a
     # separate weight set per level. **_unused absorbs any stale kwargs from callers.
     # No special-casing: the Upsampler's context is built EXACTLY like the Downsampler's, per
@@ -2027,11 +2135,11 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
                                    codelm_rate_id, rng, group_size=upsampler_ncodes)
     oe = model.K(level_idx)
 
-    def _teacher_forced():
+    def _teacher_forced(**dkw):
         return pardec_score(upsampler, target_seq, h_ctx, context_group_size=upsampler_ncodes,
-                             output_group_size=upsampler_ncodes, rate_id=rate_id, output_expansion=oe)
+                             output_group_size=upsampler_ncodes, rate_id=rate_id, output_expansion=oe, **dkw)
 
-    def _rollout():
+    def _rollout(**dkw):
         # upsampler_rollout: like downsampler_rollout, but for the upsampler's own digit-AR head --
         # every digit-level AR step is SELF-FED (token_ar_rollout) during training, not teacher-forced
         # (token_ar_teacher_forced via pardec_score) -- mitigates the train/inference mismatch where
@@ -2041,7 +2149,7 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
         # dummy-zeros target (which lacks a real label_fn target handy at this call site anyway).
         hid = pardec_score(upsampler, target_seq, h_ctx, context_group_size=upsampler_ncodes,
                             output_group_size=upsampler_ncodes, rate_id=rate_id, output_expansion=oe,
-                            return_hidden=True)
+                            return_hidden=True, **dkw)
         valid_len = hid.shape[1]
         t_out = target_seq[:, :valid_len]
         qfn = lambda lg_m, k_: quantize_dispatch(cfg.quantize_mode, lg_m,
@@ -2055,22 +2163,43 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
         aux_acc = jnp.array(0.0, dtype=lg.dtype)
         return lg, t_out, aux_loss, aux_acc
 
-    if not cfg.upsampler_rollout:
-        logits, target_out, aux_loss, aux_acc = _teacher_forced()
-    elif rng is None or cfg.upsampler_rollout_prob >= 1.0:
-        logits, target_out, aux_loss, aux_acc = _rollout()
-    elif cfg.upsampler_rollout_prob <= 0.0:
-        logits, target_out, aux_loss, aux_acc = _teacher_forced()
-    else:
-        use_roll = jax.random.bernoulli(jax.random.fold_in(rng, 626262), p=cfg.upsampler_rollout_prob)
+    def _one_pass(**dkw):
+        if force_teacher_forced or not cfg.upsampler_rollout:
+            return _teacher_forced(**dkw)
+        if rng is None or cfg.upsampler_rollout_prob >= 1.0:
+            return _rollout(**dkw)
+        if cfg.upsampler_rollout_prob <= 0.0:
+            return _teacher_forced(**dkw)
+        use_roll = jax.random.bernoulli(jax.random.fold_in(rng, 9), p=cfg.upsampler_rollout_prob)
         _canon = lambda t: (t[0].astype(h_ctx.dtype), t[1].astype(jnp.int32),
                              t[2].astype(h_ctx.dtype), t[3].astype(h_ctx.dtype))
-        logits, target_out, aux_loss, aux_acc = jax.lax.cond(
-            use_roll, lambda: _canon(_rollout()), lambda: _canon(_teacher_forced()))
-    return logits, target_out, None, aux_loss, aux_acc
+        return jax.lax.cond(use_roll, lambda: _canon(_rollout(**dkw)), lambda: _canon(_teacher_forced(**dkw)))
+
+    n_pass = cfg.level_refine_passes[level_idx]
+    Pp = cfg.level_refine_window[level_idx] * upsampler_ncodes * oe
+    fixed = n_pass > 1 and cfg.level_refine_layout == "fixed"
+    fill = "mask" if fixed else "zero"
+    passes = [_one_pass(draft_len=Pp, draft_fill="mask") if fixed else _one_pass()]
+    if n_pass > 1:
+        for p in range(1, n_pass):
+            prev_logits, prev_target = passes[-1][0], passes[-1][1]
+            if cfg.level_refine_draft_mode == "sample" and rng is not None:
+                lg = prev_logits.astype(jnp.float32) / cfg.level_refine_draft_temperature
+                lg = lg + jax.random.gumbel(jax.random.fold_in(rng, 20 + p), lg.shape)
+            else:
+                lg = prev_logits
+            draft = safe_argmax(lg).astype(jnp.int32)  # feeds a gather: avoid TPU argmax bug
+            if cfg.level_refine_gt_drop < 1.0 and rng is not None:
+                own = jax.random.bernoulli(jax.random.fold_in(rng, 10 + p), p=cfg.level_refine_gt_drop,
+                                           shape=draft.shape[:2])
+                draft = jnp.where(own[..., None], draft, prev_target.astype(jnp.int32))
+            passes.append(_one_pass(draft_seq=jax.lax.stop_gradient(draft), draft_len=Pp, draft_fill=fill))
+    outs = [(lg, t, None, al, ac) for lg, t, al, ac in passes]
+    return outs if return_passes else outs[-1]
 
 
-def _decode_generate_pardec_call(model, level_idx, ctx_idx, upsampler_ncodes, greedy, temperature, seed):
+def _decode_generate_pardec_call(model, level_idx, ctx_idx, upsampler_ncodes, greedy, temperature, seed,
+                                  draft_seq=None, draft_len=0, draft_fill="zero"):
     codelm = model.codelm_for(level_idx)
     codelm_rate_id = model.codelm_bos_rate_id(level_idx)  # CodeLM's own bos: always absolute
     rate_id = model.bos_rate_id(level_idx)  # upsampler's own bos: follows cfg.bos_rate_mode
@@ -2079,7 +2208,8 @@ def _decode_generate_pardec_call(model, level_idx, ctx_idx, upsampler_ncodes, gr
                                    codelm_rate_id, rng, group_size=upsampler_ncodes)
     return pardec_generate(model.upsampler_for(level_idx), h_ctx, context_group_size=upsampler_ncodes,
                             output_group_size=upsampler_ncodes, rng=rng, greedy=greedy, temperature=temperature,
-                            top_k=model.cfg.gen_top_k, rate_id=rate_id, output_expansion=model.K(level_idx))
+                            top_k=model.cfg.gen_top_k, rate_id=rate_id, output_expansion=model.K(level_idx),
+                            draft_seq=draft_seq, draft_len=draft_len, draft_fill=draft_fill)
 
 
 _decode_generate_pardec_jit = eqx.filter_jit(_decode_generate_pardec_call)
@@ -2087,7 +2217,19 @@ _decode_generate_pardec_jit = eqx.filter_jit(_decode_generate_pardec_call)
 
 def decode_generate_multipass(model: "LagCodecModel", level_idx: int, ctx_idx: jnp.ndarray, upsampler_ncodes: int,
                                greedy: bool = True, temperature: float = 1.0, seed: int = 0) -> jnp.ndarray:
-    return _decode_generate_pardec_jit(model, level_idx, ctx_idx, upsampler_ncodes, greedy, temperature, seed)
+    n_pass = model.cfg.level_refine_passes[level_idx]
+    Pp = model.cfg.level_refine_window[level_idx] * upsampler_ncodes * model.K(level_idx)
+    fixed = n_pass > 1 and model.cfg.level_refine_layout == "fixed"
+    fill = "mask" if fixed else "zero"
+    if fixed:
+        pred = _decode_generate_pardec_jit(model, level_idx, ctx_idx, upsampler_ncodes, greedy, temperature, seed,
+                                           None, Pp, "mask")
+    else:
+        pred = _decode_generate_pardec_jit(model, level_idx, ctx_idx, upsampler_ncodes, greedy, temperature, seed)
+    for _ in range(n_pass - 1):
+        pred = _decode_generate_pardec_jit(model, level_idx, ctx_idx, upsampler_ncodes, greedy, temperature,
+                                           seed, pred, Pp, fill)
+    return pred
 
 
 def encoder_hidden(codelm: CodeLM, x: jnp.ndarray) -> jnp.ndarray:
@@ -2241,7 +2383,7 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
         tok = encode_pardec_downsampler_generate(codelm_i, model.downsampler_for(i), tok, model.K(i), cfg,
                                                    rate_id=model.bos_rate_id(i),
                                                    codelm_rate_id=model.codelm_bos_rate_id(i),
-                                                   rng=jax.random.fold_in(rng, i), greedy=greedy,
+                                                   rng=jax.random.fold_in(rng, 100000 + i), greedy=greedy,
                                                    temperature=encode_temperature,
                                                    downsampler_ncodes=cfg.downsampler_ncodes[i])["code_idx"]
         assert tok.shape[1] >= 1, "prompt too short to produce a single code at the sampling level"
@@ -2267,7 +2409,7 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
         out = encode_pardec_downsampler_generate(codelm_i, model.downsampler_for(i), raw, model.K(i), cfg,
                                                    rate_id=model.bos_rate_id(i),
                                                    codelm_rate_id=model.codelm_bos_rate_id(i),
-                                                   rng=jax.random.fold_in(rng, 1000 + i), greedy=greedy,
+                                                   rng=jax.random.fold_in(rng, 200000 + i), greedy=greedy,
                                                    temperature=encode_temperature,
                                                    downsampler_ncodes=cfg.downsampler_ncodes[i])
         codes[i] = out["code_idx"]
@@ -2311,7 +2453,7 @@ class LagCodecModel(eqx.Module):
             level_idx = j  # share=True: n_instances==1, so level_idx is always 0 (the representative
             # index singleton_uniform_fields already enforces uniformity against); share=False:
             # level_idx==j, this instance's own dedicated level.
-            codelms.append(CodeLM(jax.random.fold_in(key, 100 + j), cfg, level_idx=level_idx))
+            codelms.append(CodeLM(jax.random.fold_in(key, 10 + j), cfg, level_idx=level_idx))
             # CodeLM is the shared feature extractor for BOTH decode heads: Downsampler's context is
             # CodeLM's hidden states from this level's own INPUT; Upsampler's context is CodeLM's
             # hidden states from re-running this level's own CODE through the exact same embed table
@@ -2328,7 +2470,7 @@ class LagCodecModel(eqx.Module):
 
             downsampler_remat = cfg.remat if cfg.downsampler_remat[level_idx] is None else cfg.downsampler_remat[level_idx]
             downsampler = PardecLM(
-                jax.random.fold_in(key, 9101 + j), context_hidden_dim=D_enc, hidden_dim=cfg.downsampler_d_model[level_idx],
+                jax.random.fold_in(key, 20 + j), context_hidden_dim=D_enc, hidden_dim=cfg.downsampler_d_model[level_idx],
                 n_heads=cfg.downsampler_n_heads[level_idx], n_kv_heads=cfg.downsampler_n_kv_heads[level_idx],
                 n_layers=cfg.downsampler_n_layers[level_idx], mlp_mult=cfg.mlp_mult[level_idx], rope_base=cfg.rope_base[level_idx],
                 output_expansion=1, context_window_groups=cfg.downsampler_window[level_idx],
@@ -2344,7 +2486,7 @@ class LagCodecModel(eqx.Module):
             # default -- overridden per-call via decode_logits_and_target_multipass/
             # decode_generate_multipass's model.K(level_idx) regardless of mode
             upsampler = PardecLM(
-                jax.random.fold_in(key, 9201 + j), context_hidden_dim=D_enc, hidden_dim=cfg.upsampler_d_model[level_idx],
+                jax.random.fold_in(key, 30 + j), context_hidden_dim=D_enc, hidden_dim=cfg.upsampler_d_model[level_idx],
                 n_heads=cfg.upsampler_n_heads[level_idx], n_kv_heads=cfg.upsampler_n_kv_heads[level_idx],
                 n_layers=cfg.upsampler_n_layers[level_idx], mlp_mult=cfg.mlp_mult[level_idx], rope_base=cfg.rope_base[level_idx],
                 output_expansion=K_default, context_window_groups=cfg.upsampler_window[level_idx],
@@ -2407,7 +2549,8 @@ def dec_loss_acc(logits: jnp.ndarray, target: jnp.ndarray, mask: jnp.ndarray = N
 def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng=None,
                    level_gt_drop=None, cascade_rng=None, encode_temperature: float = 1.0,
                    layer_drop_prob=None, label_reg_weight: float = 0.0, label_fn=None,
-                   pixel_order=None, byte_pq_fn=None) -> tuple:
+                   pixel_order=None, byte_pq_fn=None, digit_teacher_force: bool = False,
+                   return_recon: bool = False, ctx_ablation: str = None) -> tuple:
     codelm0 = model.codelm_for(0)
     byte_pq_fn = byte_pq_fn or rgb_byte_pq_fn
     # flat_bytes stays raw (fed to label_fn as-is, which interprets literal byte/pixel values);
@@ -2461,8 +2604,19 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     byte_mse = None
     mse_loss = 0.0
     ctx = codes_soft[phase - 1]
-    if model.cfg.ctx_stop_gradient:
+    # diagnostic only (default None -- no change to any existing call site): replaces the TOP-level
+    # ctx with zeros/a batch-shuffled version BEFORE any decode happens, to measure how much the
+    # decode cascade actually relies on real per-sample content vs. teacher-forced AR self-attention
+    # over real previous tokens alone. See ctx_ablation_check.py.
+    if ctx_ablation == "zero":
+        ctx = jnp.zeros_like(ctx)
+    elif ctx_ablation == "shuffle":
+        ctx = jnp.roll(ctx, shift=1, axis=0)
+    elif ctx_ablation is not None:
+        raise ValueError(f"ctx_ablation must be None/'zero'/'shuffle', got {ctx_ablation!r}")
+    if model.cfg.ctx_stop_gradient is True:
         ctx = jax.lax.stop_gradient(ctx)
+    sg_pseudo = jax.lax.stop_gradient if model.cfg.ctx_stop_gradient == "pseudo" else (lambda c: c)
     cascade_rngs = [None] * phase if cascade_rng is None else list(jax.random.split(cascade_rng, phase))
 
     start_i = phase - 1
@@ -2470,10 +2624,12 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     for i in range(start_i, -1, -1):
         dec_target = tok0 if i == 0 else codes[i - 1]
         dec_rng = level_rngs[2 * i + 1]
-        logits, target_i, mask_i, aux_loss_i, aux_acc_i = decode_logits_and_target_multipass(
+        passes = decode_logits_and_target_multipass(
             model, i, dec_target, ctx, model.cfg.upsampler_ncodes[i], rng=dec_rng,
-            encode_temperature=encode_temperature)
-        loss_i, acc_i = dec_loss_acc(logits, target_i, mask_i)
+            encode_temperature=encode_temperature, force_teacher_forced=digit_teacher_force, return_passes=True)
+        logits, target_i, mask_i, aux_loss_i, aux_acc_i = passes[-1]
+        loss_i = jnp.mean(jnp.stack([dec_loss_acc(lg, t, m)[0] for lg, t, m, _, _ in passes]))
+        acc_i = dec_loss_acc(logits, target_i, mask_i)[1]
         dec_losses.append(loss_i)
         dec_accs.append(acc_i)
         if aux_applies:
@@ -2492,63 +2648,24 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
                 mse_loss = 0.0
         if i > 0:
             real_ctx = codes_soft[i - 1]
-
-            def _gt_drop_ctx(rng_base):
-                # existing real/pseudo mixture, unchanged -- factored into a closure so the new
-                # scheduled-sampling branch below can fall back to it.
-                if level_gt_drop is None:
-                    return real_ctx
-                level_gt_drop_i = level_gt_drop if isinstance(level_gt_drop, (int, float)) \
-                    else level_gt_drop[i]
-                # level_gt_drop_i is a static Python float (never traced -- see level_forward's only
-                # caller), so these are trace-time branches, not data-dependent: 1.0/0.0 skip the
-                # unused side's compute (bernoulli draw, quantize_dispatch's rng split) entirely
-                # rather than computing both arms and selecting via jnp.where.
-                if level_gt_drop_i == 1.0:
-                    quant_rng_i = None if rng_base is None else jax.random.fold_in(rng_base, 777)
-                    c, _ = quantize_dispatch(model.cfg.quantize_mode, logits, quant_rng_i,
-                                              encode_temperature, model.cfg.quantize_drop)
-                    return c
-                elif level_gt_drop_i == 0.0:
-                    return real_ctx
-                else:
-                    use_cascade_i = jax.random.bernoulli(rng_base, p=level_gt_drop_i)
-                    # quant_rng forked off (not split from) cascade_rngs[i], so use_cascade_i's draw
-                    # above stays bit-identical regardless of quantize_mode -- only the pseudo-context's
-                    # OWN sampling noise is new.
-                    quant_rng_i = None if rng_base is None else jax.random.fold_in(rng_base, 777)
-                    pseudo_ctx, _ = quantize_dispatch(model.cfg.quantize_mode, logits, quant_rng_i,
-                                                       encode_temperature, model.cfg.quantize_drop)
-                    return jnp.where(use_cascade_i, pseudo_ctx, real_ctx)
-
-            # decoder_scheduled_sampling_prob: trace-time Python float (per-level, broadcast in
-            # Config.__post_init__), same static-branch pattern as level_gt_drop_i above. Unlike
-            # level_gt_drop (a level_forward param, defaults to None in eval callers like
-            # run_val_eval -- bypassing its own bernoulli branch), this lives on Config and is NOT
-            # None-able per call site, so it must explicitly check cascade_rngs[i] is None itself
-            # (eval/no-rng) and skip straight to the deterministic real/pseudo mixture -- same
-            # eval-is-always-real-ctx behavior level_gt_drop already gets for free.
-            ss_prob_i = model.cfg.decoder_scheduled_sampling_prob[i]
-            if ss_prob_i == 0.0 or cascade_rngs[i] is None:
-                ctx = _gt_drop_ctx(cascade_rngs[i])
+            rng_i = cascade_rngs[i]
+            gt_drop_i = None if level_gt_drop is None else (
+                level_gt_drop if isinstance(level_gt_drop, (int, float)) else level_gt_drop[i])
+            # gt_drop_i is a static Python float: 0.0/1.0 skip the unused branch's compute entirely.
+            # No rng (eval) with a fractional value: deterministic real ctx, like run_val_eval.
+            if gt_drop_i is None or gt_drop_i == 0.0 or (gt_drop_i < 1.0 and rng_i is None):
+                ctx = real_ctx
             else:
-                # "parallel" scheduled sampling: `logits` is already the output of ONE teacher-forced
-                # pardec_score call (parallel, not a sequential rollout) -- take its hard argmax and
-                # detach, approximating true scheduled sampling's GT/self-fed mix cheaply. Always
-                # detached regardless of ctx_stop_gradient (that flag's own assert in __post_init__
-                # requires it to be True whenever this prob>0, but the detach here is the mechanism's
-                # actual point, not incidental on the flag).
-                ss_idx = jnp.argmax(logits, axis=-1)
-                ss_ctx = jax.lax.stop_gradient(
-                    jax.nn.one_hot(ss_idx, model.codelm_for(i).code_vocab, dtype=real_ctx.dtype))
-                if ss_prob_i == 1.0:
-                    ctx = ss_ctx
+                quant_rng_i = None if rng_i is None else jax.random.fold_in(rng_i, 0)
+                pseudo_ctx, _ = quantize_dispatch(model.cfg.quantize_mode, logits, quant_rng_i,
+                                                   encode_temperature, model.cfg.quantize_drop)
+                pseudo_ctx = sg_pseudo(pseudo_ctx)
+                if gt_drop_i == 1.0:
+                    ctx = pseudo_ctx
                 else:
-                    ss_rng = jax.random.fold_in(cascade_rngs[i], 888)
-                    use_ss_i = jax.random.bernoulli(ss_rng, p=ss_prob_i)
-                    ctx = jnp.where(use_ss_i, ss_ctx, _gt_drop_ctx(cascade_rngs[i]))
+                    ctx = jnp.where(jax.random.bernoulli(rng_i, p=gt_drop_i), pseudo_ctx, real_ctx)
 
-            if model.cfg.ctx_stop_gradient:
+            if model.cfg.ctx_stop_gradient is True:
                 ctx = jax.lax.stop_gradient(ctx)
 
     dec_loss_total = jnp.mean(jnp.stack(dec_losses))
@@ -2568,9 +2685,12 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
         + model.cfg.mse_weight * mse_loss + label_reg_weight * label_loss_total \
         + model.cfg.ntp_weight * aux_ntp_loss_total + model.cfg.label_mse_weight * label_mse_loss_total
     # bpb = dec_loss_total / jnp.log(2.0)
-    return loss, (dec_loss_total, byte_acc, ntp_loss_total, jnp.mean(jnp.stack(enc_accs)),
-                  jnp.mean(jnp.stack(utils)), byte_mse, aux_ntp_loss_total / jnp.log(2.0), aux_ntp_acc_total,
-                  label_mse_total)
+    aux = (dec_loss_total, byte_acc, ntp_loss_total, jnp.mean(jnp.stack(enc_accs)),
+           jnp.mean(jnp.stack(utils)), byte_mse, aux_ntp_loss_total / jnp.log(2.0), aux_ntp_acc_total,
+           label_mse_total)
+    if return_recon:
+        aux = aux + (pred_bytes,)
+    return loss, aux
 
 
 def sample_multires_entry(py_rng, n_levels: int) -> tuple:
@@ -2710,14 +2830,16 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
 
     dec_losses, dec_accs = [], []
     ctx = codes_soft[depth - 1]
-    dec_rngs = [None] * depth if rng is None else list(jax.random.split(jax.random.fold_in(rng, 777), depth))
+    dec_rngs = [None] * depth if rng is None else list(jax.random.split(jax.random.fold_in(rng, 2), depth))
     for d in range(depth - 1, -1, -1):
         i = entry_level + d
         dec_target = entry_code if d == 0 else codes[d - 1]
-        logits, target_i, mask_i, aux_loss_i, aux_acc_i = decode_logits_and_target_multipass(
+        passes = decode_logits_and_target_multipass(
             model, i, dec_target, ctx, model.cfg.upsampler_ncodes[i], rng=dec_rngs[d],
-            encode_temperature=encode_temperature)
-        loss_i, acc_i = dec_loss_acc(logits, target_i, mask_i)
+            encode_temperature=encode_temperature, return_passes=True)
+        logits, target_i, mask_i, aux_loss_i, aux_acc_i = passes[-1]
+        loss_i = jnp.mean(jnp.stack([dec_loss_acc(lg, t, m)[0] for lg, t, m, _, _ in passes]))
+        acc_i = dec_loss_acc(logits, target_i, mask_i)[1]
         dec_losses.append(loss_i)
         dec_accs.append(acc_i)
         if d > 0:
@@ -2742,11 +2864,19 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
 
 
 def phase_trainable_filter(model: LagCodecModel, phase: int):
-    # SINGLETON model: codelm/downsampler/upsampler are the SAME shared weights used by every
-    # level, so there is no per-level subset to selectively freeze -- curriculum_mode is asserted
-    # 'no_freeze' unconditionally (see __post_init__), and with one shared parameter set, "no_freeze"
-    # is the only sensible behavior anyway: the whole model is trainable regardless of phase.
-    return jax.tree_util.tree_map(lambda x: eqx.is_array(x), model)
+    spec = jax.tree_util.tree_map(lambda x: eqx.is_array(x), model)
+    if model.cfg.curriculum_mode != "freeze":
+        return spec
+    # phase p trains only level p-1: lower levels frozen, higher (unused) ones too so weight decay
+    # doesn't shrink them before their own phase
+    all_false = lambda sub: jax.tree_util.tree_map(lambda _: False, sub)
+    for j in range(len(model.codelms)):
+        if j == phase - 1:
+            continue
+        spec = eqx.tree_at(lambda s: (s.codelms[j], s.downsamplers[j], s.upsamplers[j]), spec,
+                           replace=(all_false(spec.codelms[j]), all_false(spec.downsamplers[j]),
+                                    all_false(spec.upsamplers[j])))
+    return spec
 
 
 def count_params(tree) -> int:
@@ -3041,7 +3171,9 @@ CONFIG_FIELDS = ("img_size", "codelm_d_model", "codelm_n_layers", "codelm_n_head
                   "share_downsampler_upsampler_lm", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "upsampler_ncodes",
                   "sync", "gen_temperature", "gen_top_k", "gen_eval_encode_mode", "gen_eval_greedy_only",
-                  "gen_eval_all_levels", "ctx_stop_gradient", "decoder_scheduled_sampling_prob",
+                  "gen_eval_all_levels", "gen_eval_teacher_force_sanity", "ctx_stop_gradient",
+                  "level_refine_passes", "level_refine_window", "level_refine_gt_drop", "level_refine_layout",
+                  "level_refine_draft_mode", "level_refine_draft_temperature",
                   "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
                   "gumbel_at_inference", "init_scheme", "use_xsa",
                   "use_qknorm", "remat", "remat_level", "attn_window", "attn_lookahead",
@@ -3287,13 +3419,31 @@ def main():
                     help="skip the sampled (temperature/top_k) half of gen-eval, greedy decode only")
     p.add_argument("--gen_eval_all_levels", type=lambda x: x.lower() != "false", default=Config.gen_eval_all_levels,
                     help="mid-phase/end-of-phase gen-eval also loops top=0..phase-2 (not just phase-1)")
-    p.add_argument("--ctx_stop_gradient", type=lambda x: x.lower() != "false", default=Config.ctx_stop_gradient,
-                    help="stop_gradient level_forward's decode-cascade ctx every time it's built -- no "
-                         "cross-level gradient leak through real_ctx/pseudo_ctx/scheduled-sampling ctx")
-    p.add_argument("--decoder_scheduled_sampling_prob", type=_float_tuple_arg,
-                    default=Config.decoder_scheduled_sampling_prob,
-                    help="per-level prob of using a detached-argmax 'parallel scheduled sampling' ctx "
-                         "instead of level_gt_drop's real/pseudo mixture. Needs ctx_stop_gradient=True")
+    p.add_argument("--gen_eval_teacher_force_sanity", type=lambda x: x.lower() != "false",
+                    default=Config.gen_eval_teacher_force_sanity,
+                    help="alongside normal gen-eval, run a sanity reconstruction with every digit-level "
+                         "AR step forced teacher-forced (cross-level ctx still honors level_gt_drop), on "
+                         "train and val -- saves samples_{tag}_tfsanity.png")
+    p.add_argument("--ctx_stop_gradient",
+                    type=lambda x: "pseudo" if x.lower() == "pseudo" else x.lower() != "false",
+                    default=Config.ctx_stop_gradient,
+                    help="True: detach every decode-cascade ctx. 'pseudo': detach only the predicted ctx "
+                         "(upper upsampler's output), keep gradient on the real encoder ctx. False: no detach")
+    p.add_argument("--level_refine_passes", type=_tuple_arg, default=Config.level_refine_passes,
+                    help="per level: 1 = off. >1: extra upsampler passes, each seeing a draft (previous pass's "
+                         "argmax) of level_refine_window preceding groups")
+    p.add_argument("--level_refine_window", type=_tuple_arg, default=Config.level_refine_window,
+                    help="per level: number of preceding groups whose draft each refine pass sees")
+    p.add_argument("--level_refine_gt_drop", type=float, default=Config.level_refine_gt_drop,
+                    help="training only: per draft position, prob of drafting own prediction (else real target)")
+    p.add_argument("--level_refine_layout", type=str, default=Config.level_refine_layout, choices=["fixed", "variable"],
+                    help="fixed: same row layout every pass, pass 1's draft slot = learned mask token. "
+                         "variable: pass 1 has no draft slot (targets shift by the draft length in later passes)")
+    p.add_argument("--level_refine_draft_mode", type=str, default=Config.level_refine_draft_mode,
+                    choices=["argmax", "sample"],
+                    help="training draft: argmax (matches greedy gen) or sample (gumbel-max, matches sampled gen)")
+    p.add_argument("--level_refine_draft_temperature", type=float, default=Config.level_refine_draft_temperature,
+                    help="temperature for level_refine_draft_mode=sample")
     p.add_argument("--precision", type=str, default=Config.precision, choices=["bf16", "fp32"])
     p.add_argument("--curriculum_mode", type=str, default=Config.curriculum_mode, choices=["freeze", "no_freeze"])
     p.add_argument("--quantize_mode", type=str, default=Config.quantize_mode,
@@ -3489,6 +3639,14 @@ def main():
         if args.require_staged_curriculum:
             raise ValueError(msg)
         warnings.warn(msg)
+    if cfg.curriculum_mode == "freeze":
+        assert not args.no_curriculum and args.level_select_prob is None, \
+            "curriculum_mode='freeze' needs the phase-by-phase curriculum (no --no_curriculum / level_select_prob)"
+        if skip_ahead:
+            raise ValueError("curriculum_mode='freeze' with a skipped phase would freeze an untrained level")
+        if any(g > 0 for g in args.level_gt_drop):
+            warnings.warn(f"curriculum_mode='freeze' with level_gt_drop={args.level_gt_drop}: frozen lower "
+                          f"decoders get predicted ctx from the new level and can't adapt to it")
 
     (train_np, train_labels), (val_np, val_labels) = load_dataset(args.dataset, Path(args.data_root), cfg.img_size)
     if args.train_subset_n:
@@ -3607,6 +3765,28 @@ def main():
                 run_gen_eval(eval_model, top, f"{tag}_train", train_flat_prompt, train_gt_img, sample=True)
         return result
 
+    def run_gen_eval_teacher_force_sanity(eval_model, top: int, tag: str, flat_prompt, gt_img) -> float:
+        # SAME cross-level ctx cascade as training (level_gt_drop honored as-is -- see
+        # Config.gen_eval_teacher_force_sanity), but every digit-level AR step forced teacher-forced.
+        m = cast_pytree(eval_model, compute_dtype)
+        phase = top + 1
+        _, aux = val_eval_jit(m, flat_prompt, phase, rng=None,
+                               level_gt_drop=args.level_gt_drop[phase - 1],
+                               encode_temperature=args.encode_temperature[phase - 1],
+                               label_reg_weight=0.0, label_fn=label_fn, pixel_order=pixel_order,
+                               digit_teacher_force=True, return_recon=True)
+        pred_bytes = aux[-1]
+        recon_img = positions_to_image(np.asarray(pred_bytes), cfg, pixel_order)
+        mse = pixel_mse(recon_img, gt_img)
+        save_compare_grid(recon_img, gt_img, run_dir / f"samples_{tag}_tfsanity.png")
+        logger(f"[{tag}] top={top} TF_SANITY tf_sanity_mse={mse:.2f}", tag=tag, tf_sanity_mse=float(mse))
+        return mse
+
+    def run_gen_eval_teacher_force_sanity_both(eval_model, top: int, tag: str) -> None:
+        run_gen_eval_teacher_force_sanity(eval_model, top, f"{tag}_val", flat_prompt, gt_img)
+        if args.eval_gen_train:
+            run_gen_eval_teacher_force_sanity(eval_model, top, f"{tag}_train", train_flat_prompt, train_gt_img)
+
     val_eval_jit = eqx.filter_jit(level_forward)
     val_jit_timed = [False]
 
@@ -3671,6 +3851,7 @@ def main():
     total_all_steps = sum(
         _phase_total_steps(p - 1, len(train_np) // (args.batch_size[p - 1] * n_devices * jax.process_count()))
         for p in all_phases)
+    step_w = len(str(total_all_steps))
     global_pbar = tqdm(total=total_all_steps, initial=step, desc="total", dynamic_ncols=True, position=1, leave=True)
     last_global_step = step
     phase_iter = [n_phases] if args.no_curriculum else list(range(1, n_phases + 1))
@@ -3910,15 +4091,20 @@ def main():
 
                 if step % gen_eval_every_steps == 0:
                     snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
-                    run_val_eval(snapshot, phase, tag=f"level{phase - 1}_step{step}")
+                    st = f"{step:0{step_w}d}"  # zero-padded so file browsers sort samples numerically
+                    run_val_eval(snapshot, phase, tag=f"level{phase - 1}_step{st}")
                     if cfg.gen_eval_all_levels:
                         for lvl in range(phase - 1, -1, -1):
-                            run_gen_eval_both(snapshot, top=lvl, tag=f"level{lvl}_step{step}")
+                            run_gen_eval_both(snapshot, top=lvl, tag=f"level{lvl}_step{st}")
+                            if cfg.gen_eval_teacher_force_sanity:
+                                run_gen_eval_teacher_force_sanity_both(snapshot, top=lvl, tag=f"level{lvl}_step{st}")
                     else:
-                        run_gen_eval_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{step}")
+                        run_gen_eval_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{st}")
+                        if cfg.gen_eval_teacher_force_sanity:
+                            run_gen_eval_teacher_force_sanity_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{st}")
                     try:
                         plot_encoder_outs(snapshot, cfg, val_np[:args.val_batch_size[phase - 1]], pixel_order,
-                                       run_dir / f"samples_level{phase - 1}_step{step}_codegrid.png",
+                                       run_dir / f"samples_level{phase - 1}_step{st}_codegrid.png",
                                        level=phase - 1, label_fn=label_fn)
                     except Exception as e:
                         print(e)
@@ -3964,15 +4150,21 @@ def main():
             if cfg.gen_eval_all_levels:
                 for lvl in range(phase - 1, -1, -1):
                     run_gen_eval_both(model, top=lvl, tag=f"level{lvl}_final")
+                    if cfg.gen_eval_teacher_force_sanity:
+                        run_gen_eval_teacher_force_sanity_both(model, top=lvl, tag=f"level{lvl}_final")
             else:
                 run_gen_eval_both(model, top=phase - 1, tag=f"level{phase - 1}_final")
+                if cfg.gen_eval_teacher_force_sanity:
+                    run_gen_eval_teacher_force_sanity_both(model, top=phase - 1, tag=f"level{phase - 1}_final")
 
     global_pbar.update(step - last_global_step)
     global_pbar.close()
     logger("=== all phases done, running final top-down cascade eval ===")
-    run_val_eval(model, n_levels - 1, tag="final")
+    run_val_eval(model, n_phases, tag="final")
     for top in range(n_phases - 1, -1, -1):
         run_gen_eval_both(model, top=top, tag=f"final_top{top}")
+        if cfg.gen_eval_teacher_force_sanity:
+            run_gen_eval_teacher_force_sanity_both(model, top=top, tag=f"final_top{top}")
     logger("training done")
 
 

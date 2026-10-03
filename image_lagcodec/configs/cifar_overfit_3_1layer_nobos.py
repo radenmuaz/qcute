@@ -1,17 +1,7 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_4_overfit_reinmax_s_ctxdetach.py
+uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_res_4_overfit_reinmax_ctxdetach_linear.py
 """
-# Fork of cifar_res_4_overfit_reinmax_s.py -- tests ctx_stop_gradient + decoder_scheduled_sampling_prob
-# (added 2026-10-02): level_forward's decode-cascade `ctx` (real_ctx/pseudo_ctx) is a straight-through
-# estimator by default, so gradient leaks ACROSS levels through it (a level's reconstruction loss
-# trains the level ABOVE's upsampler, on top of that level's own loss) -- unlike level 0's target
-# (raw bytes), which was never differentiable. ctx_stop_gradient=True cuts that cross-level gradient
-# path entirely, matching level 0's treatment. decoder_scheduled_sampling_prob adds a per-level
-# probability of replacing level_gt_drop's real/pseudo ctx mixture with a cheap "parallel scheduled
-# sampling" ctx: one teacher-forced pardec_score pass's hard argmax, DETACHED (needs
-# ctx_stop_gradient=True, asserted in Config.__post_init__) -- approximates true scheduled sampling
-# without a sequential rollout.
-# --- model ---
+
 img_size = 32
 
 # share_downsampler_upsampler_lm = True
@@ -35,7 +25,7 @@ label_reg_weight = 1.0
 label_fn = "rgb_label_fn_jax"
 # bos_rate_mode = "relative"
 bos_rate_mode = "absolute"
-strides = (4,)*5
+strides = (1024,)
 attn_window = 1024
 upsampler_ncodes = 1
 attn_lookahead = 0
@@ -57,9 +47,10 @@ upsampler_n_kv_heads = 2
 upsampler_window = 2
 # upsampler_remat = True   # enable only if OOM
 
-# use_codelm_bos = False
-use_codelm_bos = True
-codelm_bos_prob = 1.0
+use_codelm_bos = False
+# use_codelm_bos = True
+# codelm_bos_prob = 1.0
+# curriculum_mode = "freeze"
 curriculum_mode = "no_freeze"
 # level_select_prob = (0.9, 0.8, 0.7, 0.6)  # length n_levels-1=4
 # multires_entry_gt_drop = (0.0, 0.5, 0.5, 0.5, 0.5)  # length n_levels=5, index 0 unused
@@ -70,36 +61,37 @@ mse_softmax_tau = 1.0
 level_gt_drop = 1.0
 quantize_drop = 0.0
 
-# new this fork: cut cross-level gradient leak through decode-cascade ctx, and mix in cheap
-# parallel-scheduled-sampling ctx 30% of the time (requires ctx_stop_gradient=True)
+# cut cross-level gradient leak through decode-cascade ctx, mix in cheap parallel-scheduled-sampling
+# ctx 30% of the time (requires ctx_stop_gradient=True) -- unrelated to digit-level AR, kept as-is
 ctx_stop_gradient = True
-# removed 2026-10-03, redundant with level_gt_drop: decoder_scheduled_sampling_prob = 0.3
+# decoder_scheduled_sampling_prob = 0.3
 
 init_scheme = "llama"
-use_xsa = True
+# use_xsa = True
 use_sink = True
 precision = "bf16"
 
 byte_group = 3
-token_head_type = "ar"
-codelm_token_head = "ar"   # CodeLM NTP/free-run head: autoregressive digits
-pardec_token_head = "ar"    # downsampler/upsampler digit head: autoregressive digits
-token_dim = 64
+token_head_type = "linears"
+# no digit-level AR sampling at all, parallel/MTP-style heads instead
+codelm_token_head = "linear"   # CodeLM NTP/free-run head: all digits in one parallel matmul
+pardec_token_head = "linear"    # downsampler/upsampler digit head: all digits in one parallel matmul
+token_dim = 256
 token_n_heads = 2
 traversal = "zorder"
 eval_gen_train = True
 gen_eval_all_levels = True
+gen_eval_teacher_force_sanity = True
 
 
 # --- training ---
 batch_size = 4
 val_batch_size = 8
-# level_steps = (0,)*4 + (int(100e3),)
-level_steps = (int(1e3),)*4 + (int(100e3),)
+level_steps = (int(100e3),)
 seed = 0
 train_subset_n = 100
 val_subset_n = 100
-gen_eval_every_step = 5000
+gen_eval_every_step = 1000
 epoch_verbose = False
 
 grad_clip = 1.0
@@ -109,7 +101,7 @@ lr_min = 1e-5
 # lr_min_step = int(100e3)
 warmup_steps = 1000
 optimizer = "adamw"
-optimizer_kwargs = dict(weight_decay=1e-5)
+optimizer_kwargs = dict(weight_decay=0)
 
 wa_verbose = False
 
@@ -126,6 +118,6 @@ wa_verbose = False
 # wa_wma_weights = (5.0, 4.0, 3.0, 2.0, 1.0)
 
 # --- logging ---
-log_every = 100
+log_every = 500
 ckpt_every_step = 10000
 ckpt_keep = 1

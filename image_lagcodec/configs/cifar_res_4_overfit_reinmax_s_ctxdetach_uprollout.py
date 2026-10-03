@@ -75,7 +75,7 @@ quantize_drop = 0.0
 # cut cross-level gradient leak through decode-cascade ctx, mix in cheap parallel-scheduled-sampling
 # ctx 30% of the time (requires ctx_stop_gradient=True)
 ctx_stop_gradient = True
-decoder_scheduled_sampling_prob = 0.3
+# removed 2026-10-03, redundant with level_gt_drop: decoder_scheduled_sampling_prob = 0.3
 
 # new this fork: upsampler's own digit-AR head self-feeds during training (always -- prob=1.0),
 # matching pardec_generate's actual inference-time behavior
