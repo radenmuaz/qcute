@@ -238,8 +238,192 @@ def run_pardec_refine_fixed_check(head="ar", window=1, **over):
     return all(oks)
 
 
+def run_mixer_step_check(kind):
+    """RecurrentMixer dense (parallel scan / scan) vs one-step-at-a-time state updates, with a random
+    validity mask (invalid positions must leave the state untouched in both paths)."""
+    mixer = R.RecurrentMixer(jax.random.PRNGKey(0), 32, kind, state_dim=8, n_layers=2)
+    rs = np.random.RandomState(0)
+    x = jnp.array(rs.randn(3, 11, 32).astype(np.float32))
+    valid = jnp.array(rs.rand(3, 11) > 0.3)
+    dense = mixer(x, valid)
+    st = mixer.init_state(3)
+    outs = []
+    for t in range(x.shape[1]):
+        y, st = mixer.step(x[:, t], st, valid[:, t])
+        outs.append(y)
+    step = jnp.stack(outs, axis=1)
+    err = float(jnp.abs(dense - step).max())
+    st2 = mixer.init_state(1)
+    for t in range(x.shape[1]):
+        if bool(valid[0, t]):
+            _, st2 = mixer.step(x[:1, t], st2)
+    gate_err = float(jnp.abs(st[:1] - st2).max())
+    ok = err < 1e-4 and gate_err < 1e-4
+    print(f"MIXER {kind}: dense-vs-step max|diff|={err:.2e}, gated-vs-skipped state diff={gate_err:.2e}  {'OK' if ok else 'BROKEN'}")
+    return ok
+
+
+def _ctx_and_hidden(model, flat):
+    codelm = model.codelm_for(0)
+    tok0 = R.rgb_byte_pq_fn(flat, codelm.pq_chunks, codelm.code_vocab)
+    x = R.code_embed_proj(tok0, codelm.own_input_embed, codelm.own_input_proj)
+    ctx_code_soft = codelm.encode(x, tok0, model.K(0), rng=None)["code_soft"]
+    h_ctx = R.encoder_hidden(codelm, R.code_embed_proj(ctx_code_soft, codelm.own_input_embed, codelm.own_input_proj))
+    return tok0, ctx_code_soft, h_ctx
+
+
+def run_cycle_slot_check(head="ar", n_cycles=3, **over):
+    """Stack slots: (a) dense-vs-KV/state with filled + mask slots (alone and with a fixed refine draft);
+    (b) causality: a revision code at position j is seen only by groups whose window covers j (same as
+    the main context), never by earlier groups; (c) a slot's content actually changes the output."""
+    cfg = build_cfg(pardec_token_head=head, level_cycles=(n_cycles, 1), level_cycle_mode="stack", **over)
+    print(f"[cycle STACK slots head={head} cycles={n_cycles} {over}]")
+    model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+    flat, _ = load_data(cfg)
+    codelm, up = model.codelm_for(0), model.upsampler_for(0)
+    tok0, ctx_code_soft, h_ctx = _ctx_and_hidden(model, flat)
+    rev_idx = jnp.array(np.random.RandomState(1).randint(0, 256, ctx_code_soft.shape[:-1]))
+    h_rev = R.encoder_hidden(codelm, R.code_embed_proj(rev_idx, codelm.own_input_embed, codelm.own_input_proj))
+    slots = [h_rev] + [None] * (n_cycles - 2)
+    kw = dict(context_group_size=G, output_group_size=G, output_expansion=model.K(0))
+    oks = []
+
+    def kv_vs_dense(label, **dkw):
+        gen = R.pardec_generate(up, h_ctx, rng=jax.random.PRNGKey(0), greedy=True, cycle_ctx=slots, **kw, **dkw)
+        dkw2 = dict(dkw)
+        dl, _, _, _ = R.pardec_score(up, gen, h_ctx, cycle_ctx=slots, **kw, **dkw2)
+        da = jnp.argmax(dl, axis=-1)
+        ok = bool(jnp.array_equal(da, gen))
+        print(f"STACK {label} dense-vs-KV: consistent={ok} mismatches={int((da != gen).sum())}")
+        oks.append(ok)
+        return gen
+
+    gen1 = kv_vs_dense("slots only")
+    Pp = G * model.K(0)
+    kv_vs_dense("slots + fixed refine draft", draft_seq=gen1, draft_len=Pp, draft_fill="mask")
+
+    n_codes = ctx_code_soft.shape[1]
+    j = n_codes // 2
+    pert = h_rev.at[:, j].add(1.0)
+    l0, _, _, _ = R.pardec_score(up, tok0, h_ctx, cycle_ctx=[h_rev] + slots[1:], **kw)
+    l1, _, _, _ = R.pardec_score(up, tok0, h_ctx, cycle_ctx=[pert] + slots[1:], **kw)
+    diff = jnp.abs(l0 - l1).max(axis=tuple(range(2, l0.ndim)))  # (B, L)
+    Kspan = G * model.K(0)
+    g_j = j // G
+    before = float(diff[:, :g_j * Kspan].max()) if g_j > 0 else 0.0
+    own = float(diff[:, g_j * Kspan:(g_j + 1) * Kspan].max())
+    ok_b = before == 0.0 and own > 0.0
+    print(f"STACK causality: perturb revision code {j} (group {g_j}) -> earlier groups change={before:.2e} "
+          f"(expect 0), own group={own:.2e} (expect >0)  {'OK' if ok_b else 'LEAK/OFF-BY-ONE'}")
+    oks.append(ok_b)
+    lm, _, _, _ = R.pardec_score(up, tok0, h_ctx, cycle_ctx=[None] * (n_cycles - 1), **kw)
+    ok_c = float(jnp.abs(lm - l0).max()) > 0.0
+    print(f"STACK slot used: filled-vs-mask logit change={float(jnp.abs(lm - l0).max()):.2e}  {'OK' if ok_c else 'UNUSED'}")
+    oks.append(ok_c)
+    return all(oks)
+
+
+def run_cycle_leak_check(mode="memoryless", head="ar", **over):
+    """Revision leak: with the same context and rng, swapping the level's GT target tokens must not change
+    cycle-1 digit-0 logits at each group's first position (they see only context/slots/bos, never targets).
+    rollout must give 0; pss/gt are expected to differ (they re-encode GT-derived tokens by design)."""
+    print(f"[cycle LEAK mode={mode} head={head} {over}]")
+    res = {}
+    for inp in ("rollout", "pss", "gt"):
+        cfg = build_cfg(pardec_token_head=head, level_cycles=(2, 1), level_cycle_mode=mode, level_cycle_input=inp,
+                        **over)
+        model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+        flat, _ = load_data(cfg)
+        tok0, ctx_code_soft, _ = _ctx_and_hidden(model, flat)
+        other = jnp.roll(tok0, 1, axis=0)  # another image's bytes as the "GT"
+        z0 = []
+        for tgt in (tok0, other):
+            cyc = R.decode_logits_and_target_cycles(model, 0, tgt, ctx_code_soft, G, rng=jax.random.PRNGKey(3))
+            lg = cyc[1][-1][0]
+            Kspan = G * model.K(0)
+            z0.append(lg[:, ::Kspan, 0])  # digit 0: later AR digits are teacher-forced on the token's own GT digits
+        res[inp] = float(jnp.abs(z0[0] - z0[1]).max())
+    ok = res["rollout"] == 0.0 and res["pss"] > 0.0 and res["gt"] > 0.0
+    print(f"LEAK cycle-1 group-start logit change when GT swapped: rollout={res['rollout']:.2e} (expect 0) "
+          f"pss={res['pss']:.2e} gt={res['gt']:.2e} (expect >0, by design)  {'OK' if ok else 'LEAK'}")
+    return ok
+
+
+def run_cycle_reencode_check(head="ar", **over):
+    """Training re-encode (cycle_reencode, dense, rng=None -> argmax) must give the same code as generation's
+    re-encode (encode_pardec_downsampler_generate, greedy KV/state)."""
+    cfg = build_cfg(pardec_token_head=head, level_cycles=(2, 1), **over)
+    print(f"[cycle REENCODE head={head} {over}]")
+    model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+    flat, _ = load_data(cfg)
+    tok0, _, _ = _ctx_and_hidden(model, flat)
+    _, ci_train = R.cycle_reencode(model, 0, tok0, None)
+    ci_gen, _ = R._cycle_reencode_generate(model, 0, tok0, G, True, 1.0, 0, False)
+    mism = int((ci_train != ci_gen).sum())
+    ok = mism == 0
+    print(f"REENCODE train(dense) vs gen(KV) code mismatches={mism}/{ci_gen.size}  {'OK' if ok else 'DIVERGES'}")
+    return ok
+
+
+def run_cycle_e2e_check():
+    """level_forward + generation over cycle settings: finite loss/grads, stack slot params trained,
+    detach=False reaches the re-encoder, eval deterministic, generation shapes."""
+    import equinox as eqx
+    print("[cycle E2E]")
+    ok = True
+    base = dict(strides=(4, 4), code_vocab=(256, 256), pq_chunks=(3, 3), pq_dim=(16, 16), upsampler_ncodes=(1, 1),
+                downsampler_window=(1, 1), upsampler_window=(1, 1), share_across_levels=False,
+                quantize_mode="reinmax_limit", ctx_stop_gradient="pseudo")
+    for head in ("linear", "ar"):
+        for mode in ("memoryless", "stack"):
+            for inp in ("rollout", "pss", "gt"):
+                for detach in (True, False):
+                    if inp != "rollout" and not detach:
+                        continue
+                    cfg = build_cfg(pardec_token_head=head, codelm_token_head=head,
+                                    token_head_type="linears" if head == "linear" else "ar",
+                                    level_cycles=(3, 2), level_cycle_mode=mode, level_cycle_input=inp,
+                                    level_cycle_detach=detach, level_refine_passes=(2, 1), level_refine_window=(1, 0),
+                                    **base)
+                    model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+                    flat, po = load_data(cfg)
+                    f = lambda m: R.level_forward(m, flat, 2, rng=jax.random.PRNGKey(3), level_gt_drop=1.0,
+                                                  cascade_rng=jax.random.PRNGKey(4), label_reg_weight=1.0,
+                                                  label_fn=R.rgb_label_fn_jax, pixel_order=po)
+                    (loss, aux), g = eqx.filter_jit(eqx.filter_value_and_grad(f, has_aux=True))(model)
+                    leaves = jax.tree_util.tree_leaves(eqx.filter(g, eqx.is_array))
+                    finite = bool(np.isfinite(float(loss))) and all(bool(jnp.isfinite(x).all()) for x in leaves)
+                    slot_g = (float(jnp.abs(g.upsamplers[0].cycle_slot_embed).sum()) if mode == "stack" else 1.0)
+                    ev = eqx.filter_jit(lambda m: R.level_forward(m, flat, 2, rng=None, label_reg_weight=1.0,
+                                                                  label_fn=R.rgb_label_fn_jax, pixel_order=po)[0])
+                    e1, e2 = ev(model), ev(model)
+                    codes = R.encode_pardec_downsampler(model.codelm_for(0), model.downsampler_for(0), flat, flat, flat,
+                                                        cfg, po, R.rgb_label_fn_jax, 4)["code_idx"]
+                    gen = R.decode_generate_cycles(model, 0, codes, 1, greedy=False, seed=1)
+                    this = finite and slot_g > 0 and float(e1) == float(e2) and gen.shape == flat.shape
+                    ok &= this
+                    print(f"  head={head} mode={mode} input={inp} detach={detach}: loss={float(loss):.4f} "
+                          f"finite={finite} slot_grad={slot_g:.2e} eval_det={float(e1) == float(e2)} "
+                          f"gen={tuple(gen.shape)}  {'OK' if this else 'BROKEN'}")
+    lin = dict(pardec_token_head="linear", codelm_token_head="linear", token_head_type="linears")
+    cfg_t = build_cfg(level_cycles=(2, 1), level_cycle_input="rollout", level_cycle_detach=True, **lin, **base)
+    cfg_f = build_cfg(level_cycles=(2, 1), level_cycle_input="rollout", level_cycle_detach=False, **lin, **base)
+    grads = []
+    for cfg in (cfg_t, cfg_f):
+        model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+        flat, po = load_data(cfg)
+        f = lambda m: R.level_forward(m, flat, 1, rng=jax.random.PRNGKey(3), label_reg_weight=1.0,
+                                      label_fn=R.rgb_label_fn_jax, pixel_order=po)[0]
+        grads.append(eqx.filter_jit(eqx.filter_grad(f))(model).downsamplers[0].output_head_linear)
+    reach = float(jnp.abs(grads[0] - grads[1]).max())
+    print(f"  detach=False reaches re-encoder: downsampler grad change={reach:.2e} (expect >0)  {'OK' if reach > 0 else 'BROKEN'}")
+    return ok and reach > 0
+
+
 if __name__ == "__main__":
     results = []
+    for kind in ("gru", "linear_gru", "ssm"):
+        results.append((f"mixer dense-vs-step ({kind})", run_mixer_step_check(kind)))
     results.append(("pardec refine FIXED (ar)", run_pardec_refine_fixed_check("ar")))
     results.append(("pardec refine FIXED (linear, window 2)", run_pardec_refine_fixed_check("linear", window=2)))
     results.append(("pardec refine draft (ar)", run_pardec_refine_check("ar")))
@@ -248,6 +432,22 @@ if __name__ == "__main__":
     results.append(("encoder_free_run KV-cache (ar)", run_encoder_free_run_kv_check("ar")))
     results.append(("pardec dense-vs-KV-cache (ar)", run_pardec_dense_vs_kv_check("ar")))
     results.append(("pardec dense-vs-KV-cache (linear)", run_pardec_dense_vs_kv_check("linear")))
+    for bb in ("gru", "linear_gru", "ssm"):
+        bkw = dict(codelm_backbone=bb, downsampler_backbone=bb, upsampler_backbone=bb)
+        results.append((f"encoder_free_run state ({bb})", run_encoder_free_run_kv_check("linear", **bkw)))
+        results.append((f"pardec dense-vs-state ({bb}, ar)", run_pardec_dense_vs_kv_check("ar", **bkw)))
+        results.append((f"pardec refine FIXED ({bb}, linear)", run_pardec_refine_fixed_check("linear", **bkw)))
+        results.append((f"cycle stack slots ({bb})", run_cycle_slot_check("linear", **bkw)))
+    results.append(("cycle stack slots (ar)", run_cycle_slot_check("ar")))
+    results.append(("cycle stack slots (linear, 4 cycles)", run_cycle_slot_check("linear", n_cycles=4)))
+    for mode in ("memoryless", "stack"):
+        results.append((f"cycle leak ({mode}, ar)", run_cycle_leak_check(mode, "ar")))
+        results.append((f"cycle leak ({mode}, linear)", run_cycle_leak_check(mode, "linear")))
+    results.append(("cycle re-encode train-vs-gen (ar)", run_cycle_reencode_check("ar")))
+    results.append(("cycle re-encode train-vs-gen (linear)", run_cycle_reencode_check("linear")))
+    results.append(("cycle re-encode train-vs-gen (ssm)", run_cycle_reencode_check(
+        "linear", codelm_backbone="ssm", downsampler_backbone="ssm", upsampler_backbone="ssm")))
+    results.append(("cycle end-to-end", run_cycle_e2e_check()))
     print()
     for name, ok in results:
         print(f"{name}: {'PASS' if ok else 'FAIL'}")

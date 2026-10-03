@@ -11,6 +11,7 @@ Zone `us-central2-b`, project `raden-tpu`. tpu3–8 are slated for deletion.
 | tpu34a (worker 0) | 35.186.86.22 | `imagenet64_6` | `imagenet64_6` | `image_lagcodec/configs/imagenet64_6.py` |
 | tpu34b (worker 1) | 35.186.115.139 | `imagenet64_6` | `imagenet64_6` | same (multihost, run on both hosts) |
 | tpu2 | 35.186.15.67 | idle | — | — |
+| tpu1 | 35.186.98.243 | `cifar_overfit_2stage_freeze_denoise` (2026-10-03 22:44 +03, ~2.5h) | `cifar_overfit_2stage_freeze_denoise` | `image_lagcodec/configs/cifar_overfit_2stage_freeze_denoise.py` (`run_lagcodec_res_denoise`, log `~/cifar_overfit_2stage_freeze_denoise.log`) |
 
 - tpu34 = v4-16 (8 chips, 2 hosts). Both hosts run the same command; log `~/imagenet64_6.log` on each. Launched 2026-09-21 11:32, ETA ~18:20.
 - ImageNet64 shards live in `/dev/shm/imagenet64` on each host (copied node-to-node over internal IP, ~16 GB each; gone on reboot/preemption).

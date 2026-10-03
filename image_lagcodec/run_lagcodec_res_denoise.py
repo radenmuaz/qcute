@@ -49,7 +49,7 @@ import numpy as np
 import optax
 from tqdm import tqdm
 
-from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, apply_rope, apply_xsa, init_matrix,
+from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, SwiGLU, apply_rope, apply_xsa, init_matrix,
                                         init_vector, make_lr_schedule, rmsnorm, rope_cos_sin,
                                         rope_cos_sin_pos, rotate_half, sinkgd)
 
@@ -147,6 +147,8 @@ class Config:
     # (3,16,16,-1) collapses (3,16,16,1) to n_rates=3 (levels 1&2 share a row). "absolute": rate_id
     # IS the raw level index (old behavior) -- n_rates=n always, one row per level even if two
     # levels happen to share the same stride.
+    # "codelm_upper": upsampler i's context (code i) is processed by CodeLM i+1, whose own input is code i
+    # (downsampler i keeps CodeLM i); share_across_levels=False adds one decoderless CodeLM-only level on top
     context_source: str = "codelm"  # how the downsampler/upsampler get their CONTEXT (the hidden
     # state they attend to, before context_proj). "codelm" (default, current/original behavior):
     # re-run this level's own input through CodeLM's own causal self-attention block stack
@@ -530,7 +532,7 @@ class Config:
         assert total_bytes_of(self) % self.byte_group == 0
         assert self.traversal in ("raster", "zorder")
         assert self.bos_rate_mode in ("relative", "absolute")
-        assert self.context_source in ("codelm", "own_embed", "shared_embed")
+        assert self.context_source in ("codelm", "codelm_upper", "own_embed", "shared_embed")
         assert self.pardec_token_head in ("ar", "linear"), self.pardec_token_head
         assert self.codelm_token_head in ("ar", "linear"), self.codelm_token_head
         assert 0.0 <= self.downsampler_rollout_prob <= 1.0, self.downsampler_rollout_prob
@@ -2135,7 +2137,8 @@ class CodeLM(eqx.Module):
         # share_across_levels=False: this instance already belongs to exactly one level structurally,
         # so it only needs its own private row(s) (n_rates=codelm_bos_rates[level_idx], rate_id
         # always 0 at call time -- see LagCodecModel.codelm_bos_rate_id).
-        n_bos_rates = (len(cfg.strides) if cfg.share_across_levels else cfg.codelm_bos_rates[level_idx]) \
+        n_bos_rates = (len(cfg.strides) + (cfg.context_source == "codelm_upper") if cfg.share_across_levels
+                       else cfg.codelm_bos_rates[level_idx]) \
             if cfg.use_codelm_bos else 1
         bos_keys = jax.random.split(jax.random.fold_in(key, 4), n_bos_rates)
         self.bos_embed = jnp.stack([init_vector(k, D_enc, scheme) for k in bos_keys], axis=0)
@@ -2254,7 +2257,7 @@ def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cf
     # code_soft when called from a training path that needs gradient flow through it) -- the exact
     # same value callers already use to build CodeLM's own `x` in the "codelm" mode, generalized so
     # "own_embed"/"shared_embed" modes can bypass CodeLM's own embedding table entirely too.
-    if cfg.context_source == "codelm":
+    if cfg.context_source in ("codelm", "codelm_upper"):  # which CodeLM is the caller's choice
         x = code_embed_proj(raw, codelm.own_input_embed, codelm.own_input_proj)
         # NOT bos-substituted (removed 2026-10-03): every caller of pardec_context_hidden
         # (encode_pardec_downsampler[_generate], decode_logits_and_target_multipass,
@@ -2366,6 +2369,19 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
                 entropy_loss=entropy_loss, logits=logits)
 
 
+def codelm_ntp_loss(codelm: CodeLM, raw: jnp.ndarray, target: jnp.ndarray, cfg: "Config") -> tuple:
+    # next-token loss/acc of `codelm` over its own input sequence (codelm_upper: the CodeLM one level up
+    # over the top code -- the decoderless level's only objective)
+    h = pardec_context_hidden(codelm, None, raw, cfg, 0, None, group_size=1)
+    shift = 1 + codelm.attn_lookahead
+    if h.shape[1] <= shift:
+        return jnp.array(0.0, dtype=h.dtype), jnp.array(0.0, dtype=h.dtype)
+    tgt = target[:, shift:]
+    logits = codelm_ntp_logits_tf(codelm, h[:, :-shift, :], tgt)
+    loss = -jnp.mean(jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), tgt[..., None], axis=-1))
+    return loss, jnp.mean(jnp.argmax(logits, -1) == tgt)
+
+
 def encode_pardec_downsampler_generate(codelm: CodeLM, downsampler: PardecLM, raw: jnp.ndarray, K: int,
                                         cfg: "Config", rate_id: int = 0, rng=None, greedy: bool = True,
                                         temperature: float = 1.0, top_k: int = 0,
@@ -2405,8 +2421,8 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
     # cfg.context_source (see pardec_context_hidden) -- "codelm" (default): run this level's own
     # code through CodeLM's own embed table + block stack to get real contextualized hidden states.
     # "own_embed"/"shared_embed": a dedicated ctx_embed/ctx_proj lookup shortcut, no CodeLM pass.
-    codelm = model.codelm_for(level_idx)
-    codelm_rate_id = model.codelm_bos_rate_id(level_idx)  # CodeLM's own bos: always absolute
+    codelm = model.context_codelm_for(level_idx)
+    codelm_rate_id = model.context_codelm_rate_id(level_idx)  # CodeLM's own bos: always absolute
     rate_id = model.bos_rate_id(level_idx)  # upsampler's own bos: follows cfg.bos_rate_mode
     upsampler = model.upsampler_for(level_idx)
     cfg = model.cfg
@@ -2481,8 +2497,8 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
 def _decode_generate_pardec_call(model, level_idx, ctx_idx, upsampler_ncodes, greedy, temperature, seed,
                                   draft_seq=None, draft_len=0, draft_fill="zero", cycle_ctx=None, rng=None):
     # rng (traced key) overrides PRNGKey(seed) -- for free-run decodes inside a training step
-    codelm = model.codelm_for(level_idx)
-    codelm_rate_id = model.codelm_bos_rate_id(level_idx)  # CodeLM's own bos: always absolute
+    codelm = model.context_codelm_for(level_idx)
+    codelm_rate_id = model.context_codelm_rate_id(level_idx)  # CodeLM's own bos: always absolute
     rate_id = model.bos_rate_id(level_idx)  # upsampler's own bos: follows cfg.bos_rate_mode
     rng = jax.random.PRNGKey(seed) if rng is None else rng
     h_ctx = pardec_context_hidden(codelm, model.upsampler_for(level_idx), ctx_idx, model.cfg,
@@ -2582,8 +2598,8 @@ def decode_logits_and_target_cycles(model: "LagCodecModel", level_idx: int, targ
             rev_soft = jax.lax.stop_gradient(rev_soft)
         if stack:
             slots = list(slots)
-            slots[t] = pardec_context_hidden(model.codelm_for(level_idx), model.upsampler_for(level_idx), rev_soft,
-                                             cfg, model.codelm_bos_rate_id(level_idx), rng_t,
+            slots[t] = pardec_context_hidden(model.context_codelm_for(level_idx), model.upsampler_for(level_idx),
+                                             rev_soft, cfg, model.context_codelm_rate_id(level_idx), rng_t,
                                              group_size=upsampler_ncodes)
         else:
             ctx_t = rev_soft
@@ -2600,8 +2616,8 @@ def _cycle_reencode_generate(model, level_idx, tokens, upsampler_ncodes, greedy,
                                               codelm_rate_id=model.codelm_bos_rate_id(level_idx))
     if not stack:
         return out["code_idx"], None
-    h = pardec_context_hidden(codelm, model.upsampler_for(level_idx), out["code_idx"], model.cfg,
-                              model.codelm_bos_rate_id(level_idx), None, group_size=upsampler_ncodes)
+    h = pardec_context_hidden(model.context_codelm_for(level_idx), model.upsampler_for(level_idx), out["code_idx"],
+                              model.cfg, model.context_codelm_rate_id(level_idx), None, group_size=upsampler_ncodes)
     return out["code_idx"], h
 
 
@@ -2880,11 +2896,14 @@ class LagCodecModel(eqx.Module):
             downsamplers.append(downsampler)
 
             upsampler_remat = cfg.remat if cfg.upsampler_remat[level_idx] is None else cfg.upsampler_remat[level_idx]
+            # codelm_upper: the upsampler's context comes from the CodeLM one level up
+            D_ctx_up = (cfg.codelm_d_model[min(level_idx + 1, n - 1)] if cfg.context_source == "codelm_upper"
+                        else D_enc)
             K_default = cfg.strides[level_idx] if cfg.strides[level_idx] != -1 else 1  # output_expansion
             # default -- overridden per-call via decode_logits_and_target_multipass/
             # decode_generate_multipass's model.K(level_idx) regardless of mode
             upsampler = PardecLM(
-                jax.random.fold_in(key, 30 + j), context_hidden_dim=D_enc, hidden_dim=cfg.upsampler_d_model[level_idx],
+                jax.random.fold_in(key, 30 + j), context_hidden_dim=D_ctx_up, hidden_dim=cfg.upsampler_d_model[level_idx],
                 n_heads=cfg.upsampler_n_heads[level_idx], n_kv_heads=cfg.upsampler_n_kv_heads[level_idx],
                 n_layers=cfg.upsampler_n_layers[level_idx], mlp_mult=cfg.mlp_mult[level_idx], rope_base=cfg.rope_base[level_idx],
                 output_expansion=K_default, context_window_groups=cfg.upsampler_window[level_idx],
@@ -2901,6 +2920,9 @@ class LagCodecModel(eqx.Module):
                 cycle_slots=max(cycle_stack_slots(cfg, i) for i in (range(n) if cfg.share_across_levels else [j])))
             upsamplers.append(upsampler)
 
+        if cfg.context_source == "codelm_upper" and not cfg.share_across_levels:
+            # decoderless CodeLM-only level n: processes the top code for the top upsampler (top level's arch)
+            codelms.append(CodeLM(jax.random.fold_in(key, 1000), cfg, level_idx=n - 1))
         self.codelms = tuple(codelms)
         self.downsamplers = tuple(downsamplers)
         self.upsamplers = tuple(upsamplers)
@@ -2920,6 +2942,13 @@ class LagCodecModel(eqx.Module):
         # stride; absolute: the raw level index). False: each instance already owns exactly one
         # level structurally, always row(s) 0.
         return bos_rate_map(self.cfg)[level_idx] if self.cfg.share_across_levels else 0
+
+    def context_codelm_for(self, level_idx: int) -> CodeLM:
+        # processor of code `level_idx` for that level's upsampler (see Config.context_source)
+        return self.codelm_for(level_idx + (self.cfg.context_source == "codelm_upper"))
+
+    def context_codelm_rate_id(self, level_idx: int) -> int:
+        return self.codelm_bos_rate_id(level_idx + (self.cfg.context_source == "codelm_upper"))
 
     def codelm_bos_rate_id(self, level_idx: int) -> int:
         # CodeLM's OWN bos (anchors "which level am I generating" for encoder_free_run's pure-
@@ -3002,6 +3031,10 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
         if i < phase - 1:
             raw = out["code_soft"]
             target = out["code_idx"]
+    if model.cfg.context_source == "codelm_upper":
+        ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(phase), codes_soft[phase - 1], codes[phase - 1], model.cfg)
+        enc_losses.append(ntp_up)
+        enc_accs.append(acc_up)
 
     dec_losses, dec_accs = [], []
     aux_ntp_losses, aux_ntp_accs = [], []
@@ -3233,6 +3266,11 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
         if d < depth - 1:
             raw = out["code_soft"]
             target = out["code_idx"]
+    if model.cfg.context_source == "codelm_upper":
+        ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(entry_level + depth), codes_soft[depth - 1],
+                                         codes[depth - 1], model.cfg)
+        enc_losses.append(ntp_up)
+        enc_accs.append(acc_up)
 
     dec_losses, dec_accs = [], []
     ctx = codes_soft[depth - 1]
@@ -3274,14 +3312,18 @@ def phase_trainable_filter(model: LagCodecModel, phase: int):
     if model.cfg.curriculum_mode != "freeze":
         return spec
     # phase p trains only level p-1: lower levels frozen, higher (unused) ones too so weight decay
-    # doesn't shrink them before their own phase
+    # doesn't shrink them before their own phase. codelm_upper: upsampler p-1's context is CodeLM p, so
+    # phase p trains CodeLM p (+ CodeLM 0 in phase 1) -- each CodeLM is trained in exactly one phase.
     all_false = lambda sub: jax.tree_util.tree_map(lambda _: False, sub)
+    train_codelms = ({phase} | ({0} if phase == 1 else set())) if model.cfg.context_source == "codelm_upper" \
+        else {phase - 1}
     for j in range(len(model.codelms)):
-        if j == phase - 1:
-            continue
-        spec = eqx.tree_at(lambda s: (s.codelms[j], s.downsamplers[j], s.upsamplers[j]), spec,
-                           replace=(all_false(spec.codelms[j]), all_false(spec.downsamplers[j]),
-                                    all_false(spec.upsamplers[j])))
+        if j not in train_codelms:
+            spec = eqx.tree_at(lambda s: s.codelms[j], spec, replace=all_false(spec.codelms[j]))
+    for j in range(len(model.downsamplers)):
+        if j != phase - 1:
+            spec = eqx.tree_at(lambda s: (s.downsamplers[j], s.upsamplers[j]), spec,
+                               replace=(all_false(spec.downsamplers[j]), all_false(spec.upsamplers[j])))
     return spec
 
 
@@ -3774,11 +3816,12 @@ def main():
                          "stride share the same bos row (e.g. strides=(4,4,4) -> n_rates=1). "
                          "'absolute': rate_id is the raw level index, n_rates=n always (old behavior).")
     p.add_argument("--context_source", type=str, default=Config.context_source,
-                    choices=("codelm", "own_embed", "shared_embed"),
+                    choices=("codelm", "codelm_upper", "own_embed", "shared_embed"),
                     help="How downsampler/upsampler get their context. 'codelm' (default): CodeLM's "
                          "own contextualized hidden states (encoder_hidden). 'own_embed': a plain "
                          "per-position embedding table, no self-attention, own table per module. "
-                         "'shared_embed': same, but downsampler and upsampler share one table.")
+                         "'shared_embed': same, but downsampler and upsampler share one table. 'codelm_upper': "
+                         "upsampler i's context from CodeLM i+1 (+ a CodeLM-only top level when not shared).")
     p.add_argument("--pardec_token_head", type=str, default=Config.pardec_token_head, choices=("ar", "linear"),
                     help="'ar' (default): AR digit head. 'linear': one parallel linear head for all digits "
                          "(incompatible with --downsampler_rollout).")
@@ -3871,8 +3914,9 @@ def main():
     p.add_argument("--gen_level_cycles", type=_tuple_arg, default=Config.gen_level_cycles,
                     help="per level: generation cycles (default = level_cycles)")
     for name in ("codelm_backbone", "downsampler_backbone", "upsampler_backbone"):
-        p.add_argument(f"--{name}", type=_str_tuple_arg, default=getattr(Config, name),
-                        help="per level: transformer | gru | linear_gru | ssm")
+        # argparse also runs `type` on string defaults: keep a bare value a str so Config broadcasts it
+        p.add_argument(f"--{name}", type=lambda s: _str_tuple_arg(s) if "," in s else s.strip(),
+                        default=getattr(Config, name), help="per level: transformer | gru | linear_gru | ssm")
     p.add_argument("--ssm_state_dim", type=int, default=Config.ssm_state_dim)
     p.add_argument("--precision", type=str, default=Config.precision, choices=["bf16", "fp32"])
     p.add_argument("--curriculum_mode", type=str, default=Config.curriculum_mode, choices=["freeze", "no_freeze"])

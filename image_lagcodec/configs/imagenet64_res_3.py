@@ -51,6 +51,8 @@ downsampler_window = 1
 downsampler_rollout = True
 downsampler_rollout_prob = 0.5
 
+# context_source = "own_embed"
+context_source = "codelm_upper"
 upsampler_decode_past = 0
 upsampler_decode_future = 0
 upsampler_ncodes = 1
@@ -99,7 +101,7 @@ val_batch_size = 2
 #   (1, 1, 5) epochs  ~=  (20018, 20018, 100090) steps  (140,126 total)
 # To schedule by steps instead, comment out level_epochs above and uncomment (level_epochs and
 # level_steps are mutually exclusive; steps-per-epoch scales with batch_size / n devices / n hosts):
-level_steps = (5_000, 5_000, 5_000, 5_000, 100_000)
+level_steps = (20_000, 20_000, 20_000, 20_000, 200_000)
 # level_steps = (0,0,0,1_000_000)
 seed = 0
 train_subset_n = None
