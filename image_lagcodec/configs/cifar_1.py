@@ -40,7 +40,7 @@ label_reg_weight = 1.0
 label_fn = "rgb_label_fn_jax"
 # bos_rate_mode = "relative"
 bos_rate_mode = "absolute"
-strides = (4,4)
+strides = (4,4,4,4)
 attn_window = 1024
 upsampler_ncodes = 1
 attn_lookahead = 0
@@ -53,13 +53,17 @@ downsampler_n_layers = 1
 downsampler_n_heads = 1
 downsampler_n_kv_heads = 1
 downsampler_window = 1
+downsampler_rollout = True
+downsampler_rollout_prob = 0.5
 # downsampler_remat = True   # enable only if OOM
 
 upsampler_d_model = 1024
 upsampler_n_layers = 4
 upsampler_n_heads = 2
 upsampler_n_kv_heads = 2
-upsampler_window = 2
+upsampler_window = 1
+upsampler_rollout = True
+upsampler_rollout_prob = 0.5
 # upsampler_remat = True   # enable only if OOM
 
 use_codelm_bos = False
@@ -73,16 +77,16 @@ quantize_mode = "reinmax_limit"
 encode_temperature = 1.0
 gumbel_at_inference = False
 mse_softmax_tau = 1.0
-level_gt_drop = 0.0
+level_gt_drop = 0.5
 # fork of cifar_overfit_2stage_freeze.py: level refine on. Pass 2 re-decodes each upsampler group seeing a
 # draft (pass 1 argmax) of the 1 preceding group = upsampler_ncodes*stride = 4 tokens back.
 level_refine_passes = 2
 level_refine_window = 1
-level_refine_gt_drop = 1.0
+level_refine_gt_drop = 0.5
 level_refine_layout = "fixed"
-quantize_drop = 0.0
+quantize_drop = 0.5
 # ctx_stop_gradient = True
-# ctx_stop_gradient = "pseudo"
+ctx_stop_gradient = "pseudo"
 # decoder_scheduled_sampling_prob = 0.3
 
 init_scheme = "llama"
@@ -95,8 +99,6 @@ token_head_type = "ar"
 # no digit-level AR sampling at all, parallel/MTP-style heads instead
 codelm_token_head = "ar"   # CodeLM NTP/free-run head: all digits in one parallel matmul
 pardec_token_head = "ar"    # downsampler/upsampler digit head: all digits in one parallel matmul
-upsampler_rollout = False
-# upsampler_rollout_prob = 0.5
 token_dim = 64
 token_n_heads = 2
 traversal = "zorder"
@@ -108,11 +110,11 @@ gen_eval_teacher_force_sanity = True
 # --- training ---
 batch_size = 4
 val_batch_size = 8
-level_steps = (20_000, 30_000,)
+level_steps = (20_000, 20_000, 20_000, 100_000)
 # level_steps = (0, int(100e3))
 seed = 0
-train_subset_n = 1000
-val_subset_n = 100
+train_subset_n = None
+val_subset_n = 1000
 gen_eval_every_step = 5000
 epoch_verbose = False
 

@@ -17,8 +17,8 @@ gen_eval_teacher_force_sanity = True
 share_across_levels = False
 # share_downsampler_upsampler_lm = True
 remat = True
-codelm_d_model = 512
-codelm_n_layers = 2
+codelm_d_model = 256
+codelm_n_layers = 4
 codelm_n_heads = 2
 codelm_n_kv_heads = 2
 
@@ -37,7 +37,7 @@ label_reg_weight = 1.0
 label_fn = "rgb_label_fn_jax"
 # bos_rate_mode = "relative"
 bos_rate_mode = "absolute"
-strides = (4, 4, 4, 4)
+strides = (4, 4, 4, 4, 4)
 # attn_window = 1024
 attn_window = 4096
 attn_lookahead = 0
@@ -54,7 +54,7 @@ downsampler_rollout_prob = 0.5
 upsampler_decode_past = 0
 upsampler_decode_future = 0
 upsampler_ncodes = 1
-upsampler_d_model = 1024
+upsampler_d_model = 512
 upsampler_n_layers = 4
 upsampler_n_heads = 8
 upsampler_n_kv_heads = 8
@@ -64,7 +64,7 @@ upsampler_rollout_prob = 0.5
 
 level_refine_passes = 2
 level_refine_window = 1
-level_refine_gt_drop = 1.0
+level_refine_gt_drop = 0.5
 level_refine_layout = "fixed"
 
 # upsampler_remat = True
@@ -88,10 +88,10 @@ byte_group = 3
 token_head_type = "ar"
 codelm_token_head = "ar"    # alternative: autoregressive digits
 pardec_token_head = "ar"    # alternative: autoregressive digits
-token_dim = 128
+token_dim = 64
 token_n_heads = 2
 # --- training ---
-batch_size = 2       # per DEVICE; tpu34 = 2 hosts x 4 devices -> global batch 64 (16 OOMs: 20.4G program vs 16G free)
+batch_size = 4       # per DEVICE; tpu34 = 2 hosts x 4 devices -> global batch 64 (16 OOMs: 20.4G program vs 16G free)
 val_batch_size = 2
 # level_epochs = (1, 1, 5)
 # Approximate step equivalents (tpu34 v4-16: batch_size 8 x 4 local devices x 2 hosts = global batch 64;
@@ -99,7 +99,7 @@ val_batch_size = 2
 #   (1, 1, 5) epochs  ~=  (20018, 20018, 100090) steps  (140,126 total)
 # To schedule by steps instead, comment out level_epochs above and uncomment (level_epochs and
 # level_steps are mutually exclusive; steps-per-epoch scales with batch_size / n devices / n hosts):
-level_steps = (20_000, 20_000, 20_000, 1_000_000)
+level_steps = (5_000, 5_000, 5_000, 5_000, 100_000)
 # level_steps = (0,0,0,1_000_000)
 seed = 0
 train_subset_n = None
@@ -107,7 +107,7 @@ val_subset_n = 512
 # gen_eval_every_epoch = 0.25   # ~= every 5,005 steps at global batch 64
 gen_eval_every_step = 20_000   # uncomment (and comment gen_eval_every_epoch) to eval by steps
 epoch_verbose = False
-# ctx_stop_gradient = "pseudo"
+ctx_stop_gradient = "pseudo"
 
 
 grad_clip = 1.0
@@ -118,7 +118,7 @@ lr_min = 1e-5
 # lr_min_step = int(200e3)
 warmup_steps = 1000
 optimizer = "adamw"
-optimizer_kwargs = dict(weight_decay=1e-5)
+optimizer_kwargs = dict(weight_decay=0)
 
 # --- logging ---
 log_every = 100
