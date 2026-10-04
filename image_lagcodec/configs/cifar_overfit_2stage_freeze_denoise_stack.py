@@ -1,5 +1,5 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_overfit_2stage_freeze_refine.py
+uv run python3 -m image_lagcodec.run_lagcodec_res_denoise --config image_lagcodec/configs/cifar_overfit_2stage_freeze_denoise_stack.py
 """
 # Fork of cifar_res_4_overfit_reinmax_s_ctxdetach_linear.py -- level_steps fixed back to
 # (0,)*4+(100000,) (skip phases 1-4 entirely, straight to joint all-levels training, matching the
@@ -40,53 +40,43 @@ label_reg_weight = 1.0
 label_fn = "rgb_label_fn_jax"
 # bos_rate_mode = "relative"
 bos_rate_mode = "absolute"
-strides = (4,4,4,4)
+strides = (4,4)
 attn_window = 1024
 upsampler_ncodes = 1
 attn_lookahead = 0
 upsampler_decode_past = 0
 upsampler_decode_future = 0
-remat = True
+
+# mode shift
+# remat_level = True
 
 downsampler_d_model = 128
 downsampler_n_layers = 1
 downsampler_n_heads = 1
 downsampler_n_kv_heads = 1
 downsampler_window = 1
-downsampler_rollout = True
-downsampler_rollout_prob = 0.5
 # downsampler_remat = True   # enable only if OOM
 
-# context_source = "codelm_upper"
-context_source = "own_embed"
-upsampler_d_model = 512
+upsampler_d_model = 1024
 upsampler_n_layers = 4
 upsampler_n_heads = 2
 upsampler_n_kv_heads = 2
-upsampler_window = 1
-upsampler_rollout = True
-upsampler_rollout_prob = 0.5
+upsampler_window = 2
 # upsampler_remat = True   # enable only if OOM
 
 use_codelm_bos = False
 # use_codelm_bos = True
 # codelm_bos_prob = 1.0
 # curriculum_mode = "freeze"
-curriculum_mode = "no_freeze"
+curriculum_mode = "freeze"
 # level_select_prob = (0.9, 0.8, 0.7, 0.6)  # length n_levels-1=4
 # multires_entry_gt_drop = (0.0, 0.5, 0.5, 0.5, 0.5)  # length n_levels=5, index 0 unused
-quantize_mode = "zgr"
+quantize_mode = "reinmax_limit"
 encode_temperature = 1.0
 gumbel_at_inference = False
 mse_softmax_tau = 1.0
-level_gt_drop = 0.5
-# fork of cifar_overfit_2stage_freeze.py: level refine on. Pass 2 re-decodes each upsampler group seeing a
-# draft (pass 1 argmax) of the 1 preceding group = upsampler_ncodes*stride = 4 tokens back.
-level_refine_passes = 2
-level_refine_window = 1
-level_refine_gt_drop = 0.5
-level_refine_layout = "fixed"
-quantize_drop = 0.5
+level_gt_drop = 0.0
+quantize_drop = 0.0
 # ctx_stop_gradient = True
 # ctx_stop_gradient = "pseudo"
 # decoder_scheduled_sampling_prob = 0.3
@@ -101,6 +91,8 @@ token_head_type = "ar"
 # no digit-level AR sampling at all, parallel/MTP-style heads instead
 codelm_token_head = "ar"   # CodeLM NTP/free-run head: all digits in one parallel matmul
 pardec_token_head = "ar"    # downsampler/upsampler digit head: all digits in one parallel matmul
+upsampler_rollout = False
+# upsampler_rollout_prob = 0.5
 token_dim = 64
 token_n_heads = 2
 traversal = "zorder"
@@ -108,15 +100,23 @@ eval_gen_train = True
 gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
 
+# fork of cifar_overfit_2stage_freeze.py (run_lagcodec_res_denoise): 2 same-level decode cycles per level --
+# decode, re-encode the free-run decode with the same level's downsampler (quantize_mode), decode again.
+# _stack fork: c(0) stays in context, the re-encoded revision goes into a slot (memoryless lost information
+# with every extra generation cycle in the step-20k eval: gen mse 1335 -> 2142 -> 2838 -> 3225 on train)
+level_cycles = 2
+level_cycle_mode = "stack"
+level_cycle_input = "rollout"
+
 
 # --- training ---
 batch_size = 4
 val_batch_size = 8
-level_steps = (20_000, 20_000, 20_000, 100_000)
+level_steps = (30_000, 30_000,)
 # level_steps = (0, int(100e3))
 seed = 0
-train_subset_n = None
-val_subset_n = 1000
+train_subset_n = 1000
+val_subset_n = 100
 gen_eval_every_step = 5000
 epoch_verbose = False
 

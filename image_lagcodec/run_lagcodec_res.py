@@ -3184,6 +3184,24 @@ CONFIG_FIELDS = ("img_size", "codelm_d_model", "codelm_n_layers", "codelm_n_head
                   "mse_softmax_tau", "traversal", "label_reg_weight", "label_mse_weight")
 
 
+def tie_shared_grads(grads, cfg: Config):
+    # share_downsampler_upsampler_lm / shared_embed arrays are two pytree leaves to jax.grad (each got its own
+    # partial, so adamw untied them after step 1): give both the summed gradient so they stay identical
+    getters = []
+    for j in range(len(grads.downsamplers)):
+        if cfg.share_downsampler_upsampler_lm:
+            getters += [(lambda t, j=j: t.downsamplers[j].blocks, lambda t, j=j: t.upsamplers[j].blocks),
+                        (lambda t, j=j: t.downsamplers[j].ln_f, lambda t, j=j: t.upsamplers[j].ln_f)]
+        if cfg.context_source == "shared_embed":
+            getters += [(lambda t, j=j: t.downsamplers[j].own_ctx_embed, lambda t, j=j: t.upsamplers[j].own_ctx_embed),
+                        (lambda t, j=j: t.downsamplers[j].own_ctx_proj, lambda t, j=j: t.upsamplers[j].own_ctx_proj)]
+    for a, b in getters:
+        summed = jax.tree_util.tree_map(lambda x, y: x + y, a(grads), b(grads))
+        grads = eqx.tree_at(b, eqx.tree_at(a, grads, summed, is_leaf=lambda x: x is None), summed,
+                            is_leaf=lambda x: x is None)
+    return grads
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=Path, required=True)
@@ -3945,6 +3963,7 @@ def main():
             rng, level_rng, cascade_rng = jax.random.split(rng, 3)
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
                 diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+            grads = tie_shared_grads(grads, cfg)
             grads = jax.lax.pmean(grads, axis_name="d")
             loss = jax.lax.pmean(loss, axis_name="d")
             aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
@@ -3986,6 +4005,7 @@ def main():
                 rng, level_rng, cascade_rng = jax.random.split(rng, 3)
                 (loss, aux), grads = jax.value_and_grad(loss_fn_sd, has_aux=True)(
                     diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+                grads = tie_shared_grads(grads, cfg)
                 grads = jax.lax.pmean(grads, axis_name="d")
                 loss = jax.lax.pmean(loss, axis_name="d")
                 aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)

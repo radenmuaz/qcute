@@ -30,6 +30,27 @@ Living doc — check here rather than assuming CLAUDE.md is current. Update in p
 - Gotchas: (1) TPU jit `argmax`→gather bug, use `safe_argmax`. (2) fp32 needs `jax_default_matmul_precision=highest` (set unless bf16). (3) Train OK but generation bad → suspect generation code first.
 - Config parser: non-field constants (e.g. `DEPTH = 4`) warn and are ignored.
 
+## res_denoise fork + torch port (2026-10-03)
+
+- `run_lagcodec_res_denoise.py`: fork of `run_lagcodec_res.py`; all defaults bit-identical to it (regression harness: loss/aux/grads/eval/gen).
+- Same-level cycles: `level_cycles` (per level), `level_cycle_mode` memoryless (default) | stack, `level_cycle_input` rollout (default, free-run, leak-free) | pss (`level_cycle_pss_prob`) | gt (overfit sanity), `level_cycle_detach`, `level_cycle_loss`, `gen_level_cycles`.
+  - Fixed vs `run_lagcodec` cycle: TF-argmax GT leak, revision granularity (finer code windowed with the coarser stride/table), slot-0 train/gen mismatch, order-blind shared slot table, dropped empty slots.
+- Backbones: `codelm/downsampler/upsampler_backbone` transformer | gru | linear_gru | ssm (`ssm_state_dim`); recurrent = fixed state, no KV cache.
+- `context_source="codelm_upper"`: upsampler i reads CodeLM i+1; unshared adds a CodeLM-only top level (+ bos rows); that CodeLM also gets NTP on the top code; freeze trains CodeLM p in phase p.
+- Data: `dataset="folder"`, `modality` image | text | audio | binary, `seq_len`, `audio_sample_rate`, `audio_encoding` mulaw8 | pcm16. Labels: `byte_mean_label_fn`, `byte_interp_label_fn`, `audio_resample_label_fn`, `bpe_label_fn` (stub, `HierarchicalBPE`), or `label_fn="pkg.module:fn"`. Example configs `configs/folder_*_overfit.py`.
+- Gate: `scripts/res_denoise_consistency_check.py` must end `PASS all` (name args run a subset).
+- `run_lagcodec_res_denoise_torch.py`: single-file PyTorch port, `--device auto|cpu|cuda|mps`, `--threads`; one device, bf16 autocast on CUDA only. Config/data/argparse sections are verbatim copies of the JAX file (re-sync after editing those).
+  - Gate: `scripts/res_denoise_torch_parity_check.py` (JAX weights copied in; loss ~1e-7, grads ~5e-6, generation exact) must end `PASS all`. Label resize differs by ±1 at exact .5 values (~0.1%, XLA summation order).
+- Results (tpu1, cifar overfit, freeze curriculum, 60k steps, one seed each; final gen mse val / train, n=8):
+  - baseline `cifar_overfit_2stage_freeze`: top1 2489 / 2511, top0 2202 / 1529.
+  - memoryless `_denoise` (1 gen cycle): top1 2928 / 1312, top0 2817 / 638 -- fits train far better, val worse; every extra gen cycle hurts (top1 train 1312 -> 2349 -> 3355): the re-encode loses information.
+  - stack `_denoise_stack` (2 gen cycles): top1 2752 / 2530, top0 2355 / 1548 -- about baseline; 1 vs 2 gen cycles nearly equal.
+  - Eval script: `scripts/denoise_cycle_eval.py <run> --cycles 1,2,3 --top N`.
+- Fixed in the fork (still in `run_lagcodec_res.py`): `share_downsampler_upsampler_lm` / `context_source="shared_embed"` were tied only at init -- jax.grad gave each pytree position its own partial, adamw untied them after step 1. `tie_shared_grads` sums them (torch shares one Parameter).
+- Memory flags: `downsampler_remat_chunks` / `upsampler_remat_chunks` (per level, 1 = off): pardec rows run in that many sequential checkpointed chunks (same loss/grads, ~1e-7). `codelm_remat` (per level, None -> `remat`). pmapped train steps donate model/opt_state/rng.
+- Memory audit (2026-10-04, CPU saved-residual counts, small config): reinmax_limit's dense 256x256 surrogate per digit position was 55% of what backward keeps (81% with upsampler_rollout) -- now an exact O(K) form (`quantize_reinmax_limit`; slow reference `quantize_reinmax_limit_dense`): same forward, grads ~1e-6, saved memory 1791 -> 838 MiB (remat on: 1104 -> 152, upsampler_rollout: 4378 -> 886); rollout_prob<1 (lax.cond) keeps both branches' residuals; stack cycles recompute c(0)'s CodeLM context every cycle.
+- Known: every pmap run (res too) recompiles once at step 2 (~2 min on TPU); `Attention.step` ignores `use_sink` (CodeLM free-run only).
+
 ## TODO — tiling / seam artifacts (2026-09-21 discussion, untested)
 
 - Cause: tile g sees coarse codes ≤ its group + previous-pass drafts only; groups decode in parallel. Measured (imagenet64_5, 4 imgs): |dx| at tile edge 15.4 vs 8.6 inside (GT 9.5/10.0).

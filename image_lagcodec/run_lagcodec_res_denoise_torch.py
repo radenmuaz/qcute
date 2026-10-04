@@ -68,8 +68,13 @@ RECURRENT_BACKBONES = ("gru", "linear_gru", "ssm")
 BACKBONES = ("transformer",) + RECURRENT_BACKBONES
 
 
+MODALITIES = ("image", "text", "audio", "binary")
+
+
 def total_bytes_of(cfg) -> int:
-    return cfg.img_size * cfg.img_size * 3
+    if getattr(cfg, "modality", "image") == "image":
+        return cfg.img_size * cfg.img_size * 3
+    return cfg.seq_len * cfg.byte_group
 
 
 def cycle_stack_slots(cfg, i: int) -> int:
@@ -87,12 +92,19 @@ def n_blocks_for_level(cfg, j: int) -> int:
 @dataclass
 class Config:
     img_size: int = 32
+    # data: image (img_size^2 RGB pixels) | text | audio | binary (1D: seq_len positions of byte_group bytes,
+    # traversal "raster"). dataset="folder" reads every file under data_root (see load_folder)
+    modality: str = "image"
+    seq_len: int = 4096
+    audio_sample_rate: int = 16000
+    audio_encoding: str = "mulaw8"  # mulaw8 (byte_group 1) | pcm16 (byte_group 2: high, low byte)
     # Each of CodeLM/Downsampler/Upsampler is fully independent: its own dedicated fields, own
     # defaults, no fallback chain to a shared "base" field and no override-of-a-generic-field
     # pattern. codelm_* feeds CodeLM only.
     codelm_d_model: tuple = (256, 256, 256, 256)
     codelm_n_layers: tuple = (2, 2, 2, 2)
     codelm_n_heads: tuple = (4, 4, 4, 4)
+    codelm_remat: tuple = None  # per level, None falls back to cfg.remat (like downsampler/upsampler_remat)
     codelm_n_kv_heads: tuple = (None, None, None, None)  # None per-level entry -> defaults to
     # max(1, codelm_n_heads//4) for that level (resolved below) -- within-module default, not a
     # cross-module fallback.
@@ -105,6 +117,10 @@ class Config:
     # test (unbounded OOM'd even at tiny sizes)
     downsampler_decode_past: tuple = 0   # downsampler's OWN decode_past/decode_future/remat --
     downsampler_decode_future: tuple = 0  # independent of the upsampler's, own direct defaults
+    # rows (groups) never attend to each other: >1 runs the pardec stack over that many row chunks one after
+    # another, each rematerialized in backward (peak activations ~1/chunks). 1 = off (default)
+    downsampler_remat_chunks: tuple = 1
+    upsampler_remat_chunks: tuple = 1
     downsampler_remat: tuple = None  # (0/0), no fallback chain -- None (default) for
     # downsampler_remat falls back to cfg.remat (remat granularity has no natural own-module default)
     downsampler_ncodes: tuple = 1  # batching granularity for the downsampler's OWN pardec_score/
@@ -156,6 +172,8 @@ class Config:
     # (3,16,16,-1) collapses (3,16,16,1) to n_rates=3 (levels 1&2 share a row). "absolute": rate_id
     # IS the raw level index (old behavior) -- n_rates=n always, one row per level even if two
     # levels happen to share the same stride.
+    # "codelm_upper": upsampler i's context (code i) is processed by CodeLM i+1, whose own input is code i
+    # (downsampler i keeps CodeLM i); share_across_levels=False adds one decoderless CodeLM-only level on top
     context_source: str = "codelm"  # how the downsampler/upsampler get their CONTEXT (the hidden
     # state they attend to, before context_proj). "codelm" (default, current/original behavior):
     # re-run this level's own input through CodeLM's own causal self-attention block stack
@@ -386,6 +404,7 @@ class Config:
         bcast("codelm_n_layers", int)
         bcast("codelm_n_heads", int)
         bcast_opt("codelm_n_kv_heads", int)
+        bcast_opt("codelm_remat", bool)
         bcast("downsampler_d_model", int)
         bcast("downsampler_n_layers", int)
         bcast("downsampler_n_heads", int)
@@ -395,6 +414,8 @@ class Config:
         bcast("downsampler_decode_future", int)
         bcast("downsampler_ncodes", int)
         bcast_opt("downsampler_remat", bool)
+        bcast("downsampler_remat_chunks", int)
+        bcast("upsampler_remat_chunks", int)
         bcast("upsampler_d_model", int)
         bcast("upsampler_n_layers", int)
         bcast("upsampler_n_heads", int)
@@ -517,6 +538,7 @@ class Config:
                 "downsampler_window", "downsampler_decode_past", "downsampler_decode_future", "downsampler_remat",
                 "upsampler_d_model", "upsampler_n_layers", "upsampler_n_heads", "upsampler_n_kv_heads",
                 "upsampler_window", "upsampler_decode_past", "upsampler_decode_future", "upsampler_remat",
+                "downsampler_remat_chunks", "upsampler_remat_chunks", "codelm_remat",
                 "token_dim", "token_n_heads", "token_head_type", "byte_group",
                 "codelm_backbone", "downsampler_backbone", "upsampler_backbone",
             )
@@ -535,11 +557,20 @@ class Config:
                     f"level {i} uses token_head_type={self.token_head_type[i]!r} but token_dim/" \
                     f"token_n_heads only has {len(self.token_dim)} entries -- set one per level"
                 assert self.token_dim[i] % self.token_n_heads[i] == 0
-        assert self.byte_group in (1, 3), "byte_group must be 1 (per-byte) or 3 (per-pixel RGB)"
+        assert self.modality in MODALITIES, self.modality
+        if self.modality == "image":
+            assert self.byte_group in (1, 3), "byte_group must be 1 (per-byte) or 3 (per-pixel RGB)"
+        else:
+            assert self.traversal == "raster", f"modality={self.modality} is 1D: traversal must be 'raster'"
+            assert self.byte_group >= 1 and self.seq_len >= 1
+            assert self.audio_encoding in ("mulaw8", "pcm16"), self.audio_encoding
+            if self.modality == "audio":
+                need = 2 if self.audio_encoding == "pcm16" else 1
+                assert self.byte_group == need, f"audio_encoding={self.audio_encoding} needs byte_group={need}"
         assert total_bytes_of(self) % self.byte_group == 0
         assert self.traversal in ("raster", "zorder")
         assert self.bos_rate_mode in ("relative", "absolute")
-        assert self.context_source in ("codelm", "own_embed", "shared_embed")
+        assert self.context_source in ("codelm", "codelm_upper", "own_embed", "shared_embed")
         assert self.pardec_token_head in ("ar", "linear"), self.pardec_token_head
         assert self.codelm_token_head in ("ar", "linear"), self.codelm_token_head
         assert 0.0 <= self.downsampler_rollout_prob <= 1.0, self.downsampler_rollout_prob
@@ -627,6 +658,10 @@ class Config:
             assert self.downsampler_backbone == self.upsampler_backbone, \
                 "share_downsampler_upsampler_lm needs downsampler_backbone == upsampler_backbone"
         assert self.ssm_state_dim >= 1, self.ssm_state_dim
+        assert len(self.downsampler_remat_chunks) == n and len(self.upsampler_remat_chunks) == n \
+            and len(self.codelm_remat) == n
+        assert all(c >= 1 for c in self.downsampler_remat_chunks + self.upsampler_remat_chunks), \
+            (self.downsampler_remat_chunks, self.upsampler_remat_chunks)
         assert self.init_scheme in ("llama", "zero")
         resolved_kv = []
         for i in range(n):
@@ -665,6 +700,8 @@ def zorder_pixel_order(img_size: int) -> np.ndarray:
 
 
 def pixel_order_for(cfg: Config) -> np.ndarray:
+    if cfg.modality != "image":
+        return np.arange(n_positions_of(cfg))
     if cfg.traversal == "raster":
         return np.arange(cfg.img_size * cfg.img_size)
     return zorder_pixel_order(cfg.img_size)
@@ -723,8 +760,11 @@ def load_imagenet64(data_root: Path, resolution: int = 64) -> tuple:
     return load_imagenet(data_root, resolution)
 
 
-def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards: int = None) -> tuple:
+def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards: int = None, cfg=None) -> tuple:
     # train_shards: only load the first N imagenet train shards (off-training scripts need a few images, not 15GB)
+    if name == "folder":
+        assert cfg is not None, "dataset='folder' needs the Config (modality/seq_len/...)"
+        return load_folder(data_root, cfg)
     if name == "cifar":
         res = 32
     else:
@@ -741,6 +781,8 @@ def dataset_from_config(cv: dict, repo_root: Path, train_shards: int = 1) -> tup
 
 def images_to_positions(images: np.ndarray, cfg: Config, pixel_order: np.ndarray) -> np.ndarray:
     n = images.shape[0]
+    if cfg.modality != "image":  # samples are already (n, seq_len, byte_group) sequences
+        return images.reshape(n, n_positions_of(cfg), cfg.byte_group).astype(np.int32)
     pix = images.reshape(n, cfg.img_size * cfg.img_size, 3)[:, pixel_order, :]
     if cfg.byte_group == 3:
         return pix.astype(np.int32)
@@ -749,10 +791,170 @@ def images_to_positions(images: np.ndarray, cfg: Config, pixel_order: np.ndarray
 
 def positions_to_image(positions: np.ndarray, cfg: Config, pixel_order: np.ndarray) -> np.ndarray:
     B = positions.shape[0]
+    if cfg.modality != "image":
+        return positions.reshape(B, n_positions_of(cfg), cfg.byte_group).astype(np.uint8)
     pix_traversal = positions.reshape(B, cfg.img_size * cfg.img_size, 3)
     raster = np.zeros_like(pix_traversal)
     raster[:, pixel_order, :] = pix_traversal
     return raster.reshape(B, cfg.img_size, cfg.img_size, 3).astype(np.uint8)
+
+
+def mulaw_encode(x: np.ndarray, mu: int = 255) -> np.ndarray:
+    # float waveform in [-1, 1] -> uint8 (8-bit mu-law)
+    y = np.sign(x) * np.log1p(mu * np.abs(np.clip(x, -1, 1))) / np.log1p(mu)
+    return np.clip(np.round((y + 1) / 2 * mu), 0, mu).astype(np.uint8)
+
+
+def mulaw_decode(b: np.ndarray, mu: int = 255) -> np.ndarray:
+    y = 2 * (b.astype(np.float64) / mu) - 1
+    return (np.sign(y) * np.expm1(np.abs(y) * np.log1p(mu)) / mu).astype(np.float32)
+
+
+def audio_to_bytes(x: np.ndarray, encoding: str) -> np.ndarray:
+    # float waveform (T,) -> (T, byte_group) uint8: mulaw8 -> 1 byte, pcm16 -> (high, low) of offset binary
+    if encoding == "mulaw8":
+        return mulaw_encode(x)[:, None]
+    u = np.clip(np.round(x * 32767), -32768, 32767).astype(np.int32) + 32768
+    return np.stack([u >> 8, u & 255], axis=-1).astype(np.uint8)
+
+
+def bytes_to_audio(b: np.ndarray, encoding: str) -> np.ndarray:
+    # (..., byte_group) bytes -> float waveform (...)
+    if encoding == "mulaw8":
+        return mulaw_decode(b[..., 0])
+    u = b[..., 0].astype(np.int32) * 256 + b[..., 1].astype(np.int32)
+    return ((u - 32768) / 32768.0).astype(np.float32)
+
+
+def resample_audio(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    # band-limited (anti-aliased) resampling: scipy polyphase if available, else windowed-sinc low-pass + interp
+    if sr_in == sr_out:
+        return x.astype(np.float32)
+    g = math.gcd(sr_in, sr_out)
+    try:
+        from scipy.signal import resample_poly
+        return resample_poly(x, sr_out // g, sr_in // g).astype(np.float32)
+    except ImportError:
+        pass
+    if sr_out < sr_in:
+        fc = 0.5 * sr_out / sr_in
+        n = np.arange(-32, 33)
+        h = 2 * fc * np.sinc(2 * fc * n) * np.hamming(len(n))
+        x = np.convolve(x, h / h.sum(), mode="same")
+    t_out = np.arange(int(len(x) * sr_out / sr_in)) * (sr_in / sr_out)
+    return np.interp(t_out, np.arange(len(x)), x).astype(np.float32)
+
+
+def load_audio_file(path: Path, sr: int) -> np.ndarray:
+    # any format soundfile reads (wav/flac/ogg/...), else stdlib wave (PCM wav) -> mono float32 at `sr`
+    try:
+        import soundfile
+        data, rate = soundfile.read(str(path), dtype="float32", always_2d=True)
+    except Exception:
+        import wave
+        with wave.open(str(path), "rb") as w:
+            rate, width, ch = w.getframerate(), w.getsampwidth(), w.getnchannels()
+            raw = np.frombuffer(w.readframes(w.getnframes()), dtype={1: np.uint8, 2: np.int16, 4: np.int32}[width])
+        data = raw.reshape(-1, ch).astype(np.float32)
+        data = (data - 128) / 128 if width == 1 else data / float(2 ** (8 * width - 1))
+    return resample_audio(data.mean(axis=1), rate, sr)
+
+
+def _folder_files(root: Path) -> list:
+    return sorted(f for f in root.rglob("*") if f.is_file() and not f.name.startswith("."))
+
+
+def _folder_split(root: Path) -> tuple:
+    # train/ + val/ (or validation/, test/) subfolders if present, else every 20th file is val; fewer than 20
+    # files -> (files, None): the concatenated stream is split instead (images: last image reused as val)
+    for val_name in ("val", "validation", "test"):
+        if (root / "train").is_dir() and (root / val_name).is_dir():
+            return _folder_files(root / "train"), _folder_files(root / val_name)
+    files = _folder_files(root)
+    if len(files) < 20:
+        return files, None
+    val = files[::20]
+    return [f for f in files if f not in set(val)], val
+
+
+def _seq_windows(stream: np.ndarray, seq_len: int) -> np.ndarray:
+    n = len(stream) // seq_len
+    return stream[:n * seq_len].reshape(n, seq_len, stream.shape[-1])
+
+
+def _seq_stream(files: list, cfg) -> np.ndarray:
+    # (T, byte_group) uint8: text/binary raw bytes (text files joined by newline), audio decoded + re-encoded
+    if cfg.modality == "audio":
+        parts = [audio_to_bytes(load_audio_file(f, cfg.audio_sample_rate), cfg.audio_encoding) for f in files]
+        return np.concatenate(parts) if parts else np.zeros((0, cfg.byte_group), np.uint8)
+    data = (b"\n" if cfg.modality == "text" else b"").join(f.read_bytes() for f in files)
+    n = len(data) // cfg.byte_group * cfg.byte_group
+    return np.frombuffer(data[:n], dtype=np.uint8).reshape(-1, cfg.byte_group)
+
+
+def _load_image_file(path: Path, size: int):
+    # any PIL-readable image -> RGB, shorter side resized to `size`, center crop; None if unreadable
+    from PIL import Image
+    try:
+        im = Image.open(path).convert("RGB")
+    except Exception:
+        return None
+    w, h = im.size
+    s = size / min(w, h)
+    im = im.resize((max(size, round(w * s)), max(size, round(h * s))), Image.BICUBIC)
+    w, h = im.size
+    left, top = (w - size) // 2, (h - size) // 2
+    return np.asarray(im.crop((left, top, left + size, top + size)), dtype=np.uint8)
+
+
+def load_folder(data_root: Path, cfg) -> tuple:
+    # dataset="folder": every file under data_root, per cfg.modality -> ((train, labels), (val, labels));
+    # images (n, img_size, img_size, 3), sequences (n, seq_len, byte_group) non-overlapping windows
+    train_files, val_files = _folder_split(data_root)
+    if cfg.modality == "image":
+        load = lambda fs: np.stack([a for a in (_load_image_file(f, cfg.img_size) for f in fs) if a is not None])
+        train = load(train_files)
+        val = load(val_files) if val_files else train[-1:]
+    elif val_files is None:
+        stream = _seq_stream(train_files, cfg)
+        n_val = max(cfg.seq_len, len(stream) // 20)
+        train, val = _seq_windows(stream[:-n_val], cfg.seq_len), _seq_windows(stream[-n_val:], cfg.seq_len)
+    else:
+        train = _seq_windows(_seq_stream(train_files, cfg), cfg.seq_len)
+        val = _seq_windows(_seq_stream(val_files, cfg), cfg.seq_len)
+    assert len(train) and len(val), \
+        f"folder dataset {data_root}: no {cfg.modality} samples (train={len(train)}, val={len(val)}, seq_len={cfg.seq_len})"
+    return (train, np.zeros(len(train), np.int32)), (val, np.zeros(len(val), np.int32))
+
+
+def save_samples(gen: np.ndarray, gt: np.ndarray, path: Path, cfg) -> None:
+    # image: side-by-side PNG grid; text: one .txt; audio: <stem>_<i>_{gen,gt}.wav; binary: .bin + hex preview
+    if cfg.modality == "image":
+        return save_compare_grid(gen, gt, path)
+    stem = path.with_suffix("")
+    if cfg.modality == "audio":
+        import wave
+        for i in range(gen.shape[0]):
+            for name, arr in (("gen", gen[i]), ("gt", gt[i])):
+                pcm = (np.clip(bytes_to_audio(arr.astype(np.uint8), cfg.audio_encoding), -1, 1) * 32767).astype(np.int16)
+                with wave.open(f"{stem}_{i}_{name}.wav", "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(cfg.audio_sample_rate)
+                    w.writeframes(pcm.tobytes())
+        return
+    lines = []
+    for i in range(gen.shape[0]):
+        g, t = gen[i].astype(np.uint8).tobytes(), gt[i].astype(np.uint8).tobytes()
+        if cfg.modality == "text":
+            lines += [f"=== sample {i} generated ===", g.decode("utf-8", "replace"),
+                      f"=== sample {i} ground truth ===", t.decode("utf-8", "replace")]
+        else:
+            Path(f"{stem}_{i}_gen.bin").write_bytes(g)
+            lines += [f"=== sample {i} generated (hex, first 256 B) ===", g[:256].hex(" "),
+                      f"=== sample {i} ground truth (hex, first 256 B) ===", t[:256].hex(" ")]
+    Path(f"{stem}.txt").write_text("\n".join(lines) + "\n")
+
 
 def byte_to_pq_idx(byte_vals: torch.Tensor, pq_chunks: int, code_vocab: int) -> torch.Tensor:
     bits_per_chunk = max(1, round(math.log2(code_vocab)))
@@ -855,9 +1057,112 @@ def default_label_fn_pil(images: np.ndarray, cfg: "Config", pixel_order: np.ndar
     return np.stack(chunks, axis=-1)
 
 
+def _block_reduce(x: torch.Tensor, n_blocks: int, method: str) -> torch.Tensor:
+    # (M, L, C) -> (M, n_blocks, C): mean over each code's stride window, or linear interp at its center
+    M, L, C = x.shape
+    K = L // n_blocks
+    blocks = x[:, :n_blocks * K].reshape(M, n_blocks, K, C)
+    if method == "mean":
+        return blocks.mean(dim=2)
+    return (blocks[:, :, (K - 1) // 2] + blocks[:, :, K // 2]) / 2
+
+
+def _bytes_to_digits(vals: torch.Tensor, pq_chunks: int, code_vocab: int) -> torch.Tensor:
+    # one digit per channel when they line up (C == pq_chunks, code_vocab 256), else channel mean bit-packed
+    if vals.shape[-1] == pq_chunks and code_vocab == 256:
+        return torch.round(vals.clamp(0, 255)).long()
+    return byte_to_pq_idx(torch.round(vals.mean(-1).clamp(0, 255)).long(), pq_chunks, code_vocab)
+
+
+def byte_mean_label_fn(flat_bytes: torch.Tensor, cfg: "Config", pixel_order, n_blocks: int, pq_chunks: int,
+                       code_vocab: int) -> torch.Tensor:
+    # text/binary label: each code's target = mean of the bytes in its stride window
+    return _bytes_to_digits(_block_reduce(flat_bytes.float(), n_blocks, "mean"), pq_chunks, code_vocab)
+
+
+def byte_interp_label_fn(flat_bytes: torch.Tensor, cfg: "Config", pixel_order, n_blocks: int, pq_chunks: int,
+                         code_vocab: int) -> torch.Tensor:
+    # text/binary label: bytes linearly interpolated at each stride window's center
+    return _bytes_to_digits(_block_reduce(flat_bytes.float(), n_blocks, "interp"), pq_chunks, code_vocab)
+
+
+def bytes_to_audio_t(b: torch.Tensor, encoding: str) -> torch.Tensor:
+    if encoding == "mulaw8":
+        y = 2 * (b[..., 0].float() / 255) - 1
+        return torch.sign(y) * torch.expm1(y.abs() * math.log1p(255.0)) / 255
+    return (b[..., 0].long() * 256 + b[..., 1].long() - 32768).float() / 32768.0
+
+
+def audio_to_bytes_t(x: torch.Tensor, encoding: str) -> torch.Tensor:
+    if encoding == "mulaw8":
+        y = torch.sign(x) * torch.log1p(255 * x.clamp(-1, 1).abs()) / math.log1p(255.0)
+        return torch.round((y + 1) / 2 * 255).clamp(0, 255)[..., None]
+    u = torch.round(x * 32767).clamp(-32768, 32767).long() + 32768
+    return torch.stack([u >> 8, u & 255], dim=-1).float()
+
+
+def sinc_lowpass(factor: int) -> np.ndarray:
+    # windowed-sinc FIR, cutoff at the decimated Nyquist (0.5/factor), unit DC gain
+    n = np.arange(-4 * factor, 4 * factor + 1)
+    h = np.sinc(n / factor) * np.hamming(len(n))
+    return (h / h.sum()).astype(np.float32)
+
+
+def audio_resample_label_fn(flat_bytes: torch.Tensor, cfg: "Config", pixel_order, n_blocks: int, pq_chunks: int,
+                            code_vocab: int) -> torch.Tensor:
+    # audio label: decode, anti-alias low-pass + decimate to each code's stride-window center, re-encode
+    M, L, _ = flat_bytes.shape
+    K = L // n_blocks
+    wave_ = bytes_to_audio_t(flat_bytes, cfg.audio_encoding)
+    if K > 1:
+        h = torch.as_tensor(sinc_lowpass(K), device=wave_.device)
+        wave_ = F.conv1d(wave_[:, None], h.flip(0)[None, None], padding=len(h) // 2)[:, 0]
+    centers = wave_[:, :n_blocks * K].reshape(M, n_blocks, K)[:, :, K // 2]
+    return _bytes_to_digits(audio_to_bytes_t(centers, cfg.audio_encoding), pq_chunks, code_vocab)
+
+
+class HierarchicalBPE:
+    # STUB: sentencepiece-style BPE per level (level 0: bytes/letters -> V0, level l: level-(l-1) ids -> V_l);
+    # a code's level-l label = the token covering its block center. fit() learns merges, encode() -> ids.
+    def __init__(self, vocab_sizes: tuple):
+        self.vocab_sizes = tuple(vocab_sizes)
+        self.merges = [[] for _ in self.vocab_sizes]
+
+    def fit(self, stream: np.ndarray) -> "HierarchicalBPE":
+        raise NotImplementedError("HierarchicalBPE.fit: stub")
+
+    def encode(self, stream: np.ndarray, level: int) -> np.ndarray:
+        raise NotImplementedError("HierarchicalBPE.encode: stub")
+
+
+def bpe_label_fn(flat_bytes: torch.Tensor, cfg: "Config", pixel_order, n_blocks: int, pq_chunks: int,
+                 code_vocab: int, bpe: HierarchicalBPE = None) -> torch.Tensor:
+    # STUB: label = HierarchicalBPE token at each code block's center, bit-packed into (pq_chunks, code_vocab)
+    raise NotImplementedError("bpe_label_fn: stub, see HierarchicalBPE")
+
+
+# same names as the JAX file's registry (configs work in both), mapped to the torch implementations
 LABEL_FNS = {"default_label_fn_jax": default_label_fn, "rgb_label_fn_jax": rgb_label_fn,
              "default_label_fn": default_label_fn, "rgb_label_fn": rgb_label_fn,
-             "default_label_fn_pil": default_label_fn_pil}
+             "default_label_fn_pil": default_label_fn_pil, "byte_mean_label_fn": byte_mean_label_fn,
+             "byte_interp_label_fn": byte_interp_label_fn, "audio_resample_label_fn": audio_resample_label_fn,
+             "bpe_label_fn": bpe_label_fn}
+DEFAULT_LABEL_FN = {"image": "default_label_fn_jax", "text": "byte_mean_label_fn", "binary": "byte_mean_label_fn",
+                    "audio": "audio_resample_label_fn"}
+
+
+def resolve_label_fn(spec, modality: str):
+    # config `label_fn`: None (modality default) | a LABEL_FNS name | "package.module:function" | a callable
+    if spec is None:
+        spec = DEFAULT_LABEL_FN[modality]
+    if callable(spec):
+        return spec
+    if spec in LABEL_FNS:
+        return LABEL_FNS[spec]
+    assert ":" in spec, f"unknown label_fn {spec!r}: use one of {sorted(LABEL_FNS)} or 'package.module:function'"
+    import importlib
+    mod, fn = spec.split(":", 1)
+    return getattr(importlib.import_module(mod), fn)
 
 
 class BatchIterator:
@@ -947,6 +1252,29 @@ def quantize_zgr(logits: torch.Tensor, rng, tau: float = 1.0, quantize_drop: flo
 
 
 def quantize_reinmax_limit(logits: torch.Tensor, rng, tau: float = 1.0, quantize_drop: float = 0.0) -> tuple:
+    # reinmax_limit without the (K,K) matrix: S @ logits = logits/(2K) + col*(y.logits)/(2K) - sum(logits)/(2K^2)
+    # with col, y detached -- same forward (y) and Jacobian (S) as quantize_reinmax_limit_dense, O(K) memory
+    K = logits.shape[-1]
+    p = torch.softmax(logits, dim=-1)
+    if rng is not None:
+        rng, drop_rng = rng.split(2)
+        idx = safe_argmax(logits + rand_gumbel(rng, logits.shape, logits.device))
+    else:
+        drop_rng = None
+        idx = safe_argmax(p)
+    y = _one_hot(idx, K, p.dtype)
+    p_x = (p * y).sum(-1, keepdim=True).clamp_min(1e-8)
+    col = ((y - p) / p_x).detach()
+    dx = (logits + col * (y * logits).sum(-1, keepdim=True)) / (2 * K) - logits.sum(-1, keepdim=True) / (2 * K * K)
+    st = y + (dx - dx.detach())
+    if quantize_drop > 0 and drop_rng is not None:
+        drop = rand_bernoulli(drop_rng, quantize_drop, p.shape[:-1], p.device)[..., None]
+        return torch.where(drop, p, st), idx
+    return st, idx
+
+
+def quantize_reinmax_limit_dense(logits: torch.Tensor, rng, tau: float = 1.0, quantize_drop: float = 0.0) -> tuple:
+    # slow reference for quantize_reinmax_limit (correctness checks only): materializes S per digit position
     K = logits.shape[-1]
     p = torch.softmax(logits, dim=-1)
     if rng is not None:
@@ -1401,6 +1729,15 @@ def dense_self_attention_pardec(attn: Attention, x: torch.Tensor, rope_pos_ids: 
     return y.transpose(1, 2).reshape(Bc, T, D) @ attn.out
 
 
+def remat_row_chunks(fn, rows: torch.Tensor, rope_pos_ids: torch.Tensor, key_valid: torch.Tensor,
+                     n_chunks: int) -> torch.Tensor:
+    # pardec rows are independent groups: fn over n_chunks row chunks in turn, each checkpointed when training
+    outs = []
+    for x, rp, kv in zip(rows.chunk(n_chunks), rope_pos_ids.chunk(n_chunks), key_valid.chunk(n_chunks)):
+        outs.append(torch_checkpoint(fn, x, rp, kv, use_reentrant=False) if torch.is_grad_enabled() else fn(x, rp, kv))
+    return torch.cat(outs, dim=0)
+
+
 def run_block_pardec(blk, x: torch.Tensor, rope_pos_ids: torch.Tensor, key_valid: torch.Tensor,
                      remat: bool) -> torch.Tensor:
     if isinstance(blk, RecurrentBlock):  # order-based, rope ids unused; invalid keys skip the state update
@@ -1477,7 +1814,7 @@ class PardecLM(nn.Module):
                  use_xsa: bool = True, use_qknorm: bool = True, remat: bool = False, window: int = None,
                  shared_blocks=None, shared_ln_f=None, ctx_vocab: int = None, ctx_pq_chunks: int = None,
                  ctx_pq_dim: int = None, shared_ctx_embed=None, shared_ctx_proj=None, token_head: str = "ar",
-                 backbone: str = "transformer", state_dim: int = 16, cycle_slots: int = 0):
+                 backbone: str = "transformer", state_dim: int = 16, cycle_slots: int = 0, remat_chunks: int = 1):
         super().__init__()
         if shared_blocks is not None:
             self.blocks, self.ln_f = shared_blocks, shared_ln_f
@@ -1513,6 +1850,7 @@ class PardecLM(nn.Module):
         self.token_dim, self.token_n_heads = token_dim, token_n_heads
         self.decode_past, self.decode_future = decode_past, decode_future
         self.remat = remat
+        self.remat_chunks = remat_chunks
         self.token_head = token_head
         if shared_ctx_embed is not None:
             self.own_ctx_embed, self.own_ctx_proj = shared_ctx_embed, shared_ctx_proj
@@ -1639,11 +1977,18 @@ def pardec_score(pardec: PardecLM, target_seq: torch.Tensor, context_h: torch.Te
     rope_g = torch.cat([rope_ids, rope_bos, rope_target], 1)
     rope_pos_ids = rope_g[None].expand(batch, n_groups, per_group_len).reshape(B2, per_group_len)
 
-    def run_stack(x):
-        for blk in pardec.blocks:
-            x = run_block_pardec(blk, x, rope_pos_ids, key_valid, pardec.remat)
-        return x
-    hidden = pardec.ln_f(_maybe_ckpt(run_stack, row_flat, pardec.remat))
+    if pardec.remat_chunks > 1:
+        def chunk_stack(x, rp, kv):
+            for blk in pardec.blocks:
+                x = run_block_pardec(blk, x, rp, kv, pardec.remat)
+            return pardec.ln_f(x)
+        hidden = remat_row_chunks(chunk_stack, row_flat, rope_pos_ids, key_valid, pardec.remat_chunks)
+    else:
+        def run_stack(x):
+            for blk in pardec.blocks:
+                x = run_block_pardec(blk, x, rope_pos_ids, key_valid, pardec.remat)
+            return x
+        hidden = pardec.ln_f(_maybe_ckpt(run_stack, row_flat, pardec.remat))
     pred_pos = window_size + slot_len + decode_past + torch.arange(T, device=dev)
     predicted_hidden = hidden[:, pred_pos].reshape(batch, n_groups * T, hidden_dim)
     valid_len = n_output_positions * oe
@@ -1778,7 +2123,8 @@ class CodeLM(nn.Module):
         n_layers_enc = cfg.codelm_n_layers[level_idx]
         n_heads_enc = cfg.codelm_n_heads[level_idx]
         n_kv_heads_enc = cfg.codelm_n_kv_heads[level_idx]
-        self.remat, self.remat_level = cfg.remat, cfg.remat_level
+        self.remat = cfg.remat if cfg.codelm_remat[level_idx] is None else cfg.codelm_remat[level_idx]
+        self.remat_level = cfg.remat_level
         self.attn_lookahead = cfg.attn_lookahead[level_idx]
         self.pq_chunks, self.code_vocab = cfg.pq_chunks[level_idx], cfg.code_vocab[level_idx]
         self.quantize_mode, self.quantize_drop = cfg.quantize_mode, cfg.quantize_drop
@@ -1801,8 +2147,8 @@ class CodeLM(nn.Module):
         self.ln_f = RMSNorm(D_enc)
         self.code_head = P(init_matrix((D_enc, self.pq_chunks * self.code_vocab), scheme))
         self.ntp_head = P(init_matrix((D_enc, self.pq_chunks * self.code_vocab), scheme))
-        n_bos_rates = (len(cfg.strides) if cfg.share_across_levels else cfg.codelm_bos_rates[level_idx]) \
-            if cfg.use_codelm_bos else 1
+        n_bos_rates = (len(cfg.strides) + (cfg.context_source == "codelm_upper") if cfg.share_across_levels
+                       else cfg.codelm_bos_rates[level_idx]) if cfg.use_codelm_bos else 1
         self.bos_embed = P(torch.stack([init_vector(D_enc, scheme) for _ in range(n_bos_rates)]))
         self.token_head = cfg.codelm_token_head
         self.token_dim = cfg.token_dim[level_idx]
@@ -1831,7 +2177,7 @@ def _run_stack(blocks, h: torch.Tensor, remat: bool, remat_level: bool) -> torch
 def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: torch.Tensor, cfg: "Config", rate_id: int, rng,
                           group_size: int) -> torch.Tensor:
     # downsampler/upsampler context, per cfg.context_source (no bos substitution, see the JAX file)
-    if cfg.context_source == "codelm":
+    if cfg.context_source in ("codelm", "codelm_upper"):  # which CodeLM is the caller's choice
         x = code_embed_proj(raw, codelm.own_input_embed, codelm.own_input_proj)
         return codelm.ln_f(_run_stack(codelm.blocks, x, codelm.remat, codelm.remat_level))
     return code_embed_proj(raw, pardec.own_ctx_embed, pardec.own_ctx_proj)
@@ -1897,6 +2243,17 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: torch.
                 entropy_loss=entropy_loss, logits=logits)
 
 
+def codelm_ntp_loss(codelm: CodeLM, raw: torch.Tensor, target: torch.Tensor, cfg: "Config") -> tuple:
+    # next-token loss/acc of `codelm` over its own input (codelm_upper: CodeLM one level up over the top code)
+    h = pardec_context_hidden(codelm, None, raw, cfg, 0, None, group_size=1)
+    shift = 1 + codelm.attn_lookahead
+    if h.shape[1] <= shift:
+        return h.new_zeros(()), h.new_zeros(())
+    tgt = target[:, shift:]
+    logits = codelm_ntp_logits_tf(codelm, h[:, :-shift], tgt)
+    return -torch.log_softmax(logits, -1).gather(-1, tgt[..., None]).mean(), (logits.argmax(-1) == tgt).float().mean()
+
+
 @torch.no_grad()
 def encode_pardec_downsampler_generate(codelm: CodeLM, downsampler: PardecLM, raw: torch.Tensor, K: int,
                                        cfg: "Config", rate_id: int = 0, rng=None, greedy: bool = True,
@@ -1916,8 +2273,8 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
                                        ctx_code_soft: torch.Tensor, upsampler_ncodes: int, rng=None,
                                        encode_temperature: float = 1.0, force_teacher_forced: bool = False,
                                        return_passes: bool = False, cycle_ctx: list = None, **_unused):
-    codelm = model.codelm_for(level_idx)
-    codelm_rate_id = model.codelm_bos_rate_id(level_idx)
+    codelm = model.context_codelm_for(level_idx)
+    codelm_rate_id = model.context_codelm_rate_id(level_idx)
     rate_id = model.bos_rate_id(level_idx)
     upsampler = model.upsampler_for(level_idx)
     cfg = model.cfg
@@ -1977,10 +2334,10 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
 @torch.no_grad()
 def _decode_generate_pardec_call(model, level_idx, ctx_idx, upsampler_ncodes, greedy, temperature, seed,
                                  draft_seq=None, draft_len=0, draft_fill="zero", cycle_ctx=None, rng=None):
-    codelm = model.codelm_for(level_idx)
+    codelm = model.context_codelm_for(level_idx)
     rng = Key(seed) if rng is None else rng
     h_ctx = pardec_context_hidden(codelm, model.upsampler_for(level_idx), ctx_idx, model.cfg,
-                                  model.codelm_bos_rate_id(level_idx), rng, group_size=upsampler_ncodes)
+                                  model.context_codelm_rate_id(level_idx), rng, group_size=upsampler_ncodes)
     ckw = dict(cycle_ctx=cycle_ctx) if cycle_ctx else {}
     return pardec_generate(model.upsampler_for(level_idx), h_ctx, context_group_size=upsampler_ncodes,
                            output_group_size=upsampler_ncodes, rng=rng, greedy=greedy, temperature=temperature,
@@ -2072,8 +2429,8 @@ def decode_logits_and_target_cycles(model: "LagCodecModel", level_idx: int, targ
             rev_soft = rev_soft.detach()
         if stack:
             slots = list(slots)
-            slots[t] = pardec_context_hidden(model.codelm_for(level_idx), model.upsampler_for(level_idx), rev_soft,
-                                             cfg, model.codelm_bos_rate_id(level_idx), rng_t,
+            slots[t] = pardec_context_hidden(model.context_codelm_for(level_idx), model.upsampler_for(level_idx),
+                                             rev_soft, cfg, model.context_codelm_rate_id(level_idx), rng_t,
                                              group_size=upsampler_ncodes)
         else:
             ctx_t = rev_soft
@@ -2089,8 +2446,8 @@ def _cycle_reencode_generate(model, level_idx, tokens, upsampler_ncodes, greedy,
                                              downsampler_ncodes=1, codelm_rate_id=model.codelm_bos_rate_id(level_idx))
     if not stack:
         return out["code_idx"], None
-    h = pardec_context_hidden(codelm, model.upsampler_for(level_idx), out["code_idx"], model.cfg,
-                              model.codelm_bos_rate_id(level_idx), None, group_size=upsampler_ncodes)
+    h = pardec_context_hidden(model.context_codelm_for(level_idx), model.upsampler_for(level_idx), out["code_idx"],
+                              model.cfg, model.context_codelm_rate_id(level_idx), None, group_size=upsampler_ncodes)
     return out["code_idx"], h
 
 
@@ -2099,10 +2456,11 @@ def decode_generate_cycles(model: "LagCodecModel", level_idx: int, ctx_idx: torc
                            greedy: bool = True, temperature: float = 1.0, seed: int = 0) -> torch.Tensor:
     cfg = model.cfg
     n_cyc = cfg.gen_level_cycles[level_idx]
-    if n_cyc <= 1:
+    n_slots = cycle_stack_slots(cfg, level_idx)  # trained with slots -> always decode with them (masked until filled)
+    if n_cyc <= 1 and n_slots == 0:
         return decode_generate_multipass(model, level_idx, ctx_idx, upsampler_ncodes, greedy, temperature, seed)
     stack = cfg.level_cycle_mode == "stack"
-    slots = [None] * cycle_stack_slots(cfg, level_idx) if stack else None
+    slots = [None] * n_slots if stack else None
     ctx_t = ctx_idx
     for t in range(n_cyc):
         pred = decode_generate_multipass(model, level_idx, ctx_t, upsampler_ncodes, greedy, temperature,
@@ -2249,9 +2607,13 @@ class LagCodecModel(nn.Module):
                                    output_expansion=1, context_window_groups=cfg.downsampler_window[li],
                                    decode_past=cfg.downsampler_decode_past[li],
                                    decode_future=cfg.downsampler_decode_future[li], remat=ds_remat,
+                                   remat_chunks=cfg.downsampler_remat_chunks[li],
                                    backbone=cfg.downsampler_backbone[li], **common)
             downsamplers.append(downsampler)
             up_remat = cfg.remat if cfg.upsampler_remat[li] is None else cfg.upsampler_remat[li]
+            # codelm_upper: the upsampler's context comes from the CodeLM one level up
+            up_common = dict(common, context_hidden_dim=cfg.codelm_d_model[min(li + 1, n - 1)]) \
+                if cfg.context_source == "codelm_upper" else common
             K_default = cfg.strides[li] if cfg.strides[li] != -1 else 1
             share_lm = cfg.share_downsampler_upsampler_lm
             shared_emb = cfg.context_source == "shared_embed"
@@ -2260,14 +2622,17 @@ class LagCodecModel(nn.Module):
                                  output_expansion=K_default, context_window_groups=cfg.upsampler_window[li],
                                  decode_past=cfg.upsampler_decode_past[li],
                                  decode_future=cfg.upsampler_decode_future[li], remat=up_remat,
+                                 remat_chunks=cfg.upsampler_remat_chunks[li],
                                  shared_blocks=downsampler.blocks if share_lm else None,
                                  shared_ln_f=downsampler.ln_f if share_lm else None,
                                  shared_ctx_embed=downsampler.own_ctx_embed if shared_emb else None,
                                  shared_ctx_proj=downsampler.own_ctx_proj if shared_emb else None,
                                  backbone=cfg.upsampler_backbone[li],
                                  cycle_slots=max(cycle_stack_slots(cfg, i) for i in (range(n) if cfg.share_across_levels else [j])),
-                                 **common)
+                                 **up_common)
             upsamplers.append(upsampler)
+        if cfg.context_source == "codelm_upper" and not cfg.share_across_levels:
+            codelms.append(CodeLM(cfg, level_idx=n - 1))  # decoderless CodeLM-only level n (top level's arch)
         self.codelms = nn.ModuleList(codelms)
         self.downsamplers = nn.ModuleList(downsamplers)
         self.upsamplers = nn.ModuleList(upsamplers)
@@ -2283,6 +2648,13 @@ class LagCodecModel(nn.Module):
 
     def bos_rate_id(self, level_idx: int) -> int:
         return bos_rate_map(self.cfg)[level_idx] if self.cfg.share_across_levels else 0
+
+    def context_codelm_for(self, level_idx: int) -> CodeLM:
+        # processor of code `level_idx` for that level's upsampler (see Config.context_source)
+        return self.codelm_for(level_idx + (self.cfg.context_source == "codelm_upper"))
+
+    def context_codelm_rate_id(self, level_idx: int) -> int:
+        return self.codelm_bos_rate_id(level_idx + (self.cfg.context_source == "codelm_upper"))
 
     def codelm_bos_rate_id(self, level_idx: int) -> int:
         return level_idx if self.cfg.share_across_levels else 0
@@ -2342,6 +2714,10 @@ def level_forward(model: LagCodecModel, flat_bytes: torch.Tensor, phase: int, rn
             label_mse_losses.append(((soft - label_tgt.float()) ** 2).mean())
         if i < phase - 1:
             raw, target = out["code_soft"], out["code_idx"]
+    if cfg.context_source == "codelm_upper":
+        ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(phase), codes_soft[phase - 1], codes[phase - 1], cfg)
+        enc_losses.append(ntp_up)
+        enc_accs.append(acc_up)
 
     dec_losses, dec_accs, aux_ntp_losses, aux_ntp_accs = [], [], [], []
     aux_applies = any(u.decode_future > 0 or u.decode_past > 0 for u in model.upsamplers)
@@ -2499,6 +2875,11 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: torch.Tensor, entry
             label_mses.append(((enc_logits.argmax(-1).float() - label_tgt.float()) ** 2).mean())
         if d < depth - 1:
             raw, target = out["code_soft"], out["code_idx"]
+    if cfg.context_source == "codelm_upper":
+        ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(entry_level + depth), codes_soft[depth - 1],
+                                         codes[depth - 1], cfg)
+        enc_losses.append(ntp_up)
+        enc_accs.append(acc_up)
     dec_losses, dec_accs = [], []
     ctx = codes_soft[depth - 1]
     dec_rngs = [None] * depth if rng is None else rng.fold(2).split(depth)
@@ -2524,11 +2905,13 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: torch.Tensor, entry
 
 
 def phase_trainable_modules(model: LagCodecModel, phase: int) -> list:
-    # curriculum_mode="freeze": phase p trains only level p-1's codelm/downsampler/upsampler
+    # curriculum_mode="freeze": phase p trains only level p-1's codelm/downsampler/upsampler; codelm_upper:
+    # CodeLM p instead of p-1 (+ CodeLM 0 in phase 1), the CodeLM upsampler p-1 reads
     if model.cfg.curriculum_mode != "freeze":
         return [model]
     j = phase - 1
-    return [model.codelms[j], model.downsamplers[j], model.upsamplers[j]]
+    codelms = ({phase} | ({0} if phase == 1 else set())) if model.cfg.context_source == "codelm_upper" else {j}
+    return [model.codelms[c] for c in sorted(codelms)] + [model.downsamplers[j], model.upsamplers[j]]
 
 
 def trainable_named_params(model: LagCodecModel, phase: int) -> list:
@@ -2690,13 +3073,14 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
     (run_dir / "resolved_config.py").write_text("\n".join(lines) + "\n")
 
 
-CONFIG_FIELDS = ("img_size", "codelm_d_model", "codelm_n_layers", "codelm_n_heads", "codelm_n_kv_heads",
+CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_encoding", "codelm_d_model", "codelm_remat", "codelm_n_layers", "codelm_n_heads", "codelm_n_kv_heads",
                   "downsampler_d_model", "downsampler_n_layers", "downsampler_n_heads",
                   "downsampler_n_kv_heads", "downsampler_window",
                   "downsampler_decode_past", "downsampler_decode_future", "downsampler_remat", "downsampler_ncodes",
                   "upsampler_d_model", "upsampler_n_layers", "upsampler_n_heads",
                   "upsampler_n_kv_heads", "upsampler_window",
                   "upsampler_decode_past", "upsampler_decode_future", "upsampler_remat",
+                  "downsampler_remat_chunks", "upsampler_remat_chunks",
                   "share_across_levels", "bos_rate_mode", "context_source", "pardec_token_head", "codelm_token_head", "downsampler_rollout",
                   "downsampler_rollout_prob", "upsampler_rollout", "upsampler_rollout_prob",
                   "share_downsampler_upsampler_lm", "strides",
@@ -2716,6 +3100,7 @@ CONFIG_FIELDS = ("img_size", "codelm_d_model", "codelm_n_layers", "codelm_n_head
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "entropy_weight", "mse_weight",
                   "mse_softmax_tau", "traversal", "label_reg_weight", "label_mse_weight")
+
 
 def resolve_device(name: str) -> torch.device:
     if name == "auto":
@@ -2846,7 +3231,7 @@ def prune_checkpoints(run_dir: Path, keep: int) -> None:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=Path, required=True)
-    p.add_argument("--dataset", type=str, default="cifar", choices=["cifar", "imagenet64", "imagenet256"],
+    p.add_argument("--dataset", type=str, default="cifar", choices=["cifar", "imagenet64", "imagenet256", "folder"],
                     help="cifar (default): downloads/caches under --data_root. imagenetN: reads "
                          "pre-built shards from --data_root (scripts/imagenet/download_imagenetN.py; "
                          "does not download itself). Config.img_size must match (32 cifar, N imagenetN). "
@@ -2970,10 +3355,18 @@ def main():
                          "uniformly to every phase; a tuple gives one value per phase")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--img_size", type=int, default=Config.img_size)
+    p.add_argument("--modality", type=str, default=Config.modality, choices=list(MODALITIES),
+                    help="image | text | audio | binary (1D seq_len x byte_group byte sequences); --dataset folder "
+                         "reads every file under --data_root (train/ + val/ subfolders, else every 20th file is val)")
+    p.add_argument("--seq_len", type=int, default=Config.seq_len, help="positions per sample, non-image modalities")
+    p.add_argument("--audio_sample_rate", type=int, default=Config.audio_sample_rate)
+    p.add_argument("--audio_encoding", type=str, default=Config.audio_encoding, choices=["mulaw8", "pcm16"])
     p.add_argument("--codelm_d_model", type=_tuple_arg, default=Config.codelm_d_model)
     p.add_argument("--codelm_n_layers", type=_tuple_arg, default=Config.codelm_n_layers)
     p.add_argument("--codelm_n_heads", type=_tuple_arg, default=Config.codelm_n_heads)
     p.add_argument("--codelm_n_kv_heads", type=_tuple_arg, default=Config.codelm_n_kv_heads)
+    p.add_argument("--codelm_remat", type=_opt_bool_tuple_arg, default=Config.codelm_remat,
+                    help="CodeLM's OWN per-block remat per level; 'none' (default) falls back to --remat")
     p.add_argument("--downsampler_d_model", type=_tuple_arg, default=Config.downsampler_d_model)
     p.add_argument("--downsampler_n_layers", type=_tuple_arg, default=Config.downsampler_n_layers)
     p.add_argument("--downsampler_n_heads", type=_tuple_arg, default=Config.downsampler_n_heads)
@@ -3009,6 +3402,10 @@ def main():
     p.add_argument("--upsampler_decode_future", type=_tuple_arg, default=Config.upsampler_decode_future,
                     help="upsampler PardecLM's OWN decode_future, independent of the downsampler's own "
                          "downsampler_decode_future. Default 0")
+    for name in ("downsampler_remat_chunks", "upsampler_remat_chunks"):
+        p.add_argument(f"--{name}", type=_tuple_arg, default=getattr(Config, name),
+                        help="per level: run the pardec stack over this many row chunks, each rematerialized "
+                             "(peak activations ~1/chunks, one extra forward). 1 = off")
     p.add_argument("--upsampler_remat", type=_opt_bool_tuple_arg, default=Config.upsampler_remat,
                     help="upsampler PardecLM's OWN remat, independent of the downsampler's. "
                          "'none' (default) falls back to --remat (previous shared behavior)")
@@ -3024,11 +3421,12 @@ def main():
                          "stride share the same bos row (e.g. strides=(4,4,4) -> n_rates=1). "
                          "'absolute': rate_id is the raw level index, n_rates=n always (old behavior).")
     p.add_argument("--context_source", type=str, default=Config.context_source,
-                    choices=("codelm", "own_embed", "shared_embed"),
+                    choices=("codelm", "codelm_upper", "own_embed", "shared_embed"),
                     help="How downsampler/upsampler get their context. 'codelm' (default): CodeLM's "
                          "own contextualized hidden states (encoder_hidden). 'own_embed': a plain "
                          "per-position embedding table, no self-attention, own table per module. "
-                         "'shared_embed': same, but downsampler and upsampler share one table.")
+                         "'shared_embed': same, but downsampler and upsampler share one table. 'codelm_upper': "
+                         "upsampler i's context from CodeLM i+1 (+ a CodeLM-only top level when not shared).")
     p.add_argument("--pardec_token_head", type=str, default=Config.pardec_token_head, choices=("ar", "linear"),
                     help="'ar' (default): AR digit head. 'linear': one parallel linear head for all digits "
                          "(incompatible with --downsampler_rollout).")
@@ -3227,8 +3625,7 @@ def main():
     p.add_argument("--threads", type=int, default=None, help="torch.set_num_threads (CPU)")
     pre_args, _ = p.parse_known_args()
     config_vars = load_config_module(pre_args.config)
-    label_fn_raw = config_vars.pop("label_fn", "default_label_fn_jax")
-    label_fn = LABEL_FNS[label_fn_raw] if isinstance(label_fn_raw, str) else label_fn_raw
+    label_fn_raw = config_vars.pop("label_fn", None)
     known = {a.dest for a in p._actions}
     consts = sorted(k for k in set(config_vars) - known
                     if not callable(config_vars[k]) and not isinstance(config_vars[k], type(argparse)))
@@ -3268,6 +3665,7 @@ def main():
     print(f"torch {torch.__version__} device={device} threads={torch.get_num_threads()}")
 
     cfg = Config(**{k: getattr(args, k) for k in CONFIG_FIELDS})
+    label_fn = resolve_label_fn(label_fn_raw, cfg.modality)
     n_levels = len(cfg.strides)
     n_phases = n_levels if cfg.strides[-1] != -1 else n_levels - 1
     pixel_order = pixel_order_for(cfg)
@@ -3299,8 +3697,12 @@ def main():
             "curriculum_mode='freeze' needs the phase-by-phase curriculum (no --no_curriculum / level_select_prob)"
         if skip_ahead:
             raise ValueError("curriculum_mode='freeze' with a skipped phase would freeze an untrained level")
+        if any(g > 0 for g in args.level_gt_drop):
+            warnings.warn(f"curriculum_mode='freeze' with level_gt_drop={args.level_gt_drop}: frozen lower "
+                          f"decoders get predicted ctx from the new level and can't adapt to it")
 
-    (train_np, train_labels), (val_np, val_labels) = load_dataset(args.dataset, Path(args.data_root), cfg.img_size)
+    (train_np, train_labels), (val_np, val_labels) = load_dataset(
+        args.dataset, Path(args.data_root), cfg.img_size if cfg.modality == "image" else None, cfg=cfg)
     if args.train_subset_n:
         train_np = train_np[:args.train_subset_n]
     if args.val_subset_n:
@@ -3372,7 +3774,7 @@ def main():
         acc = float((recon == flat_prompt).float().mean())
         img = positions_to_image(recon.cpu().numpy(), cfg, pixel_order)
         mse = pixel_mse(img, gt_img)
-        save_compare_grid(img, gt_img, run_dir / f"samples_{tag}.png")
+        save_samples(img, gt_img, run_dir / f"samples_{tag}.png", cfg)
         dt = time.monotonic() - t0
         logger(f"[{tag}] top={top} CASCADE{' (sampled T=%g k=%d)' % (cfg.gen_temperature, cfg.gen_top_k) if sample else ''}"
                f" gen_byte_acc={acc:.4f} gen_cascade_mse={mse:.2f} gen_time={dt:.1f}s",
@@ -3401,7 +3803,7 @@ def main():
                                    return_recon=True)
         img = positions_to_image(aux[-1].long().cpu().numpy(), cfg, pixel_order)
         mse = pixel_mse(img, gt_img)
-        save_compare_grid(img, gt_img, run_dir / f"samples_{tag}_tfsanity.png")
+        save_samples(img, gt_img, run_dir / f"samples_{tag}_tfsanity.png", cfg)
         logger(f"[{tag}] top={top} TF_SANITY tf_sanity_mse={mse:.2f}", tag=tag, tf_sanity_mse=float(mse))
         model.train()
 
@@ -3484,6 +3886,10 @@ def main():
         lr_kind, lr_peak, lr_min_val = args.lr_schedule, args.lr, args.lr_min
         if resume_meta is not None and phase == resume_meta["phase"] and resume_meta.get("schedule") is not None:
             sm = resume_meta["schedule"]
+            if (sm["total_steps"], sm["warmup_steps"], sm["lr_decay_steps"], sm["kind"], sm["lr"], sm["lr_min"]) != \
+                    (phase_total_steps, warmup, lr_decay_steps, lr_kind, lr_peak, lr_min_val):
+                logger(f"resume: current args give a different lr schedule for phase {phase} -- keeping the "
+                       f"checkpoint's (total_steps={sm['total_steps']}); start fresh to change it")
             phase_total_steps, warmup, lr_decay_steps = sm["total_steps"], sm["warmup_steps"], sm["lr_decay_steps"]
             lr_kind, lr_peak, lr_min_val = sm["kind"], sm["lr"], sm["lr_min"]
         schedule_meta = dict(total_steps=phase_total_steps, warmup_steps=warmup, lr_decay_steps=lr_decay_steps,
@@ -3565,6 +3971,7 @@ def main():
                     run_val_eval(phase, f"level{phase - 1}_step{st}")
                     eval_all(phase, lambda lvl: f"level{lvl}_step{st}")
                     try:
+                        assert cfg.modality == "image", "codegrid is image-only"
                         plot_encoder_outs(model, cfg, val_np[:vb], pixel_order,
                                           run_dir / f"samples_level{phase - 1}_step{st}_codegrid.png",
                                           level=phase - 1, label_fn=label_fn, device=device)

@@ -320,6 +320,15 @@ def run_cycle_slot_check(head="ar", n_cycles=3, **over):
     ok_c = float(jnp.abs(lm - l0).max()) > 0.0
     print(f"STACK slot used: filled-vs-mask logit change={float(jnp.abs(lm - l0).max()):.2e}  {'OK' if ok_c else 'UNUSED'}")
     oks.append(ok_c)
+    # gen_level_cycles=1 on a stack-trained model must still decode with the (all-mask) slots, like cycle 0 in training
+    import dataclasses
+    model1 = R.LagCodecModel(jax.random.PRNGKey(0), dataclasses.replace(cfg, gen_level_cycles=(1, 1)))
+    code_idx = jnp.argmax(ctx_code_soft, -1)
+    g1 = R.decode_generate_cycles(model1, 0, code_idx, G, greedy=True)
+    ref = R.decode_generate_multipass(model1, 0, code_idx, G, greedy=True, cycle_ctx=[None] * (n_cycles - 1))
+    ok_d = bool(jnp.array_equal(g1, ref))
+    print(f"STACK gen_level_cycles=1 keeps the masked slots: {'OK' if ok_d else 'LAYOUT MISMATCH'}")
+    oks.append(ok_d)
     return all(oks)
 
 
@@ -420,34 +429,187 @@ def run_cycle_e2e_check():
     return ok and reach > 0
 
 
+def run_codelm_upper_check():
+    """context_source="codelm_upper": structure (extra CodeLM-only level unless shared, bos rows), upsampler i
+    reads CodeLM i+1 and not CodeLM i, dense-vs-KV decode consistency, finite loss/grads that reach the
+    extra CodeLM, and the freeze filter's per-phase trainable CodeLMs."""
+    import equinox as eqx
+    print("[codelm_upper]")
+    oks = []
+    base = dict(strides=(4, 4), code_vocab=(256, 256), pq_chunks=(3, 3), pq_dim=(16, 16), upsampler_ncodes=(1, 1),
+                downsampler_window=(1, 1), upsampler_window=(1, 1), context_source="codelm_upper",
+                use_codelm_bos=True, codelm_bos_rates=(2, 2), codelm_d_model=(64, 48))
+    cfg = build_cfg(share_across_levels=False, **base)
+    model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+    n_ok = len(model.codelms) == 3 and model.codelms[2].bos_embed.shape == (2, 48) \
+        and model.upsamplers[0].context_proj.shape[0] == 48 and model.upsamplers[1].context_proj.shape[0] == 48
+    cfg_s = build_cfg(share_across_levels=True, **dict(base, codelm_d_model=(64, 64)))
+    model_s = R.LagCodecModel(jax.random.PRNGKey(0), cfg_s)
+    s_ok = len(model_s.codelms) == 1 and model_s.codelms[0].bos_embed.shape[0] == 3
+    print(f"  structure: unshared codelms={len(model.codelms)} (expect 3, extra has bos {model.codelms[2].bos_embed.shape}),"
+          f" shared bos rows={model_s.codelms[0].bos_embed.shape[0]} (expect 3)  {'OK' if n_ok and s_ok else 'BROKEN'}")
+    oks.append(n_ok and s_ok)
+
+    flat, po = load_data(cfg)
+    codelm0 = model.codelm_for(0)
+    tok0 = R.rgb_byte_pq_fn(flat, codelm0.pq_chunks, codelm0.code_vocab)
+    code0 = R.encode_pardec_downsampler(codelm0, model.downsampler_for(0), tok0, tok0, flat, cfg, po, R.rgb_label_fn_jax,
+                                        4)["code_soft"]
+    lg = lambda m: R.decode_logits_and_target_multipass(m, 0, tok0, code0, 1)[0]
+    base_lg = lg(model)
+    bump = lambda m, j: eqx.tree_at(lambda t: t.codelms[j].own_input_proj, m, m.codelms[j].own_input_proj + 0.5)
+    d_up, d_own = float(jnp.abs(lg(bump(model, 1)) - base_lg).max()), float(jnp.abs(lg(bump(model, 0)) - base_lg).max())
+    ok = d_up > 0 and d_own == 0.0
+    print(f"  upsampler 0 reads CodeLM 1: change from CodeLM 1={d_up:.2e} (>0), from CodeLM 0={d_own:.2e} (0)  "
+          f"{'OK' if ok else 'BROKEN'}")
+    oks.append(ok)
+
+    code_idx = jnp.argmax(code0, -1)
+    gen = R.decode_generate_multipass(model, 0, code_idx, 1, greedy=True)
+    dl = R.decode_logits_and_target_multipass(model, 0, gen, code_idx, 1)[0]
+    mism = int((jnp.argmax(dl, -1) != gen).sum())
+    print(f"  dense-vs-KV decode: mismatches={mism}  {'OK' if mism == 0 else 'DIVERGES'}")
+    oks.append(mism == 0)
+
+    f = lambda m: R.level_forward(m, flat, 2, rng=jax.random.PRNGKey(3), level_gt_drop=1.0,
+                                  cascade_rng=jax.random.PRNGKey(4), label_reg_weight=1.0,
+                                  label_fn=R.rgb_label_fn_jax, pixel_order=po)[0]
+    loss, g = eqx.filter_jit(eqx.filter_value_and_grad(f))(model)
+    g_extra = float(sum(jnp.abs(x).sum() for x in jax.tree_util.tree_leaves(eqx.filter(g.codelms[2], eqx.is_array))))
+    ok = bool(np.isfinite(float(loss))) and g_extra > 0
+    print(f"  e2e: loss={float(loss):.4f} extra CodeLM grad={g_extra:.2e}  {'OK' if ok else 'BROKEN'}")
+    oks.append(ok)
+
+    cfg_f = build_cfg(share_across_levels=False, curriculum_mode="freeze", **base)
+    model_f = R.LagCodecModel(jax.random.PRNGKey(0), cfg_f)
+    trains = []
+    for ph in (1, 2):
+        spec = R.phase_trainable_filter(model_f, ph)
+        on = lambda sub: any(jax.tree_util.tree_leaves(sub))
+        trains.append((tuple(j for j in range(3) if on(spec.codelms[j])),
+                       tuple(j for j in range(2) if on(spec.downsamplers[j]) and on(spec.upsamplers[j]))))
+    ok = trains == [((0, 1), (0,)), ((2,), (1,))]
+    print(f"  freeze trainable (codelms, levels) per phase={trains} (expect [((0, 1), (0,)), ((2,), (1,))])  "
+          f"{'OK' if ok else 'BROKEN'}")
+    oks.append(ok)
+    return all(oks)
+
+
+def run_remat_chunks_check():
+    """downsampler/upsampler_remat_chunks: chunked rows give the same loss and grads as unchunked (chunk counts that
+    don't divide the row count exercise padding; stack slots + refine drafts + recurrent backbone covered), and the
+    compiled step's temp memory drops."""
+    import dataclasses
+    import equinox as eqx
+    print("[remat chunks]")
+    oks = []
+    base = dict(strides=(4, 4), code_vocab=(256, 256), pq_chunks=(3, 3), pq_dim=(16, 16), upsampler_ncodes=(1, 1),
+                downsampler_window=(1, 1), upsampler_window=(1, 1), share_across_levels=False,
+                quantize_mode="reinmax_limit", ctx_stop_gradient="pseudo")
+    cases = [("transformer, remat off", {}),
+             ("transformer, remat on, stack cycles + refine", dict(remat=True, level_cycles=(2, 2), level_cycle_mode="stack",
+                                                                  level_cycle_input="gt", level_refine_passes=(2, 1),
+                                                                  level_refine_window=(1, 0))),
+             ("ssm backbone, remat on", dict(remat=True, codelm_backbone="ssm", downsampler_backbone="ssm",
+                                             upsampler_backbone="ssm"))]
+    for name, over in cases:
+        cfg1 = build_cfg(**base, **over)
+        cfgc = dataclasses.replace(cfg1, downsampler_remat_chunks=(3, 3), upsampler_remat_chunks=(5, 2))
+        flat, po = load_data(cfg1)
+        res = []
+        for cfg in (cfg1, cfgc):
+            model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+            f = lambda m: R.level_forward(m, flat, 2, rng=None, level_gt_drop=1.0, label_reg_weight=1.0,
+                                          label_fn=R.rgb_label_fn_jax, pixel_order=po)[0]
+            step = eqx.filter_jit(eqx.filter_value_and_grad(f))
+            loss, g = step(model)
+            try:
+                mem = step.lower(model).compile().memory_analysis().temp_size_in_bytes
+            except Exception:
+                mem = -1
+            res.append((float(loss), jax.tree_util.tree_leaves(eqx.filter(g, eqx.is_array)), mem))
+        (l1, g1, m1), (lc, gc, mc) = res
+        gerr = max(float(jnp.abs(a - b).max() / jnp.maximum(jnp.abs(a).max(), 1e-6)) for a, b in zip(g1, gc))
+        ok = abs(lc - l1) <= 1e-5 * abs(l1) and gerr < 1e-4
+        print(f"  {name}: loss {l1:.6f} vs chunked {lc:.6f}, max grad rel diff={gerr:.1e}, compiled temp "
+              f"{m1 / 2**20:.1f} -> {mc / 2**20:.1f} MiB  {'OK' if ok else 'DIFF'}")
+        oks.append(ok)
+    return all(oks)
+
+
+def run_reinmax_check():
+    """quantize_reinmax_limit (O(K)) vs quantize_reinmax_limit_dense (slow (K,K) reference): forward code_soft and idx
+    bit-identical, gradient equal up to rounding (with/without rng, quantize_drop, extreme logits); saved residuals
+    shrink from O(K^2) to O(K) per position."""
+    from jax._src.ad_checkpoint import saved_residuals
+    print("[reinmax fast vs dense]")
+    oks = []
+    k = jax.random.split(jax.random.PRNGKey(0), 4)
+    for name, scale, rng, drop in (("normal", 1.0, k[1], 0.0), ("no rng", 1.0, None, 0.0), ("extreme logits", 30.0, k[2], 0.0),
+                                   ("quantize_drop 0.3", 1.0, k[3], 0.3)):
+        lg = jax.random.normal(k[0], (2, 7, 3, 256)) * scale
+        w = jax.random.normal(jax.random.PRNGKey(9), lg.shape)
+        outs = []
+        for fn in (R.quantize_reinmax_limit, R.quantize_reinmax_limit_dense):
+            (cs, idx) = fn(lg, rng, 1.0, drop)
+            g = jax.grad(lambda l: jnp.sum(fn(l, rng, 1.0, drop)[0] * w))(lg)
+            outs.append((cs, idx, g))
+        (c1, i1, g1), (c2, i2, g2) = outs
+        fwd = bool(jnp.array_equal(c1, c2)) and bool(jnp.array_equal(i1, i2))
+        gerr = float(jnp.abs(g1 - g2).max() / jnp.maximum(jnp.abs(g2).max(), 1e-12))
+        ok = fwd and gerr < 1e-5
+        print(f"  {name}: forward bit-identical={fwd}, grad max rel diff={gerr:.1e}  {'OK' if ok else 'DIFF'}")
+        oks.append(ok)
+    lg = jax.random.normal(k[0], (4, 64, 3, 256))
+    mb = lambda fn: sum(int(np.prod(a.shape)) * a.dtype.itemsize for a, _ in
+                        saved_residuals(lambda l: jnp.sum(fn(l, k[1], 1.0, 0.0)[0] * l), lg)) / 2 ** 20
+    fast, dense = mb(R.quantize_reinmax_limit), mb(R.quantize_reinmax_limit_dense)
+    print(f"  saved for backward (4x64x3 positions): fast {fast:.2f} MiB vs dense {dense:.2f} MiB")
+    oks.append(fast < dense / 10)
+    return all(oks)
+
+
 if __name__ == "__main__":
-    results = []
+    checks = []
     for kind in ("gru", "linear_gru", "ssm"):
-        results.append((f"mixer dense-vs-step ({kind})", run_mixer_step_check(kind)))
-    results.append(("pardec refine FIXED (ar)", run_pardec_refine_fixed_check("ar")))
-    results.append(("pardec refine FIXED (linear, window 2)", run_pardec_refine_fixed_check("linear", window=2)))
-    results.append(("pardec refine draft (ar)", run_pardec_refine_check("ar")))
-    results.append(("pardec refine draft (linear, window 2)", run_pardec_refine_check("linear", window=2)))
-    results.append(("encoder_free_run KV-cache (linear)", run_encoder_free_run_kv_check("linear")))
-    results.append(("encoder_free_run KV-cache (ar)", run_encoder_free_run_kv_check("ar")))
-    results.append(("pardec dense-vs-KV-cache (ar)", run_pardec_dense_vs_kv_check("ar")))
-    results.append(("pardec dense-vs-KV-cache (linear)", run_pardec_dense_vs_kv_check("linear")))
+        checks.append((f"mixer dense-vs-step ({kind})", lambda k=kind: run_mixer_step_check(k)))
+    checks += [
+        ("pardec refine FIXED (ar)", lambda: run_pardec_refine_fixed_check("ar")),
+        ("pardec refine FIXED (linear, window 2)", lambda: run_pardec_refine_fixed_check("linear", window=2)),
+        ("pardec refine draft (ar)", lambda: run_pardec_refine_check("ar")),
+        ("pardec refine draft (linear, window 2)", lambda: run_pardec_refine_check("linear", window=2)),
+        ("encoder_free_run KV-cache (linear)", lambda: run_encoder_free_run_kv_check("linear")),
+        ("encoder_free_run KV-cache (ar)", lambda: run_encoder_free_run_kv_check("ar")),
+        ("pardec dense-vs-KV-cache (ar)", lambda: run_pardec_dense_vs_kv_check("ar")),
+        ("pardec dense-vs-KV-cache (linear)", lambda: run_pardec_dense_vs_kv_check("linear")),
+    ]
     for bb in ("gru", "linear_gru", "ssm"):
         bkw = dict(codelm_backbone=bb, downsampler_backbone=bb, upsampler_backbone=bb)
-        results.append((f"encoder_free_run state ({bb})", run_encoder_free_run_kv_check("linear", **bkw)))
-        results.append((f"pardec dense-vs-state ({bb}, ar)", run_pardec_dense_vs_kv_check("ar", **bkw)))
-        results.append((f"pardec refine FIXED ({bb}, linear)", run_pardec_refine_fixed_check("linear", **bkw)))
-        results.append((f"cycle stack slots ({bb})", run_cycle_slot_check("linear", **bkw)))
-    results.append(("cycle stack slots (ar)", run_cycle_slot_check("ar")))
-    results.append(("cycle stack slots (linear, 4 cycles)", run_cycle_slot_check("linear", n_cycles=4)))
+        checks += [
+            (f"encoder_free_run state ({bb})", lambda b=bkw: run_encoder_free_run_kv_check("linear", **b)),
+            (f"pardec dense-vs-state ({bb}, ar)", lambda b=bkw: run_pardec_dense_vs_kv_check("ar", **b)),
+            (f"pardec refine FIXED ({bb}, linear)", lambda b=bkw: run_pardec_refine_fixed_check("linear", **b)),
+            (f"cycle stack slots ({bb})", lambda b=bkw: run_cycle_slot_check("linear", **b)),
+        ]
+    checks += [
+        ("cycle stack slots (ar)", lambda: run_cycle_slot_check("ar")),
+        ("cycle stack slots (linear, 4 cycles)", lambda: run_cycle_slot_check("linear", n_cycles=4)),
+    ]
     for mode in ("memoryless", "stack"):
-        results.append((f"cycle leak ({mode}, ar)", run_cycle_leak_check(mode, "ar")))
-        results.append((f"cycle leak ({mode}, linear)", run_cycle_leak_check(mode, "linear")))
-    results.append(("cycle re-encode train-vs-gen (ar)", run_cycle_reencode_check("ar")))
-    results.append(("cycle re-encode train-vs-gen (linear)", run_cycle_reencode_check("linear")))
-    results.append(("cycle re-encode train-vs-gen (ssm)", run_cycle_reencode_check(
-        "linear", codelm_backbone="ssm", downsampler_backbone="ssm", upsampler_backbone="ssm")))
-    results.append(("cycle end-to-end", run_cycle_e2e_check()))
+        checks += [(f"cycle leak ({mode}, ar)", lambda m=mode: run_cycle_leak_check(m, "ar")),
+                   (f"cycle leak ({mode}, linear)", lambda m=mode: run_cycle_leak_check(m, "linear"))]
+    checks += [
+        ("cycle re-encode train-vs-gen (ar)", lambda: run_cycle_reencode_check("ar")),
+        ("cycle re-encode train-vs-gen (linear)", lambda: run_cycle_reencode_check("linear")),
+        ("cycle re-encode train-vs-gen (ssm)", lambda: run_cycle_reencode_check(
+            "linear", codelm_backbone="ssm", downsampler_backbone="ssm", upsampler_backbone="ssm")),
+        ("cycle end-to-end", run_cycle_e2e_check),
+        ("codelm_upper", run_codelm_upper_check),
+        ("remat chunks", run_remat_chunks_check),
+        ("reinmax fast vs dense", run_reinmax_check),
+    ]
+    only = sys.argv[1:]  # optional: run only the named checks
+    results = [(name, fn()) for name, fn in checks if not only or name in only]
     print()
     for name, ok in results:
         print(f"{name}: {'PASS' if ok else 'FAIL'}")

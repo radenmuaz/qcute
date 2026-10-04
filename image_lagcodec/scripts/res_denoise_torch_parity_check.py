@@ -109,7 +109,7 @@ def check(name, gen_levels=True, phase=2, **over):
     errs = {"loss": rel(float(tl), float(jl))}
     for k, (a, b) in enumerate(zip(taux, jaux)):
         errs[f"aux{k}"] = rel(float(a), float(b))
-    jgrads = jax_to_torch_state(jg)
+    jgrads = jax_to_torch_state(J.tie_shared_grads(jg, jcfg))  # torch shares one Parameter: compare summed grads
     gerr, worst = 0.0, ""
     for n, prm in tm.named_parameters():
         g = prm.grad.numpy() if prm.grad is not None else np.zeros(prm.shape, np.float32)
@@ -150,6 +150,31 @@ def check(name, gen_levels=True, phase=2, **over):
     return ok
 
 
+def check_reinmax():
+    # torch quantize_reinmax_limit (O(K)) vs its dense slow reference, and vs JAX's: forward exact, grads ~1e-6.
+    # rng=None so both frameworks draw idx by argmax (their random streams differ)
+    rs = np.random.RandomState(0)
+    ok = True
+    for scale, drop in ((1.0, 0.0), (30.0, 0.0), (1.0, 0.3)):
+        lg = rs.randn(2, 7, 3, 256).astype(np.float32) * scale
+        w = rs.randn(*lg.shape).astype(np.float32)
+        res = []
+        for fn in (T.quantize_reinmax_limit, T.quantize_reinmax_limit_dense):
+            x = torch.tensor(lg, requires_grad=True)
+            cs, idx = fn(x, None if drop == 0 else T.Key(1), 1.0, drop)
+            (cs * torch.tensor(w)).sum().backward()
+            res.append((cs.detach().numpy(), idx.numpy(), x.grad.numpy()))
+        (c1, i1, g1), (c2, i2, g2) = res
+        jg = np.asarray(jax.grad(lambda l: jnp.sum(J.quantize_reinmax_limit(l, None, 1.0, 0.0)[0] * jnp.array(w)))(jnp.array(lg)))
+        e_dense = float(np.abs(g1 - g2).max() / np.abs(g2).max())
+        e_jax = float(np.abs(g1 - jg).max() / np.abs(jg).max()) if drop == 0 else 0.0
+        this = np.array_equal(c1, c2) and np.array_equal(i1, i2) and e_dense < 1e-5 and e_jax < 1e-5
+        ok &= this
+        print(f"reinmax torch scale={scale} drop={drop}: forward exact={np.array_equal(c1, c2)}, grad vs dense {e_dense:.1e}, "
+              f"vs JAX {e_jax:.1e}  {'OK' if this else 'DIFF'}")
+    return ok
+
+
 if __name__ == "__main__":
     cases = [
         ("transformer ar", {}),
@@ -163,6 +188,7 @@ if __name__ == "__main__":
         ("cycles memoryless pss", dict(level_cycles=2, level_cycle_input="pss")),
         ("cycles stack gt + refine", dict(level_cycles=3, level_cycle_mode="stack", level_cycle_input="gt",
                                           level_refine_passes=2, level_refine_window=1)),
+        ("cycles stack, 1 gen cycle", dict(level_cycles=3, level_cycle_mode="stack", gen_level_cycles=1)),
         ("cycles stack rollout linear", dict(level_cycles=3, level_cycle_mode="stack", pardec_token_head="linear",
                                              codelm_token_head="linear", token_head_type="linears")),
         ("gru backbone", dict(codelm_backbone="gru", downsampler_backbone="gru", upsampler_backbone="gru")),
@@ -173,9 +199,22 @@ if __name__ == "__main__":
         ("mixed backbones", dict(codelm_backbone=("transformer", "ssm"), downsampler_backbone="linear_gru",
                                  upsampler_backbone=("gru", "transformer"))),
         ("context own_embed", dict(context_source="own_embed")),
+        ("remat chunks + codelm_remat", dict(downsampler_remat_chunks=3, upsampler_remat_chunks=(5, 2), remat=True,
+                                             codelm_remat=False, level_refine_passes=2, level_refine_window=1)),
+        ("remat chunks, ssm + stack", dict(downsampler_remat_chunks=2, upsampler_remat_chunks=3, codelm_backbone="ssm",
+                                           upsampler_backbone="ssm", level_cycles=2, level_cycle_mode="stack")),
+        ("shared ds/up LM + shared_embed", dict(share_downsampler_upsampler_lm=True, upsampler_d_model=32,
+                                                upsampler_n_layers=1, upsampler_n_heads=2, upsampler_n_kv_heads=1,
+                                                context_source="shared_embed")),
+        ("codelm_upper unshared + bos + freeze", dict(context_source="codelm_upper", use_codelm_bos=True,
+                                                      codelm_bos_rates=2, curriculum_mode="freeze")),
+        ("codelm_upper shared + stack cycles", dict(context_source="codelm_upper", share_across_levels=True,
+                                                    level_cycles=2, level_cycle_mode="stack", use_codelm_bos=True)),
     ]
     only = sys.argv[1:]
     results = [(n, check(n, **kw)) for n, kw in cases if not only or n in only]
+    if not only or "reinmax" in only:
+        results.append(("reinmax fast vs dense (torch) + vs JAX", check_reinmax()))
     print()
     for n, ok in results:
         print(f"{n}: {'PASS' if ok else 'FAIL'}")

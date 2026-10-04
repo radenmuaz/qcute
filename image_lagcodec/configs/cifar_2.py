@@ -38,8 +38,8 @@ entropy_weight = 0.0
 label_reg_weight = 1.0
 
 label_fn = "rgb_label_fn_jax"
-# bos_rate_mode = "relative"
-bos_rate_mode = "absolute"
+bos_rate_mode = "relative"
+# bos_rate_mode = "absolute"
 strides = (4,4,4,4)
 attn_window = 1024
 upsampler_ncodes = 1
@@ -70,7 +70,7 @@ upsampler_rollout_prob = 0.5
 
 use_codelm_bos = False
 # use_codelm_bos = True
-# codelm_bos_prob = 1.0
+codelm_bos_prob = 1.0
 # curriculum_mode = "freeze"
 curriculum_mode = "no_freeze"
 # level_select_prob = (0.9, 0.8, 0.7, 0.6)  # length n_levels-1=4

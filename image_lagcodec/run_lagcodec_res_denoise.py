@@ -59,8 +59,13 @@ RECURRENT_BACKBONES = ("gru", "linear_gru", "ssm")
 BACKBONES = ("transformer",) + RECURRENT_BACKBONES
 
 
+MODALITIES = ("image", "text", "audio", "binary")
+
+
 def total_bytes_of(cfg) -> int:
-    return cfg.img_size * cfg.img_size * 3
+    if getattr(cfg, "modality", "image") == "image":
+        return cfg.img_size * cfg.img_size * 3
+    return cfg.seq_len * cfg.byte_group
 
 
 def cycle_stack_slots(cfg, i: int) -> int:
@@ -78,12 +83,19 @@ def n_blocks_for_level(cfg, j: int) -> int:
 @dataclass
 class Config:
     img_size: int = 32
+    # data: image (img_size^2 RGB pixels) | text | audio | binary (1D: seq_len positions of byte_group bytes,
+    # traversal "raster"). dataset="folder" reads every file under data_root (see load_folder)
+    modality: str = "image"
+    seq_len: int = 4096
+    audio_sample_rate: int = 16000
+    audio_encoding: str = "mulaw8"  # mulaw8 (byte_group 1) | pcm16 (byte_group 2: high, low byte)
     # Each of CodeLM/Downsampler/Upsampler is fully independent: its own dedicated fields, own
     # defaults, no fallback chain to a shared "base" field and no override-of-a-generic-field
     # pattern. codelm_* feeds CodeLM only.
     codelm_d_model: tuple = (256, 256, 256, 256)
     codelm_n_layers: tuple = (2, 2, 2, 2)
     codelm_n_heads: tuple = (4, 4, 4, 4)
+    codelm_remat: tuple = None  # per level, None falls back to cfg.remat (like downsampler/upsampler_remat)
     codelm_n_kv_heads: tuple = (None, None, None, None)  # None per-level entry -> defaults to
     # max(1, codelm_n_heads//4) for that level (resolved below) -- within-module default, not a
     # cross-module fallback.
@@ -96,6 +108,10 @@ class Config:
     # test (unbounded OOM'd even at tiny sizes)
     downsampler_decode_past: tuple = 0   # downsampler's OWN decode_past/decode_future/remat --
     downsampler_decode_future: tuple = 0  # independent of the upsampler's, own direct defaults
+    # rows (groups) never attend to each other: >1 runs the pardec stack over that many row chunks one after
+    # another, each rematerialized in backward (peak activations ~1/chunks). 1 = off (default)
+    downsampler_remat_chunks: tuple = 1
+    upsampler_remat_chunks: tuple = 1
     downsampler_remat: tuple = None  # (0/0), no fallback chain -- None (default) for
     # downsampler_remat falls back to cfg.remat (remat granularity has no natural own-module default)
     downsampler_ncodes: tuple = 1  # batching granularity for the downsampler's OWN pardec_score/
@@ -379,6 +395,7 @@ class Config:
         bcast("codelm_n_layers", int)
         bcast("codelm_n_heads", int)
         bcast_opt("codelm_n_kv_heads", int)
+        bcast_opt("codelm_remat", bool)
         bcast("downsampler_d_model", int)
         bcast("downsampler_n_layers", int)
         bcast("downsampler_n_heads", int)
@@ -388,6 +405,8 @@ class Config:
         bcast("downsampler_decode_future", int)
         bcast("downsampler_ncodes", int)
         bcast_opt("downsampler_remat", bool)
+        bcast("downsampler_remat_chunks", int)
+        bcast("upsampler_remat_chunks", int)
         bcast("upsampler_d_model", int)
         bcast("upsampler_n_layers", int)
         bcast("upsampler_n_heads", int)
@@ -510,6 +529,7 @@ class Config:
                 "downsampler_window", "downsampler_decode_past", "downsampler_decode_future", "downsampler_remat",
                 "upsampler_d_model", "upsampler_n_layers", "upsampler_n_heads", "upsampler_n_kv_heads",
                 "upsampler_window", "upsampler_decode_past", "upsampler_decode_future", "upsampler_remat",
+                "downsampler_remat_chunks", "upsampler_remat_chunks", "codelm_remat",
                 "token_dim", "token_n_heads", "token_head_type", "byte_group",
                 "codelm_backbone", "downsampler_backbone", "upsampler_backbone",
             )
@@ -528,7 +548,16 @@ class Config:
                     f"level {i} uses token_head_type={self.token_head_type[i]!r} but token_dim/" \
                     f"token_n_heads only has {len(self.token_dim)} entries -- set one per level"
                 assert self.token_dim[i] % self.token_n_heads[i] == 0
-        assert self.byte_group in (1, 3), "byte_group must be 1 (per-byte) or 3 (per-pixel RGB)"
+        assert self.modality in MODALITIES, self.modality
+        if self.modality == "image":
+            assert self.byte_group in (1, 3), "byte_group must be 1 (per-byte) or 3 (per-pixel RGB)"
+        else:
+            assert self.traversal == "raster", f"modality={self.modality} is 1D: traversal must be 'raster'"
+            assert self.byte_group >= 1 and self.seq_len >= 1
+            assert self.audio_encoding in ("mulaw8", "pcm16"), self.audio_encoding
+            if self.modality == "audio":
+                need = 2 if self.audio_encoding == "pcm16" else 1
+                assert self.byte_group == need, f"audio_encoding={self.audio_encoding} needs byte_group={need}"
         assert total_bytes_of(self) % self.byte_group == 0
         assert self.traversal in ("raster", "zorder")
         assert self.bos_rate_mode in ("relative", "absolute")
@@ -620,6 +649,10 @@ class Config:
             assert self.downsampler_backbone == self.upsampler_backbone, \
                 "share_downsampler_upsampler_lm needs downsampler_backbone == upsampler_backbone"
         assert self.ssm_state_dim >= 1, self.ssm_state_dim
+        assert len(self.downsampler_remat_chunks) == n and len(self.upsampler_remat_chunks) == n \
+            and len(self.codelm_remat) == n
+        assert all(c >= 1 for c in self.downsampler_remat_chunks + self.upsampler_remat_chunks), \
+            (self.downsampler_remat_chunks, self.upsampler_remat_chunks)
         assert self.init_scheme in ("llama", "zero")
         resolved_kv = []
         for i in range(n):
@@ -658,6 +691,8 @@ def zorder_pixel_order(img_size: int) -> np.ndarray:
 
 
 def pixel_order_for(cfg: Config) -> np.ndarray:
+    if cfg.modality != "image":
+        return np.arange(n_positions_of(cfg))
     if cfg.traversal == "raster":
         return np.arange(cfg.img_size * cfg.img_size)
     return zorder_pixel_order(cfg.img_size)
@@ -716,8 +751,11 @@ def load_imagenet64(data_root: Path, resolution: int = 64) -> tuple:
     return load_imagenet(data_root, resolution)
 
 
-def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards: int = None) -> tuple:
+def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards: int = None, cfg=None) -> tuple:
     # train_shards: only load the first N imagenet train shards (off-training scripts need a few images, not 15GB)
+    if name == "folder":
+        assert cfg is not None, "dataset='folder' needs the Config (modality/seq_len/...)"
+        return load_folder(data_root, cfg)
     if name == "cifar":
         res = 32
     else:
@@ -734,6 +772,8 @@ def dataset_from_config(cv: dict, repo_root: Path, train_shards: int = 1) -> tup
 
 def images_to_positions(images: np.ndarray, cfg: Config, pixel_order: np.ndarray) -> np.ndarray:
     n = images.shape[0]
+    if cfg.modality != "image":  # samples are already (n, seq_len, byte_group) sequences
+        return images.reshape(n, n_positions_of(cfg), cfg.byte_group).astype(np.int32)
     pix = images.reshape(n, cfg.img_size * cfg.img_size, 3)[:, pixel_order, :]
     if cfg.byte_group == 3:
         return pix.astype(np.int32)
@@ -742,10 +782,169 @@ def images_to_positions(images: np.ndarray, cfg: Config, pixel_order: np.ndarray
 
 def positions_to_image(positions: np.ndarray, cfg: Config, pixel_order: np.ndarray) -> np.ndarray:
     B = positions.shape[0]
+    if cfg.modality != "image":
+        return positions.reshape(B, n_positions_of(cfg), cfg.byte_group).astype(np.uint8)
     pix_traversal = positions.reshape(B, cfg.img_size * cfg.img_size, 3)
     raster = np.zeros_like(pix_traversal)
     raster[:, pixel_order, :] = pix_traversal
     return raster.reshape(B, cfg.img_size, cfg.img_size, 3).astype(np.uint8)
+
+
+def mulaw_encode(x: np.ndarray, mu: int = 255) -> np.ndarray:
+    # float waveform in [-1, 1] -> uint8 (8-bit mu-law)
+    y = np.sign(x) * np.log1p(mu * np.abs(np.clip(x, -1, 1))) / np.log1p(mu)
+    return np.clip(np.round((y + 1) / 2 * mu), 0, mu).astype(np.uint8)
+
+
+def mulaw_decode(b: np.ndarray, mu: int = 255) -> np.ndarray:
+    y = 2 * (b.astype(np.float64) / mu) - 1
+    return (np.sign(y) * np.expm1(np.abs(y) * np.log1p(mu)) / mu).astype(np.float32)
+
+
+def audio_to_bytes(x: np.ndarray, encoding: str) -> np.ndarray:
+    # float waveform (T,) -> (T, byte_group) uint8: mulaw8 -> 1 byte, pcm16 -> (high, low) of offset binary
+    if encoding == "mulaw8":
+        return mulaw_encode(x)[:, None]
+    u = np.clip(np.round(x * 32767), -32768, 32767).astype(np.int32) + 32768
+    return np.stack([u >> 8, u & 255], axis=-1).astype(np.uint8)
+
+
+def bytes_to_audio(b: np.ndarray, encoding: str) -> np.ndarray:
+    # (..., byte_group) bytes -> float waveform (...)
+    if encoding == "mulaw8":
+        return mulaw_decode(b[..., 0])
+    u = b[..., 0].astype(np.int32) * 256 + b[..., 1].astype(np.int32)
+    return ((u - 32768) / 32768.0).astype(np.float32)
+
+
+def resample_audio(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    # band-limited (anti-aliased) resampling: scipy polyphase if available, else windowed-sinc low-pass + interp
+    if sr_in == sr_out:
+        return x.astype(np.float32)
+    g = math.gcd(sr_in, sr_out)
+    try:
+        from scipy.signal import resample_poly
+        return resample_poly(x, sr_out // g, sr_in // g).astype(np.float32)
+    except ImportError:
+        pass
+    if sr_out < sr_in:
+        fc = 0.5 * sr_out / sr_in
+        n = np.arange(-32, 33)
+        h = 2 * fc * np.sinc(2 * fc * n) * np.hamming(len(n))
+        x = np.convolve(x, h / h.sum(), mode="same")
+    t_out = np.arange(int(len(x) * sr_out / sr_in)) * (sr_in / sr_out)
+    return np.interp(t_out, np.arange(len(x)), x).astype(np.float32)
+
+
+def load_audio_file(path: Path, sr: int) -> np.ndarray:
+    # any format soundfile reads (wav/flac/ogg/...), else stdlib wave (PCM wav) -> mono float32 at `sr`
+    try:
+        import soundfile
+        data, rate = soundfile.read(str(path), dtype="float32", always_2d=True)
+    except Exception:
+        import wave
+        with wave.open(str(path), "rb") as w:
+            rate, width, ch = w.getframerate(), w.getsampwidth(), w.getnchannels()
+            raw = np.frombuffer(w.readframes(w.getnframes()), dtype={1: np.uint8, 2: np.int16, 4: np.int32}[width])
+        data = raw.reshape(-1, ch).astype(np.float32)
+        data = (data - 128) / 128 if width == 1 else data / float(2 ** (8 * width - 1))
+    return resample_audio(data.mean(axis=1), rate, sr)
+
+
+def _folder_files(root: Path) -> list:
+    return sorted(f for f in root.rglob("*") if f.is_file() and not f.name.startswith("."))
+
+
+def _folder_split(root: Path) -> tuple:
+    # train/ + val/ (or validation/, test/) subfolders if present, else every 20th file is val; fewer than 20
+    # files -> (files, None): the concatenated stream is split instead (images: last image reused as val)
+    for val_name in ("val", "validation", "test"):
+        if (root / "train").is_dir() and (root / val_name).is_dir():
+            return _folder_files(root / "train"), _folder_files(root / val_name)
+    files = _folder_files(root)
+    if len(files) < 20:
+        return files, None
+    val = files[::20]
+    return [f for f in files if f not in set(val)], val
+
+
+def _seq_windows(stream: np.ndarray, seq_len: int) -> np.ndarray:
+    n = len(stream) // seq_len
+    return stream[:n * seq_len].reshape(n, seq_len, stream.shape[-1])
+
+
+def _seq_stream(files: list, cfg) -> np.ndarray:
+    # (T, byte_group) uint8: text/binary raw bytes (text files joined by newline), audio decoded + re-encoded
+    if cfg.modality == "audio":
+        parts = [audio_to_bytes(load_audio_file(f, cfg.audio_sample_rate), cfg.audio_encoding) for f in files]
+        return np.concatenate(parts) if parts else np.zeros((0, cfg.byte_group), np.uint8)
+    data = (b"\n" if cfg.modality == "text" else b"").join(f.read_bytes() for f in files)
+    n = len(data) // cfg.byte_group * cfg.byte_group
+    return np.frombuffer(data[:n], dtype=np.uint8).reshape(-1, cfg.byte_group)
+
+
+def _load_image_file(path: Path, size: int):
+    # any PIL-readable image -> RGB, shorter side resized to `size`, center crop; None if unreadable
+    from PIL import Image
+    try:
+        im = Image.open(path).convert("RGB")
+    except Exception:
+        return None
+    w, h = im.size
+    s = size / min(w, h)
+    im = im.resize((max(size, round(w * s)), max(size, round(h * s))), Image.BICUBIC)
+    w, h = im.size
+    left, top = (w - size) // 2, (h - size) // 2
+    return np.asarray(im.crop((left, top, left + size, top + size)), dtype=np.uint8)
+
+
+def load_folder(data_root: Path, cfg) -> tuple:
+    # dataset="folder": every file under data_root, per cfg.modality -> ((train, labels), (val, labels));
+    # images (n, img_size, img_size, 3), sequences (n, seq_len, byte_group) non-overlapping windows
+    train_files, val_files = _folder_split(data_root)
+    if cfg.modality == "image":
+        load = lambda fs: np.stack([a for a in (_load_image_file(f, cfg.img_size) for f in fs) if a is not None])
+        train = load(train_files)
+        val = load(val_files) if val_files else train[-1:]
+    elif val_files is None:
+        stream = _seq_stream(train_files, cfg)
+        n_val = max(cfg.seq_len, len(stream) // 20)
+        train, val = _seq_windows(stream[:-n_val], cfg.seq_len), _seq_windows(stream[-n_val:], cfg.seq_len)
+    else:
+        train = _seq_windows(_seq_stream(train_files, cfg), cfg.seq_len)
+        val = _seq_windows(_seq_stream(val_files, cfg), cfg.seq_len)
+    assert len(train) and len(val), \
+        f"folder dataset {data_root}: no {cfg.modality} samples (train={len(train)}, val={len(val)}, seq_len={cfg.seq_len})"
+    return (train, np.zeros(len(train), np.int32)), (val, np.zeros(len(val), np.int32))
+
+
+def save_samples(gen: np.ndarray, gt: np.ndarray, path: Path, cfg) -> None:
+    # image: side-by-side PNG grid; text: one .txt; audio: <stem>_<i>_{gen,gt}.wav; binary: .bin + hex preview
+    if cfg.modality == "image":
+        return save_compare_grid(gen, gt, path)
+    stem = path.with_suffix("")
+    if cfg.modality == "audio":
+        import wave
+        for i in range(gen.shape[0]):
+            for name, arr in (("gen", gen[i]), ("gt", gt[i])):
+                pcm = (np.clip(bytes_to_audio(arr.astype(np.uint8), cfg.audio_encoding), -1, 1) * 32767).astype(np.int16)
+                with wave.open(f"{stem}_{i}_{name}.wav", "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(cfg.audio_sample_rate)
+                    w.writeframes(pcm.tobytes())
+        return
+    lines = []
+    for i in range(gen.shape[0]):
+        g, t = gen[i].astype(np.uint8).tobytes(), gt[i].astype(np.uint8).tobytes()
+        if cfg.modality == "text":
+            lines += [f"=== sample {i} generated ===", g.decode("utf-8", "replace"),
+                      f"=== sample {i} ground truth ===", t.decode("utf-8", "replace")]
+        else:
+            Path(f"{stem}_{i}_gen.bin").write_bytes(g)
+            lines += [f"=== sample {i} generated (hex, first 256 B) ===", g[:256].hex(" "),
+                      f"=== sample {i} ground truth (hex, first 256 B) ===", t[:256].hex(" ")]
+    Path(f"{stem}.txt").write_text("\n".join(lines) + "\n")
 
 
 def byte_to_pq_idx_jax(byte_vals: jnp.ndarray, pq_chunks: int, code_vocab: int) -> jnp.ndarray:
@@ -814,57 +1013,92 @@ def rgb_label_fn_jax(flat_bytes: jnp.ndarray, cfg: Config, pixel_order: np.ndarr
     return jnp.round(jnp.clip(flat_rgb, 0, 255)).astype(jnp.int32)
 
 
-# ---------------------------------------------------------------------------
-# TODO(modality-generalization): everything below is a STUB, not wired into main()/Config/
-# load_dataset/label_fn_registry -- CodeLM/Downsampler/Upsampler only ever see (pq_chunks,
-# code_vocab)-shaped tokens and don't know or care what modality produced them, so extending
-# beyond images only needs new load_fn/label_fn/byte_pq_fn implementations (the existing
-# label_fn/byte_pq_fn hooks, already string-registry-resolved in main()) plus a `modality: str`
-# Config field bundling {load_fn, pixel_order_fn, label_fn default, byte_pq_fn default} together
-# so e.g. --dataset text doesn't also require manually wiring 3 unrelated flags. traversal="raster"
-# always for both (text/audio are already 1D sequential -- no z-order locality to exploit, and the
-# zorder power-of-4-stride assert doesn't meaningfully apply to non-spatial data).
-# ---------------------------------------------------------------------------
-
-def load_text(data_root: Path) -> tuple:
-    # TODO: raw UTF-8 byte stream loader (byte_group=1, code_vocab=256, pq_chunks=1) -- mirrors
-    # load_cifar10's (train, val) tuple-of-(data, labels) shape, labels can be dummy/unused.
-    raise NotImplementedError("load_text: TODO, see modality-generalization stub section")
+def _block_reduce_jax(x: jnp.ndarray, n_blocks: int, method: str) -> jnp.ndarray:
+    # (M, L, C) -> (M, n_blocks, C): mean over each code's stride window, or linear interp at its center
+    M, L, C = x.shape
+    K = L // n_blocks
+    blocks = x[:, :n_blocks * K].reshape(M, n_blocks, K, C)
+    if method == "mean":
+        return blocks.mean(axis=2)
+    return (blocks[:, :, (K - 1) // 2] + blocks[:, :, K // 2]) / 2
 
 
-def load_audio(data_root: Path, sample_rate: int = 16000, bit_depth: int = 16) -> tuple:
-    # TODO: raw PCM byte stream loader (byte_group=2 for 16-bit samples, or mu-law-compress to
-    # 8-bit first and treat as byte_group=1 like text -- avoids a 65536-wide softmax head).
-    raise NotImplementedError("load_audio: TODO, see modality-generalization stub section")
+def _bytes_to_digits_jax(vals: jnp.ndarray, pq_chunks: int, code_vocab: int) -> jnp.ndarray:
+    # (M, n, C) byte values -> (M, n, pq_chunks): one digit per channel when they line up (C == pq_chunks,
+    # code_vocab 256), else the channel mean bit-packed like default_label_fn_jax
+    if vals.shape[-1] == pq_chunks and code_vocab == 256:
+        return jnp.round(jnp.clip(vals, 0, 255)).astype(jnp.int32)
+    return byte_to_pq_idx_jax(jnp.round(jnp.clip(vals.mean(-1), 0, 255)).astype(jnp.int32), pq_chunks, code_vocab)
 
 
-def bpe_label_fn(flat_bytes: jnp.ndarray, cfg: Config, pixel_order, n_blocks: int,
-                  pq_chunks: int, code_vocab: int, bpe_merge_table=None) -> jnp.ndarray:
-    # TODO: text's label_fn analogue to rgb_label_fn_jax -- for a K-byte (or K-token) block at this
-    # level, look up which BPE merge rule it resolves to under bpe_merge_table and return that
-    # merge's token id as the real, deterministic supervised target (same "teacher-forced
-    # classification against a real target" shape encode_pardec_downsampler already expects, no
-    # architecture change needed). "BPE of BPE" for higher levels falls out of the existing level
-    # structure for free: level0's bpe_merge_table merges raw UTF-8 BYTES into byte-level BPE
-    # tokens; level1's own (separate) bpe_merge_table merges the LEVEL-0 TOKEN STREAM (not raw
-    # bytes) into super-tokens, i.e. each level just needs its own merge table/vocab, exactly like
-    # pq_chunks/code_vocab are already per-run constants today -- would need the singleton
-    # uniform-across-levels assert relaxed for target vocab size specifically (not model weights,
-    # which stay shared/uniform regardless of what vocab the target happens to use per level).
-    raise NotImplementedError("bpe_label_fn: TODO, see modality-generalization stub section")
+def byte_mean_label_fn_jax(flat_bytes: jnp.ndarray, cfg: Config, pixel_order, n_blocks: int, pq_chunks: int,
+                           code_vocab: int) -> jnp.ndarray:
+    # text/binary label: each code's target = mean of the bytes in its stride window
+    return _bytes_to_digits_jax(_block_reduce_jax(flat_bytes.astype(jnp.float32), n_blocks, "mean"), pq_chunks,
+                                code_vocab)
 
 
-def resample_label_fn(flat_bytes: jnp.ndarray, cfg: Config, pixel_order, n_blocks: int,
-                       pq_chunks: int, code_vocab: int) -> jnp.ndarray:
-    # TODO: audio's label_fn analogue -- unlike images' "pick position K-1"/pooled-resize target,
-    # naive strided downsampling of a waveform aliases (and can shift perceived pitch), so this
-    # MUST run a real anti-aliasing low-pass filter before decimating (e.g.
-    # scipy.signal.resample_poly(wave, up=1, down=K), computed once CPU-side per level, same timing
-    # as images_to_positions today) then requantize the band-limited result back to bytes as the
-    # real target. Correct polyphase resampling preserves pitch by construction -- pitch-shifting is
-    # exactly the artifact that naive strided/nearest-neighbor downsampling introduces, not a
-    # separate concern to solve on top.
-    raise NotImplementedError("resample_label_fn: TODO, see modality-generalization stub section")
+def byte_interp_label_fn_jax(flat_bytes: jnp.ndarray, cfg: Config, pixel_order, n_blocks: int, pq_chunks: int,
+                             code_vocab: int) -> jnp.ndarray:
+    # text/binary label: bytes linearly interpolated at each stride window's center
+    return _bytes_to_digits_jax(_block_reduce_jax(flat_bytes.astype(jnp.float32), n_blocks, "interp"), pq_chunks,
+                                code_vocab)
+
+
+def bytes_to_audio_jax(b: jnp.ndarray, encoding: str) -> jnp.ndarray:
+    if encoding == "mulaw8":
+        y = 2 * (b[..., 0].astype(jnp.float32) / 255) - 1
+        return jnp.sign(y) * jnp.expm1(jnp.abs(y) * jnp.log1p(255.0)) / 255
+    return (b[..., 0].astype(jnp.int32) * 256 + b[..., 1].astype(jnp.int32) - 32768).astype(jnp.float32) / 32768.0
+
+
+def audio_to_bytes_jax(x: jnp.ndarray, encoding: str) -> jnp.ndarray:
+    if encoding == "mulaw8":
+        y = jnp.sign(x) * jnp.log1p(255 * jnp.abs(jnp.clip(x, -1, 1))) / jnp.log1p(255.0)
+        return jnp.clip(jnp.round((y + 1) / 2 * 255), 0, 255)[..., None]
+    u = jnp.clip(jnp.round(x * 32767), -32768, 32767).astype(jnp.int32) + 32768
+    return jnp.stack([u >> 8, u & 255], axis=-1).astype(jnp.float32)
+
+
+def sinc_lowpass(factor: int) -> np.ndarray:
+    # windowed-sinc FIR, cutoff at the decimated Nyquist (0.5/factor), unit DC gain
+    n = np.arange(-4 * factor, 4 * factor + 1)
+    h = np.sinc(n / factor) * np.hamming(len(n))
+    return (h / h.sum()).astype(np.float32)
+
+
+def audio_resample_label_fn_jax(flat_bytes: jnp.ndarray, cfg: Config, pixel_order, n_blocks: int, pq_chunks: int,
+                                code_vocab: int) -> jnp.ndarray:
+    # audio label: decode the waveform, anti-alias low-pass + decimate to each code's stride-window center
+    # (integer factor = positions per code), re-encode with cfg.audio_encoding
+    M, L, _ = flat_bytes.shape
+    K = L // n_blocks
+    wave_ = bytes_to_audio_jax(flat_bytes, cfg.audio_encoding)
+    if K > 1:
+        h = jnp.asarray(sinc_lowpass(K))
+        wave_ = jax.vmap(lambda w: jnp.convolve(w, h, mode="same"))(wave_)
+    centers = wave_[:, :n_blocks * K].reshape(M, n_blocks, K)[:, :, K // 2]
+    return _bytes_to_digits_jax(audio_to_bytes_jax(centers, cfg.audio_encoding), pq_chunks, code_vocab)
+
+
+class HierarchicalBPE:
+    # STUB: sentencepiece-style BPE per level (level 0: bytes/letters -> V0, level l: level-(l-1) ids -> V_l);
+    # a code's level-l label = the token covering its block center. fit() learns merges, encode() -> ids.
+    def __init__(self, vocab_sizes: tuple):
+        self.vocab_sizes = tuple(vocab_sizes)
+        self.merges = [[] for _ in self.vocab_sizes]  # per level: [(left_id, right_id, new_id), ...]
+
+    def fit(self, stream: np.ndarray) -> "HierarchicalBPE":
+        raise NotImplementedError("HierarchicalBPE.fit: stub")
+
+    def encode(self, stream: np.ndarray, level: int) -> np.ndarray:
+        raise NotImplementedError("HierarchicalBPE.encode: stub")
+
+
+def bpe_label_fn_jax(flat_bytes: jnp.ndarray, cfg: Config, pixel_order, n_blocks: int, pq_chunks: int,
+                     code_vocab: int, bpe: HierarchicalBPE = None) -> jnp.ndarray:
+    # STUB: label = HierarchicalBPE token at each code block's center, bit-packed into (pq_chunks, code_vocab)
+    raise NotImplementedError("bpe_label_fn: stub, see HierarchicalBPE")
 
 
 def default_label_fn_pil(images: np.ndarray, cfg: Config, pixel_order: np.ndarray, n_blocks: int,
@@ -890,6 +1124,29 @@ def default_label_fn_pil(images: np.ndarray, cfg: Config, pixel_order: np.ndarra
     shifted = byte_vals >> (8 - total_bits) if total_bits <= 8 else byte_vals << (total_bits - 8)
     chunks = [(shifted >> ((pq_chunks - 1 - c) * bits_per_chunk)) & (code_vocab - 1) for c in range(pq_chunks)]
     return np.stack(chunks, axis=-1)
+
+
+LABEL_FNS = {"default_label_fn_jax": default_label_fn_jax, "rgb_label_fn_jax": rgb_label_fn_jax,
+             "default_label_fn_pil": default_label_fn_pil, "byte_mean_label_fn": byte_mean_label_fn_jax,
+             "byte_interp_label_fn": byte_interp_label_fn_jax, "audio_resample_label_fn": audio_resample_label_fn_jax,
+             "bpe_label_fn": bpe_label_fn_jax}
+DEFAULT_LABEL_FN = {"image": "default_label_fn_jax", "text": "byte_mean_label_fn", "binary": "byte_mean_label_fn",
+                    "audio": "audio_resample_label_fn"}
+
+
+def resolve_label_fn(spec, modality: str):
+    # config `label_fn`: None (modality default) | a LABEL_FNS name | "package.module:function" | a callable;
+    # signature fn(flat_bytes, cfg, pixel_order, n_blocks, pq_chunks, code_vocab) -> (M, n_blocks, pq_chunks)
+    if spec is None:
+        spec = DEFAULT_LABEL_FN[modality]
+    if callable(spec):
+        return spec
+    if spec in LABEL_FNS:
+        return LABEL_FNS[spec]
+    assert ":" in spec, f"unknown label_fn {spec!r}: use one of {sorted(LABEL_FNS)} or 'package.module:function'"
+    import importlib
+    mod, fn = spec.split(":", 1)
+    return getattr(importlib.import_module(mod), fn)
 
 
 class BatchIterator:
@@ -1003,6 +1260,34 @@ def quantize_zgr(logits: jnp.ndarray, rng, tau: float = 1.0, quantize_drop: floa
 
 
 def quantize_reinmax_limit(logits: jnp.ndarray, rng, tau: float = 1.0, quantize_drop: float = 0.0) -> tuple:
+    # reinmax_limit without the (K,K) matrix: S @ logits = logits/(2K) + col*(y.logits)/(2K) - sum(logits)/(2K^2)
+    # with col, y stop-gradient -- same forward (y) and Jacobian (S) as quantize_reinmax_limit_dense, O(K) memory
+    del tau
+    K = logits.shape[-1]
+    p = jax.nn.softmax(logits, axis=-1)
+    if rng is not None:
+        rng, drop_rng = jax.random.split(rng)
+        u = jax.random.uniform(rng, logits.shape, minval=1e-8, maxval=1.0 - 1e-8)
+        idx = safe_argmax(logits - jnp.log(-jnp.log(u)))
+    else:
+        drop_rng = None
+        idx = safe_argmax(p)
+    y = jax.nn.one_hot(idx, K, dtype=p.dtype)
+    p_x = jnp.maximum(jnp.sum(p * y, axis=-1, keepdims=True), 1e-8)
+    col = jax.lax.stop_gradient((y - p) / p_x)
+    dx = (logits + col * jnp.sum(y * logits, axis=-1, keepdims=True)) / (2 * K) \
+        - jnp.sum(logits, axis=-1, keepdims=True) / (2 * K * K)
+    st = y + (dx - jax.lax.stop_gradient(dx))
+    if quantize_drop > 0 and drop_rng is not None:
+        drop = jax.random.bernoulli(drop_rng, p=quantize_drop, shape=p.shape[:-1])[..., None]
+        code_soft = jnp.where(drop, p, st)
+    else:
+        code_soft = st
+    return code_soft, idx
+
+
+def quantize_reinmax_limit_dense(logits: jnp.ndarray, rng, tau: float = 1.0, quantize_drop: float = 0.0) -> tuple:
+    # slow reference for quantize_reinmax_limit (correctness checks only): materializes S per digit position.
     # reinmax_limit: closed-form asymptotic limit of the MVE estimator (no Cholesky/lstsq solve --
     # see github.com/James-Hooper123/Generalized-and-Optimal-Straight-Through-Estimators). Builds the
     # (K,K) surrogate matrix S directly via a rank-1 correction instead of solving a linear system --
@@ -1269,6 +1554,22 @@ def dense_self_attention_pardec(attn: Attention, x: jnp.ndarray, rope_pos_ids: j
         y = apply_xsa(y, v)
     y = y.transpose(0, 2, 1, 3).reshape(Bc, T, D)
     return y @ attn.out
+
+
+def remat_row_chunks(fn, rows: jnp.ndarray, rope_pos_ids: jnp.ndarray, key_valid: jnp.ndarray,
+                     n_chunks: int) -> jnp.ndarray:
+    # pardec rows are independent groups: fn over n_chunks row chunks in sequence (lax.map), each under
+    # jax.checkpoint -- backward keeps only chunk inputs. Rows padded to a multiple of n_chunks, then dropped.
+    B2 = rows.shape[0]
+    per = -(-B2 // n_chunks)
+    pad = per * n_chunks - B2
+    if pad:
+        rows = jnp.pad(rows, ((0, pad), (0, 0), (0, 0)))
+        rope_pos_ids = jnp.pad(rope_pos_ids, ((0, pad), (0, 0)))
+        key_valid = jnp.pad(key_valid, ((0, pad), (0, 0)), constant_values=True)
+    split = lambda a: a.reshape((n_chunks, per) + a.shape[1:])
+    out = jax.lax.map(jax.checkpoint(lambda a: fn(*a)), (split(rows), split(rope_pos_ids), split(key_valid)))
+    return out.reshape((n_chunks * per,) + out.shape[2:])[:B2]
 
 
 def run_block_pardec(blk: Block, x: jnp.ndarray, rope_pos_ids: jnp.ndarray, key_valid: jnp.ndarray,
@@ -1563,6 +1864,7 @@ class PardecLM(eqx.Module):
     # AFTER each group's own target span, scored separately as a widened-lookahead NTP aux signal
     # (see pardec_score) -- 0 = off
     remat: bool = eqx.field(static=True)
+    remat_chunks: int = eqx.field(static=True)  # see Config.upsampler_remat_chunks
     token_head: str = eqx.field(static=True)  # "ar" | "linear", see Config.pardec_token_head
 
     def __init__(self, key, context_hidden_dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int,
@@ -1575,7 +1877,7 @@ class PardecLM(eqx.Module):
                  ctx_vocab: int = None, ctx_pq_chunks: int = None, ctx_pq_dim: int = None,
                  shared_ctx_embed: jnp.ndarray = None, shared_ctx_proj: jnp.ndarray = None,
                  token_head: str = "ar", backbone: str = "transformer", state_dim: int = 16,
-                 cycle_slots: int = 0):
+                 cycle_slots: int = 0, remat_chunks: int = 1):
         # shared_blocks/shared_ln_f (both None by default): when given, REUSE these instead of
         # building a fresh transformer stack -- the LM weight-sharing option (see
         # cfg.share_downsampler_upsampler_lm): downsampler and upsampler can share the SAME
@@ -1621,6 +1923,7 @@ class PardecLM(eqx.Module):
         self.token_dim, self.token_n_heads = token_dim, token_n_heads
         self.decode_past, self.decode_future = decode_past, decode_future
         self.remat = remat
+        self.remat_chunks = remat_chunks
         self.token_head = token_head
         if shared_ctx_embed is not None:
             self.own_ctx_embed, self.own_ctx_proj = shared_ctx_embed, shared_ctx_proj
@@ -1781,12 +2084,19 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
     rope_pos_ids_g = jnp.concatenate([rope_ids, rope_bos, rope_target], axis=1)
     rope_pos_ids = jnp.broadcast_to(rope_pos_ids_g[None], (batch, n_groups, per_group_len)).reshape(batch * n_groups, per_group_len)
 
-    def run_stack(x):
-        for blk in pardec.blocks:
-            x = run_block_pardec(blk, x, rope_pos_ids, key_valid, pardec.remat)
-        return x
-    hidden = jax.checkpoint(run_stack)(row_flat) if pardec.remat else run_stack(row_flat)
-    hidden = pardec.ln_f(hidden)
+    if pardec.remat_chunks > 1:
+        def chunk_stack(x, rp, kv):
+            for blk in pardec.blocks:
+                x = run_block_pardec(blk, x, rp, kv, pardec.remat)
+            return pardec.ln_f(x)
+        hidden = remat_row_chunks(chunk_stack, row_flat, rope_pos_ids, key_valid, pardec.remat_chunks)
+    else:
+        def run_stack(x):
+            for blk in pardec.blocks:
+                x = run_block_pardec(blk, x, rope_pos_ids, key_valid, pardec.remat)
+            return x
+        hidden = jax.checkpoint(run_stack)(row_flat) if pardec.remat else run_stack(row_flat)
+        hidden = pardec.ln_f(hidden)
     prediction_positions = window_size + slot_len + decode_past + jnp.arange(target_len_per_group)
     predicted_hidden = hidden[:, prediction_positions, :]
     predicted_hidden = predicted_hidden.reshape(batch, n_groups * target_len_per_group, hidden_dim)
@@ -2098,7 +2408,7 @@ class CodeLM(eqx.Module):
         n_layers_enc = cfg.codelm_n_layers[level_idx]
         n_heads_enc = cfg.codelm_n_heads[level_idx]
         n_kv_heads_enc = cfg.codelm_n_kv_heads[level_idx]
-        self.remat = cfg.remat
+        self.remat = cfg.remat if cfg.codelm_remat[level_idx] is None else cfg.codelm_remat[level_idx]
         self.remat_level = cfg.remat_level
         self.attn_lookahead = cfg.attn_lookahead[level_idx]
         self.pq_chunks, self.code_vocab = cfg.pq_chunks[level_idx], cfg.code_vocab[level_idx]
@@ -2535,9 +2845,8 @@ def decode_generate_multipass(model: "LagCodecModel", level_idx: int, ctx_idx: j
 
 def cycle_reencode(model: "LagCodecModel", level_idx: int, tokens: jnp.ndarray, rng=None,
                    encode_temperature: float = 1.0) -> tuple:
-    # downsampler i's code for level-i tokens, self-fed (never label_fn/GT): digits drawn per
-    # quantize_mode (argmax when rng is None). Differentiable through quantize_mode's estimator.
-    # Same dense path as training's encode -- needs downsampler_ncodes=1 (one code per group).
+    # downsampler i's code for level-i tokens, self-fed (never label_fn/GT), digits per quantize_mode (argmax
+    # without rng), differentiable via its estimator; dense like training's encode (downsampler_ncodes=1)
     cfg = model.cfg
     codelm, ds = model.codelm_for(level_idx), model.downsampler_for(level_idx)
     K = model.K(level_idx)
@@ -2560,9 +2869,8 @@ def cycle_reencode(model: "LagCodecModel", level_idx: int, tokens: jnp.ndarray, 
 def decode_logits_and_target_cycles(model: "LagCodecModel", level_idx: int, target_seq: jnp.ndarray,
                                     ctx_code_soft: jnp.ndarray, upsampler_ncodes: int, rng=None,
                                     encode_temperature: float = 1.0, force_teacher_forced: bool = False) -> list:
-    # level_cycles at this level: one decode_logits_and_target_multipass passes-list per cycle (cycle 0
-    # = the plain decode, identical rng). Between cycles the decoded tokens (level_cycle_input) are
-    # re-encoded into this level's code c(t+1): memoryless decodes from it alone, stack adds it as a slot.
+    # one multipass passes-list per cycle (cycle 0 = the plain decode, same rng); between cycles the
+    # level_cycle_input tokens are re-encoded into c(t+1): memoryless decodes from it alone, stack adds a slot
     cfg = model.cfg
     n_cyc = cfg.level_cycles[level_idx]
     kw = dict(encode_temperature=encode_temperature, force_teacher_forced=force_teacher_forced, return_passes=True)
@@ -2629,10 +2937,11 @@ def decode_generate_cycles(model: "LagCodecModel", level_idx: int, ctx_idx: jnp.
     # generation counterpart of decode_logits_and_target_cycles (gen_level_cycles cycles, free-run)
     cfg = model.cfg
     n_cyc = cfg.gen_level_cycles[level_idx]
-    if n_cyc <= 1:
+    n_slots = cycle_stack_slots(cfg, level_idx)  # trained with slots -> always decode with them (masked until filled)
+    if n_cyc <= 1 and n_slots == 0:
         return decode_generate_multipass(model, level_idx, ctx_idx, upsampler_ncodes, greedy, temperature, seed)
     stack = cfg.level_cycle_mode == "stack"
-    slots = [None] * cycle_stack_slots(cfg, level_idx) if stack else None
+    slots = [None] * n_slots if stack else None
     ctx_t = ctx_idx
     for t in range(n_cyc):
         pred = decode_generate_multipass(model, level_idx, ctx_t, upsampler_ncodes, greedy, temperature,
@@ -2891,6 +3200,7 @@ class LagCodecModel(eqx.Module):
                 token_dim=cfg.token_dim[level_idx], token_n_heads=cfg.token_n_heads[level_idx],
                 decode_past=cfg.downsampler_decode_past[level_idx], decode_future=cfg.downsampler_decode_future[level_idx],
                 n_rates=n_rates, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, remat=downsampler_remat,
+                remat_chunks=cfg.downsampler_remat_chunks[level_idx],
                 ctx_vocab=code_vocab, ctx_pq_chunks=pq_chunks, ctx_pq_dim=pq_dim, token_head=cfg.pardec_token_head,
                 backbone=cfg.downsampler_backbone[level_idx], state_dim=cfg.ssm_state_dim)
             downsamplers.append(downsampler)
@@ -2911,6 +3221,7 @@ class LagCodecModel(eqx.Module):
                 token_dim=cfg.token_dim[level_idx], token_n_heads=cfg.token_n_heads[level_idx],
                 decode_past=cfg.upsampler_decode_past[level_idx], decode_future=cfg.upsampler_decode_future[level_idx],
                 n_rates=n_rates, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, remat=upsampler_remat,
+                remat_chunks=cfg.upsampler_remat_chunks[level_idx],
                 shared_blocks=downsampler.blocks if cfg.share_downsampler_upsampler_lm else None,
                 shared_ln_f=downsampler.ln_f if cfg.share_downsampler_upsampler_lm else None,
                 ctx_vocab=code_vocab, ctx_pq_chunks=pq_chunks, ctx_pq_dim=pq_dim, token_head=cfg.pardec_token_head,
@@ -3327,6 +3638,24 @@ def phase_trainable_filter(model: LagCodecModel, phase: int):
     return spec
 
 
+def tie_shared_grads(grads, cfg: Config):
+    # share_downsampler_upsampler_lm / shared_embed arrays are two pytree leaves to jax.grad (each got its own
+    # partial, so adamw untied them after step 1): give both the summed gradient so they stay identical
+    getters = []
+    for j in range(len(grads.downsamplers)):
+        if cfg.share_downsampler_upsampler_lm:
+            getters += [(lambda t, j=j: t.downsamplers[j].blocks, lambda t, j=j: t.upsamplers[j].blocks),
+                        (lambda t, j=j: t.downsamplers[j].ln_f, lambda t, j=j: t.upsamplers[j].ln_f)]
+        if cfg.context_source == "shared_embed":
+            getters += [(lambda t, j=j: t.downsamplers[j].own_ctx_embed, lambda t, j=j: t.upsamplers[j].own_ctx_embed),
+                        (lambda t, j=j: t.downsamplers[j].own_ctx_proj, lambda t, j=j: t.upsamplers[j].own_ctx_proj)]
+    for a, b in getters:
+        summed = jax.tree_util.tree_map(lambda x, y: x + y, a(grads), b(grads))
+        grads = eqx.tree_at(b, eqx.tree_at(a, grads, summed, is_leaf=lambda x: x is None), summed,
+                            is_leaf=lambda x: x is None)
+    return grads
+
+
 def count_params(tree) -> int:
     return sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array)))
 
@@ -3607,13 +3936,14 @@ def write_resolved_config(run_dir: Path, args: argparse.Namespace) -> None:
     (run_dir / "resolved_config.py").write_text("\n".join(lines) + "\n")
 
 
-CONFIG_FIELDS = ("img_size", "codelm_d_model", "codelm_n_layers", "codelm_n_heads", "codelm_n_kv_heads",
+CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_encoding", "codelm_d_model", "codelm_remat", "codelm_n_layers", "codelm_n_heads", "codelm_n_kv_heads",
                   "downsampler_d_model", "downsampler_n_layers", "downsampler_n_heads",
                   "downsampler_n_kv_heads", "downsampler_window",
                   "downsampler_decode_past", "downsampler_decode_future", "downsampler_remat", "downsampler_ncodes",
                   "upsampler_d_model", "upsampler_n_layers", "upsampler_n_heads",
                   "upsampler_n_kv_heads", "upsampler_window",
                   "upsampler_decode_past", "upsampler_decode_future", "upsampler_remat",
+                  "downsampler_remat_chunks", "upsampler_remat_chunks",
                   "share_across_levels", "bos_rate_mode", "context_source", "pardec_token_head", "codelm_token_head", "downsampler_rollout",
                   "downsampler_rollout_prob", "upsampler_rollout", "upsampler_rollout_prob",
                   "share_downsampler_upsampler_lm", "strides",
@@ -3638,7 +3968,7 @@ CONFIG_FIELDS = ("img_size", "codelm_d_model", "codelm_n_layers", "codelm_n_head
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=Path, required=True)
-    p.add_argument("--dataset", type=str, default="cifar", choices=["cifar", "imagenet64", "imagenet256"],
+    p.add_argument("--dataset", type=str, default="cifar", choices=["cifar", "imagenet64", "imagenet256", "folder"],
                     help="cifar (default): downloads/caches under --data_root. imagenetN: reads "
                          "pre-built shards from --data_root (scripts/imagenet/download_imagenetN.py; "
                          "does not download itself). Config.img_size must match (32 cifar, N imagenetN). "
@@ -3762,10 +4092,18 @@ def main():
                          "uniformly to every phase; a tuple gives one value per phase")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--img_size", type=int, default=Config.img_size)
+    p.add_argument("--modality", type=str, default=Config.modality, choices=list(MODALITIES),
+                    help="image | text | audio | binary (1D seq_len x byte_group byte sequences); --dataset folder "
+                         "reads every file under --data_root (train/ + val/ subfolders, else every 20th file is val)")
+    p.add_argument("--seq_len", type=int, default=Config.seq_len, help="positions per sample, non-image modalities")
+    p.add_argument("--audio_sample_rate", type=int, default=Config.audio_sample_rate)
+    p.add_argument("--audio_encoding", type=str, default=Config.audio_encoding, choices=["mulaw8", "pcm16"])
     p.add_argument("--codelm_d_model", type=_tuple_arg, default=Config.codelm_d_model)
     p.add_argument("--codelm_n_layers", type=_tuple_arg, default=Config.codelm_n_layers)
     p.add_argument("--codelm_n_heads", type=_tuple_arg, default=Config.codelm_n_heads)
     p.add_argument("--codelm_n_kv_heads", type=_tuple_arg, default=Config.codelm_n_kv_heads)
+    p.add_argument("--codelm_remat", type=_opt_bool_tuple_arg, default=Config.codelm_remat,
+                    help="CodeLM's OWN per-block remat per level; 'none' (default) falls back to --remat")
     p.add_argument("--downsampler_d_model", type=_tuple_arg, default=Config.downsampler_d_model)
     p.add_argument("--downsampler_n_layers", type=_tuple_arg, default=Config.downsampler_n_layers)
     p.add_argument("--downsampler_n_heads", type=_tuple_arg, default=Config.downsampler_n_heads)
@@ -3801,6 +4139,10 @@ def main():
     p.add_argument("--upsampler_decode_future", type=_tuple_arg, default=Config.upsampler_decode_future,
                     help="upsampler PardecLM's OWN decode_future, independent of the downsampler's own "
                          "downsampler_decode_future. Default 0")
+    for name in ("downsampler_remat_chunks", "upsampler_remat_chunks"):
+        p.add_argument(f"--{name}", type=_tuple_arg, default=getattr(Config, name),
+                        help="per level: run the pardec stack over this many row chunks, each rematerialized "
+                             "(peak activations ~1/chunks, one extra forward). 1 = off")
     p.add_argument("--upsampler_remat", type=_opt_bool_tuple_arg, default=Config.upsampler_remat,
                     help="upsampler PardecLM's OWN remat, independent of the downsampler's. "
                          "'none' (default) falls back to --remat (previous shared behavior)")
@@ -4017,10 +4359,7 @@ def main():
     p.add_argument("--traversal", type=str, default=Config.traversal, choices=["raster", "zorder"])
     pre_args, _ = p.parse_known_args()
     config_vars = load_config_module(pre_args.config)
-    label_fn_registry = {"default_label_fn_jax": default_label_fn_jax, "rgb_label_fn_jax": rgb_label_fn_jax,
-                          "default_label_fn_pil": default_label_fn_pil}
-    label_fn_raw = config_vars.pop("label_fn", "default_label_fn_jax")
-    label_fn = label_fn_registry[label_fn_raw] if isinstance(label_fn_raw, str) else label_fn_raw
+    label_fn_raw = config_vars.pop("label_fn", None)
     known = {a.dest for a in p._actions}
     unknown = set(config_vars) - known
     # helper constants (e.g. DEPTH = 4) are allowed: warn and ignore; imports/functions are ignored silently
@@ -4060,6 +4399,7 @@ def main():
     n_devices = args.n_devices or jax.local_device_count()
     print(f"jax devices ({n_devices} used of {jax.local_device_count()} local): {jax.devices()}")
     cfg = Config(**{k: getattr(args, k) for k in CONFIG_FIELDS})
+    label_fn = resolve_label_fn(label_fn_raw, cfg.modality)
     n_levels = len(cfg.strides)
     top_level_trainable = cfg.strides[-1] != -1
     n_phases = n_levels if top_level_trainable else n_levels - 1
@@ -4122,7 +4462,8 @@ def main():
             warnings.warn(f"curriculum_mode='freeze' with level_gt_drop={args.level_gt_drop}: frozen lower "
                           f"decoders get predicted ctx from the new level and can't adapt to it")
 
-    (train_np, train_labels), (val_np, val_labels) = load_dataset(args.dataset, Path(args.data_root), cfg.img_size)
+    (train_np, train_labels), (val_np, val_labels) = load_dataset(
+        args.dataset, Path(args.data_root), cfg.img_size if cfg.modality == "image" else None, cfg=cfg)
     if args.train_subset_n:
         train_np = train_np[:args.train_subset_n]
     if args.val_subset_n:
@@ -4214,7 +4555,7 @@ def main():
         cascade_acc = float(jnp.mean(cascade_recon == flat_prompt))
         cascade_img = positions_to_image(np.asarray(cascade_recon), cfg, pixel_order)
         cascade_mse = pixel_mse(cascade_img, gt_img)
-        save_compare_grid(cascade_img, gt_img, run_dir / f"samples_{tag}.png")
+        save_samples(cascade_img, gt_img, run_dir / f"samples_{tag}.png", cfg)
 
         gen_time_s = time.monotonic() - gen_t0
         msg = f"[{tag}] top={top} CASCADE{' (sampled T=%g k=%d)' % (cfg.gen_temperature, cfg.gen_top_k) if sample else ''} gen_byte_acc={cascade_acc:.4f} gen_cascade_mse={cascade_mse:.2f}"
@@ -4252,7 +4593,7 @@ def main():
         pred_bytes = aux[-1]
         recon_img = positions_to_image(np.asarray(pred_bytes), cfg, pixel_order)
         mse = pixel_mse(recon_img, gt_img)
-        save_compare_grid(recon_img, gt_img, run_dir / f"samples_{tag}_tfsanity.png")
+        save_samples(recon_img, gt_img, run_dir / f"samples_{tag}_tfsanity.png", cfg)
         logger(f"[{tag}] top={top} TF_SANITY tf_sanity_mse={mse:.2f}", tag=tag, tf_sanity_mse=float(mse))
         return mse
 
@@ -4419,6 +4760,7 @@ def main():
             rng, level_rng, cascade_rng = jax.random.split(rng, 3)
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
                 diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+            grads = tie_shared_grads(grads, cfg)
             grads = jax.lax.pmean(grads, axis_name="d")
             loss = jax.lax.pmean(loss, axis_name="d")
             aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
@@ -4435,7 +4777,8 @@ def main():
             diff_model = eqx.apply_updates(diff_model, updates)
             return diff_model, opt_state, rng, loss, aux
 
-        train_step = jax.pmap(train_step, axis_name="d")
+        # donate model/opt_state/rng: replaced by the outputs every step (frees the old copies in the update)
+        train_step = jax.pmap(train_step, axis_name="d", donate_argnums=(0, 1, 2))
 
         # --level_select_prob: any-level training (see sample_level_range/level_forward_multires).
         # (entry_level, depth) must be static per trace (same constraint `phase` already has), so
@@ -4460,6 +4803,7 @@ def main():
                 rng, level_rng, cascade_rng = jax.random.split(rng, 3)
                 (loss, aux), grads = jax.value_and_grad(loss_fn_sd, has_aux=True)(
                     diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+                grads = tie_shared_grads(grads, cfg)
                 grads = jax.lax.pmean(grads, axis_name="d")
                 loss = jax.lax.pmean(loss, axis_name="d")
                 aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
@@ -4469,7 +4813,7 @@ def main():
                 diff_model = eqx.apply_updates(diff_model, updates)
                 return diff_model, opt_state, rng, loss, aux
 
-            return jax.pmap(train_step_sd, axis_name="d")
+            return jax.pmap(train_step_sd, axis_name="d", donate_argnums=(0, 1, 2))
 
         p_diff_model = replicate(diff_model, n_devices)
         p_opt_state = replicate(opt_state, n_devices)
@@ -4577,6 +4921,7 @@ def main():
                         if cfg.gen_eval_teacher_force_sanity:
                             run_gen_eval_teacher_force_sanity_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{st}")
                     try:
+                        assert cfg.modality == "image", "codegrid is image-only"
                         plot_encoder_outs(snapshot, cfg, val_np[:args.val_batch_size[phase - 1]], pixel_order,
                                        run_dir / f"samples_level{phase - 1}_step{st}_codegrid.png",
                                        level=phase - 1, label_fn=label_fn)
