@@ -54,7 +54,7 @@ downsampler_n_heads = 1
 downsampler_n_kv_heads = 1
 downsampler_window = 1
 downsampler_rollout = True
-downsampler_rollout_prob = 0.5
+downsampler_rollout_prob = 1.0
 # downsampler_remat = True   # enable only if OOM
 
 # context_source = "codelm_upper"
@@ -65,10 +65,15 @@ upsampler_n_heads = 2
 upsampler_n_kv_heads = 2
 upsampler_window = 1
 upsampler_rollout = True
-upsampler_rollout_prob = 0.5
+upsampler_rollout_prob = 1.0
 # upsampler_remat = True   # enable only if OOM
+upsampler_pss_passes = -1
+# upsampler_pss_passes = (-1, -1, 1, 1)  # per level
+upsampler_pss_prob = 1.0                 # always own prediction = full rollout inputs
+# upsampler_pss_prob = 0.5               # true scheduled sampling: own vs GT per position
+pss_input_mode = "argmax"  
 
-# use_codelm_bos = False
+use_codelm_bos = False
 # use_codelm_bos = True
 # codelm_bos_prob = 1.0
 # curriculum_mode = "freeze"

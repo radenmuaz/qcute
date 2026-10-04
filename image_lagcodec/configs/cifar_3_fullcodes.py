@@ -38,11 +38,11 @@ entropy_weight = 0.0
 label_reg_weight = 1.0
 
 label_fn = "rgb_label_fn_jax"
-bos_rate_mode = "relative"
-# bos_rate_mode = "absolute"
+# bos_rate_mode = "relative"
+bos_rate_mode = "absolute"
 strides = (4,4,4,4)
 attn_window = 1024
-upsampler_ncodes = 1
+upsampler_ncodes = (256,64,16,4)
 attn_lookahead = 0
 upsampler_decode_past = 0
 upsampler_decode_future = 0
@@ -68,9 +68,9 @@ upsampler_rollout = True
 upsampler_rollout_prob = 0.5
 # upsampler_remat = True   # enable only if OOM
 
-use_codelm_bos = False
+# use_codelm_bos = False
 # use_codelm_bos = True
-codelm_bos_prob = 1.0
+# codelm_bos_prob = 1.0
 # curriculum_mode = "freeze"
 curriculum_mode = "no_freeze"
 # level_select_prob = (0.9, 0.8, 0.7, 0.6)  # length n_levels-1=4
@@ -82,10 +82,10 @@ mse_softmax_tau = 1.0
 level_gt_drop = 0.5
 # fork of cifar_overfit_2stage_freeze.py: level refine on. Pass 2 re-decodes each upsampler group seeing a
 # draft (pass 1 argmax) of the 1 preceding group = upsampler_ncodes*stride = 4 tokens back.
-level_refine_passes = 2
-level_refine_window = 1
-level_refine_gt_drop = 0.5
-level_refine_layout = "fixed"
+level_refine_passes = 1
+# level_refine_window = 1
+# level_refine_gt_drop = 0.5
+# level_refine_layout = "fixed"
 quantize_drop = 0.5
 # ctx_stop_gradient = True
 # ctx_stop_gradient = "pseudo"
@@ -112,8 +112,8 @@ gen_eval_teacher_force_sanity = True
 # --- training ---
 batch_size = 4
 val_batch_size = 8
-level_steps = (20_000, 20_000, 20_000, 100_000)
-# level_steps = (0, int(100e3))
+# level_steps = (20_000, 20_000, 20_000, 100_000)
+level_steps = (0, int(100e3))
 seed = 0
 train_subset_n = None
 val_subset_n = 1000
