@@ -287,6 +287,11 @@ class Config:
     label_reg_weight: float = 0.0
     label_mse_weight: float = 0.0  # 0 = metric only (always computed when label_reg_weight>0);
     # >0 additionally backprops a soft/differentiable version, mirrors mse_weight/mse_loss below
+    encoder_level_loss_weights: tuple | None = None
+    decoder_level_loss_weights: tuple | None = None
+    log_levelwise_metrics: bool = False
+    log_levelwise_eval: bool = False
+    log_levelwise_gen: bool = False
 
     gen_temperature: float = 1.0
     gen_top_k: int = 8
@@ -396,6 +401,17 @@ class Config:
                 setattr(self, name, (None,) * n)
             elif isinstance(val, types):
                 setattr(self, name, (val,) * n)
+
+        if self.encoder_level_loss_weights is not None:
+            if isinstance(self.encoder_level_loss_weights, (int, float)):
+                self.encoder_level_loss_weights = (float(self.encoder_level_loss_weights),) * n
+            else:
+                self.encoder_level_loss_weights = tuple(float(x) for x in self.encoder_level_loss_weights)
+        if self.decoder_level_loss_weights is not None:
+            if isinstance(self.decoder_level_loss_weights, (int, float)):
+                self.decoder_level_loss_weights = (float(self.decoder_level_loss_weights),) * n
+            else:
+                self.decoder_level_loss_weights = tuple(float(x) for x in self.decoder_level_loss_weights)
 
         bcast("code_vocab", int)
         bcast("pq_chunks", int)
@@ -3353,6 +3369,17 @@ def dec_loss_acc(logits: jnp.ndarray, target: jnp.ndarray, mask: jnp.ndarray = N
     return jnp.sum(nll * m) / denom, jnp.sum(correct * m) / denom
 
 
+def weighted_level_mean(losses: list, weights) -> jnp.ndarray:
+    if not losses:
+        return jnp.array(0.0)
+    stacked = jnp.stack(losses)
+    if weights is None:
+        return jnp.mean(stacked)
+    w = jnp.asarray(weights[:len(losses)], dtype=stacked.dtype)
+    denom = jnp.maximum(jnp.sum(w), 1e-8)
+    return jnp.sum(stacked * w) / denom
+
+
 def cycle_loss(cycles: list, mode: str) -> jnp.ndarray:
     # mean over refine passes, then over cycles ("all") or the last cycle only
     per = [jnp.mean(jnp.stack([dec_loss_acc(lg, t, m)[0] for lg, t, m, _, _ in passes])) for passes in cycles]
@@ -3363,7 +3390,8 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
                    level_gt_drop=None, cascade_rng=None, encode_temperature: float = 1.0,
                    layer_drop_prob=None, label_reg_weight: float = 0.0, label_fn=None,
                    pixel_order=None, byte_pq_fn=None, digit_teacher_force: bool = False,
-                   return_recon: bool = False, ctx_ablation: str = None) -> tuple:
+                   return_recon: bool = False, return_levelwise: bool = False,
+                   ctx_ablation: str = None) -> tuple:
     codelm0 = model.codelm_for(0)
     byte_pq_fn = byte_pq_fn or rgb_byte_pq_fn
     # flat_bytes stays raw (fed to label_fn as-is, which interprets literal byte/pixel values);
@@ -3486,9 +3514,9 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
             if model.cfg.ctx_stop_gradient is True:
                 ctx = jax.lax.stop_gradient(ctx)
 
-    dec_loss_total = jnp.mean(jnp.stack(dec_losses))
+    dec_loss_total = weighted_level_mean(dec_losses, model.cfg.decoder_level_loss_weights)
     byte_acc = dec_accs[-1]
-    ntp_loss_total = jnp.mean(jnp.stack(enc_losses))
+    ntp_loss_total = weighted_level_mean(enc_losses, model.cfg.encoder_level_loss_weights)
     entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
     label_loss_total = jnp.mean(jnp.stack(label_losses)) if label_losses else 0.0
     label_mse_total = jnp.mean(jnp.stack(label_mses)) if label_mses else jnp.array(0.0)
@@ -3506,6 +3534,8 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     aux = (dec_loss_total, byte_acc, ntp_loss_total, jnp.mean(jnp.stack(enc_accs)),
            jnp.mean(jnp.stack(utils)), byte_mse, aux_ntp_loss_total / jnp.log(2.0), aux_ntp_acc_total,
            label_mse_total)
+    if return_levelwise:
+        aux = aux + (jnp.stack(enc_losses), jnp.stack(enc_accs), jnp.stack(dec_losses), jnp.stack(dec_accs))
     if return_recon:
         aux = aux + (pred_bytes,)
     return loss, aux
@@ -3670,10 +3700,10 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
         if d > 0:
             ctx = codes_soft[d - 1]
 
-    dec_loss_total = jnp.mean(jnp.stack(dec_losses))
+    dec_loss_total = weighted_level_mean(dec_losses, model.cfg.decoder_level_loss_weights)
     byte_acc = dec_accs[-1]  # accuracy of the deepest->entry_level+1 decode step, matches
     # level_forward's own-code-accuracy convention (last-computed = shallowest/own-level step)
-    ntp_loss_total = jnp.mean(jnp.stack(enc_losses))
+    ntp_loss_total = weighted_level_mean(enc_losses, model.cfg.encoder_level_loss_weights)
     entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
     label_loss_total = jnp.mean(jnp.stack(label_losses)) if label_losses else 0.0
     label_mse_total = jnp.mean(jnp.stack(label_mses)) if label_mses else jnp.array(0.0)
@@ -3681,11 +3711,14 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
         + label_reg_weight * label_loss_total
     bpb = dec_loss_total / jnp.log(2.0)
     zero = jnp.array(0.0)
+    aux = (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
+           jnp.mean(jnp.stack(utils)), zero, zero, zero, label_mse_total)
+    if model.cfg.log_levelwise_metrics:
+        aux = aux + (jnp.stack(enc_losses), jnp.stack(enc_accs), jnp.stack(dec_losses), jnp.stack(dec_accs))
     # aux tuple shape matches level_forward's (bpb, byte_acc, ntp_bpb, e_acc, util, byte_mse,
     # aux_ntp_bpb, aux_ntp_acc, label_mse) so run_val_eval/the train logger work unchanged --
     # byte_mse/aux_ntp_* don't apply here (no raw-pixel reconstruction when entry_level>0), zeroed.
-    return loss, (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
-                  jnp.mean(jnp.stack(utils)), zero, zero, zero, label_mse_total)
+    return loss, aux
 
 
 def phase_trainable_filter(model: LagCodecModel, phase: int):
@@ -4036,7 +4069,9 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
                   "use_codelm_bos", "codelm_bos_prob", "codelm_bos_rates",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "entropy_weight", "mse_weight",
-                  "mse_softmax_tau", "traversal", "label_reg_weight", "label_mse_weight")
+                  "mse_softmax_tau", "traversal", "label_reg_weight", "label_mse_weight",
+                  "encoder_level_loss_weights", "decoder_level_loss_weights",
+                  "log_levelwise_metrics", "log_levelwise_eval", "log_levelwise_gen")
 
 
 def main():
@@ -4139,6 +4174,16 @@ def main():
     p.add_argument("--verbose", type=lambda x: x.lower() != "false", default=True,
                     help="gen-eval: when the eval batch has fewer than 10 samples, also log a "
                          "per-sample mse1=.. mse2=.. line. Default True")
+    p.add_argument("--encoder_level_loss_weights", type=_float_tuple_arg, default=None,
+                    help="optional per-level weights for the encoder codelm losses. If unset, all levels are weighted equally")
+    p.add_argument("--decoder_level_loss_weights", type=_float_tuple_arg, default=None,
+                    help="optional per-level weights for the decoder upsampler losses. If unset, all levels are weighted equally")
+    p.add_argument("--log_levelwise_metrics", type=lambda x: x.lower() != "false", default=False,
+                    help="include level-wise encoder/decoder loss and accuracy arrays in training/val logs")
+    p.add_argument("--log_levelwise_eval", type=lambda x: x.lower() != "false", default=False,
+                    help="log per-level val losses/accuracies in the eval summary")
+    p.add_argument("--log_levelwise_gen", type=lambda x: x.lower() != "false", default=False,
+                    help="log per-level generation metrics when running gen-eval")
     p.add_argument("--wa_every_step", type=int, default=None, help="WA update cadence, in steps")
     p.add_argument("--wa_every_epoch", type=float, default=None,
                     help="WA update cadence, in epochs (auto-converted to steps). At most one "
@@ -4642,9 +4687,22 @@ def main():
         cascade_mse = pixel_mse(cascade_img, gt_img)
         save_samples(cascade_img, gt_img, run_dir / f"samples_{tag}.png", cfg)
 
+        gen_levelwise_acc = None
+        if cfg.log_levelwise_gen:
+            level_targets = []
+            for i in range(top + 1):
+                n_blocks_i = codes[i].shape[1]
+                level_tgt = label_fn(flat_prompt, cfg, pixel_order, n_blocks_i,
+                                    cfg.pq_chunks[i], cfg.code_vocab[i])
+                level_targets.append(level_tgt)
+            gen_levelwise_acc = [float(jnp.mean(codes[i] == level_targets[i])) for i in range(top + 1)]
+
         gen_time_s = time.monotonic() - gen_t0
         msg = f"[{tag}] top={top} CASCADE{' (sampled T=%g k=%d)' % (cfg.gen_temperature, cfg.gen_top_k) if sample else ''} gen_byte_acc={cascade_acc:.4f} gen_cascade_mse={cascade_mse:.2f}"
         rec = dict(tag=tag, gen_cascade_acc=cascade_acc, gen_cascade_mse=cascade_mse, gen_time_s=gen_time_s)
+        if gen_levelwise_acc is not None:
+            rec["gen_levelwise_acc"] = gen_levelwise_acc
+            msg += " gen_levels=" + ",".join(f"{i}:{a:.3f}" for i, a in enumerate(gen_levelwise_acc))
         msg += f" gen_time={gen_time_s:.1f}s"
         if gen_compile_s is not None:
             msg += f" (first call, incl. jit compile: {gen_compile_s:.1f}s)"
@@ -4699,6 +4757,10 @@ def main():
         total_loss = 0.0
         total_n = 0
         val_compile_s = None
+        enc_level_losses_sum = None
+        enc_level_accs_sum = None
+        dec_level_losses_sum = None
+        dec_level_accs_sum = None
         for start in range(0, n, bs):
             batch_imgs = val_np[start:start + bs]
             bn = len(batch_imgs)
@@ -4707,26 +4769,57 @@ def main():
             loss_b, aux_b = val_eval_jit(m, batch_flat, phase, rng=None,
                                           encode_temperature=args.encode_temperature[phase - 1],
                                           label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
-                                          pixel_order=pixel_order)
+                                          pixel_order=pixel_order,
+                                          return_levelwise=cfg.log_levelwise_eval or cfg.log_levelwise_metrics)
             if not val_jit_timed[0]:
                 val_compile_s = time.monotonic() - batch_t0
                 val_jit_timed[0] = True
-            sums += bn * np.array([float(a) for a in aux_b])
+            if cfg.log_levelwise_eval or cfg.log_levelwise_metrics:
+                aux_vals = list(aux_b)
+                if len(aux_vals) >= 14:
+                    enc_level_losses_b = np.asarray(aux_vals[-4])
+                    enc_level_accs_b = np.asarray(aux_vals[-3])
+                    dec_level_losses_b = np.asarray(aux_vals[-2])
+                    dec_level_accs_b = np.asarray(aux_vals[-1])
+                    if enc_level_losses_sum is None:
+                        enc_level_losses_sum = np.zeros_like(enc_level_losses_b, dtype=np.float64)
+                        enc_level_accs_sum = np.zeros_like(enc_level_accs_b, dtype=np.float64)
+                        dec_level_losses_sum = np.zeros_like(dec_level_losses_b, dtype=np.float64)
+                        dec_level_accs_sum = np.zeros_like(dec_level_accs_b, dtype=np.float64)
+                    enc_level_losses_sum += bn * enc_level_losses_b
+                    enc_level_accs_sum += bn * enc_level_accs_b
+                    dec_level_losses_sum += bn * dec_level_losses_b
+                    dec_level_accs_sum += bn * dec_level_accs_b
+            sums += bn * np.array([float(a) for a in aux_b[:9]])
             total_loss += bn * float(loss_b)
             total_n += bn
         dec_loss, dec_acc, enc_loss, enc_acc, util, val_mse, _aux_ntp_bpb, aux_ntp_acc, val_label_mse = \
             (sums / total_n).tolist()
         loss = total_loss / total_n
         val_time_s = time.monotonic() - val_t0
-        msg = (f"[{tag}] VAL loss={loss:.2f} val_dec_loss={dec_loss:.2f} val_dec_acc={dec_acc:.2f} val_mse={val_mse:.4f} "
-               f"val_enc_acc={enc_acc:.2f} val_d_ntp_acc={aux_ntp_acc:.2f} "
-               f"val_label_mse={val_label_mse:.2f} val_time={val_time_s:.1f}s")
+        levelwise_suffix = ""
         rec = dict(tag=tag, val_loss=loss,
                    val_dec_loss=dec_loss, val_dec_acc=dec_acc,
                     val_enc_loss=enc_loss, val_enc_acc=enc_acc,
                     val_util=util, val_mse=val_mse,
                     val_d_ntp_acc=aux_ntp_acc, val_label_mse=val_label_mse,
                     val_time_s=val_time_s)
+        if cfg.log_levelwise_eval or cfg.log_levelwise_metrics:
+            val_enc_level_losses = (enc_level_losses_sum / total_n).tolist()
+            val_enc_level_accs = (enc_level_accs_sum / total_n).tolist()
+            val_dec_level_losses = (dec_level_losses_sum / total_n).tolist()
+            val_dec_level_accs = (dec_level_accs_sum / total_n).tolist()
+            rec.update(dict(val_enc_level_losses=val_enc_level_losses,
+                            val_enc_level_accs=val_enc_level_accs,
+                            val_dec_level_losses=val_dec_level_losses,
+                            val_dec_level_accs=val_dec_level_accs))
+            levelwise_suffix = (
+                " enc_levels=" + ",".join(f"{i}:{x:.3f}" for i, x in enumerate(val_enc_level_losses)) +
+                " dec_levels=" + ",".join(f"{i}:{x:.3f}" for i, x in enumerate(val_dec_level_losses))
+            )
+        msg = (f"[{tag}] VAL loss={loss:.2f} val_dec_loss={dec_loss:.2f} val_dec_acc={dec_acc:.2f} val_mse={val_mse:.4f} "
+               f"val_enc_acc={enc_acc:.2f} val_d_ntp_acc={aux_ntp_acc:.2f} "
+               f"val_label_mse={val_label_mse:.2f}{levelwise_suffix} val_time={val_time_s:.1f}s")
         if val_compile_s is not None:
             msg += f" (first batch, incl. jit compile: {val_compile_s:.1f}s)"
             rec["val_compile_s"] = val_compile_s
@@ -4805,7 +4898,8 @@ def main():
                                      encode_temperature=encode_temperature_phase,
                                      layer_drop_prob=layer_drop_prob_phase,
                                      label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
-                                     pixel_order=pixel_order)
+                                     pixel_order=pixel_order,
+                                     return_levelwise=cfg.log_levelwise_metrics)
 
         steps_per_epoch_lr = len(train_iter)
         phase_total_steps = _phase_total_steps(phase - 1, steps_per_epoch_lr)
@@ -4968,29 +5062,45 @@ def main():
                     logger(f"{active_desc}: first train_step (incl. jit compile) took "
                            f"{time.monotonic() - jit_t0:.1f}s")
                     jit_timed = True
-                dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse, grad_norm = \
-                    [float(local_array(a)[0]) for a in aux]
+                if cfg.log_levelwise_metrics:
+                    dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse, grad_norm, \
+                        enc_level_losses, enc_level_accs, dec_level_losses, dec_level_accs = [
+                            local_array(a)[0] if i < 10 else local_array(a) for i, a in enumerate(aux)
+                        ]
+                    enc_level_losses = np.asarray(enc_level_losses)
+                    enc_level_accs = np.asarray(enc_level_accs)
+                    dec_level_losses = np.asarray(dec_level_losses)
+                    dec_level_accs = np.asarray(dec_level_accs)
+                else:
+                    dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse, grad_norm = \
+                        [float(local_array(a)[0]) for a in aux]
+                    enc_level_losses = enc_level_accs = dec_level_losses = dec_level_accs = None
                 lr = float(lr_schedule(step - 1))
                 lr_str = _fmt_lr(lr)
                 pbar.set_postfix(step=step, loss=f"{loss0:.2f}",
                                   acc=f"{dec_acc:.2f}",
                                   lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
+                    log_kwargs = dict(level=phase - 1, epoch=epoch_num, step=step, loss=loss0,
+                                      dec_loss=dec_loss, dec_acc=dec_acc,
+                                      enc_acc=enc_acc, util=util,
+                                      mse=train_mse, label_mse=label_mse,
+                                      lr=lr, grad_norm=grad_norm)
+                    if cfg.log_levelwise_metrics:
+                        log_kwargs.update(dict(enc_level_losses=enc_level_losses.tolist(),
+                                               enc_level_accs=enc_level_accs.tolist(),
+                                               dec_level_losses=dec_level_losses.tolist(),
+                                               dec_level_accs=dec_level_accs.tolist()))
                     logger(f"l={phase - 1} e={epoch_num} s={step} "
                            f"loss={loss0:.2f} "
                            f"dec_loss={dec_loss:.2f} dec_acc={dec_acc:.2f} "
                            f"enc_loss={enc_loss:.2f} enc_acc={enc_acc:.2f} "
                            f"util={util:.2f} mse={train_mse:.1f} "
-                        #    f"d_ntp_acc={aux_ntp_acc:.2f}"
                            f"label_mse={label_mse:.2f} "
-                           f"lr={lr_str} grad_norm={grad_norm:.2f}",
-                           level=phase - 1, epoch=epoch_num, step=step, loss=loss0,
-                           dec_loss=dec_loss, dec_acc=dec_acc,
-                           enc_acc=enc_acc, util=util,
-                           mse=train_mse,
-                        #    d_ntp_acc=aux_ntp_acc, 
-                           label_mse=label_mse,
-                           lr=lr, grad_norm=grad_norm)
+                           f"lr={lr_str} grad_norm={grad_norm:.2f}"
+                           + (f" enc_levels={enc_level_losses.tolist()} dec_levels={dec_level_losses.tolist()}"
+                              if cfg.log_levelwise_metrics else ""),
+                           **log_kwargs)
 
                 if step % gen_eval_every_steps == 0:
                     snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)

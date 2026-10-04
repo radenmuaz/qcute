@@ -113,10 +113,10 @@ gen_eval_teacher_force_sanity = True
 # --- training ---
 batch_size = 4
 val_batch_size = 8
-# level_steps = (20_000, 20_000, 20_000, 100_000)
-level_steps = (0,)*4 + (int(100e3),)
+# level_steps = (0,)*4 + (int(100e3),)
+level_steps = (int(10e3),)*4 + (int(10e3),)
 seed = 0
-train_subset_n = None
+train_subset_n = 100
 val_subset_n = 1000
 gen_eval_every_step = 5000
 epoch_verbose = False
