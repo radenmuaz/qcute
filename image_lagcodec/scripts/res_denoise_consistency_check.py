@@ -569,6 +569,58 @@ def run_reinmax_check():
     return all(oks)
 
 
+def run_pss_check():
+    """upsampler/downsampler_pss_passes: n passes make the first n tokens of every row equal a real greedy rollout
+    (-1 = whole row, linear head and ar head + upsampler_rollout); prob=0 equals teacher forcing; passes=1 is the
+    old path; training grads finite with both sides on."""
+    import dataclasses
+    import equinox as eqx
+    print("[parallel scheduled sampling]")
+    oks = []
+    base = dict(strides=(4, 4), code_vocab=(256, 256), pq_chunks=(3, 3), pq_dim=(16, 16), upsampler_ncodes=(2, 1),
+                downsampler_window=(1, 1), upsampler_window=(1, 1), share_across_levels=False)
+    for name, over in (("linear", dict(pardec_token_head="linear", codelm_token_head="linear")),
+                       ("ar + upsampler_rollout", dict(pardec_token_head="ar", codelm_token_head="ar", token_head_type="ar",
+                                                       upsampler_rollout=True, upsampler_ncodes=(1, 1)))):
+        cfg1 = build_cfg(**{**base, **over})
+        model = R.LagCodecModel(jax.random.PRNGKey(0), cfg1)
+        flat, po = load_data(cfg1)
+        tgt = R.rgb_byte_pq_fn(flat, cfg1.pq_chunks[0], cfg1.code_vocab[0])
+        nc = cfg1.upsampler_ncodes[0]
+        T = nc * 4
+        ctx = jax.random.randint(jax.random.PRNGKey(5), (B, tgt.shape[1] // 4, 3), 0, 256)
+        gen = np.asarray(R._decode_generate_pardec_call(model, 0, ctx, nc, True, 1.0, 0)).reshape(B, -1, T, 3)
+        with_cfg = lambda **kw: R.LagCodecModel(jax.random.PRNGKey(0), dataclasses.replace(cfg1, **kw))  # same weights
+        score = lambda m, rng=None: R.decode_logits_and_target_multipass(m, 0, tgt, ctx, nc, rng=rng)[0]
+        for n in (1, 2, -1):
+            pred = np.asarray(jnp.argmax(score(with_cfg(upsampler_pss_passes=(n, 1))), -1)).reshape(B, -1, T, 3)
+            k = T if n == -1 else n
+            ok = bool((pred[:, :, :k] == gen[:, :, :k]).all())
+            print(f"  {name}: passes={n}: first {k}/{T} row tokens equal greedy rollout={ok}, whole-row match="
+                  f"{float((pred == gen).mean()):.3f}  {'OK' if ok else 'DIFF'}")
+            oks.append(ok)
+        rng = jax.random.PRNGKey(7)
+        tf = score(model, rng)
+        p0 = score(with_cfg(upsampler_pss_passes=(3, 1), upsampler_pss_prob=0.0), rng)
+        samp = score(with_cfg(upsampler_pss_passes=(3, 1), upsampler_pss_prob=0.5, pss_input_mode="sample"), rng)
+        ok = bool(jnp.array_equal(tf, p0)) and bool(jnp.isfinite(samp).all()) and not bool(jnp.array_equal(tf, samp))
+        print(f"  {name}: prob=0 equals teacher forcing={bool(jnp.array_equal(tf, p0))}, sample/prob=0.5 differs  "
+              f"{'OK' if ok else 'DIFF'}")
+        oks.append(ok)
+    cfg = build_cfg(**{**base, "downsampler_ncodes": (2, 2), "upsampler_pss_passes": (3, -1), "downsampler_pss_passes": (2, -1),
+                       "upsampler_pss_prob": 0.7, "downsampler_pss_prob": 0.7, "quantize_mode": "reinmax_limit"})
+    model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+    flat, po = load_data(cfg)
+    f = lambda m: R.level_forward(m, flat, 2, rng=jax.random.PRNGKey(3), level_gt_drop=1.0, cascade_rng=jax.random.PRNGKey(4),
+                                  label_reg_weight=1.0, label_fn=R.rgb_label_fn_jax, pixel_order=po)[0]
+    loss, g = eqx.filter_jit(eqx.filter_value_and_grad(f))(model)
+    ok = bool(np.isfinite(float(loss))) and all(bool(jnp.isfinite(x).all()) for x in
+                                                jax.tree_util.tree_leaves(eqx.filter(g, eqx.is_array)))
+    print(f"  train step, both sides on (downsampler_ncodes=2): loss={float(loss):.4f} finite grads={ok}  {'OK' if ok else 'DIFF'}")
+    oks.append(ok)
+    return all(oks)
+
+
 if __name__ == "__main__":
     checks = []
     for kind in ("gru", "linear_gru", "ssm"):
@@ -607,6 +659,7 @@ if __name__ == "__main__":
         ("codelm_upper", run_codelm_upper_check),
         ("remat chunks", run_remat_chunks_check),
         ("reinmax fast vs dense", run_reinmax_check),
+        ("parallel scheduled sampling", run_pss_check),
     ]
     only = sys.argv[1:]  # optional: run only the named checks
     results = [(name, fn()) for name, fn in checks if not only or name in only]

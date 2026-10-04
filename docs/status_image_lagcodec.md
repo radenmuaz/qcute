@@ -34,6 +34,11 @@ Living doc — check here rather than assuming CLAUDE.md is current. Update in p
 
 - `run_lagcodec_res_denoise.py`: fork of `run_lagcodec_res.py`; all defaults bit-identical to it (regression harness: loss/aux/grads/eval/gen).
 - Same-level cycles: `level_cycles` (per level), `level_cycle_mode` memoryless (default) | stack, `level_cycle_input` rollout (default, free-run, leak-free) | pss (`level_cycle_pss_prob`) | gt (overfit sanity), `level_cycle_detach`, `level_cycle_loss`, `gen_level_cycles`.
+- Parallel scheduled sampling on a pardec row's own token inputs (2026-10-04, both files): `upsampler_pss_passes` / `downsampler_pss_passes` (per level, 1 = off, -1 = one pass per row token), `*_pss_prob` (own vs GT per position), `pss_input_mode` argmax | sample, `pss_temperature`.
+  - Pass 1 teacher-forces GT; later passes re-feed the previous pass's detached prediction; loss on the last pass only. Context is untouched (that is `level_gt_drop`). Independent of refine passes.
+  - n passes make the first n tokens of each row equal a real greedy rollout; -1 is exact (checked vs generation, linear head and ar head + `upsampler_rollout`). ar head without `upsampler_rollout`: digits inside a token stay GT-forced, so approximate.
+  - Downsampler side is a no-op unless `downsampler_ncodes > 1` (one token per row has no token input). Eval always feeds own prediction. Cost: one extra forward per pass, backward only on the last.
+  - TODO: CodeLM pss (its inputs are true codes from the prefill; only makes sense for free generation).
   - Fixed vs `run_lagcodec` cycle: TF-argmax GT leak, revision granularity (finer code windowed with the coarser stride/table), slot-0 train/gen mismatch, order-blind shared slot table, dropped empty slots.
 - Backbones: `codelm/downsampler/upsampler_backbone` transformer | gru | linear_gru | ssm (`ssm_state_dim`); recurrent = fixed state, no KV cache.
 - `context_source="codelm_upper"`: upsampler i reads CodeLM i+1; unshared adds a CodeLM-only top level (+ bos rows); that CodeLM also gets NTP on the top code; freeze trains CodeLM p in phase p.

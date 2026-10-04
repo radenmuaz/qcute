@@ -358,6 +358,15 @@ class Config:
     level_cycle_pss_prob: float = 1.0  # pss: per-position prob of own argmax, else GT. Eval: always own
     level_cycle_detach: bool = True  # False: grad flows into the re-encoder via quantize_mode's estimator
     level_cycle_loss: str = "all"  # all = average over cycles | last
+    # parallel scheduled sampling on a pardec row's own shifted token inputs (not the context, see level_gt_drop):
+    # pass 1 teacher-forces GT, each later pass re-feeds the previous pass's detached prediction; loss = last pass
+    upsampler_pss_passes: tuple = 1  # per level; 1 = off, -1 = one pass per row token (exact rollout inputs)
+    downsampler_pss_passes: tuple = 1  # same for the downsampler; only matters when downsampler_ncodes > 1
+    upsampler_pss_prob: float = 1.0  # per-position prob of own prediction, else GT. Eval: always own
+    downsampler_pss_prob: float = 1.0
+    pss_input_mode: str = "argmax"  # argmax | sample (gumbel-max at pss_temperature; eval: argmax)
+    pss_temperature: float = 1.0
+    # TODO: CodeLM pss -- its inputs are true codes from the prefill today, only meaningful for free generation
     gen_level_cycles: tuple = None  # generation override per level (None = level_cycles); stack: <= level_cycles
     # per level: transformer | gru | linear_gru | ssm (recurrent: causal, attention-only fields ignored)
     codelm_backbone: tuple = "transformer"
@@ -417,6 +426,8 @@ class Config:
         bcast("level_refine_passes", int)
         bcast("level_refine_window", int)
         bcast("level_cycles", int)
+        bcast("upsampler_pss_passes", int)
+        bcast("downsampler_pss_passes", int)
         if self.gen_level_cycles is None:
             self.gen_level_cycles = self.level_cycles
         bcast("gen_level_cycles", int)
@@ -627,6 +638,9 @@ class Config:
         assert self.level_cycle_input in ("rollout", "pss", "gt"), self.level_cycle_input
         assert 0.0 <= self.level_cycle_pss_prob <= 1.0, self.level_cycle_pss_prob
         assert self.level_cycle_loss in ("all", "last"), self.level_cycle_loss
+        assert all(x == -1 or x >= 1 for x in self.upsampler_pss_passes + self.downsampler_pss_passes), "pss_passes: -1 or >=1"
+        assert 0.0 <= self.upsampler_pss_prob <= 1.0 and 0.0 <= self.downsampler_pss_prob <= 1.0
+        assert self.pss_input_mode in ("argmax", "sample") and self.pss_temperature > 0.0
         for i in range(n):
             c, gc = self.level_cycles[i], self.gen_level_cycles[i]
             assert c >= 1 and gc >= 1, f"level {i}: level_cycles={c}, gen_level_cycles={gc} must be >=1"
@@ -1982,7 +1996,9 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
                   context_group_size: int, output_group_size: int, rate_id: int = 0,
                   output_expansion: int = None, return_hidden: bool = False,
                   draft_seq: jnp.ndarray = None, draft_len: int = 0, draft_fill: str = "zero",
-                  cycle_ctx: list = None) -> tuple:
+                  cycle_ctx: list = None, input_seq: jnp.ndarray = None) -> tuple:
+    # input_seq (pss): tokens embedded as the row's own inputs instead of target_seq, which stays the
+    # loss / digit-head target. Same shape as target_seq.
     # cycle_ctx (level_cycle_mode="stack"): per slot a (batch, n_context_positions, context_hidden)
     # revision hidden or None (mask); slots go right after bos: [window | bos | slots | draft | targets].
     # draft_seq/draft_len (level refine): fill the decode_past slot with each group's draft_len
@@ -2023,14 +2039,21 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
     if target_len_per_group_padded > 0:
         target_padded = jnp.pad(target_seq, ((0, 0), (0, target_len_per_group_padded), (0, 0)))
 
-    if decode_future > 0:
-        tail_padded = jnp.pad(target_padded, ((0, 0), (0, decode_future), (0, 0)))
-        real_tail_windows = jnp.stack(
-            [tail_padded[:, g * target_len_per_group:g * target_len_per_group + target_len_per_group + decode_future]
-             for g in range(n_groups)], axis=1)
-    else:
-        real_tail_windows = target_padded.reshape(batch, n_groups, target_len_per_group, *target_seq.shape[2:])
-    real_tail_flat = real_tail_windows.reshape(batch * n_groups, target_len_per_group + decode_future, *target_seq.shape[2:])
+    def tail_windows(padded):
+        if decode_future > 0:
+            tail_padded = jnp.pad(padded, ((0, 0), (0, decode_future), (0, 0)))
+            return jnp.stack(
+                [tail_padded[:, g * target_len_per_group:g * target_len_per_group + target_len_per_group + decode_future]
+                 for g in range(n_groups)], axis=1)
+        return padded.reshape(batch, n_groups, target_len_per_group, *target_seq.shape[2:])
+    real_tail_windows = tail_windows(target_padded)
+    input_padded, input_windows = target_padded, real_tail_windows
+    if input_seq is not None:
+        input_padded = input_seq.astype(target_seq.dtype)
+        if target_len_per_group_padded > 0:
+            input_padded = jnp.pad(input_padded, ((0, 0), (0, target_len_per_group_padded), (0, 0)))
+        input_windows = tail_windows(input_padded)
+    real_tail_flat = input_windows.reshape(batch * n_groups, target_len_per_group + decode_future, *target_seq.shape[2:])
     real_tail_embedded = code_embed_proj(real_tail_flat, pardec.target_embed, pardec.target_proj)
 
     if decode_past > 0 and refine and draft_seq is None:
@@ -2039,7 +2062,7 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
         draft_valid_flat = jnp.ones((batch * n_groups, decode_past), dtype=bool)
         target_embedded_flat = jnp.concatenate([draft_embedded, real_tail_embedded], axis=1)
     elif decode_past > 0:
-        draft_flat, draft_valid_flat = group_draft_windows(draft_seq if refine else target_padded, n_groups,
+        draft_flat, draft_valid_flat = group_draft_windows(draft_seq if refine else input_padded, n_groups,
                                                            target_len_per_group, decode_past, n_output_positions * oe)
         draft_embedded = code_embed_proj(draft_flat, pardec.target_embed, pardec.target_proj)
         if refine and draft_fill == "mask":
@@ -2591,10 +2614,32 @@ def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cf
     return code_embed_proj(raw, pardec.own_ctx_embed, pardec.own_ctx_proj)
 
 
+def pss_inputs(logits: jnp.ndarray, target: jnp.ndarray, cfg: "Config", rng, prob: float) -> jnp.ndarray:
+    # parallel scheduled sampling inputs: own prediction per position w.p. prob, else GT, detached. Mask and
+    # gumbel noise do not depend on the pass, so one pass per row token reproduces a sequential rollout.
+    lg = logits
+    if cfg.pss_input_mode == "sample" and rng is not None:
+        lg = lg.astype(jnp.float32) / cfg.pss_temperature
+        lg = lg + jax.random.gumbel(jax.random.fold_in(rng, 41), lg.shape)
+    own_tok = safe_argmax(lg).astype(jnp.int32)  # feeds a gather: avoid TPU argmax bug
+    if prob < 1.0 and rng is not None:
+        own = jax.random.bernoulli(jax.random.fold_in(rng, 40), p=prob, shape=own_tok.shape[:2])
+        own_tok = jnp.where(own[..., None], own_tok, target.astype(jnp.int32))
+    return jax.lax.stop_gradient(own_tok)
+
+
+def pss_n_passes(passes: int, row_tokens: int, decode_past: int) -> int:
+    # -1 = one pass per row token; a single-token row with no decode_past has no token input to swap
+    if row_tokens <= 1 and decode_past == 0:
+        return 1
+    return row_tokens if passes == -1 else passes
+
+
 def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.ndarray, target_idx: jnp.ndarray,
                                flat_bytes: jnp.ndarray, cfg: "Config", pixel_order, label_fn,
                                K: int, rate_id: int = 0, rng=None, downsampler_ncodes: int = 1,
-                               encode_temperature: float = 1.0, codelm_rate_id: int = None) -> dict:
+                               encode_temperature: float = 1.0, codelm_rate_id: int = None,
+                               pss_passes: int = 1) -> dict:
     # CodeLM forward (same as CodeLM.encode()'s first half), then the SHARED downsampler PardecLM
     # teacher-forced against label_fn's real downsampled-image target (context_group_size=K,
     # output_group_size=1 -- one code per K-block, genuinely autoregressive over context).
@@ -2628,8 +2673,11 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
     def _teacher_forced():
         # teacher-forced on label_fn(image) digits (default path; see Config.downsampler_rollout)
         label_tgt = label_fn(flat_bytes, cfg, pixel_order, n_blocks, codelm.pq_chunks, codelm.code_vocab)
-        lg, _, _, _ = pardec_score(downsampler, label_tgt, h, context_group_size=K * downsampler_ncodes,
-                                    output_group_size=downsampler_ncodes, rate_id=rate_id)
+        score = lambda **kw: pardec_score(downsampler, label_tgt, h, context_group_size=K * downsampler_ncodes,
+                                          output_group_size=downsampler_ncodes, rate_id=rate_id, **kw)[0]
+        lg = score()
+        for _ in range(1, pss_n_passes(pss_passes, downsampler_ncodes, downsampler.decode_past)):
+            lg = score(input_seq=pss_inputs(lg, label_tgt, cfg, rng, cfg.downsampler_pss_prob))
         cs, ci = quantize_dispatch(codelm.quantize_mode, lg, rng, encode_temperature, codelm.quantize_drop)
         return lg, cs, ci
 
@@ -2779,6 +2827,17 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
         _canon = lambda t: (t[0].astype(h_ctx.dtype), t[1].astype(jnp.int32),
                              t[2].astype(h_ctx.dtype), t[3].astype(h_ctx.dtype))
         return jax.lax.cond(use_roll, lambda: _canon(_rollout(**dkw)), lambda: _canon(_teacher_forced(**dkw)))
+
+    n_ss = 1 if force_teacher_forced else pss_n_passes(cfg.upsampler_pss_passes[level_idx], upsampler_ncodes * oe,
+                                                        upsampler.decode_past)
+    _tf_or_rollout = _one_pass
+
+    def _one_pass(**dkw):
+        # pss: re-feed the previous pass's own prediction as the row's token inputs; only the last pass is scored
+        out = _tf_or_rollout(**dkw)
+        for _ in range(1, n_ss):
+            out = _tf_or_rollout(input_seq=pss_inputs(out[0], out[1], cfg, rng, cfg.upsampler_pss_prob), **dkw)
+        return out
 
     n_pass = cfg.level_refine_passes[level_idx]
     Pp = cfg.level_refine_window[level_idx] * upsampler_ncodes * oe
@@ -3315,7 +3374,8 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
         out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, model.cfg,
                                          pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                          codelm_rate_id=model.codelm_bos_rate_id(i),
-                                         rng=level_rngs[2 * i], downsampler_ncodes=model.cfg.downsampler_ncodes[i])
+                                         rng=level_rngs[2 * i], downsampler_ncodes=model.cfg.downsampler_ncodes[i],
+                                        pss_passes=model.cfg.downsampler_pss_passes[i])
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
         enc_losses.append(out["ntp_loss"])
@@ -3498,7 +3558,8 @@ def _encode_chain_upto(model, flat_bytes, upto_level, cfg, label_fn, pixel_order
         out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, cfg,
                                          pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                          codelm_rate_id=model.codelm_bos_rate_id(i), rng=level_rngs[i],
-                                         downsampler_ncodes=cfg.downsampler_ncodes[i])
+                                         downsampler_ncodes=cfg.downsampler_ncodes[i],
+                                        pss_passes=cfg.downsampler_pss_passes[i])
         code_idx, code_soft = out["code_idx"], out["code_soft"]
         raw, target = code_soft, code_idx
     return code_idx, code_soft
@@ -3558,7 +3619,8 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
         out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, model.cfg,
                                          pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                          codelm_rate_id=model.codelm_bos_rate_id(i),
-                                         rng=level_rngs[2 * d], downsampler_ncodes=model.cfg.downsampler_ncodes[i])
+                                         rng=level_rngs[2 * d], downsampler_ncodes=model.cfg.downsampler_ncodes[i],
+                                        pss_passes=model.cfg.downsampler_pss_passes[i])
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
         enc_losses.append(out["ntp_loss"])
@@ -3789,7 +3851,8 @@ def plot_encoder_outs(model: "LagCodecModel", cfg: Config, imgs: np.ndarray, pix
         out_i = encode_pardec_downsampler(codelm_i, model.downsampler_for(i), raw, flat, flat_raw, cfg,
                                            pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                            codelm_rate_id=model.codelm_bos_rate_id(i),
-                                           downsampler_ncodes=cfg.downsampler_ncodes[i])
+                                           downsampler_ncodes=cfg.downsampler_ncodes[i],
+                                        pss_passes=cfg.downsampler_pss_passes[i])
         flat = out_i["code_idx"]
         raw = out_i["code_soft"]
     # Must dispatch exactly like level_forward's own encode call (line ~1809) -- otherwise this
@@ -3800,7 +3863,8 @@ def plot_encoder_outs(model: "LagCodecModel", cfg: Config, imgs: np.ndarray, pix
     out = encode_pardec_downsampler(codelm, model.downsampler_for(level), raw, flat, flat_raw, cfg,
                                      pixel_order, label_fn, model.K(level), rate_id=model.bos_rate_id(level),
                                      codelm_rate_id=model.codelm_bos_rate_id(level),
-                                     downsampler_ncodes=cfg.downsampler_ncodes[level])
+                                     downsampler_ncodes=cfg.downsampler_ncodes[level],
+                                        pss_passes=cfg.downsampler_pss_passes[level])
     code_idx = np.asarray(out["code_idx"])
     util = float(out["util"])
     M, n_blocks, C = code_idx.shape
@@ -3954,6 +4018,8 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
                   "level_refine_draft_mode", "level_refine_draft_temperature",
                   "level_cycles", "level_cycle_mode", "level_cycle_input", "level_cycle_pss_prob",
                   "level_cycle_detach", "level_cycle_loss", "gen_level_cycles",
+                  "upsampler_pss_passes", "downsampler_pss_passes", "upsampler_pss_prob", "downsampler_pss_prob",
+                  "pss_input_mode", "pss_temperature",
                   "codelm_backbone", "downsampler_backbone", "upsampler_backbone", "ssm_state_dim",
                   "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
                   "gumbel_at_inference", "init_scheme", "use_xsa",
@@ -4253,6 +4319,16 @@ def main():
     p.add_argument("--level_cycle_detach", type=lambda x: x.lower() != "false", default=Config.level_cycle_detach,
                     help="False: cycle loss also trains the re-encoder through quantize_mode's estimator")
     p.add_argument("--level_cycle_loss", type=str, default=Config.level_cycle_loss, choices=["all", "last"])
+    p.add_argument("--upsampler_pss_passes", type=_tuple_arg, default=Config.upsampler_pss_passes,
+                    help="per level: parallel scheduled sampling passes on the upsampler's own token inputs "
+                         "(1 = off, -1 = one per row token = exact rollout inputs); loss on the last pass")
+    p.add_argument("--downsampler_pss_passes", type=_tuple_arg, default=Config.downsampler_pss_passes,
+                    help="same for the downsampler (only matters when downsampler_ncodes > 1)")
+    p.add_argument("--upsampler_pss_prob", type=float, default=Config.upsampler_pss_prob,
+                    help="pss: per-position prob of own prediction (else GT)")
+    p.add_argument("--downsampler_pss_prob", type=float, default=Config.downsampler_pss_prob)
+    p.add_argument("--pss_input_mode", type=str, default=Config.pss_input_mode, choices=["argmax", "sample"])
+    p.add_argument("--pss_temperature", type=float, default=Config.pss_temperature)
     p.add_argument("--gen_level_cycles", type=_tuple_arg, default=Config.gen_level_cycles,
                     help="per level: generation cycles (default = level_cycles)")
     for name in ("codelm_backbone", "downsampler_backbone", "upsampler_backbone"):
@@ -4533,7 +4609,8 @@ def main():
                 out = encode_pardec_downsampler(codelm_i, m.downsampler_for(i), raw, target, flat_prompt, cfg,
                                                  pixel_order, label_fn, m.K(i), rate_id=m.bos_rate_id(i),
                                                  codelm_rate_id=m.codelm_bos_rate_id(i),
-                                                 rng=eval_rngs[i], downsampler_ncodes=cfg.downsampler_ncodes[i])
+                                                 rng=eval_rngs[i], downsampler_ncodes=cfg.downsampler_ncodes[i],
+                                        pss_passes=cfg.downsampler_pss_passes[i])
             codes.append(out["code_idx"])
             codes_soft.append(out["code_soft"])
             if i < top:

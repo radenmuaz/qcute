@@ -210,6 +210,11 @@ if __name__ == "__main__":
                                                       codelm_bos_rates=2, curriculum_mode="freeze")),
         ("codelm_upper shared + stack cycles", dict(context_source="codelm_upper", share_across_levels=True,
                                                     level_cycles=2, level_cycle_mode="stack", use_codelm_bos=True)),
+        ("pss upsampler", dict(upsampler_pss_passes=(3, -1))),
+        ("pss both sides + ncodes 2 + refine", dict(upsampler_pss_passes=2, downsampler_pss_passes=-1, downsampler_ncodes=2,
+                                                    upsampler_ncodes=2, level_refine_passes=2, level_refine_window=1)),
+        ("pss + upsampler_rollout + stack cycles", dict(upsampler_pss_passes=-1, upsampler_rollout=True, level_cycles=2,
+                                                        level_cycle_mode="stack")),
     ]
     only = sys.argv[1:]
     results = [(n, check(n, **kw)) for n, kw in cases if not only or n in only]

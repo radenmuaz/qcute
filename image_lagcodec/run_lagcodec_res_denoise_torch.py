@@ -367,6 +367,15 @@ class Config:
     level_cycle_pss_prob: float = 1.0  # pss: per-position prob of own argmax, else GT. Eval: always own
     level_cycle_detach: bool = True  # False: grad flows into the re-encoder via quantize_mode's estimator
     level_cycle_loss: str = "all"  # all = average over cycles | last
+    # parallel scheduled sampling on a pardec row's own shifted token inputs (not the context, see level_gt_drop):
+    # pass 1 teacher-forces GT, each later pass re-feeds the previous pass's detached prediction; loss = last pass
+    upsampler_pss_passes: tuple = 1  # per level; 1 = off, -1 = one pass per row token (exact rollout inputs)
+    downsampler_pss_passes: tuple = 1  # same for the downsampler; only matters when downsampler_ncodes > 1
+    upsampler_pss_prob: float = 1.0  # per-position prob of own prediction, else GT. Eval: always own
+    downsampler_pss_prob: float = 1.0
+    pss_input_mode: str = "argmax"  # argmax | sample (gumbel-max at pss_temperature; eval: argmax)
+    pss_temperature: float = 1.0
+    # TODO: CodeLM pss -- its inputs are true codes from the prefill today, only meaningful for free generation
     gen_level_cycles: tuple = None  # generation override per level (None = level_cycles); stack: <= level_cycles
     # per level: transformer | gru | linear_gru | ssm (recurrent: causal, attention-only fields ignored)
     codelm_backbone: tuple = "transformer"
@@ -426,6 +435,8 @@ class Config:
         bcast("level_refine_passes", int)
         bcast("level_refine_window", int)
         bcast("level_cycles", int)
+        bcast("upsampler_pss_passes", int)
+        bcast("downsampler_pss_passes", int)
         if self.gen_level_cycles is None:
             self.gen_level_cycles = self.level_cycles
         bcast("gen_level_cycles", int)
@@ -636,6 +647,9 @@ class Config:
         assert self.level_cycle_input in ("rollout", "pss", "gt"), self.level_cycle_input
         assert 0.0 <= self.level_cycle_pss_prob <= 1.0, self.level_cycle_pss_prob
         assert self.level_cycle_loss in ("all", "last"), self.level_cycle_loss
+        assert all(x == -1 or x >= 1 for x in self.upsampler_pss_passes + self.downsampler_pss_passes), "pss_passes: -1 or >=1"
+        assert 0.0 <= self.upsampler_pss_prob <= 1.0 and 0.0 <= self.downsampler_pss_prob <= 1.0
+        assert self.pss_input_mode in ("argmax", "sample") and self.pss_temperature > 0.0
         for i in range(n):
             c, gc = self.level_cycles[i], self.gen_level_cycles[i]
             assert c >= 1 and gc >= 1, f"level {i}: level_cycles={c}, gen_level_cycles={gc} must be >=1"
@@ -1900,8 +1914,9 @@ def cycle_slot_rows(pardec: PardecLM, cycle_ctx: list, context_group_size: int, 
 def pardec_score(pardec: PardecLM, target_seq: torch.Tensor, context_h: torch.Tensor, context_group_size: int,
                  output_group_size: int, rate_id: int = 0, output_expansion: int = None, return_hidden: bool = False,
                  draft_seq: torch.Tensor = None, draft_len: int = 0, draft_fill: str = "zero",
-                 cycle_ctx: list = None) -> tuple:
+                 cycle_ctx: list = None, input_seq: torch.Tensor = None) -> tuple:
     # teacher-forced scoring of every group in parallel (dense); see the JAX pardec_score for the row layout
+    # input_seq (pss): tokens embedded as the row's own inputs instead of target_seq (still the loss target)
     oe = pardec.output_expansion if output_expansion is None else output_expansion
     batch, n_context_positions, _ = context_h.shape
     dev = context_h.device
@@ -1925,12 +1940,20 @@ def pardec_score(pardec: PardecLM, target_seq: torch.Tensor, context_h: torch.Te
     target_padded = target_seq
     if tail_pad > 0:
         target_padded = torch.cat([target_seq, target_seq.new_zeros((batch, tail_pad) + tuple(target_seq.shape[2:]))], 1)
-    if decode_future > 0:
-        tail_padded = torch.cat([target_padded, target_padded.new_zeros((batch, decode_future) + tuple(target_seq.shape[2:]))], 1)
-        real_tail_windows = _windows(tail_padded, [g * T for g in range(n_groups)], T + decode_future)
-    else:
-        real_tail_windows = target_padded.reshape(batch, n_groups, T, *target_seq.shape[2:])
-    real_tail_flat = real_tail_windows.reshape(B2, T + decode_future, *target_seq.shape[2:])
+
+    def tail_windows(padded):
+        if decode_future > 0:
+            tail_padded = torch.cat([padded, padded.new_zeros((batch, decode_future) + tuple(target_seq.shape[2:]))], 1)
+            return _windows(tail_padded, [g * T for g in range(n_groups)], T + decode_future)
+        return padded.reshape(batch, n_groups, T, *target_seq.shape[2:])
+    real_tail_windows = tail_windows(target_padded)
+    input_padded, input_windows = target_padded, real_tail_windows
+    if input_seq is not None:
+        input_padded = input_seq.to(target_seq.dtype)
+        if tail_pad > 0:
+            input_padded = torch.cat([input_padded, input_padded.new_zeros((batch, tail_pad) + tuple(target_seq.shape[2:]))], 1)
+        input_windows = tail_windows(input_padded)
+    real_tail_flat = input_windows.reshape(B2, T + decode_future, *target_seq.shape[2:])
     real_tail_embedded = code_embed_proj(real_tail_flat, pardec.target_embed, pardec.target_proj)
 
     if decode_past > 0 and refine and draft_seq is None:
@@ -1938,7 +1961,7 @@ def pardec_score(pardec: PardecLM, target_seq: torch.Tensor, context_h: torch.Te
         draft_valid_flat = torch.ones(B2, decode_past, dtype=torch.bool, device=dev)
         target_embedded_flat = torch.cat([draft_embedded, real_tail_embedded], 1)
     elif decode_past > 0:
-        draft_flat, draft_valid_flat = group_draft_windows(draft_seq if refine else target_padded, n_groups, T,
+        draft_flat, draft_valid_flat = group_draft_windows(draft_seq if refine else input_padded, n_groups, T,
                                                            decode_past, n_output_positions * oe)
         draft_embedded = code_embed_proj(draft_flat, pardec.target_embed, pardec.target_proj)
         if refine and draft_fill == "mask":
@@ -2190,10 +2213,32 @@ def codelm_ntp_logits_tf(codelm: CodeLM, h: torch.Tensor, target: torch.Tensor) 
                                    codelm.tok_ln_f, codelm.tok_out_head, codelm.token_dim, codelm.code_vocab, h, target)
 
 
+def pss_inputs(logits: torch.Tensor, target: torch.Tensor, cfg: "Config", rng, prob: float) -> torch.Tensor:
+    # parallel scheduled sampling inputs: own prediction per position w.p. prob, else GT, detached. Mask and
+    # gumbel noise do not depend on the pass, so one pass per row token reproduces a sequential rollout.
+    lg = logits
+    if cfg.pss_input_mode == "sample" and rng is not None:
+        lg = lg.float() / cfg.pss_temperature
+        lg = lg + rand_gumbel(rng.fold(41), lg.shape, lg.device)
+    own_tok = safe_argmax(lg)
+    if prob < 1.0 and rng is not None:
+        own = rand_bernoulli(rng.fold(40), prob, own_tok.shape[:2], own_tok.device)
+        own_tok = torch.where(own[..., None], own_tok, target.long())
+    return own_tok.detach()
+
+
+def pss_n_passes(passes: int, row_tokens: int, decode_past: int) -> int:
+    # -1 = one pass per row token; a single-token row with no decode_past has no token input to swap
+    if row_tokens <= 1 and decode_past == 0:
+        return 1
+    return row_tokens if passes == -1 else passes
+
+
 def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: torch.Tensor, target_idx: torch.Tensor,
                               flat_bytes: torch.Tensor, cfg: "Config", pixel_order, label_fn, K: int,
                               rate_id: int = 0, rng=None, downsampler_ncodes: int = 1,
-                              encode_temperature: float = 1.0, codelm_rate_id: int = None) -> dict:
+                              encode_temperature: float = 1.0, codelm_rate_id: int = None,
+                              pss_passes: int = 1) -> dict:
     codelm_rate_id = rate_id if codelm_rate_id is None else codelm_rate_id
     h = pardec_context_hidden(codelm, downsampler, raw, cfg, codelm_rate_id, rng, group_size=K * downsampler_ncodes)
     M, L, D = h.shape
@@ -2201,8 +2246,15 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: torch.
 
     def _teacher_forced():
         label_tgt = label_fn(flat_bytes, cfg, pixel_order, n_blocks, codelm.pq_chunks, codelm.code_vocab)
-        lg, _, _, _ = pardec_score(downsampler, label_tgt, h, context_group_size=K * downsampler_ncodes,
-                                   output_group_size=downsampler_ncodes, rate_id=rate_id)
+        score = lambda **kw: pardec_score(downsampler, label_tgt, h, context_group_size=K * downsampler_ncodes,
+                                          output_group_size=downsampler_ncodes, rate_id=rate_id, **kw)[0]
+        n_ss = pss_n_passes(pss_passes, downsampler_ncodes, downsampler.decode_past)
+        with torch.set_grad_enabled(n_ss == 1 and torch.is_grad_enabled()):  # only the last pass needs a graph
+            lg = score()
+        for s_ in range(1, n_ss):
+            inp = pss_inputs(lg, label_tgt, cfg, rng, cfg.downsampler_pss_prob)
+            with torch.set_grad_enabled(s_ == n_ss - 1 and torch.is_grad_enabled()):
+                lg = score(input_seq=inp)
         cs, ci = quantize_dispatch(codelm.quantize_mode, lg, rng, encode_temperature, codelm.quantize_drop)
         return lg, cs, ci
 
@@ -2308,6 +2360,20 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
             return _teacher_forced(**dkw)
         use_roll = bool(rand_bernoulli(rng.fold(9), cfg.upsampler_rollout_prob, (), h_ctx.device))
         return _rollout(**dkw) if use_roll else _teacher_forced(**dkw)
+
+    n_ss = 1 if force_teacher_forced else pss_n_passes(cfg.upsampler_pss_passes[level_idx], upsampler_ncodes * oe,
+                                                        upsampler.decode_past)
+    _tf_or_rollout = _one_pass
+
+    def _one_pass(**dkw):
+        # pss: re-feed the previous pass's own prediction as the row's token inputs; only the last pass is scored
+        with torch.set_grad_enabled(n_ss == 1 and torch.is_grad_enabled()):  # only the last pass needs a graph
+            out = _tf_or_rollout(**dkw)
+        for s_ in range(1, n_ss):
+            inp = pss_inputs(out[0], out[1], cfg, rng, cfg.upsampler_pss_prob)
+            with torch.set_grad_enabled(s_ == n_ss - 1 and torch.is_grad_enabled()):
+                out = _tf_or_rollout(input_seq=inp, **dkw)
+        return out
 
     n_pass = cfg.level_refine_passes[level_idx]
     Pp = cfg.level_refine_window[level_idx] * upsampler_ncodes * oe
@@ -2696,7 +2762,7 @@ def level_forward(model: LagCodecModel, flat_bytes: torch.Tensor, phase: int, rn
         out = encode_pardec_downsampler(model.codelm_for(i), model.downsampler_for(i), raw, target, flat_bytes, cfg,
                                         pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                         codelm_rate_id=model.codelm_bos_rate_id(i), rng=level_rngs[2 * i],
-                                        downsampler_ncodes=cfg.downsampler_ncodes[i])
+                                        downsampler_ncodes=cfg.downsampler_ncodes[i], pss_passes=cfg.downsampler_pss_passes[i])
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
         enc_losses.append(out["ntp_loss"])
@@ -2822,7 +2888,7 @@ def _encode_chain_upto(model, flat_bytes, upto_level, cfg, label_fn, pixel_order
         out = encode_pardec_downsampler(model.codelm_for(i), model.downsampler_for(i), raw, target, flat_bytes, cfg,
                                         pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                         codelm_rate_id=model.codelm_bos_rate_id(i), rng=level_rngs[i],
-                                        downsampler_ncodes=cfg.downsampler_ncodes[i])
+                                        downsampler_ncodes=cfg.downsampler_ncodes[i], pss_passes=cfg.downsampler_pss_passes[i])
         code_idx, code_soft = out["code_idx"], out["code_soft"]
         raw, target = code_soft, code_idx
     return code_idx, code_soft
@@ -2861,7 +2927,7 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: torch.Tensor, entry
         out = encode_pardec_downsampler(model.codelm_for(i), model.downsampler_for(i), raw, target, flat_bytes, cfg,
                                         pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                         codelm_rate_id=model.codelm_bos_rate_id(i), rng=level_rngs[2 * d],
-                                        downsampler_ncodes=cfg.downsampler_ncodes[i])
+                                        downsampler_ncodes=cfg.downsampler_ncodes[i], pss_passes=cfg.downsampler_pss_passes[i])
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
         enc_losses.append(out["ntp_loss"])
@@ -2940,12 +3006,12 @@ def plot_encoder_outs(model: LagCodecModel, cfg: "Config", imgs: np.ndarray, pix
         out_i = encode_pardec_downsampler(model.codelm_for(i), model.downsampler_for(i), raw, flat, flat_raw, cfg,
                                           pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                           codelm_rate_id=model.codelm_bos_rate_id(i),
-                                          downsampler_ncodes=cfg.downsampler_ncodes[i])
+                                          downsampler_ncodes=cfg.downsampler_ncodes[i], pss_passes=cfg.downsampler_pss_passes[i])
         flat, raw = out_i["code_idx"], out_i["code_soft"]
     out = encode_pardec_downsampler(model.codelm_for(level), model.downsampler_for(level), raw, flat, flat_raw, cfg,
                                     pixel_order, label_fn, model.K(level), rate_id=model.bos_rate_id(level),
                                     codelm_rate_id=model.codelm_bos_rate_id(level),
-                                    downsampler_ncodes=cfg.downsampler_ncodes[level])
+                                    downsampler_ncodes=cfg.downsampler_ncodes[level], pss_passes=cfg.downsampler_pss_passes[level])
     code_idx = out["code_idx"].cpu().numpy()
     util = float(out["util"])
     M, n_blocks, C = code_idx.shape
@@ -3091,6 +3157,8 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
                   "level_refine_draft_mode", "level_refine_draft_temperature",
                   "level_cycles", "level_cycle_mode", "level_cycle_input", "level_cycle_pss_prob",
                   "level_cycle_detach", "level_cycle_loss", "gen_level_cycles",
+                  "upsampler_pss_passes", "downsampler_pss_passes", "upsampler_pss_prob", "downsampler_pss_prob",
+                  "pss_input_mode", "pss_temperature",
                   "codelm_backbone", "downsampler_backbone", "upsampler_backbone", "ssm_state_dim",
                   "precision", "curriculum_mode", "quantize_mode", "quantize_drop",
                   "gumbel_at_inference", "init_scheme", "use_xsa",
@@ -3516,6 +3584,16 @@ def main():
     p.add_argument("--level_cycle_detach", type=lambda x: x.lower() != "false", default=Config.level_cycle_detach,
                     help="False: cycle loss also trains the re-encoder through quantize_mode's estimator")
     p.add_argument("--level_cycle_loss", type=str, default=Config.level_cycle_loss, choices=["all", "last"])
+    p.add_argument("--upsampler_pss_passes", type=_tuple_arg, default=Config.upsampler_pss_passes,
+                    help="per level: parallel scheduled sampling passes on the upsampler's own token inputs "
+                         "(1 = off, -1 = one per row token = exact rollout inputs); loss on the last pass")
+    p.add_argument("--downsampler_pss_passes", type=_tuple_arg, default=Config.downsampler_pss_passes,
+                    help="same for the downsampler (only matters when downsampler_ncodes > 1)")
+    p.add_argument("--upsampler_pss_prob", type=float, default=Config.upsampler_pss_prob,
+                    help="pss: per-position prob of own prediction (else GT)")
+    p.add_argument("--downsampler_pss_prob", type=float, default=Config.downsampler_pss_prob)
+    p.add_argument("--pss_input_mode", type=str, default=Config.pss_input_mode, choices=["argmax", "sample"])
+    p.add_argument("--pss_temperature", type=float, default=Config.pss_temperature)
     p.add_argument("--gen_level_cycles", type=_tuple_arg, default=Config.gen_level_cycles,
                     help="per level: generation cycles (default = level_cycles)")
     for name in ("codelm_backbone", "downsampler_backbone", "upsampler_backbone"):
@@ -3763,7 +3841,7 @@ def main():
                                                     flat_prompt, cfg, pixel_order, label_fn, model.K(i),
                                                     rate_id=model.bos_rate_id(i),
                                                     codelm_rate_id=model.codelm_bos_rate_id(i), rng=eval_rngs[i],
-                                                    downsampler_ncodes=cfg.downsampler_ncodes[i])
+                                                    downsampler_ncodes=cfg.downsampler_ncodes[i], pss_passes=cfg.downsampler_pss_passes[i])
                 codes.append(out["code_idx"])
                 if i < top:
                     raw, target = out["code_soft"], out["code_idx"]

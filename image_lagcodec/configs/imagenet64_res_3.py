@@ -64,7 +64,9 @@ upsampler_window = 1
 upsampler_rollout = True
 upsampler_rollout_prob = 0.5
 remat_chunks = 4
-
+upsampler_pss_passes = -1
+upsampler_pss_prob = 0.5
+pss_input_mode = "argmax"
 level_refine_passes = 2
 level_refine_window = 1
 level_refine_gt_drop = 0.5
@@ -102,15 +104,16 @@ val_batch_size = 2
 #   (1, 1, 5) epochs  ~=  (20018, 20018, 100090) steps  (140,126 total)
 # To schedule by steps instead, comment out level_epochs above and uncomment (level_epochs and
 # level_steps are mutually exclusive; steps-per-epoch scales with batch_size / n devices / n hosts):
-level_steps = (20_000, 20_000, 20_000, 20_000, 200_000)
+# level_steps = (5_000, 5_000, 5_000, 5_000, 200_000)
+level_steps = (1_000, 1_000, 1_000, 1_000, 200_000)
 # level_steps = (0,0,0,1_000_000)
 seed = 0
 train_subset_n = None
 val_subset_n = 512
 # gen_eval_every_epoch = 0.25   # ~= every 5,005 steps at global batch 64
-gen_eval_every_step = 20_000   # uncomment (and comment gen_eval_every_epoch) to eval by steps
+gen_eval_every_step = 10_000   # uncomment (and comment gen_eval_every_epoch) to eval by steps
 epoch_verbose = False
-ctx_stop_gradient = "pseudo"
+# ctx_stop_gradient = "pseudo"
 
 
 grad_clip = 1.0
