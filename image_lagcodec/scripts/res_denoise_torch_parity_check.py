@@ -215,6 +215,10 @@ if __name__ == "__main__":
                                                     upsampler_ncodes=2, level_refine_passes=2, level_refine_window=1)),
         ("pss + upsampler_rollout + stack cycles", dict(upsampler_pss_passes=-1, upsampler_rollout=True, level_cycles=2,
                                                         level_cycle_mode="stack")),
+        ("rollout both + ncodes 2", dict(downsampler_rollout=True, upsampler_rollout=True, downsampler_ncodes=2,
+                                         upsampler_ncodes=2)),
+        ("rollout ncodes 4 capped + pss", dict(downsampler_rollout=True, upsampler_rollout=True, downsampler_ncodes=4,
+                                               upsampler_ncodes=2, downsampler_pss_passes=2, upsampler_pss_passes=2)),
     ]
     only = sys.argv[1:]
     results = [(n, check(n, **kw)) for n, kw in cases if not only or n in only]

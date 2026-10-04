@@ -621,6 +621,56 @@ def run_pss_check():
     return all(oks)
 
 
+def run_rollout_ncodes_check():
+    """downsampler_rollout / upsampler_rollout with ncodes>1: eval rollout equals greedy generation (downsampler: all
+    row codes, capped passes: the first ones; upsampler: with pss -1), and a train step has finite grads."""
+    import dataclasses
+    import equinox as eqx
+    print("[rollout with ncodes>1]")
+    oks = []
+    base = dict(strides=(4, 4), code_vocab=(256, 256), pq_chunks=(3, 3), pq_dim=(16, 16), downsampler_window=(1, 1),
+                upsampler_window=(1, 1), share_across_levels=False, pardec_token_head="ar", codelm_token_head="ar",
+                token_head_type="ar", downsampler_rollout=True, upsampler_rollout=True)
+    for nc in (2, 4):
+        cfg = build_cfg(**{**base, "downsampler_ncodes": (nc, nc), "upsampler_ncodes": (nc, 1)})
+        model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+        flat, po = load_data(cfg)
+        tok = R.rgb_byte_pq_fn(flat, cfg.pq_chunks[0], cfg.code_vocab[0])
+        cl, ds = model.codelm_for(0), model.downsampler_for(0)
+        gen = np.asarray(R.encode_pardec_downsampler_generate(cl, ds, tok, 4, cfg, rng=jax.random.PRNGKey(1), greedy=True,
+                                                              downsampler_ncodes=nc)["code_idx"])
+        for passes in (1, 2):
+            roll = np.asarray(R.encode_pardec_downsampler(cl, ds, tok, tok, flat, cfg, po, R.rgb_label_fn_jax, 4, rng=None,
+                                                          downsampler_ncodes=nc, pss_passes=passes)["code_idx"])
+            k = nc if passes == 1 else min(passes, nc)
+            a, b = roll.reshape(B, -1, nc, 3)[:, :, :k], gen.reshape(B, -1, nc, 3)[:, :, :k]
+            ok = bool((a == b).all())
+            print(f"  downsampler ncodes={nc} passes={passes}: first {k}/{nc} row codes equal greedy generation={ok}, "
+                  f"whole-row match={float((roll == gen).mean()):.3f}  {'OK' if ok else 'DIFF'}")
+            oks.append(ok)
+        ctx = jax.random.randint(jax.random.PRNGKey(5), (B, tok.shape[1] // 4, 3), 0, 256)
+        g_up = np.asarray(R._decode_generate_pardec_call(model, 0, ctx, nc, True, 1.0, 0))
+        m_pss = R.LagCodecModel(jax.random.PRNGKey(0), dataclasses.replace(cfg, upsampler_pss_passes=(-1, 1)))
+        pred = np.asarray(jnp.argmax(R.decode_logits_and_target_multipass(m_pss, 0, tok, ctx, nc, rng=None)[0], -1))
+        ok = bool((pred == g_up).all())
+        print(f"  upsampler ncodes={nc} rollout + pss -1 equals greedy generation={ok}  {'OK' if ok else 'DIFF'}")
+        oks.append(ok)
+    cfg = build_cfg(**{**base, "downsampler_ncodes": (2, 2), "upsampler_ncodes": (2, 1), "downsampler_rollout_prob": 0.5,
+                       "upsampler_rollout_prob": 0.5, "upsampler_pss_passes": (2, 1), "quantize_mode": "zgr"})
+    model = R.LagCodecModel(jax.random.PRNGKey(0), cfg)
+    flat, po = load_data(cfg)
+    f = lambda m: R.level_forward(m, flat, 2, rng=jax.random.PRNGKey(3), level_gt_drop=1.0, cascade_rng=jax.random.PRNGKey(4),
+                                  label_reg_weight=1.0, label_fn=R.rgb_label_fn_jax, pixel_order=po)[0]
+    loss, g = eqx.filter_jit(eqx.filter_value_and_grad(f))(model)
+    leaves = jax.tree_util.tree_leaves(eqx.filter(g, eqx.is_array))
+    ds_g = float(sum(jnp.abs(x).sum() for x in jax.tree_util.tree_leaves(eqx.filter(g.downsamplers, eqx.is_array))))
+    ok = bool(np.isfinite(float(loss))) and all(bool(jnp.isfinite(x).all()) for x in leaves) and ds_g > 0
+    print(f"  train step, both rollouts prob 0.5, ncodes=2: loss={float(loss):.4f} finite grads, downsampler |g|={ds_g:.3g}  "
+          f"{'OK' if ok else 'DIFF'}")
+    oks.append(ok)
+    return all(oks)
+
+
 if __name__ == "__main__":
     checks = []
     for kind in ("gru", "linear_gru", "ssm"):
@@ -660,6 +710,7 @@ if __name__ == "__main__":
         ("remat chunks", run_remat_chunks_check),
         ("reinmax fast vs dense", run_reinmax_check),
         ("parallel scheduled sampling", run_pss_check),
+        ("rollout with ncodes>1", run_rollout_ncodes_check),
     ]
     only = sys.argv[1:]  # optional: run only the named checks
     results = [(name, fn()) for name, fn in checks if not only or name in only]

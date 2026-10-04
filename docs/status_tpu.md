@@ -10,9 +10,10 @@ Zone `us-central2-b`, project `raden-tpu`. tpu3–8 are slated for deletion.
 |---|---|---|---|---|
 | tpu34a (worker 0) | 35.186.86.22 | `imagenet64_6` | `imagenet64_6` | `image_lagcodec/configs/imagenet64_6.py` |
 | tpu34b (worker 1) | 35.186.115.139 | `imagenet64_6` | `imagenet64_6` | same (multihost, run on both hosts) |
-| tpu2 | 35.186.15.67 | idle | — | — |
-| tpu1 | 35.186.98.243 | idle (2026-10-04 03:50 +03) | — | — |
+| tpu2 | 35.186.15.67 | `cifar_2_pss` (`run_lagcodec_res_denoise`), seen running 2026-10-04 16:19 +03, step ~76000 | `0` | `image_lagcodec/configs/cifar_2_pss.py` |
+| tpu1 | 35.186.98.243 | `cifar_1_pss` (`run_lagcodec_res`), seen running 2026-10-04 16:19 +03, step ~92000 | `0` | `image_lagcodec/configs/cifar_1_pss.py` |
 
+- tpu1/tpu2 2026-10-04: user-launched runs above; CPU-only audits ran next to them 15:15-16:19 +03 (see status_image_lagcodec.md), leaving `~/audit_ckpt/` (848 MB), `~/audit_out/`, `~/audit_*.log` on each node.
 - tpu1 done 2026-10-04: `cifar_overfit_2stage_freeze_denoise` (memoryless cycles, 2h18m), `cifar_overfit_2stage_freeze_denoise_stack` (stack cycles, 2h40m), `torch_cpu_cifar_overfit_2stage_freeze_denoise` (torch port on CPU, 300+300 steps); tmux sessions kept for post-mortem.
 
 - tpu34 = v4-16 (8 chips, 2 hosts). Both hosts run the same command; log `~/imagenet64_6.log` on each. Launched 2026-09-21 11:32, ETA ~18:20.

@@ -172,7 +172,8 @@ class Config:
     # sequential) is then never exercised during training at all. True: digits are self-fed
     # (token_ar_rollout, straight-through per quantize_mode) while the loss still scores against the
     # real target -- training the digit head the way it's actually used at generation time. Needs
-    # upsampler_ncodes==1, upsampler_decode_past/future==0, pardec_token_head="ar".
+    # upsampler_decode_past/future==0, pardec_token_head="ar". Row TOKENS stay teacher-forced (any
+    # upsampler_ncodes).
     upsampler_rollout_prob: float = 1.0  # probability (per decode step, one draw per level) of using
     # the rollout path instead of teacher-forced when upsampler_rollout=True. Eval (rng=None) always
     # uses the rollout.
@@ -505,8 +506,6 @@ class Config:
             if self.pardec_token_head != "ar":
                 raise ValueError("upsampler_rollout is incompatible with pardec_token_head='linear' "
                                  "(the rollout self-feeds digits through the AR token head)")
-            assert all(g == 1 for g in self.upsampler_ncodes), \
-                f"upsampler_rollout needs upsampler_ncodes==1 at every level, got {self.upsampler_ncodes}"
             assert all(p == 0 for p in self.upsampler_decode_past) \
                 and all(f == 0 for f in self.upsampler_decode_future), \
                 "upsampler_rollout needs upsampler_decode_past/future==0 (they embed real target tokens)"

@@ -208,7 +208,8 @@ class Config:
     # latent when label_reg_weight=0). True: the downsampler instead SELF-FEEDS -- digits are
     # sampled (straight-through gumbel / hard, per quantize_mode) and fed back through the AR head,
     # exactly as at inference; label_fn is then only used for the optional label_reg aux loss.
-    # Needs downsampler_ncodes==1, downsampler_decode_past/future==0, pardec_token_head="ar".
+    # Needs downsampler_decode_past/future==0, pardec_token_head="ar". downsampler_ncodes>1: the row is rolled
+    # out too, one pass per row code (exact); downsampler_pss_passes>1 caps the passes (approximate).
     # Warns when False while label_reg_weight==0.
     downsampler_rollout_prob: float = 1.0  # probability (per train step, one draw per level) of
     # using the rollout path instead of the teacher-forced one when downsampler_rollout=True.
@@ -220,7 +221,8 @@ class Config:
     # sequential) is then never exercised during training at all. True: digits are self-fed
     # (token_ar_rollout, straight-through per quantize_mode) while the loss still scores against the
     # real target -- training the digit head the way it's actually used at generation time. Needs
-    # upsampler_ncodes==1, upsampler_decode_past/future==0, pardec_token_head="ar".
+    # upsampler_decode_past/future==0, pardec_token_head="ar". Row TOKENS stay teacher-forced (any
+    # upsampler_ncodes); upsampler_pss_passes self-feeds those.
     upsampler_rollout_prob: float = 1.0  # probability (per decode step, one draw per level) of using
     # the rollout path instead of teacher-forced when upsampler_rollout=True. Eval (rng=None) always
     # uses the rollout.
@@ -370,7 +372,8 @@ class Config:
     # parallel scheduled sampling on a pardec row's own shifted token inputs (not the context, see level_gt_drop):
     # pass 1 teacher-forces GT, each later pass re-feeds the previous pass's detached prediction; loss = last pass
     upsampler_pss_passes: tuple = 1  # per level; 1 = off, -1 = one pass per row token (exact rollout inputs)
-    downsampler_pss_passes: tuple = 1  # same for the downsampler; only matters when downsampler_ncodes > 1
+    downsampler_pss_passes: tuple = 1  # same for the downsampler; only matters when downsampler_ncodes > 1.
+    # On the downsampler_rollout path: 1/-1 = one pass per row code, >1 = cap (see downsampler_rollout).
     upsampler_pss_prob: float = 1.0  # per-position prob of own prediction, else GT. Eval: always own
     downsampler_pss_prob: float = 1.0
     pss_input_mode: str = "argmax"  # argmax | sample (gumbel-max at pss_temperature; eval: argmax)
@@ -589,8 +592,6 @@ class Config:
             if self.pardec_token_head != "ar":
                 raise ValueError("downsampler_rollout is incompatible with pardec_token_head='linear' "
                                  "(the rollout self-feeds digits through the AR token head)")
-            assert all(g == 1 for g in self.downsampler_ncodes), \
-                f"downsampler_rollout needs downsampler_ncodes==1 at every level, got {self.downsampler_ncodes}"
             assert all(p == 0 for p in self.downsampler_decode_past) \
                 and all(f == 0 for f in self.downsampler_decode_future), \
                 "downsampler_rollout needs downsampler_decode_past/future==0 (they embed real label tokens)"
@@ -599,8 +600,6 @@ class Config:
             if self.pardec_token_head != "ar":
                 raise ValueError("upsampler_rollout is incompatible with pardec_token_head='linear' "
                                  "(the rollout self-feeds digits through the AR token head)")
-            assert all(g == 1 for g in self.upsampler_ncodes), \
-                f"upsampler_rollout needs upsampler_ncodes==1 at every level, got {self.upsampler_ncodes}"
             assert all(p == 0 for p in self.upsampler_decode_past) \
                 and all(f == 0 for f in self.upsampler_decode_future), \
                 "upsampler_rollout needs upsampler_decode_past/future==0 (they embed real target tokens)"
@@ -2234,6 +2233,11 @@ def pss_n_passes(passes: int, row_tokens: int, decode_past: int) -> int:
     return row_tokens if passes == -1 else passes
 
 
+def rollout_n_passes(passes: int, row_tokens: int) -> int:
+    # downsampler_rollout row passes: one per row code (exact) unless downsampler_pss_passes>1 caps it
+    return row_tokens if passes in (-1, 1) else min(passes, row_tokens)
+
+
 def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: torch.Tensor, target_idx: torch.Tensor,
                               flat_bytes: torch.Tensor, cfg: "Config", pixel_order, label_fn, K: int,
                               rate_id: int = 0, rng=None, downsampler_ncodes: int = 1,
@@ -2259,15 +2263,21 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: torch.
         return lg, cs, ci
 
     def _rollout():
-        hid = pardec_score(downsampler, h.new_zeros((M, n_blocks, codelm.pq_chunks), dtype=torch.long), h,
-                           context_group_size=K * downsampler_ncodes, output_group_size=downsampler_ncodes,
-                           rate_id=rate_id, return_hidden=True)
+        # ncodes>1: a row code's input is the previous pass's own code (same noise every pass), never label_fn
+        dummy = h.new_zeros((M, n_blocks, codelm.pq_chunks), dtype=torch.long)
         qfn = lambda lg_m, k_: quantize_dispatch(codelm.quantize_mode, lg_m, k_ if rng is not None else None,
                                                  encode_temperature, codelm.quantize_drop)
-        cs, ci, lg = token_ar_rollout(downsampler.token_in_proj, downsampler.token_member_embed,
-                                      downsampler.token_norm1, downsampler.token_attn, downsampler.token_ln_f,
-                                      downsampler.token_out_head, downsampler.output_chunks, hid,
-                                      rng if rng is not None else Key(0), qfn)
+        n_roll = rollout_n_passes(pss_passes, min(downsampler_ncodes, n_blocks))
+        ci = None
+        for s_ in range(n_roll):
+            with torch.set_grad_enabled(s_ == n_roll - 1 and torch.is_grad_enabled()):  # only the last pass needs a graph
+                hid = pardec_score(downsampler, dummy, h, context_group_size=K * downsampler_ncodes,
+                                   output_group_size=downsampler_ncodes, rate_id=rate_id, return_hidden=True,
+                                   input_seq=None if ci is None else ci.detach())
+                cs, ci, lg = token_ar_rollout(downsampler.token_in_proj, downsampler.token_member_embed,
+                                              downsampler.token_norm1, downsampler.token_attn, downsampler.token_ln_f,
+                                              downsampler.token_out_head, downsampler.output_chunks, hid,
+                                              rng if rng is not None else Key(0), qfn)
         return lg, cs, ci
 
     if not cfg.downsampler_rollout:

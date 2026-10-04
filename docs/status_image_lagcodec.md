@@ -34,12 +34,15 @@ Living doc — check here rather than assuming CLAUDE.md is current. Update in p
 
 - `run_lagcodec_res_denoise.py`: fork of `run_lagcodec_res.py`; all defaults bit-identical to it (regression harness: loss/aux/grads/eval/gen).
 - Same-level cycles: `level_cycles` (per level), `level_cycle_mode` memoryless (default) | stack, `level_cycle_input` rollout (default, free-run, leak-free) | pss (`level_cycle_pss_prob`) | gt (overfit sanity), `level_cycle_detach`, `level_cycle_loss`, `gen_level_cycles`.
+  - Fixed vs `run_lagcodec` cycle: TF-argmax GT leak, revision granularity (finer code windowed with the coarser stride/table), slot-0 train/gen mismatch, order-blind shared slot table, dropped empty slots.
 - Parallel scheduled sampling on a pardec row's own token inputs (2026-10-04, both files): `upsampler_pss_passes` / `downsampler_pss_passes` (per level, 1 = off, -1 = one pass per row token), `*_pss_prob` (own vs GT per position), `pss_input_mode` argmax | sample, `pss_temperature`.
   - Pass 1 teacher-forces GT; later passes re-feed the previous pass's detached prediction; loss on the last pass only. Context is untouched (that is `level_gt_drop`). Independent of refine passes.
   - n passes make the first n tokens of each row equal a real greedy rollout; -1 is exact (checked vs generation, linear head and ar head + `upsampler_rollout`). ar head without `upsampler_rollout`: digits inside a token stay GT-forced, so approximate.
   - Downsampler side is a no-op unless `downsampler_ncodes > 1` (one token per row has no token input). Eval always feeds own prediction. Cost: one extra forward per pass, backward only on the last.
   - TODO: CodeLM pss (its inputs are true codes from the prefill; only makes sense for free generation).
-  - Fixed vs `run_lagcodec` cycle: TF-argmax GT leak, revision granularity (finer code windowed with the coarser stride/table), slot-0 train/gen mismatch, order-blind shared slot table, dropped empty slots.
+- Rollout with `ncodes > 1` (2026-10-04): `upsampler_rollout` no longer needs `upsampler_ncodes == 1` (res + fork; row tokens stay teacher-forced, digits self-fed; add `upsampler_pss_passes` in the fork to self-feed the row).
+  - Fork only: `downsampler_rollout` with `downsampler_ncodes > 1` re-feeds its own codes along the row, one pass per row code (equals greedy generation, never label tokens); `downsampler_pss_passes > 1` caps the passes (approximate).
+  - Checked: `rollout with ncodes>1` in `res_denoise_consistency_check`, two new torch parity cases. `cifar_3_fullcodes.py` now loads as written.
 - Backbones: `codelm/downsampler/upsampler_backbone` transformer | gru | linear_gru | ssm (`ssm_state_dim`); recurrent = fixed state, no KV cache.
 - `context_source="codelm_upper"`: upsampler i reads CodeLM i+1; unshared adds a CodeLM-only top level (+ bos rows); that CodeLM also gets NTP on the top code; freeze trains CodeLM p in phase p.
 - Data: `dataset="folder"`, `modality` image | text | audio | binary, `seq_len`, `audio_sample_rate`, `audio_encoding` mulaw8 | pcm16. Labels: `byte_mean_label_fn`, `byte_interp_label_fn`, `audio_resample_label_fn`, `bpe_label_fn` (stub, `HierarchicalBPE`), or `label_fn="pkg.module:fn"`. Example configs `configs/folder_*_overfit.py`.
@@ -55,6 +58,53 @@ Living doc — check here rather than assuming CLAUDE.md is current. Update in p
 - Memory flags: `downsampler_remat_chunks` / `upsampler_remat_chunks` (per level, 1 = off): pardec rows run in that many sequential checkpointed chunks (same loss/grads, ~1e-7). `codelm_remat` (per level, None -> `remat`). pmapped train steps donate model/opt_state/rng.
 - Memory audit (2026-10-04, CPU saved-residual counts, small config): reinmax_limit's dense 256x256 surrogate per digit position was 55% of what backward keeps (81% with upsampler_rollout) -- now an exact O(K) form (`quantize_reinmax_limit`; slow reference `quantize_reinmax_limit_dense`): same forward, grads ~1e-6, saved memory 1791 -> 838 MiB (remat on: 1104 -> 152, upsampler_rollout: 4378 -> 886); rollout_prob<1 (lax.cond) keeps both branches' residuals; stack cycles recompute c(0)'s CodeLM context every cycle.
 - Known: every pmap run (res too) recompiles once at step 2 (~2 min on TPU); `Attention.step` ignores `use_sink` (CodeLM free-run only).
+
+## TF vs generation audit (2026-10-04, `cifar_1_pss` on tpu1, `cifar_2_pss` on tpu2, step 60000)
+
+CPU-only (f32) on the nodes, 64 train + 64 val images, levels 0-2 (level 3 untrained at this step). MSE in pixel units; train and val agree within a few %. On the runs' own 8 eval images the audit reproduces the logged step-60000 `TF_SANITY` and `CASCADE` numbers within 1-4% (e.g. `cifar_1_pss` train: 149.8 / 692 / 1202 / 1625 vs logged 151.2 / 705 / 1210 / 1623), so TPU / bf16 is not the cause.
+
+- **No code-path mismatch.** Generation's own tokens re-scored by the dense teacher-forced code give the same argmax (0-8 of 65536 tokens differ). Encoder generate path == eval path (>= 0.9993 of digits).
+- **`TF_SANITY` never tests the cascade.** With `level_gt_drop=0.5` and no rng it uses real codes at every level, so it prints the same number for every top (it is the level-0 TF decode).
+- **Exact match is rare even teacher-forced.** Level 0, full TF: 98.5% of the 1024 timesteps are not exact (12% of digits match). "TF looks like GT" is an MSE statement.
+- **What TF hides (level 0, real codes as context, train):**
+
+| level-0 decode, real codes | cifar_1_pss | cifar_2_pss |
+|---|---|---|
+| TF: GT digits + GT row tokens (= `TF_SANITY`) | 125 | 514 |
+| GT row tokens, own digits (res eval path) | 274 | 516 |
+| free generation | 585 | 575 |
+| floor: code repeated x4 / true 2x2 mean repeated | 302 / 283 | 304 / 283 |
+
+  - `cifar_1_pss` TF error is almost all in the first digit: per channel 272 / 52 / 51. G and B are read off the GT R digit (digit gain 0.56-0.7), tokens 2-3 off the GT row tokens (levels 1-2: row-token gain down to -2, code gain up to 3 = "4 x mean minus the others").
+  - `cifar_2_pss` (pss -1, rollout 1.0): eval path == generation exactly, TF ~ generation, both ~500-800. Its decoder ignores its own digits and row tokens (gain ~0); only the code matters (gain 0.7-1.0).
+- **The code holds the block mean only.** Predicting the children's deviation from the row mean from the code: R^2 <= 0.005 on val (ridge, polynomial, binned). So no decoder can beat the block-mean floor: generation is blocky by construction, and detail only appears under TF because it is read from GT.
+- **Greedy argmax adds noise on top.** First digit of a row's first token: predictive std ~20, top-10 values within 0.026-0.029 probability, so the argmax lands at code +-14 (mse 478 vs 328 for the code itself). Generated row mean is off from its own code by rms 12-15: each 2x2 block gets a brightness offset.
+- **Greedy codes snap to a few values.** 10-16 digit values hold 17-27% of all level-0 code digits (e.g. 113: 3.1% of codes vs 0.4% of labels).
+- **Cascade (pixel mse, train).** "mean rule" = every code digit and decoder digit is the rounded mean of its distribution instead of the argmax (no retraining):
+
+| | top 0 | top 1 | top 2 |
+|---|---|---|---|
+| floor: true block mean repeated | 283 | 754 | 1396 |
+| cifar_1_pss generation as run | 585 | 1153 | 1642 |
+| cifar_1_pss mean rule | 326 | 793 | 1423 |
+| cifar_2_pss generation as run | 575 | 1948 | 2396 |
+| cifar_2_pss mean rule | 339 | 870 | 1619 |
+
+  - With the mean rule both models sit on the floor: they are a block-mean pyramid, generation = nearest-neighbour upsampling of the top code.
+  - Cross-check from CIFAR alone (no model): true block-mean image upsampled back, nearest = 283 / 754 / 1396 (same floors), bicubic = 188 / 605 / 1226. A fixed filter over neighbouring block means already gets that; `upsampler_window=1` + `own_embed` rows see only their own code.
+- **Training feeds the context differently from generation** (`quantize_drop=0.5`: half the context digits are soft probability vectors, the rest samples; generation: hard argmax). Level-0 TF with training-style context: 80 vs 125. Not a fix: handing soft distributions down the cascade is worse (top 1: 1565 / 3471 vs 1153 / 1948).
+- **Timestep patterns (level 0 of 1024, `cifar_1_pss`):**
+  - TF mean error by `t%4`: 14.5 / 13.2 / 9.0 / 7.9 (first two tokens of each 2x2 row are worst); generation is flat (19.6-20.2).
+  - TF by `(t//4)%4`: 12.7 / 9.9 / 12.4 / 9.6 -- rows whose refine draft comes from a non-adjacent block are worse; worst timesteps are z-order jumps (768, 608, 896, 256).
+  - Error follows 2x2 contrast: quartiles 3.0 / 6.5 / 12.3 / 22.3 (TF), 5.9 / 11.4 / 21.6 / 39.7 (generation). Flat regions decode fine (flat-gray transfer curves: mean |out - in| < 1 at level 0).
+  - Timesteps with error > 16: TF 19%, eval path 23%, generation 38%, cascade top 1 / 2: 55% / 69%. In generation whole rows of 4 fail together.
+- Refine pass 2 helps under TF (138 -> 125) and hurts in generation (478 -> 585, `cifar_1_pss` level 0).
+- bf16 on CPU moves these numbers by 1-3% only (8 eval images: generation 716 / 1228 / 1637 vs f32 692 / 1202 / 1625).
+- Newer checkpoints, 16 train images, same pattern incl. level 3: `cifar_1_pss` step 80000 level-0 TF 161 / generation 852 (floor 318), cascade top 3 = 2863; `cifar_2_pss` step 70000 level-0 TF 605 / generation 653. Not better than step 60000 relative to the floor (suspect: different image counts).
+- `cifar_1_pss` on tpu1 runs under `run_lagcodec_res`, which has no pss flags: the config's `upsampler_pss_*` lines are silently ignored there (its resolved config has none). Only `cifar_2_pss` (fork) actually trains with pss.
+- Untested ideas: let the code carry detail (lower `label_reg_weight`, or extra code digits beyond the 3 label digits); `upsampler_window > 1` so a row sees neighbouring codes; mean / sampled digits at generation; log generation-with-real-codes per level next to `TF_SANITY`.
+- Scripts (`image_lagcodec/scripts/`): `audit_tf_vs_gen_timesteps`, `audit_decode_rule`, `audit_ctx_source`, `audit_transfer_curve`, `audit_output_profile`, `audit_code_info`, `audit_cascade_modes`. All CPU-only; pin them (`taskset -c 88-119,208-239 nice -n 19`) -- unpinned they slowed training up to ~1.8x.
+- On the nodes: `~/audit_ckpt/` (model copies, 444 MB each, two per node), `~/audit_out/` (per-timestep arrays; `<run>_samples/*.png` = recon|GT grids for as-run vs mean rule vs block-mean floor), `~/audit_*.log` (exact timestep lists per train image in `audit_full_f32.log`).
 
 ## TODO — tiling / seam artifacts (2026-09-21 discussion, untested)
 
