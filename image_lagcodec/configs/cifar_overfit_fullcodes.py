@@ -109,7 +109,9 @@ eval_gen_train = True
 gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
 
-
+log_levelwise_metrics = True
+log_levelwise_eval = True
+log_levelwise_gen  = True
 # --- training ---
 batch_size = 4
 val_batch_size = 8

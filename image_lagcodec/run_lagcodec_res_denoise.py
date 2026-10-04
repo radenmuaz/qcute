@@ -4776,7 +4776,7 @@ def main():
                 val_jit_timed[0] = True
             if cfg.log_levelwise_eval or cfg.log_levelwise_metrics:
                 aux_vals = list(aux_b)
-                if len(aux_vals) >= 14:
+                if len(aux_vals) >= 13:
                     enc_level_losses_b = np.asarray(aux_vals[-4])
                     enc_level_accs_b = np.asarray(aux_vals[-3])
                     dec_level_losses_b = np.asarray(aux_vals[-2])
@@ -5063,14 +5063,11 @@ def main():
                            f"{time.monotonic() - jit_t0:.1f}s")
                     jit_timed = True
                 if cfg.log_levelwise_metrics:
-                    dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse, grad_norm, \
-                        enc_level_losses, enc_level_accs, dec_level_losses, dec_level_accs = [
-                            local_array(a)[0] if i < 10 else local_array(a) for i, a in enumerate(aux)
-                        ]
-                    enc_level_losses = np.asarray(enc_level_losses)
-                    enc_level_accs = np.asarray(enc_level_accs)
-                    dec_level_losses = np.asarray(dec_level_losses)
-                    dec_level_accs = np.asarray(dec_level_accs)
+                    scalar_aux = [local_array(a)[0] for a in aux[:10]]
+                    dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse, grad_norm = scalar_aux
+                    enc_level_losses, enc_level_accs, dec_level_losses, dec_level_accs = [
+                        np.asarray(local_array(a)) for a in aux[10:14]
+                    ]
                 else:
                     dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse, grad_norm = \
                         [float(local_array(a)[0]) for a in aux]
