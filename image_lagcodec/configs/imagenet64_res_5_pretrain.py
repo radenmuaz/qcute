@@ -6,6 +6,7 @@ img_size = 64
 dataset = "imagenet64"
 data_root = "/dev/shm/imagenet64"
 multihost = True
+fsdp = True
 
 traversal = "zorder"
 eval_gen_train = True
@@ -27,11 +28,11 @@ share_across_levels = False
 # codelm_n_kv_heads = (8,8,4,4,2)
 # mlp_mult = 8
 
-codelm_d_model = (1024,1024,512,512,256)
-codelm_n_layers = (16,16,8,8,4)
-codelm_n_heads = (8,8,4,4,2)
-codelm_n_kv_heads = (8,8,4,4,2)
-mlp_mult = 2
+codelm_d_model = (2048,1024,512,256,128)
+codelm_n_layers = (32,16,8,4,2)
+codelm_n_heads = (16,8,4,2,1)
+codelm_n_kv_heads = (16,8,4,2,1)
+mlp_mult = 4
 
 code_vocab = 256
 pq_chunks = 3
@@ -106,8 +107,8 @@ pardec_token_head = "ar"    # alternative: autoregressive digits
 token_dim = 128
 token_n_heads = 2
 # --- training ---
-batch_size = 1      # per DEVICE; tpu34 = 2 hosts x 4 devices -> global batch 64 (16 OOMs: 20.4G program vs 16G free)
-val_batch_size = 1
+batch_size = 4      # per DEVICE; tpu34 = 2 hosts x 4 devices -> global batch 64 (16 OOMs: 20.4G program vs 16G free)
+val_batch_size = 4
 # level_epochs = (1, 1, 5)
 # Approximate step equivalents (tpu34 v4-16: batch_size 8 x 4 local devices x 2 hosts = global batch 64;
 # ImageNet64 train = 1,281,167 imgs -> 1 epoch = 1,281,167 / 64 = 20,018 steps):
@@ -138,5 +139,5 @@ optimizer_kwargs = dict(weight_decay=0)
 
 # --- logging ---
 log_every = 100
-ckpt_every_step = 5000
-ckpt_keep = 1
+ckpt_every_step = 10_000
+ckpt_keep = 2

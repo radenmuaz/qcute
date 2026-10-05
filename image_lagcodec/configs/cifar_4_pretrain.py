@@ -86,8 +86,8 @@ gen_eval_teacher_force_sanity = False
 
 
 # --- training ---
-batch_size = 4
-val_batch_size = 2
+batch_size = 32
+val_batch_size = 8
 # level_steps = (20_000, 20_000, 20_000, 100_000)
 level_steps = (0,)*4+ (int(1e6),)
 seed = 0
@@ -121,5 +121,5 @@ wa_verbose = False
 
 # --- logging ---
 log_every = 500
-ckpt_every_step = 10000
-ckpt_keep = 1
+ckpt_every_step = int(2e5)
+ckpt_keep = 10

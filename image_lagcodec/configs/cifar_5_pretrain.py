@@ -5,17 +5,12 @@ uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcod
 img_size = 32
 encoder_only_pretrain = True
 log_levelwise_metrics = True
+fsdp = True  # shard model parameters and optimizer state over the available JAX device mesh
 share_across_levels = False
-# codelm_d_model = (512,512,256,256,128)
-# codelm_n_layers = (16,16,8,8,4)
-# codelm_n_heads = (8,8,4,4,2)
-# codelm_n_kv_heads = (8,8,4,4,2)
-# mlp_mult = 8
-
-codelm_d_model = (1024,1024,512,512,256)
-codelm_n_layers = (16,16,8,8,4)
-codelm_n_heads = (8,8,4,4,2)
-codelm_n_kv_heads = (8,8,4,4,2)
+codelm_d_model = (2048,1024,512,256,128)
+codelm_n_layers = (32,16,8,4,2)
+codelm_n_heads = (16,8,4,2,1)
+codelm_n_kv_heads = (16,8,4,2,1)
 mlp_mult = 4
 
 code_vocab = 256
@@ -86,8 +81,8 @@ gen_eval_teacher_force_sanity = False
 
 
 # --- training ---
-batch_size = 1
-val_batch_size = 1
+batch_size = 2
+val_batch_size = 2
 # level_steps = (20_000, 20_000, 20_000, 100_000)
 level_steps = (0,)*4+ (int(1e6),)
 seed = 0
@@ -121,5 +116,5 @@ wa_verbose = False
 
 # --- logging ---
 log_every = 500
-ckpt_every_step = 10000
-ckpt_keep = 1
+ckpt_every_step = int(2e5)
+ckpt_keep = 10
