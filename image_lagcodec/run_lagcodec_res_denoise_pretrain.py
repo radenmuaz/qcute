@@ -3451,70 +3451,80 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
 
     byte_mse = None
     mse_loss = 0.0
-    ctx = codes_soft[phase - 1]
-    # diagnostic only (default None -- no change to any existing call site): replaces the TOP-level
-    # ctx with zeros/a batch-shuffled version BEFORE any decode happens, to measure how much the
-    # decode cascade actually relies on real per-sample content vs. teacher-forced AR self-attention
-    # over real previous tokens alone. See ctx_ablation_check.py.
-    if ctx_ablation == "zero":
-        ctx = jnp.zeros_like(ctx)
-    elif ctx_ablation == "shuffle":
-        ctx = jnp.roll(ctx, shift=1, axis=0)
-    elif ctx_ablation is not None:
-        raise ValueError(f"ctx_ablation must be None/'zero'/'shuffle', got {ctx_ablation!r}")
-    if model.cfg.ctx_stop_gradient is True:
-        ctx = jax.lax.stop_gradient(ctx)
-    sg_pseudo = jax.lax.stop_gradient if model.cfg.ctx_stop_gradient == "pseudo" else (lambda c: c)
-    cascade_rngs = [None] * phase if cascade_rng is None else list(jax.random.split(cascade_rng, phase))
+    pred_bytes = None
+    if model.cfg.encoder_only_pretrain:
+        # Encoder-only pretrain: measure the CodeLM + Downsampler path only. The upsampler is kept
+        # initialized and frozen, but the forward pass never runs the decoder cascade in this mode.
+        byte_acc = jnp.array(0.0)
+        byte_mse = jnp.array(0.0)
+        pred_bytes = jnp.zeros_like(flat_bytes)
+        dec_losses = [jnp.array(0.0, dtype=jnp.float32)]
+        dec_accs = [jnp.array(0.0, dtype=jnp.float32)]
+    else:
+        ctx = codes_soft[phase - 1]
+        # diagnostic only (default None -- no change to any existing call site): replaces the TOP-level
+        # ctx with zeros/a batch-shuffled version BEFORE any decode happens, to measure how much the
+        # decode cascade actually relies on real per-sample content vs. teacher-forced AR self-attention
+        # over real previous tokens alone. See ctx_ablation_check.py.
+        if ctx_ablation == "zero":
+            ctx = jnp.zeros_like(ctx)
+        elif ctx_ablation == "shuffle":
+            ctx = jnp.roll(ctx, shift=1, axis=0)
+        elif ctx_ablation is not None:
+            raise ValueError(f"ctx_ablation must be None/'zero'/'shuffle', got {ctx_ablation!r}")
+        if model.cfg.ctx_stop_gradient is True:
+            ctx = jax.lax.stop_gradient(ctx)
+        sg_pseudo = jax.lax.stop_gradient if model.cfg.ctx_stop_gradient == "pseudo" else (lambda c: c)
+        cascade_rngs = [None] * phase if cascade_rng is None else list(jax.random.split(cascade_rng, phase))
 
-    start_i = phase - 1
+        start_i = phase - 1
 
-    for i in range(start_i, -1, -1):
-        dec_target = tok0 if i == 0 else codes[i - 1]
-        dec_rng = level_rngs[2 * i + 1]
-        cycles = decode_logits_and_target_cycles(
-            model, i, dec_target, ctx, model.cfg.upsampler_ncodes[i], rng=dec_rng,
-            encode_temperature=encode_temperature, force_teacher_forced=digit_teacher_force)
-        logits, target_i, mask_i, aux_loss_i, aux_acc_i = cycles[-1][-1]
-        loss_i = cycle_loss(cycles, model.cfg.level_cycle_loss)
-        acc_i = dec_loss_acc(logits, target_i, mask_i)[1]
-        dec_losses.append(loss_i)
-        dec_accs.append(acc_i)
-        if aux_applies:
-            aux_ntp_losses.append(aux_loss_i)
-            aux_ntp_accs.append(aux_acc_i)
-        if i == 0:
-            pred_bytes = jnp.argmax(logits, axis=-1).astype(jnp.float32)
-            byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)
-            if model.cfg.mse_weight > 0:
-                byte_probs = jax.nn.softmax(logits / model.cfg.mse_softmax_tau, axis=-1)
-                byte_values = jnp.arange(byte_probs.shape[-1], dtype=byte_probs.dtype)
-                pred_pixel = jnp.sum(byte_probs * byte_values, axis=-1)
-                max_val = byte_probs.shape[-1] - 1
-                mse_loss = jnp.mean(((pred_pixel - target_i.astype(jnp.float32)) / max_val) ** 2)
-            else:
-                mse_loss = 0.0
-        if i > 0:
-            real_ctx = codes_soft[i - 1]
-            rng_i = cascade_rngs[i]
-            gt_drop_i = None if level_gt_drop is None else (
-                level_gt_drop if isinstance(level_gt_drop, (int, float)) else level_gt_drop[i])
-            # gt_drop_i is a static Python float: 0.0/1.0 skip the unused branch's compute entirely.
-            # No rng (eval) with a fractional value: deterministic real ctx, like run_val_eval.
-            if gt_drop_i is None or gt_drop_i == 0.0 or (gt_drop_i < 1.0 and rng_i is None):
-                ctx = real_ctx
-            else:
-                quant_rng_i = None if rng_i is None else jax.random.fold_in(rng_i, 0)
-                pseudo_ctx, _ = quantize_dispatch(model.cfg.quantize_mode, logits, quant_rng_i,
-                                                   encode_temperature, model.cfg.quantize_drop)
-                pseudo_ctx = sg_pseudo(pseudo_ctx)
-                if gt_drop_i == 1.0:
-                    ctx = pseudo_ctx
+        for i in range(start_i, -1, -1):
+            dec_target = tok0 if i == 0 else codes[i - 1]
+            dec_rng = level_rngs[2 * i + 1]
+            cycles = decode_logits_and_target_cycles(
+                model, i, dec_target, ctx, model.cfg.upsampler_ncodes[i], rng=dec_rng,
+                encode_temperature=encode_temperature, force_teacher_forced=digit_teacher_force)
+            logits, target_i, mask_i, aux_loss_i, aux_acc_i = cycles[-1][-1]
+            loss_i = cycle_loss(cycles, model.cfg.level_cycle_loss)
+            acc_i = dec_loss_acc(logits, target_i, mask_i)[1]
+            dec_losses.append(loss_i)
+            dec_accs.append(acc_i)
+            if aux_applies:
+                aux_ntp_losses.append(aux_loss_i)
+                aux_ntp_accs.append(aux_acc_i)
+            if i == 0:
+                pred_bytes = jnp.argmax(logits, axis=-1).astype(jnp.float32)
+                byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)
+                if model.cfg.mse_weight > 0:
+                    byte_probs = jax.nn.softmax(logits / model.cfg.mse_softmax_tau, axis=-1)
+                    byte_values = jnp.arange(byte_probs.shape[-1], dtype=byte_probs.dtype)
+                    pred_pixel = jnp.sum(byte_probs * byte_values, axis=-1)
+                    max_val = byte_probs.shape[-1] - 1
+                    mse_loss = jnp.mean(((pred_pixel - target_i.astype(jnp.float32)) / max_val) ** 2)
                 else:
-                    ctx = jnp.where(jax.random.bernoulli(rng_i, p=gt_drop_i), pseudo_ctx, real_ctx)
+                    mse_loss = 0.0
+            if i > 0:
+                real_ctx = codes_soft[i - 1]
+                rng_i = cascade_rngs[i]
+                gt_drop_i = None if level_gt_drop is None else (
+                    level_gt_drop if isinstance(level_gt_drop, (int, float)) else level_gt_drop[i])
+                # gt_drop_i is a static Python float: 0.0/1.0 skip the unused branch's compute entirely.
+                # No rng (eval) with a fractional value: deterministic real ctx, like run_val_eval.
+                if gt_drop_i is None or gt_drop_i == 0.0 or (gt_drop_i < 1.0 and rng_i is None):
+                    ctx = real_ctx
+                else:
+                    quant_rng_i = None if rng_i is None else jax.random.fold_in(rng_i, 0)
+                    pseudo_ctx, _ = quantize_dispatch(model.cfg.quantize_mode, logits, quant_rng_i,
+                                                       encode_temperature, model.cfg.quantize_drop)
+                    pseudo_ctx = sg_pseudo(pseudo_ctx)
+                    if gt_drop_i == 1.0:
+                        ctx = pseudo_ctx
+                    else:
+                        ctx = jnp.where(jax.random.bernoulli(rng_i, p=gt_drop_i), pseudo_ctx, real_ctx)
 
-            if model.cfg.ctx_stop_gradient is True:
-                ctx = jax.lax.stop_gradient(ctx)
+                if model.cfg.ctx_stop_gradient is True:
+                    ctx = jax.lax.stop_gradient(ctx)
 
     dec_loss_total = weighted_level_mean(dec_losses, model.cfg.decoder_level_loss_weights)
     byte_acc = dec_accs[-1]
@@ -3532,6 +3542,10 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
         + model.cfg.mse_weight * mse_loss + label_reg_weight * label_loss_total \
         + model.cfg.ntp_weight * aux_ntp_loss_total + model.cfg.label_mse_weight * label_mse_loss_total
+    if model.cfg.encoder_only_pretrain:
+        loss = model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
+            + label_reg_weight * label_loss_total + model.cfg.ntp_weight * aux_ntp_loss_total \
+            + model.cfg.label_mse_weight * label_mse_loss_total
     # bpb = dec_loss_total / jnp.log(2.0)
     aux = (dec_loss_total, byte_acc, ntp_loss_total, jnp.mean(jnp.stack(enc_accs)),
            jnp.mean(jnp.stack(utils)), byte_mse, aux_ntp_loss_total / jnp.log(2.0), aux_ntp_acc_total,
@@ -3729,8 +3743,7 @@ def phase_trainable_filter(model: LagCodecModel, phase: int):
         all_false = lambda sub: jax.tree_util.tree_map(lambda _: False, sub)
         for j in range(len(model.upsamplers)):
             spec = eqx.tree_at(lambda s: s.upsamplers[j], spec, replace=all_false(spec.upsamplers[j]))
-        if model.cfg.curriculum_mode != "freeze":
-            return spec
+        return spec
     if model.cfg.curriculum_mode != "freeze":
         return spec
     # phase p trains only level p-1: lower levels frozen, higher (unused) ones too so weight decay
@@ -4110,7 +4123,8 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
                   "entropy_weight", "mse_weight",
                   "mse_softmax_tau", "traversal", "label_reg_weight", "label_mse_weight",
                   "encoder_level_loss_weights", "decoder_level_loss_weights",
-                  "log_levelwise_metrics", "log_levelwise_eval", "log_levelwise_gen")
+                  "log_levelwise_metrics", "log_levelwise_eval", "log_levelwise_gen",
+                  "encoder_only_pretrain", "load_encoder_checkpoint")
 
 
 def main():
@@ -4195,8 +4209,8 @@ def main():
                          "disables pruning -- keep every checkpoint")
     p.add_argument("--resume", type=lambda x: x.lower() != "false", default=False,
                     help="resume from the latest checkpoint under this run's log dir, if any")
-    p.add_argument("--encoder_only_pretrain", type=lambda x: x.lower() != "false", default=False,
-                    help="freeze the upsampler and train the encoder path only (CodeLM + Downsampler), while keeping the upsampler initialized for later full-model continuation")
+    p.add_argument("--encoder_only_pretrain", type=lambda x: x.lower() != "false", default=True,
+                    help="ignored in this pretrain runner: the dedicated encoder-only path is always enabled; the upsampler stays initialized but frozen and decoder loss/generation are disabled")
     p.add_argument("--load_encoder_checkpoint", type=Path, default=None,
                     help="start a fresh run by restoring only the CodeLM and Downsampler states from a checkpoint; the current upsampler is left initialized and not overwritten")
     p.add_argument("--wa_mode", type=str, default="none", choices=["none", "ema", "wma"],
@@ -4541,6 +4555,9 @@ def main():
     config_vars = {k: v for k, v in config_vars.items() if k in known}
     p.set_defaults(**config_vars)
     args = p.parse_args()
+    if not bool(args.encoder_only_pretrain):
+        warnings.warn("--encoder_only_pretrain is ignored in the pretrain runner; encoder-only mode is always forced on.")
+    args.encoder_only_pretrain = True
     if args.run_name is None:
         args.run_name = pre_args.config.stem
 
@@ -4673,7 +4690,7 @@ def main():
         model = load_encoder_only_checkpoint(model, ckpt_path)
         logger(f"loaded CodeLM + Downsampler state from {ckpt_path}; Upsampler left initialized and frozen for encoder-only start")
 
-    cfg.encoder_only_pretrain = bool(args.encoder_only_pretrain)
+    cfg.encoder_only_pretrain = True
     cfg.load_encoder_checkpoint = str(args.load_encoder_checkpoint) if args.load_encoder_checkpoint is not None else None
 
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
@@ -4824,6 +4841,7 @@ def main():
                                           encode_temperature=args.encode_temperature[phase - 1],
                                           label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
                                           pixel_order=pixel_order,
+                                          digit_teacher_force=cfg.encoder_only_pretrain,
                                           return_levelwise=cfg.log_levelwise_eval or cfg.log_levelwise_metrics)
             if not val_jit_timed[0]:
                 val_compile_s = time.monotonic() - batch_t0
@@ -5162,22 +5180,23 @@ def main():
                     snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
                     st = f"{step:0{step_w}d}"  # zero-padded so file browsers sort samples numerically
                     run_val_eval(snapshot, phase, tag=f"level{phase - 1}_step{st}")
-                    if cfg.gen_eval_all_levels:
-                        for lvl in range(phase - 1, -1, -1):
-                            run_gen_eval_both(snapshot, top=lvl, tag=f"level{lvl}_step{st}")
+                    if not cfg.encoder_only_pretrain:
+                        if cfg.gen_eval_all_levels:
+                            for lvl in range(phase - 1, -1, -1):
+                                run_gen_eval_both(snapshot, top=lvl, tag=f"level{lvl}_step{st}")
+                                if cfg.gen_eval_teacher_force_sanity:
+                                    run_gen_eval_teacher_force_sanity_both(snapshot, top=lvl, tag=f"level{lvl}_step{st}")
+                        else:
+                            run_gen_eval_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{st}")
                             if cfg.gen_eval_teacher_force_sanity:
-                                run_gen_eval_teacher_force_sanity_both(snapshot, top=lvl, tag=f"level{lvl}_step{st}")
-                    else:
-                        run_gen_eval_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{st}")
-                        if cfg.gen_eval_teacher_force_sanity:
-                            run_gen_eval_teacher_force_sanity_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{st}")
-                    try:
-                        assert cfg.modality == "image", "codegrid is image-only"
-                        plot_encoder_outs(snapshot, cfg, val_np[:args.val_batch_size[phase - 1]], pixel_order,
-                                       run_dir / f"samples_level{phase - 1}_step{st}_codegrid.png",
-                                       level=phase - 1, label_fn=label_fn)
-                    except Exception as e:
-                        print(e)
+                                run_gen_eval_teacher_force_sanity_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{st}")
+                        try:
+                            assert cfg.modality == "image", "codegrid is image-only"
+                            plot_encoder_outs(snapshot, cfg, val_np[:args.val_batch_size[phase - 1]], pixel_order,
+                                           run_dir / f"samples_level{phase - 1}_step{st}_codegrid.png",
+                                           level=phase - 1, label_fn=label_fn)
+                        except Exception as e:
+                            print(e)
 
                 if step % ckpt_every_steps == 0:
                     ckpt_model = eqx.combine(to_host(unreplicate(p_diff_model)), static_model)
@@ -5217,24 +5236,26 @@ def main():
         prune_checkpoints(run_dir, args.ckpt_keep)
         if args.final_eval:
             run_val_eval(model, phase, tag=f"level{phase - 1}_final")
-            if cfg.gen_eval_all_levels:
-                for lvl in range(phase - 1, -1, -1):
-                    run_gen_eval_both(model, top=lvl, tag=f"level{lvl}_final")
+            if not cfg.encoder_only_pretrain:
+                if cfg.gen_eval_all_levels:
+                    for lvl in range(phase - 1, -1, -1):
+                        run_gen_eval_both(model, top=lvl, tag=f"level{lvl}_final")
+                        if cfg.gen_eval_teacher_force_sanity:
+                            run_gen_eval_teacher_force_sanity_both(model, top=lvl, tag=f"level{lvl}_final")
+                else:
+                    run_gen_eval_both(model, top=phase - 1, tag=f"level{phase - 1}_final")
                     if cfg.gen_eval_teacher_force_sanity:
-                        run_gen_eval_teacher_force_sanity_both(model, top=lvl, tag=f"level{lvl}_final")
-            else:
-                run_gen_eval_both(model, top=phase - 1, tag=f"level{phase - 1}_final")
-                if cfg.gen_eval_teacher_force_sanity:
-                    run_gen_eval_teacher_force_sanity_both(model, top=phase - 1, tag=f"level{phase - 1}_final")
+                        run_gen_eval_teacher_force_sanity_both(model, top=phase - 1, tag=f"level{phase - 1}_final")
 
     global_pbar.update(step - last_global_step)
     global_pbar.close()
-    logger("=== all phases done, running final top-down cascade eval ===")
+    logger("=== all phases done, running final teacher-forced validation metrics ===")
     run_val_eval(model, n_phases, tag="final")
-    for top in range(n_phases - 1, -1, -1):
-        run_gen_eval_both(model, top=top, tag=f"final_top{top}")
-        if cfg.gen_eval_teacher_force_sanity:
-            run_gen_eval_teacher_force_sanity_both(model, top=top, tag=f"final_top{top}")
+    if not cfg.encoder_only_pretrain:
+        for top in range(n_phases - 1, -1, -1):
+            run_gen_eval_both(model, top=top, tag=f"final_top{top}")
+            if cfg.gen_eval_teacher_force_sanity:
+                run_gen_eval_teacher_force_sanity_both(model, top=top, tag=f"final_top{top}")
     logger("training done")
 
 

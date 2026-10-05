@@ -292,8 +292,6 @@ class Config:
     log_levelwise_metrics: bool = False
     log_levelwise_eval: bool = False
     log_levelwise_gen: bool = False
-    encoder_only_pretrain: bool = False
-    load_encoder_checkpoint: str | None = None
 
     gen_temperature: float = 1.0
     gen_top_k: int = 8
@@ -3725,12 +3723,6 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
 
 def phase_trainable_filter(model: LagCodecModel, phase: int):
     spec = jax.tree_util.tree_map(lambda x: eqx.is_array(x), model)
-    if model.cfg.encoder_only_pretrain:
-        all_false = lambda sub: jax.tree_util.tree_map(lambda _: False, sub)
-        for j in range(len(model.upsamplers)):
-            spec = eqx.tree_at(lambda s: s.upsamplers[j], spec, replace=all_false(spec.upsamplers[j]))
-        if model.cfg.curriculum_mode != "freeze":
-            return spec
     if model.cfg.curriculum_mode != "freeze":
         return spec
     # phase p trains only level p-1: lower levels frozen, higher (unused) ones too so weight decay
@@ -3833,17 +3825,6 @@ def save_checkpoint(ckpt_dir: Path, model, opt_state, p_rng, train_iter: "BatchI
     if schedule_meta is not None:
         meta["schedule"] = schedule_meta
     (ckpt_dir / "meta.json").write_text(json.dumps(meta))
-
-
-def load_encoder_only_checkpoint(model, ckpt_path: Path):
-    loaded_model = eqx.tree_deserialise_leaves(ckpt_path / "model.eqx", model)
-    if len(loaded_model.codelms) != len(model.codelms) or len(loaded_model.downsamplers) != len(model.downsamplers):
-        raise ValueError(f"checkpoint {ckpt_path} has incompatible encoder shapes: "
-                         f"codelms={len(loaded_model.codelms)}, downsamplers={len(loaded_model.downsamplers)} "
-                         f"vs current model codelms={len(model.codelms)}, downsamplers={len(model.downsamplers)}")
-    return eqx.tree_at(lambda m: (m.codelms, m.downsamplers), model,
-                       replace=(loaded_model.codelms, loaded_model.downsamplers),
-                       is_leaf=lambda x: False)
 
 
 def find_latest_checkpoint(run_dir: Path):
@@ -4195,10 +4176,6 @@ def main():
                          "disables pruning -- keep every checkpoint")
     p.add_argument("--resume", type=lambda x: x.lower() != "false", default=False,
                     help="resume from the latest checkpoint under this run's log dir, if any")
-    p.add_argument("--encoder_only_pretrain", type=lambda x: x.lower() != "false", default=False,
-                    help="freeze the upsampler and train the encoder path only (CodeLM + Downsampler), while keeping the upsampler initialized for later full-model continuation")
-    p.add_argument("--load_encoder_checkpoint", type=Path, default=None,
-                    help="start a fresh run by restoring only the CodeLM and Downsampler states from a checkpoint; the current upsampler is left initialized and not overwritten")
     p.add_argument("--wa_mode", type=str, default="none", choices=["none", "ema", "wma"],
                     help="weight averaging: 'ema' (Polyak shadow copy) or 'wma' (rolling "
                          "mean over a FIFO stack of raw snapshots). 'none' (default) disables "
@@ -4664,17 +4641,6 @@ def main():
                    f"phase_step={resume_meta['phase_step']} step={resume_meta['step']}")
         else:
             logger("--resume set but no checkpoint found under this run_dir -- starting fresh")
-    if args.load_encoder_checkpoint is not None:
-        if args.resume:
-            raise ValueError("--resume and --load_encoder_checkpoint cannot be used together")
-        ckpt_path = Path(args.load_encoder_checkpoint)
-        if not ckpt_path.exists():
-            raise FileNotFoundError(f"encoder checkpoint not found: {ckpt_path}")
-        model = load_encoder_only_checkpoint(model, ckpt_path)
-        logger(f"loaded CodeLM + Downsampler state from {ckpt_path}; Upsampler left initialized and frozen for encoder-only start")
-
-    cfg.encoder_only_pretrain = bool(args.encoder_only_pretrain)
-    cfg.load_encoder_checkpoint = str(args.load_encoder_checkpoint) if args.load_encoder_checkpoint is not None else None
 
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
     if cfg.precision != "bf16":

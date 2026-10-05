@@ -1,24 +1,11 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res --config image_lagcodec/configs/cifar_overfit_2stage_freeze_refine.py
+uv run python3 -m image_lagcodec.run_lagcodec_res_denoise --config image_lagcodec/configs/cifar_1_pss_exact.py
 """
-# Fork of cifar_res_4_overfit_reinmax_s_ctxdetach_linear.py -- level_steps fixed back to
-# (0,)*4+(100000,) (skip phases 1-4 entirely, straight to joint all-levels training, matching the
-# rest of the cifar_res_4 family) instead of the _s variant's (1e3,)*4+(100000,) staged steps;
-# "_s_" dropped from the name accordingly. Cleaned to remove digit-level AR sampling entirely
-# (added 2026-10-02): codelm_token_head/pardec_token_head both "linear" instead of "ar" -- all
-# pq_chunks digits of a code/token are predicted in ONE parallel matmul, both at train time
-# (pardec_score) AND at generation time (pardec_generate/encoder_free_run's per-step sampling is
-# still sequential ACROSS positions, but no longer sequential WITHIN a position's digits). This
-# removes the train/inference mismatch a checkpoint_level_eval.py probe pointed at (digit-AR
-# self-feeding via pardec_generate is never exercised during teacher-forced AR-head training) by
-# construction, rather than training around it (see the _uprollout fork for that alternative) --
-# isolates whether avoiding digit-AR sampling altogether (MTP-style parallel inference) fixes the
-# severe generate-vs-teacher-force MSE gap on its own. downsampler_rollout/upsampler_rollout left at
-# default False (incompatible with pardec_token_head="linear", would raise). ctx_stop_gradient +
-# decoder_scheduled_sampling_prob (level-to-level, orthogonal to digit-level AR) kept as-is.
+# Fork of cifar_1.py: true scheduled sampling on the upsampler's token inputs (pss, one pass per row token).
+# Needs run_lagcodec_res_denoise (run_lagcodec_res has no pss flags).
 # --- model ---
 img_size = 32
-
+encoder_only_pretrain = True 
 # share_downsampler_upsampler_lm = True
 share_across_levels = False
 codelm_d_model = 512
@@ -42,8 +29,7 @@ label_fn = "rgb_label_fn_jax"
 bos_rate_mode = "absolute"
 strides = (4,4,4,4,4)
 attn_window = 1024
-# upsampler_ncodes = (-1,-1,-1,-1)
-upsampler_ncodes = (256,64,16,4,1)
+upsampler_ncodes = 1
 attn_lookahead = 0
 upsampler_decode_past = 0
 upsampler_decode_future = 0
@@ -55,7 +41,7 @@ downsampler_n_heads = 1
 downsampler_n_kv_heads = 1
 downsampler_window = 1
 downsampler_rollout = True
-downsampler_rollout_prob = 0.2
+downsampler_rollout_prob = 0.8
 # downsampler_remat = True   # enable only if OOM
 
 # context_source = "codelm_upper"
@@ -66,12 +52,12 @@ upsampler_n_heads = 2
 upsampler_n_kv_heads = 2
 upsampler_window = 1
 upsampler_rollout = True
-upsampler_rollout_prob = 0.2
+upsampler_rollout_prob = 0.8   # cifar_1: 0.5; 1.0 keeps pss exact with the ar head
 # upsampler_remat = True   # enable only if OOM
 
 # use_codelm_bos = False
-# use_codelm_bos = True
-# codelm_bos_prob = 1.0
+use_codelm_bos = True
+codelm_bos_prob = 0.8
 # curriculum_mode = "freeze"
 curriculum_mode = "no_freeze"
 # level_select_prob = (0.9, 0.8, 0.7, 0.6)  # length n_levels-1=4
@@ -83,10 +69,22 @@ mse_softmax_tau = 1.0
 level_gt_drop = 0.8
 # fork of cifar_overfit_2stage_freeze.py: level refine on. Pass 2 re-decodes each upsampler group seeing a
 # draft (pass 1 argmax) of the 1 preceding group = upsampler_ncodes*stride = 4 tokens back.
-level_refine_passes = 1
-# level_refine_window = 1
-# level_refine_gt_drop = 0.5
-# level_refine_layout = "fixed"
+level_refine_passes = 2
+level_refine_window = 1
+level_refine_gt_drop = 0.8
+level_refine_layout = "fixed"
+# pss exact: -1 = one pass per row token (4 here), so the last pass sees the same inputs as a real rollout.
+# Exact with the ar head only when digits are self-fed too: upsampler_rollout_prob = 1.0 (set above).
+upsampler_pss_passes = -1
+# upsampler_pss_passes = (-1, -1, 1, 1)  # per level
+upsampler_pss_prob = 0.8
+pss_input_mode = "argmax"                # matches greedy generation
+# pss_input_mode = "sample"              # gumbel-max, matches sampled generation
+# pss_temperature = 1.0
+# downsampler side: no effect unless downsampler_ncodes > 1 (one token per row has no token input)
+# downsampler_ncodes = 2
+# downsampler_pss_passes = -1
+# downsampler_pss_prob = 1.0
 quantize_drop = 0.2
 # ctx_stop_gradient = True
 # ctx_stop_gradient = "pseudo"
@@ -105,20 +103,18 @@ pardec_token_head = "ar"    # downsampler/upsampler digit head: all digits in on
 token_dim = 64
 token_n_heads = 2
 traversal = "zorder"
-eval_gen_train = True
-gen_eval_all_levels = True
-gen_eval_teacher_force_sanity = True
+eval_gen_train = False
+gen_eval_all_levels = False
+gen_eval_teacher_force_sanity = False
 
-log_levelwise_metrics = True
-log_levelwise_eval = True
-log_levelwise_gen  = True
+
 # --- training ---
 batch_size = 4
 val_batch_size = 8
-level_steps = (0,)*4 + (int(100e3),)
-# level_steps = (int(10e3),)*4 + (int(50e3),)
+# level_steps = (20_000, 20_000, 20_000, 100_000)
+level_steps = (0,)*4+ (int(100e3),)
 seed = 0
-train_subset_n = 100
+train_subset_n = None
 val_subset_n = 1000
 gen_eval_every_step = 5000
 epoch_verbose = False

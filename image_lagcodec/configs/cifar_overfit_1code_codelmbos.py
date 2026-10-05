@@ -43,7 +43,8 @@ bos_rate_mode = "absolute"
 strides = (4,4,4,4,4)
 attn_window = 1024
 # upsampler_ncodes = (-1,-1,-1,-1)
-upsampler_ncodes = (256,64,16,4,1)
+# upsampler_ncodes = (256,64,16,4,1)
+upsampler_ncodes = 1
 attn_lookahead = 0
 upsampler_decode_past = 0
 upsampler_decode_future = 0
@@ -70,8 +71,8 @@ upsampler_rollout_prob = 0.2
 # upsampler_remat = True   # enable only if OOM
 
 # use_codelm_bos = False
-# use_codelm_bos = True
-# codelm_bos_prob = 1.0
+use_codelm_bos = True
+codelm_bos_prob = 1.0
 # curriculum_mode = "freeze"
 curriculum_mode = "no_freeze"
 # level_select_prob = (0.9, 0.8, 0.7, 0.6)  # length n_levels-1=4
