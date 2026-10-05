@@ -3638,7 +3638,7 @@ def fsdp_put_array(x, sharding):
         return x
     else:
         from jax.experimental.multihost_utils import process_allgather
-        host_value = np.asarray(process_allgather(x))
+        host_value = np.asarray(process_allgather(x, tiled=True))
     if jax.process_count() == 1:
         return jax.device_put(host_value, sharding)
     return jax.make_array_from_process_local_data(
@@ -4487,7 +4487,8 @@ def main():
         fsdp_mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("fsdp",))
         fsdp_replicated = jax.sharding.NamedSharding(
             fsdp_mesh, jax.sharding.PartitionSpec())
-        fsdp_init_device = jax.devices("cpu")[0]
+        # Each host must initialize locally; a global CPU device may be owned only by process 0.
+        fsdp_init_device = jax.local_devices()[0]
         logger_device_count = fsdp_mesh.devices.size
     else:
         logger_device_count = n_devices
@@ -5043,7 +5044,8 @@ def main():
                     scalar_aux = [scalar_float(a) for a in aux[:9]]
                     dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse = scalar_aux
                     enc_level_losses, enc_level_accs, dec_level_losses, dec_level_accs = [
-                        np.asarray(device_mean_array(a), dtype=np.float64) for a in aux[9:13]
+                        np.asarray(a if args.fsdp else device_mean_array(a), dtype=np.float64)
+                        for a in aux[9:13]
                     ]
                     grad_norm = scalar_float(aux[13])
                 else:

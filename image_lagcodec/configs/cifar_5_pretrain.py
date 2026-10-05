@@ -81,8 +81,8 @@ gen_eval_teacher_force_sanity = False
 
 
 # --- training ---
-batch_size = 2
-val_batch_size = 2
+batch_size = 4
+val_batch_size = 4
 # level_steps = (20_000, 20_000, 20_000, 100_000)
 level_steps = (0,)*4+ (int(1e6),)
 seed = 0
