@@ -1,26 +1,23 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/cifar_4_pretrain.py
+uv run python3 -m image_lagcodec.run_lagcodec_res_denoise --config image_lagcodec/configs/cifar_1_pss_exact.py
 """
-# Encoder-only CodeLM/downsampler pretraining.
+# Fork of cifar_1.py: true scheduled sampling on the upsampler's token inputs (pss, one pass per row token).
+# Needs run_lagcodec_res_denoise (run_lagcodec_res has no pss flags).
+# --- model ---
 img_size = 32
-encoder_only_pretrain = True
-log_levelwise_metrics = True
+encoder_only_pretrain = True 
+load_encoder_checkpoint = ""
+# share_downsampler_upsampler_lm = True
 share_across_levels = False
-# codelm_d_model = (512,512,256,256,128)
-# codelm_n_layers = (16,16,8,8,4)
-# codelm_n_heads = (8,8,4,4,2)
-# codelm_n_kv_heads = (8,8,4,4,2)
-# mlp_mult = 8
-
-codelm_d_model = (1024,1024,512,512,256)
-codelm_n_layers = (16,16,8,8,4)
-codelm_n_heads = (8,8,4,4,2)
-codelm_n_kv_heads = (8,8,4,4,2)
-mlp_mult = 2
+codelm_d_model = 512
+codelm_n_layers = 2
+codelm_n_heads = 2
+codelm_n_kv_heads = 2
 
 code_vocab = 256
 pq_chunks = 3
-pq_dim = 128
+pq_dim = 64
+mlp_mult = 4
 rope_base = 10000.0
 
 ntp_weight = 1.0
@@ -32,9 +29,12 @@ label_fn = "rgb_label_fn_jax"
 # bos_rate_mode = "relative"
 bos_rate_mode = "absolute"
 strides = (4,4,4,4,4)
-attn_window = -1
+attn_window = 1024
+upsampler_ncodes = 1
 attn_lookahead = 0
-# remat = True
+upsampler_decode_past = 0
+upsampler_decode_future = 0
+remat = True
 
 downsampler_d_model = 128
 downsampler_n_layers = 1
@@ -47,6 +47,14 @@ downsampler_rollout_prob = 0.8
 
 # context_source = "codelm_upper"
 context_source = "own_embed"
+upsampler_d_model = 512
+upsampler_n_layers = 4
+upsampler_n_heads = 2
+upsampler_n_kv_heads = 2
+upsampler_window = 1
+upsampler_rollout = True
+upsampler_rollout_prob = 0.8   # cifar_1: 0.5; 1.0 keeps pss exact with the ar head
+# upsampler_remat = True   # enable only if OOM
 
 # use_codelm_bos = False
 use_codelm_bos = True
@@ -60,7 +68,18 @@ encode_temperature = 1.0
 gumbel_at_inference = False
 mse_softmax_tau = 1.0
 level_gt_drop = 0.8
-# pss_input_mode = "argmax"                # matches greedy generation
+# fork of cifar_overfit_2stage_freeze.py: level refine on. Pass 2 re-decodes each upsampler group seeing a
+# draft (pass 1 argmax) of the 1 preceding group = upsampler_ncodes*stride = 4 tokens back.
+level_refine_passes = 2
+level_refine_window = 1
+level_refine_gt_drop = 0.8
+level_refine_layout = "fixed"
+# pss exact: -1 = one pass per row token (4 here), so the last pass sees the same inputs as a real rollout.
+# Exact with the ar head only when digits are self-fed too: upsampler_rollout_prob = 1.0 (set above).
+upsampler_pss_passes = -1
+# upsampler_pss_passes = (-1, -1, 1, 1)  # per level
+upsampler_pss_prob = 0.8
+pss_input_mode = "argmax"                # matches greedy generation
 # pss_input_mode = "sample"              # gumbel-max, matches sampled generation
 # pss_temperature = 1.0
 # downsampler side: no effect unless downsampler_ncodes > 1 (one token per row has no token input)
@@ -68,6 +87,10 @@ level_gt_drop = 0.8
 # downsampler_pss_passes = -1
 # downsampler_pss_prob = 1.0
 quantize_drop = 0.2
+# ctx_stop_gradient = True
+# ctx_stop_gradient = "pseudo"
+# decoder_scheduled_sampling_prob = 0.3
+
 init_scheme = "llama"
 # use_xsa = True
 use_sink = True
@@ -78,18 +101,19 @@ token_head_type = "ar"
 # no digit-level AR sampling at all, parallel/MTP-style heads instead
 codelm_token_head = "ar"   # CodeLM NTP/free-run head: all digits in one parallel matmul
 pardec_token_head = "ar"    # downsampler/upsampler digit head: all digits in one parallel matmul
-token_dim = 128
+token_dim = 64
 token_n_heads = 2
 traversal = "zorder"
+eval_gen_train = False
 gen_eval_all_levels = False
 gen_eval_teacher_force_sanity = False
 
 
 # --- training ---
 batch_size = 4
-val_batch_size = 2
+val_batch_size = 8
 # level_steps = (20_000, 20_000, 20_000, 100_000)
-level_steps = (0,)*4+ (int(1e6),)
+level_steps = (0,)*4+ (int(100e3),)
 seed = 0
 train_subset_n = None
 val_subset_n = 1000

@@ -48,10 +48,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from tqdm import tqdm
-
+# jax.config.update("jax_memory_fitting_level", "O3")
 from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, SwiGLU, apply_rope, apply_xsa, init_matrix,
                                         init_vector, make_lr_schedule, rmsnorm, rope_cos_sin,
                                         rope_cos_sin_pos, rotate_half, sinkgd)
+from image_lagcodec import run_lagcodec_res as full_runner
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
@@ -292,7 +293,7 @@ class Config:
     log_levelwise_metrics: bool = False
     log_levelwise_eval: bool = False
     log_levelwise_gen: bool = False
-    encoder_only_pretrain: bool = False
+    encoder_only_pretrain: bool = True
     load_encoder_checkpoint: str | None = None
 
     gen_temperature: float = 1.0
@@ -406,9 +407,13 @@ class Config:
 
         if self.encoder_level_loss_weights is not None:
             if isinstance(self.encoder_level_loss_weights, (int, float)):
-                self.encoder_level_loss_weights = (float(self.encoder_level_loss_weights),) * n
+                n_encoder_weights = n + (self.context_source == "codelm_upper")
+                self.encoder_level_loss_weights = (float(self.encoder_level_loss_weights),) * n_encoder_weights
             else:
                 self.encoder_level_loss_weights = tuple(float(x) for x in self.encoder_level_loss_weights)
+                n_encoder_weights = n + (self.context_source == "codelm_upper")
+                if len(self.encoder_level_loss_weights) != n_encoder_weights:
+                    raise ValueError(f"encoder_level_loss_weights needs {n_encoder_weights} values")
         if self.decoder_level_loss_weights is not None:
             if isinstance(self.decoder_level_loss_weights, (int, float)):
                 self.decoder_level_loss_weights = (float(self.decoder_level_loss_weights),) * n
@@ -3238,35 +3243,21 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
 
 
 class LagCodecModel(eqx.Module):
-    # cfg.share_across_levels=True (default, original behavior): codelms/downsamplers/upsamplers
-    # each hold exactly ONE instance (tuple of length 1), reused at every level via codelm_for/
-    # downsampler_for/upsampler_for + bos_rate_id -- "which level" communicated only via rate_id (a
-    # bos_embed row), not via separate weights. This is the only JAX-correct way to tie weights (one
-    # pytree leaf position, called n times inside a single traced loss -- see train_step's comment).
-    # cfg.share_across_levels=False: one independent CodeLM/Downsampler/Upsampler PER LEVEL (own
-    # weights, own architecture -- singleton_uniform_fields assert is skipped in this mode so
-    # per-level d_model/n_layers/etc may genuinely differ), tuples have length n = len(strides).
+    # Shared mode stores one CodeLM/Downsampler; unshared mode stores one per level.
     codelms: tuple
     downsamplers: tuple
-    upsamplers: tuple
     cfg: Config = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config):
         self.cfg = cfg
         n = len(cfg.strides)
         n_instances = 1 if cfg.share_across_levels else n
-        codelms, downsamplers, upsamplers = [], [], []
+        codelms, downsamplers = [], []
         for j in range(n_instances):
             level_idx = j  # share=True: n_instances==1, so level_idx is always 0 (the representative
             # index singleton_uniform_fields already enforces uniformity against); share=False:
             # level_idx==j, this instance's own dedicated level.
             codelms.append(CodeLM(jax.random.fold_in(key, 10 + j), cfg, level_idx=level_idx))
-            # CodeLM is the shared feature extractor for BOTH decode heads: Downsampler's context is
-            # CodeLM's hidden states from this level's own INPUT; Upsampler's context is CodeLM's
-            # hidden states from re-running this level's own CODE through the exact same embed table
-            # + block stack (see decode_logits_and_target_multipass/_decode_generate_pardec_call) --
-            # no special-cased separate ctx_embed/ctx_proj shortcut for the Upsampler. Both therefore
-            # share the same context_hidden_dim = this instance's own CodeLM D_enc.
             D_enc = cfg.codelm_d_model[level_idx]
             pq_dim, code_vocab, pq_chunks = cfg.pq_dim[level_idx], cfg.code_vocab[level_idx], cfg.pq_chunks[level_idx]
             scheme, use_xsa, use_qknorm = cfg.init_scheme, cfg.use_xsa, cfg.use_qknorm
@@ -3290,38 +3281,11 @@ class LagCodecModel(eqx.Module):
                 backbone=cfg.downsampler_backbone[level_idx], state_dim=cfg.ssm_state_dim)
             downsamplers.append(downsampler)
 
-            upsampler_remat = cfg.remat if cfg.upsampler_remat[level_idx] is None else cfg.upsampler_remat[level_idx]
-            # codelm_upper: the upsampler's context comes from the CodeLM one level up
-            D_ctx_up = (cfg.codelm_d_model[min(level_idx + 1, n - 1)] if cfg.context_source == "codelm_upper"
-                        else D_enc)
-            K_default = cfg.strides[level_idx] if cfg.strides[level_idx] != -1 else 1  # output_expansion
-            # default -- overridden per-call via decode_logits_and_target_multipass/
-            # decode_generate_multipass's model.K(level_idx) regardless of mode
-            upsampler = PardecLM(
-                jax.random.fold_in(key, 30 + j), context_hidden_dim=D_ctx_up, hidden_dim=cfg.upsampler_d_model[level_idx],
-                n_heads=cfg.upsampler_n_heads[level_idx], n_kv_heads=cfg.upsampler_n_kv_heads[level_idx],
-                n_layers=cfg.upsampler_n_layers[level_idx], mlp_mult=cfg.mlp_mult[level_idx], rope_base=cfg.rope_base[level_idx],
-                output_expansion=K_default, context_window_groups=cfg.upsampler_window[level_idx],
-                output_vocab=code_vocab, output_chunks=pq_chunks, pq_dim=pq_dim,
-                token_dim=cfg.token_dim[level_idx], token_n_heads=cfg.token_n_heads[level_idx],
-                decode_past=cfg.upsampler_decode_past[level_idx], decode_future=cfg.upsampler_decode_future[level_idx],
-                n_rates=n_rates, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, remat=upsampler_remat,
-                remat_chunks=cfg.upsampler_remat_chunks[level_idx],
-                shared_blocks=downsampler.blocks if cfg.share_downsampler_upsampler_lm else None,
-                shared_ln_f=downsampler.ln_f if cfg.share_downsampler_upsampler_lm else None,
-                ctx_vocab=code_vocab, ctx_pq_chunks=pq_chunks, ctx_pq_dim=pq_dim, token_head=cfg.pardec_token_head,
-                shared_ctx_embed=downsampler.own_ctx_embed if cfg.context_source == "shared_embed" else None,
-                shared_ctx_proj=downsampler.own_ctx_proj if cfg.context_source == "shared_embed" else None,
-                backbone=cfg.upsampler_backbone[level_idx], state_dim=cfg.ssm_state_dim,
-                cycle_slots=max(cycle_stack_slots(cfg, i) for i in (range(n) if cfg.share_across_levels else [j])))
-            upsamplers.append(upsampler)
-
         if cfg.context_source == "codelm_upper" and not cfg.share_across_levels:
-            # decoderless CodeLM-only level n: processes the top code for the top upsampler (top level's arch)
+            # CodeLM-only context level used by the top encoder.
             codelms.append(CodeLM(jax.random.fold_in(key, 1000), cfg, level_idx=n - 1))
         self.codelms = tuple(codelms)
         self.downsamplers = tuple(downsamplers)
-        self.upsamplers = tuple(upsamplers)
 
     def codelm_for(self, level_idx: int) -> CodeLM:
         return self.codelms[0] if self.cfg.share_across_levels else self.codelms[level_idx]
@@ -3329,22 +3293,12 @@ class LagCodecModel(eqx.Module):
     def downsampler_for(self, level_idx: int) -> "PardecLM":
         return self.downsamplers[0] if self.cfg.share_across_levels else self.downsamplers[level_idx]
 
-    def upsampler_for(self, level_idx: int) -> "PardecLM":
-        return self.upsamplers[0] if self.cfg.share_across_levels else self.upsamplers[level_idx]
-
     def bos_rate_id(self, level_idx: int) -> int:
-        # Downsampler/upsampler's OWN bos (anchors a group's contraction/expansion RATE).
+        # Downsampler's own BOS identifies its contraction rate.
         # share_across_levels=True: rate_id comes from bos_rate_map (relative: dedup by effective
         # stride; absolute: the raw level index). False: each instance already owns exactly one
         # level structurally, always row(s) 0.
         return bos_rate_map(self.cfg)[level_idx] if self.cfg.share_across_levels else 0
-
-    def context_codelm_for(self, level_idx: int) -> CodeLM:
-        # processor of code `level_idx` for that level's upsampler (see Config.context_source)
-        return self.codelm_for(level_idx + (self.cfg.context_source == "codelm_upper"))
-
-    def context_codelm_rate_id(self, level_idx: int) -> int:
-        return self.codelm_bos_rate_id(level_idx + (self.cfg.context_source == "codelm_upper"))
 
     def codelm_bos_rate_id(self, level_idx: int) -> int:
         # CodeLM's OWN bos (anchors "which level am I generating" for encoder_free_run's pure-
@@ -3371,13 +3325,21 @@ def dec_loss_acc(logits: jnp.ndarray, target: jnp.ndarray, mask: jnp.ndarray = N
     return jnp.sum(nll * m) / denom, jnp.sum(correct * m) / denom
 
 
-def weighted_level_mean(losses: list, weights) -> jnp.ndarray:
+def weighted_level_mean(losses: list, weights, level_indices=None) -> jnp.ndarray:
     if not losses:
         return jnp.array(0.0)
     stacked = jnp.stack(losses)
     if weights is None:
         return jnp.mean(stacked)
-    w = jnp.asarray(weights[:len(losses)], dtype=stacked.dtype)
+    if level_indices is None:
+        selected_weights = weights[:len(losses)]
+    else:
+        if len(level_indices) != len(losses):
+            raise ValueError("level_indices must have one entry per loss")
+        if any(i < 0 or i >= len(weights) for i in level_indices):
+            raise ValueError(f"level index exceeds configured loss weights: {level_indices}")
+        selected_weights = [weights[i] for i in level_indices]
+    w = jnp.asarray(selected_weights, dtype=stacked.dtype)
     denom = jnp.maximum(jnp.sum(w), 1e-8)
     return jnp.sum(stacked * w) / denom
 
@@ -3394,6 +3356,10 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
                    pixel_order=None, byte_pq_fn=None, digit_teacher_force: bool = False,
                    return_recon: bool = False, return_levelwise: bool = False,
                    ctx_ablation: str = None) -> tuple:
+    if not model.cfg.encoder_only_pretrain:
+        raise ValueError("the pretrain runner supports encoder-only training")
+    if return_recon or ctx_ablation is not None:
+        raise ValueError("decoder reconstruction and context ablation are unavailable in encoder-only pretraining")
     codelm0 = model.codelm_for(0)
     byte_pq_fn = byte_pq_fn or rgb_byte_pq_fn
     # flat_bytes stays raw (fed to label_fn as-is, which interprets literal byte/pixel values);
@@ -3406,13 +3372,13 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     codes, codes_soft = [], []
     enc_losses, enc_accs, utils, entropy_losses, label_losses = [], [], [], [], []
     label_mses, label_mse_losses = [], []
-    level_rngs = [None] * (2 * phase) if rng is None else list(jax.random.split(rng, 2 * phase))
+    level_rngs = [None] * phase if rng is None else list(jax.random.split(rng, phase))
     for i in range(phase):
         codelm = model.codelm_for(i)
         out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, model.cfg,
                                          pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                          codelm_rate_id=model.codelm_bos_rate_id(i),
-                                         rng=level_rngs[2 * i], downsampler_ncodes=model.cfg.downsampler_ncodes[i],
+                                         rng=level_rngs[i], downsampler_ncodes=model.cfg.downsampler_ncodes[i],
                                         pss_passes=model.cfg.downsampler_pss_passes[i])
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
@@ -3445,101 +3411,24 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
         enc_losses.append(ntp_up)
         enc_accs.append(acc_up)
 
-    dec_losses, dec_accs = [], []
-    aux_ntp_losses, aux_ntp_accs = [], []
-    aux_applies = any(u.decode_future > 0 or u.decode_past > 0 for u in model.upsamplers)
-
-    byte_mse = None
-    mse_loss = 0.0
-    ctx = codes_soft[phase - 1]
-    # diagnostic only (default None -- no change to any existing call site): replaces the TOP-level
-    # ctx with zeros/a batch-shuffled version BEFORE any decode happens, to measure how much the
-    # decode cascade actually relies on real per-sample content vs. teacher-forced AR self-attention
-    # over real previous tokens alone. See ctx_ablation_check.py.
-    if ctx_ablation == "zero":
-        ctx = jnp.zeros_like(ctx)
-    elif ctx_ablation == "shuffle":
-        ctx = jnp.roll(ctx, shift=1, axis=0)
-    elif ctx_ablation is not None:
-        raise ValueError(f"ctx_ablation must be None/'zero'/'shuffle', got {ctx_ablation!r}")
-    if model.cfg.ctx_stop_gradient is True:
-        ctx = jax.lax.stop_gradient(ctx)
-    sg_pseudo = jax.lax.stop_gradient if model.cfg.ctx_stop_gradient == "pseudo" else (lambda c: c)
-    cascade_rngs = [None] * phase if cascade_rng is None else list(jax.random.split(cascade_rng, phase))
-
-    start_i = phase - 1
-
-    for i in range(start_i, -1, -1):
-        dec_target = tok0 if i == 0 else codes[i - 1]
-        dec_rng = level_rngs[2 * i + 1]
-        cycles = decode_logits_and_target_cycles(
-            model, i, dec_target, ctx, model.cfg.upsampler_ncodes[i], rng=dec_rng,
-            encode_temperature=encode_temperature, force_teacher_forced=digit_teacher_force)
-        logits, target_i, mask_i, aux_loss_i, aux_acc_i = cycles[-1][-1]
-        loss_i = cycle_loss(cycles, model.cfg.level_cycle_loss)
-        acc_i = dec_loss_acc(logits, target_i, mask_i)[1]
-        dec_losses.append(loss_i)
-        dec_accs.append(acc_i)
-        if aux_applies:
-            aux_ntp_losses.append(aux_loss_i)
-            aux_ntp_accs.append(aux_acc_i)
-        if i == 0:
-            pred_bytes = jnp.argmax(logits, axis=-1).astype(jnp.float32)
-            byte_mse = jnp.mean((pred_bytes - target_i.astype(jnp.float32)) ** 2)
-            if model.cfg.mse_weight > 0:
-                byte_probs = jax.nn.softmax(logits / model.cfg.mse_softmax_tau, axis=-1)
-                byte_values = jnp.arange(byte_probs.shape[-1], dtype=byte_probs.dtype)
-                pred_pixel = jnp.sum(byte_probs * byte_values, axis=-1)
-                max_val = byte_probs.shape[-1] - 1
-                mse_loss = jnp.mean(((pred_pixel - target_i.astype(jnp.float32)) / max_val) ** 2)
-            else:
-                mse_loss = 0.0
-        if i > 0:
-            real_ctx = codes_soft[i - 1]
-            rng_i = cascade_rngs[i]
-            gt_drop_i = None if level_gt_drop is None else (
-                level_gt_drop if isinstance(level_gt_drop, (int, float)) else level_gt_drop[i])
-            # gt_drop_i is a static Python float: 0.0/1.0 skip the unused branch's compute entirely.
-            # No rng (eval) with a fractional value: deterministic real ctx, like run_val_eval.
-            if gt_drop_i is None or gt_drop_i == 0.0 or (gt_drop_i < 1.0 and rng_i is None):
-                ctx = real_ctx
-            else:
-                quant_rng_i = None if rng_i is None else jax.random.fold_in(rng_i, 0)
-                pseudo_ctx, _ = quantize_dispatch(model.cfg.quantize_mode, logits, quant_rng_i,
-                                                   encode_temperature, model.cfg.quantize_drop)
-                pseudo_ctx = sg_pseudo(pseudo_ctx)
-                if gt_drop_i == 1.0:
-                    ctx = pseudo_ctx
-                else:
-                    ctx = jnp.where(jax.random.bernoulli(rng_i, p=gt_drop_i), pseudo_ctx, real_ctx)
-
-            if model.cfg.ctx_stop_gradient is True:
-                ctx = jax.lax.stop_gradient(ctx)
-
-    dec_loss_total = weighted_level_mean(dec_losses, model.cfg.decoder_level_loss_weights)
-    byte_acc = dec_accs[-1]
-    ntp_loss_total = weighted_level_mean(enc_losses, model.cfg.encoder_level_loss_weights)
+    encoder_levels = list(range(phase))
+    if model.cfg.context_source == "codelm_upper":
+        encoder_levels.append(phase)
+    ntp_loss_total = weighted_level_mean(
+        enc_losses, model.cfg.encoder_level_loss_weights, encoder_levels)
     entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
     label_loss_total = jnp.mean(jnp.stack(label_losses)) if label_losses else 0.0
     label_mse_total = jnp.mean(jnp.stack(label_mses)) if label_mses else jnp.array(0.0)
     label_mse_loss_total = jnp.mean(jnp.stack(label_mse_losses)) if label_mse_losses else 0.0
-    if aux_ntp_losses:
-        aux_ntp_loss_total = jnp.mean(jnp.stack(aux_ntp_losses))
-        aux_ntp_acc_total = jnp.mean(jnp.stack(aux_ntp_accs))
-    else:
-        aux_ntp_loss_total = jnp.array(0.0)
-        aux_ntp_acc_total = jnp.array(0.0)
-    loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
-        + model.cfg.mse_weight * mse_loss + label_reg_weight * label_loss_total \
-        + model.cfg.ntp_weight * aux_ntp_loss_total + model.cfg.label_mse_weight * label_mse_loss_total
-    # bpb = dec_loss_total / jnp.log(2.0)
-    aux = (dec_loss_total, byte_acc, ntp_loss_total, jnp.mean(jnp.stack(enc_accs)),
-           jnp.mean(jnp.stack(utils)), byte_mse, aux_ntp_loss_total / jnp.log(2.0), aux_ntp_acc_total,
+    loss = model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
+        + label_reg_weight * label_loss_total + model.cfg.label_mse_weight * label_mse_loss_total
+    zero = jnp.array(0.0, dtype=ntp_loss_total.dtype)
+    aux = (zero, zero, ntp_loss_total, jnp.mean(jnp.stack(enc_accs)),
+           jnp.mean(jnp.stack(utils)), zero, zero, zero,
            label_mse_total)
     if return_levelwise:
-        aux = aux + (jnp.stack(enc_losses), jnp.stack(enc_accs), jnp.stack(dec_losses), jnp.stack(dec_accs))
-    if return_recon:
-        aux = aux + (pred_bytes,)
+        dec_zeros = jnp.zeros((phase,), dtype=ntp_loss_total.dtype)
+        aux = aux + (jnp.stack(enc_losses), jnp.stack(enc_accs), dec_zeros, dec_zeros)
     return loss, aux
 
 
@@ -3617,154 +3506,82 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
     # cfg.share_across_levels=True, every level reuses the SAME shared CodeLM/downsampler/upsampler
     # (see LagCodecModel) -- this is what actually trains those shared parameters across every
     # resolution they need to work at, not just the one fixed depth level_forward always uses.
-    codelm_entry = model.codelm_for(entry_level)
-    byte_pq_fn = byte_pq_fn or rgb_byte_pq_fn
-    if entry_level == 0:
-        entry_code = byte_pq_fn(flat_bytes, codelm_entry.pq_chunks, codelm_entry.code_vocab)
-        raw, target = entry_code, entry_code
-    else:
-        n_blocks_entry = n_blocks_for_level(model.cfg, entry_level - 1)
-        label_shortcut = label_fn(flat_bytes, model.cfg, pixel_order, n_blocks_entry,
-                                   model.cfg.pq_chunks[entry_level - 1], model.cfg.code_vocab[entry_level - 1])
-        # entry_gt_drop (forked from level_gt_drop's own real-vs-rollout mixing, for this entry_level
-        # construction specifically -- see Config.multires_entry_gt_drop): with probability
-        # entry_gt_drop, use the REAL encoder chain's own output (the model's actual, exposure-
-        # biased input at this level) instead of label_fn's idealized resize-based shortcut. The
-        # chain is stop_gradient'd -- "no update onto levels before the selected entry_level" (this
-        # step's gradient only trains the [entry_level, entry_level+depth) range actually run below,
-        # matching entry_gt_drop=None's existing default behavior exactly).
-        if entry_gt_drop is not None and rng is not None:
-            rng, chain_rng, blend_rng = jax.random.split(rng, 3)
-            chain_idx, chain_soft = _encode_chain_upto(model, flat_bytes, entry_level, model.cfg, label_fn,
-                                                        pixel_order, byte_pq_fn, chain_rng)
-            chain_idx = jax.lax.stop_gradient(chain_idx)
-            chain_soft = jax.lax.stop_gradient(chain_soft)
-            use_real = jax.random.bernoulli(blend_rng, p=entry_gt_drop, shape=(flat_bytes.shape[0],))
-            label_soft = jax.nn.one_hot(label_shortcut, model.cfg.code_vocab[entry_level - 1], dtype=chain_soft.dtype)
-            hard_bcast = use_real.reshape((-1,) + (1,) * (label_shortcut.ndim - 1))
-            soft_bcast = use_real.reshape((-1,) + (1,) * (label_soft.ndim - 1))
-            target = jnp.where(hard_bcast, chain_idx, label_shortcut)
-            raw = jnp.where(soft_bcast, chain_soft, label_soft)
+    if not model.cfg.encoder_only_pretrain:
+        raise ValueError("the pretrain runner supports encoder-only training")
+    if model.cfg.encoder_only_pretrain:
+        codelm_entry = model.codelm_for(entry_level)
+        byte_pq_fn = byte_pq_fn or rgb_byte_pq_fn
+        if entry_level == 0:
+            entry_code = byte_pq_fn(flat_bytes, codelm_entry.pq_chunks, codelm_entry.code_vocab)
+            raw, target = entry_code, entry_code
         else:
+            n_blocks_entry = n_blocks_for_level(model.cfg, entry_level - 1)
+            label_shortcut = label_fn(flat_bytes, model.cfg, pixel_order, n_blocks_entry,
+                                       model.cfg.pq_chunks[entry_level - 1], model.cfg.code_vocab[entry_level - 1])
             raw, target = label_shortcut, label_shortcut
-    entry_code = target  # the entry level's own hard representation, used below as the final
-    # (shallowest) decode step's target -- whichever branch set `target` above (label shortcut, or
-    # the entry_gt_drop blend of label shortcut vs real chain).
-    codes, codes_soft = [], []
-    enc_losses, enc_accs, utils, entropy_losses, label_losses, label_mses = [], [], [], [], [], []
-    level_rngs = [None] * (2 * depth) if rng is None else list(jax.random.split(rng, 2 * depth))
-    for d in range(depth):
-        i = entry_level + d
-        codelm = model.codelm_for(i)
-        out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, model.cfg,
-                                         pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
-                                         codelm_rate_id=model.codelm_bos_rate_id(i),
-                                         rng=level_rngs[2 * d], downsampler_ncodes=model.cfg.downsampler_ncodes[i],
-                                        pss_passes=model.cfg.downsampler_pss_passes[i])
-        codes.append(out["code_idx"])
-        codes_soft.append(out["code_soft"])
-        enc_losses.append(out["ntp_loss"])
-        enc_accs.append(out["ntp_acc"])
-        utils.append(out["util"])
-        entropy_losses.append(out["entropy_loss"])
-        if label_reg_weight > 0:
-            enc_logits = out["logits"]
-            n_blocks_i = enc_logits.shape[1]
-            label_tgt = label_fn(flat_bytes, model.cfg, pixel_order, n_blocks_i,
+        entry_code = target
+        codes, codes_soft = [], []
+        enc_losses, enc_accs, utils, entropy_losses, label_losses, label_mses, label_mse_losses = \
+            [], [], [], [], [], [], []
+        level_rngs = [None] * depth if rng is None else list(jax.random.split(rng, depth))
+        for d in range(depth):
+            i = entry_level + d
+            codelm = model.codelm_for(i)
+            out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, model.cfg,
+                                             pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
+                                             codelm_rate_id=model.codelm_bos_rate_id(i),
+                                             rng=level_rngs[d], downsampler_ncodes=model.cfg.downsampler_ncodes[i],
+                                            pss_passes=model.cfg.downsampler_pss_passes[i])
+            codes.append(out["code_idx"])
+            codes_soft.append(out["code_soft"])
+            enc_losses.append(out["ntp_loss"])
+            enc_accs.append(out["ntp_acc"])
+            utils.append(out["util"])
+            entropy_losses.append(out["entropy_loss"])
+            if label_reg_weight > 0:
+                enc_logits = out["logits"]
+                n_blocks_i = enc_logits.shape[1]
+                label_tgt = label_fn(flat_bytes, model.cfg, pixel_order, n_blocks_i,
                                   model.cfg.pq_chunks[i], model.cfg.code_vocab[i])
-            logp_i = jax.nn.log_softmax(enc_logits, axis=-1)
-            label_losses.append(-jnp.mean(jnp.take_along_axis(logp_i, label_tgt[..., None], axis=-1)))
-            pred_label_hard = jnp.argmax(enc_logits, axis=-1).astype(jnp.float32)
-            label_mses.append(jnp.mean((pred_label_hard - label_tgt.astype(jnp.float32)) ** 2))
-        if d < depth - 1:
-            raw = out["code_soft"]
-            target = out["code_idx"]
-    if model.cfg.context_source == "codelm_upper":
-        ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(entry_level + depth), codes_soft[depth - 1],
-                                         codes[depth - 1], model.cfg)
-        enc_losses.append(ntp_up)
-        enc_accs.append(acc_up)
-
-    dec_losses, dec_accs = [], []
-    ctx = codes_soft[depth - 1]
-    dec_rngs = [None] * depth if rng is None else list(jax.random.split(jax.random.fold_in(rng, 2), depth))
-    for d in range(depth - 1, -1, -1):
-        i = entry_level + d
-        dec_target = entry_code if d == 0 else codes[d - 1]
-        cycles = decode_logits_and_target_cycles(
-            model, i, dec_target, ctx, model.cfg.upsampler_ncodes[i], rng=dec_rngs[d],
-            encode_temperature=encode_temperature)
-        logits, target_i, mask_i, aux_loss_i, aux_acc_i = cycles[-1][-1]
-        loss_i = cycle_loss(cycles, model.cfg.level_cycle_loss)
-        acc_i = dec_loss_acc(logits, target_i, mask_i)[1]
-        dec_losses.append(loss_i)
-        dec_accs.append(acc_i)
-        if d > 0:
-            ctx = codes_soft[d - 1]
-
-    dec_loss_total = weighted_level_mean(dec_losses, model.cfg.decoder_level_loss_weights)
-    byte_acc = dec_accs[-1]  # accuracy of the deepest->entry_level+1 decode step, matches
-    # level_forward's own-code-accuracy convention (last-computed = shallowest/own-level step)
-    ntp_loss_total = weighted_level_mean(enc_losses, model.cfg.encoder_level_loss_weights)
-    entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
-    label_loss_total = jnp.mean(jnp.stack(label_losses)) if label_losses else 0.0
-    label_mse_total = jnp.mean(jnp.stack(label_mses)) if label_mses else jnp.array(0.0)
-    loss = dec_loss_total + model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
-        + label_reg_weight * label_loss_total
-    bpb = dec_loss_total / jnp.log(2.0)
-    zero = jnp.array(0.0)
-    aux = (bpb, byte_acc, ntp_loss_total / jnp.log(2.0), jnp.mean(jnp.stack(enc_accs)),
-           jnp.mean(jnp.stack(utils)), zero, zero, zero, label_mse_total)
-    if model.cfg.log_levelwise_metrics:
-        aux = aux + (jnp.stack(enc_losses), jnp.stack(enc_accs), jnp.stack(dec_losses), jnp.stack(dec_accs))
-    # aux tuple shape matches level_forward's (bpb, byte_acc, ntp_bpb, e_acc, util, byte_mse,
-    # aux_ntp_bpb, aux_ntp_acc, label_mse) so run_val_eval/the train logger work unchanged --
-    # byte_mse/aux_ntp_* don't apply here (no raw-pixel reconstruction when entry_level>0), zeroed.
-    return loss, aux
-
+                logp_i = jax.nn.log_softmax(enc_logits, axis=-1)
+                label_losses.append(-jnp.mean(jnp.take_along_axis(logp_i, label_tgt[..., None], axis=-1)))
+                pred_label_hard = jnp.argmax(enc_logits, axis=-1).astype(jnp.float32)
+                label_mses.append(jnp.mean((pred_label_hard - label_tgt.astype(jnp.float32)) ** 2))
+                label_probs_i = jax.nn.softmax(enc_logits, axis=-1)
+                label_values_i = jnp.arange(label_probs_i.shape[-1], dtype=label_probs_i.dtype)
+                pred_label_soft = jnp.sum(label_probs_i * label_values_i, axis=-1)
+                label_mse_losses.append(jnp.mean((pred_label_soft - label_tgt.astype(jnp.float32)) ** 2))
+            if d < depth - 1:
+                raw = out["code_soft"]
+                target = out["code_idx"]
+        if model.cfg.context_source == "codelm_upper":
+            ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(entry_level + depth), codes_soft[depth - 1],
+                                             codes[depth - 1], model.cfg)
+            enc_losses.append(ntp_up)
+            enc_accs.append(acc_up)
+        encoder_levels = list(range(entry_level, entry_level + depth))
+        if model.cfg.context_source == "codelm_upper":
+            encoder_levels.append(entry_level + depth)
+        ntp_loss_total = weighted_level_mean(
+            enc_losses, model.cfg.encoder_level_loss_weights, encoder_levels)
+        entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
+        label_loss_total = jnp.mean(jnp.stack(label_losses)) if label_losses else 0.0
+        label_mse_total = jnp.mean(jnp.stack(label_mses)) if label_mses else jnp.array(0.0)
+        label_mse_loss_total = jnp.mean(jnp.stack(label_mse_losses)) if label_mse_losses else 0.0
+        loss = model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
+            + label_reg_weight * label_loss_total + model.cfg.label_mse_weight * label_mse_loss_total
+        bpb = jnp.array(0.0, dtype=jnp.float32)
+        byte_acc = jnp.array(0.0, dtype=jnp.float32)
+        aux = (bpb, byte_acc, ntp_loss_total, jnp.mean(jnp.stack(enc_accs)),
+               jnp.mean(jnp.stack(utils)), jnp.array(0.0, dtype=jnp.float32),
+               jnp.array(0.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32), label_mse_total)
+        if model.cfg.log_levelwise_metrics:
+            aux = aux + (jnp.stack(enc_losses), jnp.stack(enc_accs), jnp.stack([jnp.array(0.0, dtype=jnp.float32)] * len(enc_losses)),
+                         jnp.stack([jnp.array(0.0, dtype=jnp.float32)] * len(enc_accs)))
+        return loss, aux
 
 def phase_trainable_filter(model: LagCodecModel, phase: int):
-    spec = jax.tree_util.tree_map(lambda x: eqx.is_array(x), model)
-    if model.cfg.encoder_only_pretrain:
-        all_false = lambda sub: jax.tree_util.tree_map(lambda _: False, sub)
-        for j in range(len(model.upsamplers)):
-            spec = eqx.tree_at(lambda s: s.upsamplers[j], spec, replace=all_false(spec.upsamplers[j]))
-        if model.cfg.curriculum_mode != "freeze":
-            return spec
-    if model.cfg.curriculum_mode != "freeze":
-        return spec
-    # phase p trains only level p-1: lower levels frozen, higher (unused) ones too so weight decay
-    # doesn't shrink them before their own phase. codelm_upper: upsampler p-1's context is CodeLM p, so
-    # phase p trains CodeLM p (+ CodeLM 0 in phase 1) -- each CodeLM is trained in exactly one phase.
-    all_false = lambda sub: jax.tree_util.tree_map(lambda _: False, sub)
-    train_codelms = ({phase} | ({0} if phase == 1 else set())) if model.cfg.context_source == "codelm_upper" \
-        else {phase - 1}
-    for j in range(len(model.codelms)):
-        if j not in train_codelms:
-            spec = eqx.tree_at(lambda s: s.codelms[j], spec, replace=all_false(spec.codelms[j]))
-    for j in range(len(model.downsamplers)):
-        if j != phase - 1:
-            spec = eqx.tree_at(lambda s: (s.downsamplers[j], s.upsamplers[j]), spec,
-                               replace=(all_false(spec.downsamplers[j]), all_false(spec.upsamplers[j])))
-    return spec
-
-
-def tie_shared_grads(grads, cfg: Config):
-    # share_downsampler_upsampler_lm / shared_embed arrays are two pytree leaves to jax.grad (each got its own
-    # partial, so adamw untied them after step 1): give both the summed gradient so they stay identical
-    getters = []
-    for j in range(len(grads.downsamplers)):
-        if cfg.share_downsampler_upsampler_lm:
-            getters += [(lambda t, j=j: t.downsamplers[j].blocks, lambda t, j=j: t.upsamplers[j].blocks),
-                        (lambda t, j=j: t.downsamplers[j].ln_f, lambda t, j=j: t.upsamplers[j].ln_f)]
-        if cfg.context_source == "shared_embed":
-            getters += [(lambda t, j=j: t.downsamplers[j].own_ctx_embed, lambda t, j=j: t.upsamplers[j].own_ctx_embed),
-                        (lambda t, j=j: t.downsamplers[j].own_ctx_proj, lambda t, j=j: t.upsamplers[j].own_ctx_proj)]
-    for a, b in getters:
-        summed = jax.tree_util.tree_map(lambda x, y: x + y, a(grads), b(grads))
-        grads = eqx.tree_at(b, eqx.tree_at(a, grads, summed, is_leaf=lambda x: x is None), summed,
-                            is_leaf=lambda x: x is None)
-    return grads
+    return jax.tree_util.tree_map(lambda x: eqx.is_array(x), model)
 
 
 def count_params(tree) -> int:
@@ -3824,6 +3641,7 @@ def save_checkpoint(ckpt_dir: Path, model, opt_state, p_rng, train_iter: "BatchI
                      phase: int, phase_step: int, step: int, seed: int, schedule_meta: dict = None) -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     eqx.tree_serialise_leaves(ckpt_dir / "model.eqx", model)
+    eqx.tree_serialise_leaves(ckpt_dir / "encoder.eqx", (model.codelms, model.downsamplers))
     eqx.tree_serialise_leaves(ckpt_dir / "opt_state.eqx", opt_state)
     eqx.tree_serialise_leaves(ckpt_dir / "p_rng.eqx", p_rng)
     (ckpt_dir / "dataloader_state.json").write_text(json.dumps(dict(
@@ -3836,13 +3654,20 @@ def save_checkpoint(ckpt_dir: Path, model, opt_state, p_rng, train_iter: "BatchI
 
 
 def load_encoder_only_checkpoint(model, ckpt_path: Path):
-    loaded_model = eqx.tree_deserialise_leaves(ckpt_path / "model.eqx", model)
-    if len(loaded_model.codelms) != len(model.codelms) or len(loaded_model.downsamplers) != len(model.downsamplers):
-        raise ValueError(f"checkpoint {ckpt_path} has incompatible encoder shapes: "
-                         f"codelms={len(loaded_model.codelms)}, downsamplers={len(loaded_model.downsamplers)} "
-                         f"vs current model codelms={len(model.codelms)}, downsamplers={len(model.downsamplers)}")
+    encoder_path = ckpt_path / "encoder.eqx" if ckpt_path.is_dir() else ckpt_path
+    if encoder_path.name == "encoder.eqx" and encoder_path.is_file():
+        loaded_encoder = eqx.tree_deserialise_leaves(
+            encoder_path, (model.codelms, model.downsamplers))
+        return eqx.tree_at(lambda m: (m.codelms, m.downsamplers), model,
+                           replace=loaded_encoder, is_leaf=lambda x: False)
+
+    model_path = ckpt_path / "model.eqx" if ckpt_path.is_dir() else ckpt_path
+    if not model_path.is_file():
+        raise FileNotFoundError(f"encoder checkpoint needs encoder.eqx or model.eqx: {ckpt_path}")
+    legacy_model = full_runner.LagCodecModel(jax.random.PRNGKey(0), model.cfg)
+    loaded_encoder = eqx.tree_deserialise_leaves(model_path, legacy_model)
     return eqx.tree_at(lambda m: (m.codelms, m.downsamplers), model,
-                       replace=(loaded_model.codelms, loaded_model.downsamplers),
+                       replace=(loaded_encoder.codelms, loaded_encoder.downsamplers),
                        is_leaf=lambda x: False)
 
 
@@ -4110,7 +3935,8 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
                   "entropy_weight", "mse_weight",
                   "mse_softmax_tau", "traversal", "label_reg_weight", "label_mse_weight",
                   "encoder_level_loss_weights", "decoder_level_loss_weights",
-                  "log_levelwise_metrics", "log_levelwise_eval", "log_levelwise_gen")
+                  "log_levelwise_metrics", "log_levelwise_eval", "log_levelwise_gen",
+                  "encoder_only_pretrain", "load_encoder_checkpoint")
 
 
 def main():
@@ -4195,10 +4021,10 @@ def main():
                          "disables pruning -- keep every checkpoint")
     p.add_argument("--resume", type=lambda x: x.lower() != "false", default=False,
                     help="resume from the latest checkpoint under this run's log dir, if any")
-    p.add_argument("--encoder_only_pretrain", type=lambda x: x.lower() != "false", default=False,
-                    help="freeze the upsampler and train the encoder path only (CodeLM + Downsampler), while keeping the upsampler initialized for later full-model continuation")
+    p.add_argument("--encoder_only_pretrain", type=lambda x: x.lower() != "false", default=True,
+                    help="ignored in this runner: only CodeLM/downsampler parameters are constructed and trained")
     p.add_argument("--load_encoder_checkpoint", type=Path, default=None,
-                    help="start a fresh run by restoring only the CodeLM and Downsampler states from a checkpoint; the current upsampler is left initialized and not overwritten")
+                    help="start fresh from CodeLM/downsampler weights in an encoder.eqx or full checkpoint")
     p.add_argument("--wa_mode", type=str, default="none", choices=["none", "ema", "wma"],
                     help="weight averaging: 'ema' (Polyak shadow copy) or 'wma' (rolling "
                          "mean over a FIFO stack of raw snapshots). 'none' (default) disables "
@@ -4541,6 +4367,9 @@ def main():
     config_vars = {k: v for k, v in config_vars.items() if k in known}
     p.set_defaults(**config_vars)
     args = p.parse_args()
+    if not bool(args.encoder_only_pretrain):
+        warnings.warn("--encoder_only_pretrain is ignored in the pretrain runner; encoder-only mode is always forced on.")
+    args.encoder_only_pretrain = True
     if args.run_name is None:
         args.run_name = pre_args.config.stem
 
@@ -4671,133 +4500,82 @@ def main():
         if not ckpt_path.exists():
             raise FileNotFoundError(f"encoder checkpoint not found: {ckpt_path}")
         model = load_encoder_only_checkpoint(model, ckpt_path)
-        logger(f"loaded CodeLM + Downsampler state from {ckpt_path}; Upsampler left initialized and frozen for encoder-only start")
+        logger(f"loaded CodeLM + Downsampler state from {ckpt_path}")
 
-    cfg.encoder_only_pretrain = bool(args.encoder_only_pretrain)
+    cfg.encoder_only_pretrain = True
     cfg.load_encoder_checkpoint = str(args.load_encoder_checkpoint) if args.load_encoder_checkpoint is not None else None
 
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
     if cfg.precision != "bf16":
         jax.config.update("jax_default_matmul_precision", "highest")
-    recon_prompt = flat_prompt = gt_img = None
-    train_recon_prompt = train_flat_prompt = train_gt_img = None
-    gen_jit_timed = [False]
+    def token_preview(tokens: np.ndarray, level: int) -> np.ndarray:
+        if level == 0:
+            return positions_to_image(tokens, cfg, pixel_order)
+        count = tokens.shape[1]
+        side = math.isqrt(count)
+        if side * side != count or tokens.shape[-1] < 3:
+            raise ValueError(f"level {level}: cannot render {count} positions with {tokens.shape[-1]} chunks")
+        vocab = cfg.code_vocab[level]
+        rgb_seq = (tokens[0, :, :3].astype(np.float32) * (255.0 / max(1, vocab - 1))).clip(0, 255).astype(np.uint8)
+        order = zorder_pixel_order(side) if cfg.traversal == "zorder" else np.arange(count)
+        raster = np.zeros_like(rgb_seq)
+        raster[order] = rgb_seq
+        grid = raster.reshape(side, side, 3)
+        rows = np.linspace(0, side - 1, cfg.img_size).round().astype(int)
+        cols = np.linspace(0, side - 1, cfg.img_size).round().astype(int)
+        return grid[rows[:, None], cols[None, :]][None]
 
-    def run_gen_eval(eval_model, top: int, tag: str, flat_prompt, gt_img, sample: bool = False) -> tuple:
-        gen_t0 = time.monotonic()
-        tag = tag + ("_sample" if sample else "")
-        g_kw = dict(greedy=not sample, temperature=cfg.gen_temperature, seed=1 if sample else 0)
+    def teacher_force_level0(m, tokens: jnp.ndarray) -> jnp.ndarray:
+        codelm = m.codelm_for(0)
+        h = pardec_context_hidden(m.codelm_for(0), m.downsampler_for(0), tokens, cfg,
+                                  m.codelm_bos_rate_id(0), None,
+                                  group_size=m.K(0) * cfg.downsampler_ncodes[0])
+        logits = codelm_ntp_logits_tf(codelm, h[:, :-1], tokens[:, 1:])
+        predicted = jnp.argmax(logits, axis=-1).astype(tokens.dtype)
+        return tokens.at[:, 1:].set(predicted)
+
+    def run_qual_eval(eval_model, phase: int, tag: str) -> None:
         m = cast_pytree(eval_model, compute_dtype)
-        codelm0 = m.codelm_for(0)
-        tok0 = rgb_byte_pq_fn(flat_prompt, codelm0.pq_chunks, codelm0.code_vocab)
-        raw, target = tok0, tok0
-        codes, codes_soft = [], []
-        # gen_eval_encode_mode="generate" always needs real randomness (it's actual sampling, not a
-        # quantize_mode dispatch choice) -- independent of gumbel_at_inference, which only governs
-        # the teacher_force path's quantize_dispatch rng.
-        if cfg.gen_eval_encode_mode == "generate":
-            eval_rngs = list(jax.random.split(jax.random.fold_in(jax.random.PRNGKey(0), hash(tag) % (2**31)), top + 1))
-        else:
-            eval_rngs = ([None] * (top + 1) if not cfg.gumbel_at_inference
-                         else list(jax.random.split(jax.random.fold_in(jax.random.PRNGKey(0), hash(tag) % (2**31)), top + 1)))
-        for i in range(top + 1):
-            codelm_i = m.codelm_for(i)
-            if cfg.gen_eval_encode_mode == "generate":
-                # self-generated forward encode (encode_pardec_downsampler_generate): each level's
-                # code comes from the downsampler's own AR head, not label_fn's ground-truth target --
-                # still contextualized on the real prompt image via CodeLM (`raw`).
-                out = encode_pardec_downsampler_generate(codelm_i, m.downsampler_for(i), raw, m.K(i), cfg,
-                                                          rate_id=m.bos_rate_id(i),
-                                                          codelm_rate_id=m.codelm_bos_rate_id(i),
-                                                          rng=eval_rngs[i], greedy=not sample,
-                                                          temperature=cfg.gen_temperature, top_k=cfg.gen_top_k,
-                                                          downsampler_ncodes=cfg.downsampler_ncodes[i])
-            else:
-                out = encode_pardec_downsampler(codelm_i, m.downsampler_for(i), raw, target, flat_prompt, cfg,
-                                                 pixel_order, label_fn, m.K(i), rate_id=m.bos_rate_id(i),
-                                                 codelm_rate_id=m.codelm_bos_rate_id(i),
-                                                 rng=eval_rngs[i], downsampler_ncodes=cfg.downsampler_ncodes[i],
-                                        pss_passes=cfg.downsampler_pss_passes[i])
-            codes.append(out["code_idx"])
-            codes_soft.append(out["code_soft"])
-            if i < top:
-                raw = out["code_soft"]
-                target = out["code_idx"]
+        sources = [("train", train_np[:1]), ("val", val_np[:1])]
+        for source_name, images in sources:
+            gt_image = images.astype(np.uint8)
+            flat = jnp.asarray(images_to_positions(images, cfg, pixel_order))
+            raw = rgb_byte_pq_fn(flat, m.codelm_for(0).pq_chunks, m.codelm_for(0).code_vocab)
+            level_tokens = []
+            for level in range(phase):
+                key = jax.random.PRNGKey(args.seed + level * 1009 + (0 if source_name == "val" else 1))
+                out = encode_pardec_downsampler_generate(
+                    m.codelm_for(level), m.downsampler_for(level), raw, m.K(level), cfg,
+                    rate_id=m.bos_rate_id(level), codelm_rate_id=m.codelm_bos_rate_id(level),
+                    rng=key, greedy=True, temperature=1.0, top_k=0,
+                    downsampler_ncodes=cfg.downsampler_ncodes[level])
+                raw = out["code_idx"]
+                level_tokens.append(raw)
 
-        recon_acc = None
+            for level, tokens in enumerate(level_tokens):
+                preview_gt = token_preview(np.asarray(tokens), level)
+                for requested_prefix in (1, 128):
+                    prefix = min(requested_prefix, tokens.shape[1])
+                    generated = encoder_free_run(
+                        m.codelm_for(level), tokens[:, :prefix], tokens.shape[1], m.K(level),
+                        jax.random.PRNGKey(args.seed + level * 101 + prefix),
+                        greedy=True, temperature=1.0, top_k=0,
+                        rate_id=m.codelm_bos_rate_id(level))
+                    preview_gen = token_preview(np.asarray(generated), level)
+                    sample_path = run_dir / f"samples_{tag}_{source_name}_level{level}_prompt{prefix}.png"
+                    save_samples(preview_gen, preview_gt, sample_path, cfg)
+                    logger(f"[{tag}] QUAL source={source_name} level={level} "
+                           f"prompt_positions={prefix}/{tokens.shape[1]} kv_cache=true "
+                           f"saved={sample_path.name}")
 
-        cascade_t0 = time.monotonic()
-        cur_code = codes[top]
-        loop_start = top
-        for i in range(loop_start, 0, -1):
-            cur_code = decode_generate_cycles(m, i, cur_code, cfg.upsampler_ncodes[i], **g_kw)
-        cascade_recon = decode_generate_cycles(m, 0, cur_code, cfg.upsampler_ncodes[0], **g_kw)
-        gen_compile_s = None
-        if not gen_jit_timed[0]:
-            gen_compile_s = time.monotonic() - cascade_t0
-            gen_jit_timed[0] = True
-        cascade_acc = float(jnp.mean(cascade_recon == flat_prompt))
-        cascade_img = positions_to_image(np.asarray(cascade_recon), cfg, pixel_order)
-        cascade_mse = pixel_mse(cascade_img, gt_img)
-        save_samples(cascade_img, gt_img, run_dir / f"samples_{tag}.png", cfg)
-
-        gen_levelwise_acc = None
-        if cfg.log_levelwise_gen:
-            level_targets = []
-            for i in range(top + 1):
-                n_blocks_i = codes[i].shape[1]
-                level_tgt = label_fn(flat_prompt, cfg, pixel_order, n_blocks_i,
-                                    cfg.pq_chunks[i], cfg.code_vocab[i])
-                level_targets.append(level_tgt)
-            gen_levelwise_acc = [float(jnp.mean(codes[i] == level_targets[i])) for i in range(top + 1)]
-
-        gen_time_s = time.monotonic() - gen_t0
-        msg = f"[{tag}] top={top} CASCADE{' (sampled T=%g k=%d)' % (cfg.gen_temperature, cfg.gen_top_k) if sample else ''} gen_byte_acc={cascade_acc:.4f} gen_cascade_mse={cascade_mse:.2f}"
-        rec = dict(tag=tag, gen_cascade_acc=cascade_acc, gen_cascade_mse=cascade_mse, gen_time_s=gen_time_s)
-        if gen_levelwise_acc is not None:
-            rec["gen_levelwise_acc"] = gen_levelwise_acc
-            msg += " gen_levels=" + ",".join(f"{i}:{a:.3f}" for i, a in enumerate(gen_levelwise_acc))
-        msg += f" gen_time={gen_time_s:.1f}s"
-        if gen_compile_s is not None:
-            msg += f" (first call, incl. jit compile: {gen_compile_s:.1f}s)"
-            rec["gen_compile_s"] = gen_compile_s
-        logger(msg, **rec)
-        if args.verbose and cascade_img.shape[0] < 10:
-            per_sample_mse = [pixel_mse(cascade_img[i:i + 1], gt_img[i:i + 1]) for i in range(cascade_img.shape[0])]
-            logger(" ".join(f"mse{i + 1}={m:.2f}" for i, m in enumerate(per_sample_mse)))
-        return recon_acc, cascade_acc
-
-    def run_gen_eval_both(eval_model, top: int, tag: str) -> tuple:
-        result = run_gen_eval(eval_model, top, f"{tag}_val", flat_prompt, gt_img)
-        if not cfg.gen_eval_greedy_only:
-            run_gen_eval(eval_model, top, f"{tag}_val", flat_prompt, gt_img, sample=True)
-        if args.eval_gen_train:
-            run_gen_eval(eval_model, top, f"{tag}_train", train_flat_prompt, train_gt_img)
-            if not cfg.gen_eval_greedy_only:
-                run_gen_eval(eval_model, top, f"{tag}_train", train_flat_prompt, train_gt_img, sample=True)
-        return result
-
-    def run_gen_eval_teacher_force_sanity(eval_model, top: int, tag: str, flat_prompt, gt_img) -> float:
-        # SAME cross-level ctx cascade as training (level_gt_drop honored as-is -- see
-        # Config.gen_eval_teacher_force_sanity), but every digit-level AR step forced teacher-forced.
-        m = cast_pytree(eval_model, compute_dtype)
-        phase = top + 1
-        _, aux = val_eval_jit(m, flat_prompt, phase, rng=None,
-                               level_gt_drop=args.level_gt_drop[phase - 1],
-                               encode_temperature=args.encode_temperature[phase - 1],
-                               label_reg_weight=0.0, label_fn=label_fn, pixel_order=pixel_order,
-                               digit_teacher_force=True, return_recon=True)
-        pred_bytes = aux[-1]
-        recon_img = positions_to_image(np.asarray(pred_bytes), cfg, pixel_order)
-        mse = pixel_mse(recon_img, gt_img)
-        save_samples(recon_img, gt_img, run_dir / f"samples_{tag}_tfsanity.png", cfg)
-        logger(f"[{tag}] top={top} TF_SANITY tf_sanity_mse={mse:.2f}", tag=tag, tf_sanity_mse=float(mse))
-        return mse
-
-    def run_gen_eval_teacher_force_sanity_both(eval_model, top: int, tag: str) -> None:
-        run_gen_eval_teacher_force_sanity(eval_model, top, f"{tag}_val", flat_prompt, gt_img)
-        if args.eval_gen_train:
-            run_gen_eval_teacher_force_sanity(eval_model, top, f"{tag}_train", train_flat_prompt, train_gt_img)
+                if level == 0:
+                    tf_tokens = teacher_force_level0(m, tokens)
+                    tf_image = positions_to_image(np.asarray(tf_tokens), cfg, pixel_order)
+                    mse = pixel_mse(tf_image, gt_image)
+                    save_samples(tf_image, gt_image,
+                                 run_dir / f"samples_{tag}_{source_name}_level0_teacher_force.png", cfg)
+                    logger(f"[{tag}] TF_SANITY source={source_name} level=0 mse={mse:.3f}",
+                           tag=tag, source=source_name, tf_sanity_mse=float(mse))
 
     val_eval_jit = eqx.filter_jit(level_forward)
     val_jit_timed = [False]
@@ -4930,13 +4708,6 @@ def main():
             continue
         train_iter = BatchIterator(train_np, train_labels[:len(train_np)], args.batch_size[phase - 1],
                                     n_devices, shuffle=True, seed=args.seed, cfg=cfg)
-        recon_prompt = val_np[:args.val_batch_size[phase - 1]]
-        flat_prompt = jnp.array(images_to_positions(recon_prompt, cfg, pixel_order))
-        gt_img = recon_prompt.astype(np.uint8)
-        if args.eval_gen_train:
-            train_recon_prompt = train_np[:args.val_batch_size[phase - 1]]
-            train_flat_prompt = jnp.array(images_to_positions(train_recon_prompt, cfg, pixel_order))
-            train_gt_img = train_recon_prompt.astype(np.uint8)
 
         filter_spec = phase_trainable_filter(model, phase)
         diff_model, static_model = eqx.partition(model, filter_spec)
@@ -4993,12 +4764,11 @@ def main():
             rng, level_rng, cascade_rng = jax.random.split(rng, 3)
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
                 diff_model, static_model, flat_bytes, level_rng, cascade_rng)
-            grads = tie_shared_grads(grads, cfg)
             grads = jax.lax.pmean(grads, axis_name="d")
             loss = jax.lax.pmean(loss, axis_name="d")
             aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
             # no gradient tying needed: with cfg.share_across_levels=True (default), codelm_for/
-            # downsampler_for/upsampler_for all resolve to the SAME singleton instance regardless of
+            # downsampler_for resolve to the SAME singleton instance regardless of
             # level index -- level_forward calling it at several different level indices within this
             # one trace already gets correctly-summed gradients from JAX's autodiff, same as any
             # other value used multiple times in one function. This is why LagCodecModel stores a
@@ -5036,7 +4806,6 @@ def main():
                 rng, level_rng, cascade_rng = jax.random.split(rng, 3)
                 (loss, aux), grads = jax.value_and_grad(loss_fn_sd, has_aux=True)(
                     diff_model, static_model, flat_bytes, level_rng, cascade_rng)
-                grads = tie_shared_grads(grads, cfg)
                 grads = jax.lax.pmean(grads, axis_name="d")
                 loss = jax.lax.pmean(loss, axis_name="d")
                 aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
@@ -5075,7 +4844,6 @@ def main():
                 if multires_active else ""))
 
         steps_per_epoch = len(train_iter)
-        gen_eval_every_steps = _every_steps(args.gen_eval_every_step, args.gen_eval_every_epoch, steps_per_epoch)
         ckpt_every_steps = _every_steps(args.ckpt_every_step, args.ckpt_every_epoch, steps_per_epoch)
         wa_every_steps = _every_steps(args.wa_every_step, args.wa_every_epoch, steps_per_epoch)
 
@@ -5117,11 +4885,12 @@ def main():
                            f"{time.monotonic() - jit_t0:.1f}s")
                     jit_timed = True
                 if cfg.log_levelwise_metrics:
-                    scalar_aux = [scalar_float(a) for a in aux[:10]]
-                    dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse, grad_norm = scalar_aux
+                    scalar_aux = [scalar_float(a) for a in aux[:9]]
+                    dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse = scalar_aux
                     enc_level_losses, enc_level_accs, dec_level_losses, dec_level_accs = [
-                        np.asarray(device_mean_array(a)) for a in aux[10:14]
+                        np.asarray(device_mean_array(a), dtype=np.float64) for a in aux[9:13]
                     ]
+                    grad_norm = scalar_float(aux[13])
                 else:
                     dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse, grad_norm = \
                         [scalar_float(a) for a in aux[:10]]
@@ -5129,55 +4898,31 @@ def main():
                 lr = float(lr_schedule(step - 1))
                 lr_str = _fmt_lr(lr)
                 pbar.set_postfix(step=step, loss=f"{loss0:.2f}",
-                                  acc=f"{dec_acc:.2f}",
+                                  acc=f"{enc_acc:.2f}",
                                   lr=lr_str, gnorm=f"{grad_norm:.2f}")
                 if step % args.log_every == 0:
                     log_kwargs = dict(level=phase - 1, epoch=epoch_num, step=step, loss=loss0,
-                                      dec_loss=dec_loss, dec_acc=dec_acc,
-                                      enc_acc=enc_acc, util=util,
+                                      enc_loss=enc_loss, enc_acc=enc_acc, util=util,
                                       mse=train_mse, label_mse=label_mse,
                                       lr=lr, grad_norm=grad_norm)
                     if cfg.log_levelwise_metrics:
                         log_kwargs.update(dict(enc_level_losses=enc_level_losses.tolist(),
-                                               enc_level_accs=enc_level_accs.tolist(),
-                                               dec_level_losses=dec_level_losses.tolist(),
-                                               dec_level_accs=dec_level_accs.tolist()))
+                                               enc_level_accs=enc_level_accs.tolist()))
                     levelwise_suffix = ""
                     if cfg.log_levelwise_metrics:
                         enc_vals = np.asarray(enc_level_losses).reshape(-1)
-                        dec_vals = np.asarray(dec_level_losses).reshape(-1)
                         enc_str = "[" + ", ".join(f"{x:.2f}" for x in enc_vals) + "]"
-                        dec_str = "[" + ", ".join(f"{x:.2f}" for x in dec_vals) + "]"
-                        levelwise_suffix = f" enc_levels={enc_str} dec_levels={dec_str}"
+                        levelwise_suffix = f" enc_losses={enc_str}"
+                        enc_vals = np.asarray(enc_level_accs).reshape(-1)
+                        enc_str = "[" + ", ".join(f"{x:.2f}" for x in enc_vals) + "]"
+                        levelwise_suffix += f" enc_accs={enc_str}"
                     logger(f"l={phase - 1} e={epoch_num} s={step} "
                            f"loss={loss0:.2f} "
-                           f"dec_loss={dec_loss:.2f} dec_acc={dec_acc:.2f} "
                            f"enc_loss={enc_loss:.2f} enc_acc={enc_acc:.2f} "
                            f"util={util:.2f} mse={train_mse:.1f} "
                            f"label_mse={label_mse:.2f} "
                            f"lr={lr_str} grad_norm={grad_norm:.2f}{levelwise_suffix}",
                            **log_kwargs)
-
-                if step % gen_eval_every_steps == 0:
-                    snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
-                    st = f"{step:0{step_w}d}"  # zero-padded so file browsers sort samples numerically
-                    run_val_eval(snapshot, phase, tag=f"level{phase - 1}_step{st}")
-                    if cfg.gen_eval_all_levels:
-                        for lvl in range(phase - 1, -1, -1):
-                            run_gen_eval_both(snapshot, top=lvl, tag=f"level{lvl}_step{st}")
-                            if cfg.gen_eval_teacher_force_sanity:
-                                run_gen_eval_teacher_force_sanity_both(snapshot, top=lvl, tag=f"level{lvl}_step{st}")
-                    else:
-                        run_gen_eval_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{st}")
-                        if cfg.gen_eval_teacher_force_sanity:
-                            run_gen_eval_teacher_force_sanity_both(snapshot, top=phase - 1, tag=f"level{phase - 1}_step{st}")
-                    try:
-                        assert cfg.modality == "image", "codegrid is image-only"
-                        plot_encoder_outs(snapshot, cfg, val_np[:args.val_batch_size[phase - 1]], pixel_order,
-                                       run_dir / f"samples_level{phase - 1}_step{st}_codegrid.png",
-                                       level=phase - 1, label_fn=label_fn)
-                    except Exception as e:
-                        print(e)
 
                 if step % ckpt_every_steps == 0:
                     ckpt_model = eqx.combine(to_host(unreplicate(p_diff_model)), static_model)
@@ -5217,24 +4962,12 @@ def main():
         prune_checkpoints(run_dir, args.ckpt_keep)
         if args.final_eval:
             run_val_eval(model, phase, tag=f"level{phase - 1}_final")
-            if cfg.gen_eval_all_levels:
-                for lvl in range(phase - 1, -1, -1):
-                    run_gen_eval_both(model, top=lvl, tag=f"level{lvl}_final")
-                    if cfg.gen_eval_teacher_force_sanity:
-                        run_gen_eval_teacher_force_sanity_both(model, top=lvl, tag=f"level{lvl}_final")
-            else:
-                run_gen_eval_both(model, top=phase - 1, tag=f"level{phase - 1}_final")
-                if cfg.gen_eval_teacher_force_sanity:
-                    run_gen_eval_teacher_force_sanity_both(model, top=phase - 1, tag=f"level{phase - 1}_final")
 
     global_pbar.update(step - last_global_step)
     global_pbar.close()
-    logger("=== all phases done, running final top-down cascade eval ===")
+    logger("=== all phases done, running final teacher-forced validation metrics ===")
     run_val_eval(model, n_phases, tag="final")
-    for top in range(n_phases - 1, -1, -1):
-        run_gen_eval_both(model, top=top, tag=f"final_top{top}")
-        if cfg.gen_eval_teacher_force_sanity:
-            run_gen_eval_teacher_force_sanity_both(model, top=top, tag=f"final_top{top}")
+    run_qual_eval(model, n_phases, tag="final")
     logger("training done")
 
 

@@ -1,5 +1,5 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/cifar_4_pretrain.py
+uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/cifar_5_pretrain.py
 """
 # Encoder-only CodeLM/downsampler pretraining.
 img_size = 32
@@ -16,7 +16,7 @@ codelm_d_model = (1024,1024,512,512,256)
 codelm_n_layers = (16,16,8,8,4)
 codelm_n_heads = (8,8,4,4,2)
 codelm_n_kv_heads = (8,8,4,4,2)
-mlp_mult = 2
+mlp_mult = 4
 
 code_vocab = 256
 pq_chunks = 3
@@ -86,8 +86,8 @@ gen_eval_teacher_force_sanity = False
 
 
 # --- training ---
-batch_size = 4
-val_batch_size = 2
+batch_size = 1
+val_batch_size = 1
 # level_steps = (20_000, 20_000, 20_000, 100_000)
 level_steps = (0,)*4+ (int(1e6),)
 seed = 0
