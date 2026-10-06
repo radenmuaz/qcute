@@ -79,6 +79,7 @@ traversal = "zorder"
 eval_gen_train = True
 gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
+gen_eval_prompt = 512
 
 
 # --- training ---

@@ -52,7 +52,7 @@ from tqdm import tqdm
 # jax.config.update("jax_memory_fitting_level", "O3")
 from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, SwiGLU, apply_rope, apply_xsa, init_matrix,
                                         init_vector, make_lr_schedule, rmsnorm, rope_cos_sin,
-                                        rope_cos_sin_pos, rotate_half, sinkgd)
+                                        rope_cos_sin_pos, rotate_half, set_splash_shard_map_mesh, sinkgd)
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
@@ -166,15 +166,14 @@ class Config:
     # levels happen to share the same stride.
     # "codelm_upper": upsampler i's context (code i) is processed by CodeLM i+1, whose own input is code i
     # (downsampler i keeps CodeLM i); share_across_levels=False adds one decoderless CodeLM-only level on top
-    context_source: str = "codelm"  # how the downsampler/upsampler get their CONTEXT (the hidden
-    # state they attend to, before context_proj). "codelm" (default, current/original behavior):
-    # re-run this level's own input through CodeLM's own causal self-attention block stack
-    # (encoder_hidden) -- context is CONTEXTUALIZED (every position has seen its own causal past via
-    # CodeLM's attention). "own_embed": skip CodeLM's block stack entirely -- context is a PLAIN
-    # per-position embedding (own_ctx_embed/own_ctx_proj, same shape as CodeLM's own_input_embed/
-    # own_input_proj) with NO cross-position mixing at all, downsampler and upsampler each get their
-    # OWN dedicated table. "shared_embed": same plain-embedding bypass, but downsampler and upsampler
-    # SHARE one table. Added 2026-09-28 to test the hypothesis that CodeLM's causal self-attention
+    context_source: str = "codelm"  # context source for the UPSAMPLER (the hidden state it attends
+    # to, before context_proj). Downsampler encoding always uses CodeLM's own causal self-attention
+    # stack, so the CodeLM NTP/free-run path is trained consistently. "codelm" (default): use the
+    # level's own contextualized CodeLM states. "own_embed": skip CodeLM's block stack entirely for
+    # the upsampler -- its context is a PLAIN per-position embedding (own_ctx_embed/own_ctx_proj,
+    # same shape as CodeLM's own_input_embed/own_input_proj) with NO cross-position mixing.
+    # "shared_embed": same plain-embedding bypass, but upsampler levels SHARE one table. Added
+    # 2026-09-28 to test the hypothesis that CodeLM's causal self-attention
     # context (vs. the old pre-refactor run_lagcodec.py's dedicated, non-contextualized ctx_embed
     # table) is responsible for the periodic every-8th-row/col decode artifact (see
     # audit_gen_dots.py) -- weight-sharing, label-antialiasing and group-size (upsampler_ncodes) were
@@ -317,6 +316,9 @@ class Config:
     # (quarters, with eval_gen_train) gen-eval cost when the sampled variant isn't needed. Default
     # True: assures gen-eval is deterministic argmax by default, regardless of gen_eval_encode_mode.
     gen_eval_greedy_only: bool = True
+    # Float (0,1): long qualitative prompt as a fraction of each level's sequence. Int: absolute
+    # byte count, rounded up to a whole token position (e.g. RGB byte_group=3: 2048 -> 683 positions).
+    gen_eval_prompt: float | int = 0.5
     # mid-phase (gen_eval_every_step/epoch) and end-of-phase (--final_eval) gen-eval normally only
     # evaluate top=phase-1 (the level just being trained). True: also loop top=0..phase-2, same as the
     # all-phases-done final loop at the end of main() already does -- gives per-level reconstruction
@@ -386,6 +388,13 @@ class Config:
     ssm_state_dim: int = 16
 
     def __post_init__(self):
+        if isinstance(self.gen_eval_prompt, bool) or not isinstance(self.gen_eval_prompt, (int, float)):
+            raise ValueError("gen_eval_prompt must be a fraction (float in (0,1)) or byte count (positive int)")
+        if isinstance(self.gen_eval_prompt, int):
+            if self.gen_eval_prompt <= 0:
+                raise ValueError("integer gen_eval_prompt byte count must be positive")
+        elif not 0.0 < self.gen_eval_prompt < 1.0:
+            raise ValueError("float gen_eval_prompt fraction must be strictly between 0 and 1")
         if self.remat and self.remat_level:
             warnings.warn("remat and remat_level both set: remat_level wins (whole encoder/decoder stacks are "
                           "checkpointed, not individual blocks)")
@@ -2609,14 +2618,17 @@ def codelm_bos_substitute(codelm: CodeLM, x: jnp.ndarray, rate_id: int, rng, gro
 
 
 def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cfg: "Config",
-                           rate_id: int, rng, group_size: int) -> jnp.ndarray:
-    # Single source of truth for how the downsampler/upsampler get their CONTEXT, per
-    # cfg.context_source (see Config field docstring). `raw` is the pre-embedding representation of
+                           rate_id: int, rng, group_size: int,
+                           context_source: str = None) -> jnp.ndarray:
+    # Single source of truth for how a PardecLM gets its CONTEXT. `context_source` defaults to the
+    # configured upsampler source; downsampler callsites explicitly pass "codelm". `raw` is the
+    # pre-embedding representation of
     # this level's own input (hard idx for raw bytes/a previous level's code_idx, or the SOFT
     # code_soft when called from a training path that needs gradient flow through it) -- the exact
     # same value callers already use to build CodeLM's own `x` in the "codelm" mode, generalized so
     # "own_embed"/"shared_embed" modes can bypass CodeLM's own embedding table entirely too.
-    if cfg.context_source in ("codelm", "codelm_upper"):  # which CodeLM is the caller's choice
+    source = cfg.context_source if context_source is None else context_source
+    if source in ("codelm", "codelm_upper"):  # which CodeLM is the caller's choice
         x = code_embed_proj(raw, codelm.own_input_embed, codelm.own_input_proj)
         # NOT bos-substituted (removed 2026-10-03): every caller of pardec_context_hidden
         # (encode_pardec_downsampler[_generate], decode_logits_and_target_multipass,
@@ -2632,9 +2644,14 @@ def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cf
             for blk in codelm.blocks:
                 h = run_block(blk, h, codelm.remat and not codelm.remat_level)
             return h
+        if rng is None:
+            # Validation runs with globally sharded FSDP arrays. SplashAttention's Pallas
+            # kernel cannot be auto-partitioned across a multi-host mesh, so evaluate the same
+            # causal encoder with its per-position cache path instead.
+            return _encoder_hidden_cached(codelm, raw)
         h = jax.checkpoint(_enc_stack)(h) if codelm.remat_level else _enc_stack(h)
         return codelm.ln_f(h)
-    # "own_embed"/"shared_embed": plain per-position embedding, NO self-attention/contextualization
+        # "own_embed"/"shared_embed": plain per-position embedding, NO self-attention/contextualization
     # at all -- CodeLM's own block stack is skipped entirely (codelm_bos is therefore also moot here,
     # it only ever modulated CodeLM's own forward pass).
     return code_embed_proj(raw, pardec.own_ctx_embed, pardec.own_ctx_proj)
@@ -2689,9 +2706,11 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
     # LagCodecModel.codelm_bos_rate_id), independent of `rate_id` below (the downsampler's OWN bos,
     # which follows cfg.bos_rate_mode). Defaults to `rate_id` for standalone/test callers that don't
     # distinguish the two. `raw` is `target_idx` in the level-0 byte case or the previous level's own
-    # code_soft/code_idx -- see pardec_context_hidden for how cfg.context_source dispatches it.
+    # code_soft/code_idx. Downsampler encoding always uses CodeLM context; context_source controls
+    # only upsampler context.
     codelm_rate_id = rate_id if codelm_rate_id is None else codelm_rate_id
-    h = pardec_context_hidden(codelm, downsampler, raw, cfg, codelm_rate_id, rng, group_size=K * downsampler_ncodes)
+    h = pardec_context_hidden(codelm, downsampler, raw, cfg, codelm_rate_id, rng,
+                              group_size=K * downsampler_ncodes, context_source="codelm")
     M, L, D = h.shape
     n_blocks = L // K
     # context_group_size=K*downsampler_ncodes, output_group_size=downsampler_ncodes, rate_id=this
@@ -2793,7 +2812,8 @@ def encode_pardec_downsampler_generate(codelm: CodeLM, downsampler: PardecLM, ra
     # see encode_pardec_downsampler's own docstring -- CodeLM's bos is always absolute, independent
     # of `rate_id` (the downsampler's own bos, which follows cfg.bos_rate_mode).
     codelm_rate_id = rate_id if codelm_rate_id is None else codelm_rate_id
-    h = pardec_context_hidden(codelm, downsampler, raw, cfg, codelm_rate_id, rng, group_size=K * downsampler_ncodes)
+    h = pardec_context_hidden(codelm, downsampler, raw, cfg, codelm_rate_id, rng,
+                              group_size=K * downsampler_ncodes, context_source="codelm")
     code_idx = pardec_generate(downsampler, h, context_group_size=K * downsampler_ncodes,
                                 output_group_size=downsampler_ncodes, rng=rng,
                                 greedy=greedy, temperature=temperature, top_k=top_k, rate_id=rate_id,
@@ -2944,7 +2964,8 @@ def cycle_reencode(model: "LagCodecModel", level_idx: int, tokens: jnp.ndarray, 
     cfg = model.cfg
     codelm, ds = model.codelm_for(level_idx), model.downsampler_for(level_idx)
     K = model.K(level_idx)
-    h = pardec_context_hidden(codelm, ds, tokens, cfg, model.codelm_bos_rate_id(level_idx), rng, group_size=K)
+    h = pardec_context_hidden(codelm, ds, tokens, cfg, model.codelm_bos_rate_id(level_idx), rng,
+                              group_size=K, context_source="codelm")
     n_blocks = h.shape[1] // K
     hid = pardec_score(ds, jnp.zeros((h.shape[0], n_blocks, ds.output_chunks), jnp.int32), h,
                        context_group_size=K, output_group_size=1, rate_id=model.bos_rate_id(level_idx),
@@ -3098,6 +3119,26 @@ def _sample_tokens(logits: jnp.ndarray, rng, greedy: bool, temperature, top_k: i
     return safe_argmax(lg + jax.random.gumbel(rng, lg.shape))
 
 
+def _encoder_hidden_cached(codelm: CodeLM, tokens: jnp.ndarray) -> jnp.ndarray:
+    """Compute causal CodeLM states via incremental attention/recurrent caches, without Splash."""
+    B, total_len, _ = tokens.shape
+    x = code_embed_proj(tokens, codelm.own_input_embed, codelm.own_input_proj)
+    caches0 = [block_cache_init(blk, B, total_len) for blk in codelm.blocks]
+
+    def step(caches, x_and_pos):
+        x_t, pos = x_and_pos
+        h = x_t
+        new_caches = []
+        for blk, cache in zip(codelm.blocks, caches):
+            h, cache = block_step(blk, h, cache, pos, total_len)
+            new_caches.append(cache)
+        return new_caches, codelm.ln_f(h)
+
+    _, h_all = jax.lax.scan(
+        step, caches0, (jnp.swapaxes(x, 0, 1), jnp.arange(total_len)))
+    return jnp.swapaxes(h_all, 0, 1)
+
+
 def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, temperature, greedy: bool,
                       top_k: int, use_bos: bool = False, rate_id: int = 0) -> jnp.ndarray:
     # tokens (B,total_len,C) holds the prompt in [:P] (P may be traced); the rest is overwritten.
@@ -3152,6 +3193,31 @@ def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, tempe
 
 
 _encoder_free_run_jit = eqx.filter_jit(_encoder_free_run)
+
+
+def _encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1) -> jnp.ndarray:
+    """Teacher-force CodeLM over its own tokens using incremental block caches.
+
+    Stepping position by position avoids the full-sequence TPU SplashAttention call, which cannot
+    be auto-partitioned by JAX on a multi-host FSDP mesh. K is accepted to parallel the free-run
+    API; NTP generation itself is position-based.
+    """
+    if tokens.shape[1] <= 1:
+        return tokens
+    h_all = _encoder_hidden_cached(codelm, tokens)
+    logits = codelm_ntp_logits_tf(codelm, h_all[:, :-1], tokens[:, 1:])
+    predicted = jnp.argmax(logits, axis=-1).astype(tokens.dtype)
+    return tokens.at[:, 1:].set(predicted)
+
+
+_encoder_teacher_force_jit = eqx.filter_jit(_encoder_teacher_force)
+
+
+def encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1) -> jnp.ndarray:
+    """Return the sequence with position 0 retained and all later tokens NTP-predicted."""
+    assert codelm.attn_lookahead == 0, \
+        f"encoder teacher-forcing needs attn_lookahead=0 (got {codelm.attn_lookahead})"
+    return _encoder_teacher_force_jit(codelm, tokens, K)
 
 
 def encoder_free_run(codelm: CodeLM, prompt_tokens: jnp.ndarray, total_len: int, K: int, rng, greedy: bool = False,
@@ -3980,6 +4046,10 @@ def _float_tuple_arg(s: str) -> tuple:
     return tuple(float(x) for x in s.split(","))
 
 
+def _int_or_float_arg(s: str) -> int | float:
+    return int(s) if s.strip().lstrip("+-").isdigit() else float(s)
+
+
 def _bool_tuple_arg(s: str) -> tuple:
     return tuple(x.strip().lower() != "false" for x in s.split(","))
 
@@ -4018,6 +4088,7 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
                   "share_downsampler_upsampler_lm", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "upsampler_ncodes",
                   "sync", "gen_temperature", "gen_top_k", "gen_eval_encode_mode", "gen_eval_greedy_only",
+                  "gen_eval_prompt",
                   "gen_eval_all_levels", "gen_eval_teacher_force_sanity", "ctx_stop_gradient",
                   "level_refine_passes", "level_refine_window", "level_refine_gt_drop", "level_refine_layout",
                   "level_refine_draft_mode", "level_refine_draft_temperature",
@@ -4303,6 +4374,9 @@ def main():
                          "image's label_fn target instead")
     p.add_argument("--gen_eval_greedy_only", type=lambda x: x.lower() != "false", default=Config.gen_eval_greedy_only,
                     help="skip the sampled (temperature/top_k) half of gen-eval, greedy decode only")
+    p.add_argument("--gen_eval_prompt", type=_int_or_float_arg, default=Config.gen_eval_prompt,
+                    help="long qualitative prompt: float fraction (default 0.5 of each level's sequence) "
+                         "or positive integer byte count (e.g. 2048; rounded up to whole token positions)")
     p.add_argument("--gen_eval_all_levels", type=lambda x: x.lower() != "false", default=Config.gen_eval_all_levels,
                     help="mid-phase/end-of-phase gen-eval also loops top=0..phase-2 (not just phase-1)")
     p.add_argument("--gen_eval_teacher_force_sanity", type=lambda x: x.lower() != "false",
@@ -4510,12 +4584,17 @@ def main():
         if args.n_devices is not None and args.n_devices != jax.local_device_count():
             raise ValueError("--fsdp uses every JAX device; do not set --n_devices to a subset")
         fsdp_mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("fsdp",))
+        # FSDP shards arrays across devices even on a single host. Splash's Mosaic
+        # custom call therefore needs shard_map for every FSDP mesh, not only
+        # multihost meshes.
+        set_splash_shard_map_mesh(fsdp_mesh)
         fsdp_replicated = jax.sharding.NamedSharding(
             fsdp_mesh, jax.sharding.PartitionSpec())
         # Each host must initialize locally; a global CPU device may be owned only by process 0.
         fsdp_init_device = jax.local_devices()[0]
         logger_device_count = fsdp_mesh.devices.size
     else:
+        set_splash_shard_map_mesh(None)
         logger_device_count = n_devices
     cfg = Config(**{k: getattr(args, k) for k in CONFIG_FIELDS})
     label_fn = resolve_label_fn(label_fn_raw, cfg.modality)
@@ -4640,29 +4719,20 @@ def main():
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
     if cfg.precision != "bf16":
         jax.config.update("jax_default_matmul_precision", "highest")
-    def token_preview(tokens: np.ndarray, level: int) -> np.ndarray:
+    def token_preview(tokens: np.ndarray, level: int, vocab: int = None) -> np.ndarray:
         count = tokens.shape[1]
         side = math.isqrt(count)
         if side * side != count or tokens.shape[-1] < 3:
             raise ValueError(f"level {level}: cannot render {count} positions with {tokens.shape[-1]} chunks")
-        vocab = cfg.code_vocab[level]
+        vocab = cfg.code_vocab[level] if vocab is None else vocab
         rgb_seq = (tokens[0, :, :3].astype(np.float32) * (255.0 / max(1, vocab - 1))).clip(0, 255).astype(np.uint8)
         order = zorder_pixel_order(side) if cfg.traversal == "zorder" else np.arange(count)
         raster = np.zeros_like(rgb_seq)
         raster[order] = rgb_seq
-        grid = raster.reshape(side, side, 3)
-        rows = np.linspace(0, side - 1, cfg.img_size).round().astype(int)
-        cols = np.linspace(0, side - 1, cfg.img_size).round().astype(int)
-        return grid[rows[:, None], cols[None, :]][None]
+        return raster.reshape(1, side, side, 3)
 
-    def teacher_force_level0(m, tokens: jnp.ndarray) -> jnp.ndarray:
-        codelm = m.codelm_for(0)
-        h = pardec_context_hidden(m.codelm_for(0), m.downsampler_for(0), tokens, cfg,
-                                  m.codelm_bos_rate_id(0), None,
-                                  group_size=m.K(0) * cfg.downsampler_ncodes[0])
-        logits = codelm_ntp_logits_tf(codelm, h[:, :-1], tokens[:, 1:])
-        predicted = jnp.argmax(logits, axis=-1).astype(tokens.dtype)
-        return tokens.at[:, 1:].set(predicted)
+    def teacher_force_level(m, level: int, tokens: jnp.ndarray) -> jnp.ndarray:
+        return encoder_teacher_force(m.codelm_for(level), tokens, K=1)
 
     def run_qual_eval(eval_model, phase: int, tag: str) -> None:
         if cfg.modality != "image":
@@ -4675,65 +4745,76 @@ def main():
             flat = jnp.asarray(images_to_positions(images, cfg, pixel_order))
             if args.fsdp:
                 flat = fsdp_put_array(flat, fsdp_replicated)
-            raw = rgb_byte_pq_fn(flat, m.codelm_for(0).pq_chunks, m.codelm_for(0).code_vocab)
-            level_tokens = []
-            for level in range(phase):
-                key = jax.random.PRNGKey(args.seed + level * 1009 + (0 if source_name == "val" else 1))
-                if args.fsdp:
-                    key = fsdp_put_array(key, fsdp_replicated)
-                out = encode_pardec_downsampler_generate(
-                    m.codelm_for(level), m.downsampler_for(level), raw, m.K(level), cfg,
-                    rate_id=m.bos_rate_id(level), codelm_rate_id=m.codelm_bos_rate_id(level),
-                    rng=key, greedy=True, temperature=1.0, top_k=0,
-                    downsampler_ncodes=cfg.downsampler_ncodes[level])
-                raw = out["code_idx"]
-                level_tokens.append(raw)
+            # Match each CodeLM's native input distribution without invoking any downsampler:
+            # level 0 sees original RGB bytes; level i>0 sees the image-derived code sequence
+            # targeted by downsampler i-1 (the same label_fn representation used in training).
+            level_tokens = [rgb_byte_pq_fn(
+                flat, m.codelm_for(0).pq_chunks, m.codelm_for(0).code_vocab)]
+            for level in range(1, phase):
+                prev = level - 1
+                n_positions = n_blocks_for_level(cfg, prev)
+                level_tokens.append(label_fn(
+                    flat, cfg, pixel_order, n_positions,
+                    cfg.pq_chunks[prev], cfg.code_vocab[prev]))
 
             for level, tokens in enumerate(level_tokens):
                 host_tokens = fsdp_to_host(tokens) if args.fsdp else tokens
-                preview_gt = token_preview(np.asarray(host_tokens), level)
-                # A sequence position is one modeled RGB/code token containing C chunks.
-                # Convert requested byte counts to whole-token prefixes, rounding up so even
-                # a one-byte request retains one complete token. At level 0 with byte_group=3,
-                # these are RGB pixels; at coarser levels they are RGB code vectors.
+                input_vocab = m.codelm_for(level).code_vocab
+                preview_gt = token_preview(np.asarray(host_tokens), level, input_vocab)
+                level_side = math.isqrt(tokens.shape[1])
                 chunks_per_token = tokens.shape[-1]
-                for requested_prefix_bytes in (1, 128):
-                    requested_positions = max(
-                        1, math.ceil(requested_prefix_bytes / chunks_per_token))
-                    prefix = min(requested_positions, tokens.shape[1])
+                if isinstance(cfg.gen_eval_prompt, int):
+                    requested_positions = math.ceil(cfg.gen_eval_prompt / chunks_per_token)
+                    prompt_label = f"bytes{cfg.gen_eval_prompt}"
+                    prompt_request = prompt_label
+                    long_prefix = min(tokens.shape[1], max(1, requested_positions))
+                else:
+                    prompt_label = None
+                    prompt_request = f"{cfg.gen_eval_prompt:.3g}fraction"
+                    long_prefix = min(tokens.shape[1], max(
+                        1, round(tokens.shape[1] * cfg.gen_eval_prompt)))
+                prompt_prefixes = list(dict.fromkeys((1, long_prefix)))
+                for prefix in prompt_prefixes:
                     gen_key = jax.random.PRNGKey(args.seed + level * 101 + prefix)
                     if args.fsdp:
                         gen_key = fsdp_put_array(gen_key, fsdp_replicated)
                     generated = encoder_free_run(
-                        m.codelm_for(level), tokens[:, :prefix], tokens.shape[1], m.K(level),
+                        m.codelm_for(level), tokens[:, :prefix], tokens.shape[1], 1,
                         gen_key,
                         greedy=True, temperature=1.0, top_k=0,
                         rate_id=m.codelm_bos_rate_id(level))
                     if args.fsdp:
                         generated = fsdp_to_host(generated)
-                    preview_gen = token_preview(np.asarray(generated), level)
+                    preview_gen = token_preview(np.asarray(generated), level, input_vocab)
+                    prompt_suffix = (f"prompt{prompt_label}" if prompt_label is not None and prefix == long_prefix
+                                     else f"promptpos{prefix}")
                     sample_path = run_dir / (
-                        f"samples_{tag}_{source_name}_level{level}_"
-                        f"promptbytes{requested_prefix_bytes}.png")
+                        f"samples_{tag}_{source_name}_level{level}_{prompt_suffix}.png")
                     if jax.process_index() == 0:
                         save_samples(preview_gen, preview_gt, sample_path, cfg)
                     logger(f"[{tag}] QUAL source={source_name} level={level} "
-                           f"prompt_bytes={requested_prefix_bytes} "
+                           f"prompt_request={prompt_request} "
                            f"prompt_positions={prefix}/{tokens.shape[1]} "
-                           f"token_chunks={chunks_per_token} kv_cache=true "
+                           f"grid={level_side}x{level_side} "
+                           f"token_chunks={chunks_per_token} kv_cache=true downsampler=false "
                            f"saved={sample_path.name}")
 
-                if level == 0:
-                    tf_tokens = teacher_force_level0(m, tokens)
-                    if args.fsdp:
-                        tf_tokens = fsdp_to_host(tf_tokens)
-                    tf_image = token_preview(np.asarray(tf_tokens), level)
-                    mse = pixel_mse(tf_image, gt_image)
-                    if jax.process_index() == 0:
-                        save_samples(tf_image, gt_image,
-                                     run_dir / f"samples_{tag}_{source_name}_level0_teacher_force.png", cfg)
-                    logger(f"[{tag}] TF_SANITY source={source_name} level=0 mse={mse:.3f}",
-                           tag=tag, source=source_name, tf_sanity_mse=float(mse))
+                tf_tokens = teacher_force_level(m, level, tokens)
+                if args.fsdp:
+                    tf_tokens = fsdp_to_host(tf_tokens)
+                tf_image = token_preview(np.asarray(tf_tokens), level, input_vocab)
+                # Compare at this level's native spatial resolution/sequence length. preview_gt
+                # is the image-derived target sequence rendered on exactly the same grid.
+                mse = pixel_mse(tf_image, preview_gt)
+                if jax.process_index() == 0:
+                    save_samples(
+                        tf_image, preview_gt,
+                        run_dir / f"samples_{tag}_{source_name}_level{level}_teacher_force.png", cfg)
+                logger(f"[{tag}] TF_SANITY source={source_name} level={level} "
+                       f"mse={mse:.3f} grid={level_side}x{level_side} "
+                       f"seq_len={tokens.shape[1]} downsampler=false",
+                       tag=tag, source=source_name, level=level,
+                       tf_sanity_mse=float(mse))
 
     val_eval_jit = eqx.filter_jit(level_forward)
     val_jit_timed = [False]
@@ -5067,9 +5148,11 @@ def main():
                     if step_fn is None:
                         step_fn = _build_multires_step(s_lvl, d_lvl)
                         multires_step_cache[(s_lvl, d_lvl)] = step_fn
-                    p_diff_model, p_opt_state, p_rng, loss, aux = step_fn(p_diff_model, p_opt_state, p_rng, flat)
+                    p_diff_model, p_opt_state, p_rng, loss, aux = step_fn(
+                        p_diff_model, p_opt_state, p_rng, flat)
                 else:
-                    p_diff_model, p_opt_state, p_rng, loss, aux = train_step(p_diff_model, p_opt_state, p_rng, flat)
+                    p_diff_model, p_opt_state, p_rng, loss, aux = train_step(
+                        p_diff_model, p_opt_state, p_rng, flat)
                 if args.fsdp:
                     loss, aux = fsdp_to_host((loss, aux))
                 step += 1

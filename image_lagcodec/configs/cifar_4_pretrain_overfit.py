@@ -93,7 +93,7 @@ val_batch_size = 8
 # level_steps = (20_000, 20_000, 20_000, 100_000)
 level_steps = (0,)*4+ (int(1e6),)
 seed = 0
-# train_subset_n = 200
+train_subset_n = 200
 val_subset_n = 1000
 gen_eval_every_step = 5000
 epoch_verbose = False
@@ -105,7 +105,7 @@ lr_min = 1e-5
 # lr_min_step = int(100e3)
 warmup_steps = 1000
 optimizer = "adamw"
-optimizer_kwargs = dict(weight_decay=1e-5)
+optimizer_kwargs = dict(weight_decay=0)
 
 wa_verbose = False
 

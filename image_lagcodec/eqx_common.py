@@ -19,6 +19,15 @@ from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_ke
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash_mask_lib
 
 _SPLASH_BLOCK = 128  # Pallas TPU lane width -- block_kv_compute must be a multiple of this.
+_SPLASH_SHARD_MAP_MESH = None
+
+
+def set_splash_shard_map_mesh(mesh) -> None:
+    """Set the explicit mesh used to run Mosaic Splash kernels in multihost FSDP."""
+    global _SPLASH_SHARD_MAP_MESH
+    # A concrete Mesh works outside jit, but shard_map is created while tracing a
+    # jitted training step. Its AbstractMesh is the form JAX expects in that context.
+    _SPLASH_SHARD_MAP_MESH = None if mesh is None else mesh.abstract_mesh
 
 
 def _splash_pad(x: jnp.ndarray, block: int) -> jnp.ndarray:
@@ -81,10 +90,35 @@ def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: boo
     B, Hq, T, hd = q.shape
     q_p, k_p, v_p = _splash_pad(q, _SPLASH_BLOCK), _splash_pad(k, _SPLASH_BLOCK), _splash_pad(v, _SPLASH_BLOCK)
     kernel = _splash_attn_kernel(Hq, q_p.shape[-2], causal, window, lookahead)
-    if sink is not None:
-        y = jax.vmap(lambda qq, kk, vv: kernel(qq, kk, vv, sinks=sink))(q_p * sm_scale, k_p, v_p)
+
+    # Splash's Mosaic custom call is a single-device kernel. Under a global FSDP
+    # mesh, GSPMD cannot partition that call automatically. Replicate the attention
+    # operands inside shard_map so each mesh shard runs the complete kernel locally;
+    # gradients are reduced by shard_map's transpose rule as needed.
+    mesh = _SPLASH_SHARD_MAP_MESH
+    if mesh is None:
+        # Preserve the original single-host path exactly.
+        if sink is not None:
+            y = jax.vmap(lambda qq, kk, vv: kernel(qq, kk, vv, sinks=sink))(
+                q_p * sm_scale, k_p, v_p)
+        else:
+            y = jax.vmap(kernel)(q_p * sm_scale, k_p, v_p)
     else:
-        y = jax.vmap(kernel)(q_p * sm_scale, k_p, v_p)
+        def run_local(qq, kk, vv, ss):
+            if ss is not None:
+                return jax.vmap(lambda qh, kh, vh: kernel(qh, kh, vh, sinks=ss))(
+                    qq * sm_scale, kk, vv)
+            return jax.vmap(kernel)(qq * sm_scale, kk, vv)
+
+        replicated = jax.sharding.PartitionSpec()
+        y = jax.shard_map(
+            run_local,
+            mesh=mesh,
+            in_specs=(replicated, replicated, replicated,
+                      None if sink is None else replicated),
+            out_specs=replicated,
+            check_vma=False,
+        )(q_p, k_p, v_p, sink)
     return y[:, :, :T, :]
 
 
@@ -469,7 +503,14 @@ class Attention(eqx.Module):
         if extra_valid is not None:
             valid = valid & extra_valid[:, None, :]
         logits = jnp.where(valid, logits, -1e9)
+        if self.sink is not None:
+            # Match splash_attention(..., sinks=...): each head gets a learned logit with
+            # zero value contribution, so it adds probability mass to the softmax denominator.
+            sink_logits = jnp.broadcast_to(self.sink.astype(logits.dtype)[None, :, None],
+                                           (Bc, self.n_heads, 1))
+            logits = jnp.concatenate([logits, sink_logits], axis=-1)
         attn = jax.nn.softmax(logits, axis=-1)
+        attn = attn[..., :T_max]
         y = jnp.einsum("bht,bhtd->bhd", attn, v_full)  # (Bc,H,hd)
         if self.use_xsa:
             v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
