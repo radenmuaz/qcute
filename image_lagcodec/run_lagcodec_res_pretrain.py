@@ -305,6 +305,8 @@ class Config:
 
     gen_temperature: float = 1.0
     gen_top_k: int = 8
+    gen_top_p: float = 1.0
+    gen_eval_batch_size: int | None = None
 
     # gen-eval forward (encode) direction: "generate" (default) self-generates each level's code via
     # the downsampler's own AR head (encode_pardec_downsampler_generate, no ground-truth digit target
@@ -668,6 +670,14 @@ class Config:
                 "curriculum_mode='freeze' needs share_across_levels=False (shared weights can't be frozen per level)"
         assert self.quantize_mode in ("argmax", "gumbel", "zgr", "reinmax_limit")
         assert self.gen_eval_encode_mode in ("generate", "teacher_force")
+        if self.gen_temperature <= 0:
+            raise ValueError("gen_temperature must be positive")
+        if self.gen_top_k < 0:
+            raise ValueError("gen_top_k must be nonnegative")
+        if not 0.0 < self.gen_top_p <= 1.0:
+            raise ValueError("gen_top_p must be in (0,1]")
+        if self.gen_eval_batch_size is not None and self.gen_eval_batch_size < 1:
+            raise ValueError("gen_eval_batch_size must be positive when set")
         if not isinstance(self.ctx_stop_gradient, str):
             self.ctx_stop_gradient = bool(self.ctx_stop_gradient)
         assert self.ctx_stop_gradient in (False, True, "pseudo"), self.ctx_stop_gradient
@@ -1606,13 +1616,22 @@ def reshape_pq(logits: jnp.ndarray, pq_chunks: int, code_vocab: int) -> jnp.ndar
     return logits.reshape(*logits.shape[:-1], pq_chunks, code_vocab)
 
 
-def sample_idx(logits: jnp.ndarray, rng, greedy: bool, temperature: float, top_k: int = 0) -> tuple:
+def sample_idx(logits: jnp.ndarray, rng, greedy: bool, temperature: float, top_k: int = 0,
+               top_p: float = 1.0) -> tuple:
     if greedy:
         return safe_argmax(logits), rng
     rng, k_ = jax.random.split(rng)
     lg = logits / temperature
     if top_k and top_k < lg.shape[-1]:
         lg = jnp.where(lg < jax.lax.top_k(lg, top_k)[0][..., -1:], -jnp.inf, lg)
+    if top_p < 1.0:
+        sorted_lg = jnp.sort(lg, axis=-1)[..., ::-1]
+        sorted_probs = jax.nn.softmax(sorted_lg, axis=-1)
+        cumulative = jnp.cumsum(sorted_probs, axis=-1)
+        keep_sorted = cumulative - sorted_probs < top_p
+        keep_sorted = keep_sorted.at[..., 0].set(True)
+        cutoff = jnp.min(jnp.where(keep_sorted, sorted_lg, jnp.inf), axis=-1, keepdims=True)
+        lg = jnp.where(lg >= cutoff, lg, -jnp.inf)
     return safe_argmax(lg + jax.random.gumbel(k_, lg.shape)), rng
 
 
@@ -1974,7 +1993,8 @@ def token_ar_teacher_forced(in_proj, member_embed, norm1, attn, ln_f, out_head, 
 
 
 def token_ar_generate(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks: int,
-                       h: jnp.ndarray, rng, greedy: bool, temperature: float, top_k: int = 0) -> tuple:
+                       h: jnp.ndarray, rng, greedy: bool, temperature: float, top_k: int = 0,
+                       top_p: float = 1.0) -> tuple:
     lead = h.shape[:-1]
     D = h.shape[-1]
     N = int(np.prod(lead)) if lead else 1
@@ -1985,7 +2005,7 @@ def token_ar_generate(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks
         seq_in = jnp.concatenate(collected, axis=1)
         h1 = seq_in + dense_self_attention(attn, norm1(seq_in), causal=True)
         logit_m = ln_f(h1)[:, -1, :] @ out_head
-        val_m, rng = sample_idx(logit_m, rng, greedy, temperature, top_k)
+        val_m, rng = sample_idx(logit_m, rng, greedy, temperature, top_k, top_p)
         vals.append(val_m)
         if m < chunks - 1:
             collected.append(member_embed[val_m][:, None, :])
@@ -3255,18 +3275,19 @@ def codelm_ntp_logits_tf(codelm: CodeLM, h: jnp.ndarray, target: jnp.ndarray) ->
 
 
 def codelm_sample_next(codelm: CodeLM, h_prev: jnp.ndarray, rng, greedy: bool, temperature,
-                       top_k: int = 0) -> jnp.ndarray:
+                       top_k: int = 0, top_p: float = 1.0) -> jnp.ndarray:
     # Sample the next token (B, chunks) from the last hidden state h_prev (B, D).
     if codelm.token_head == "linear":
         return _sample_tokens(reshape_pq(h_prev @ codelm.ntp_head, codelm.pq_chunks, codelm.code_vocab),
-                              rng, greedy, temperature, top_k)
+                              rng, greedy, temperature, top_k, top_p)
     idx, _ = token_ar_generate(codelm.tok_in_proj, codelm.tok_member_embed, codelm.tok_norm1,
                                 codelm.tok_attn, codelm.tok_ln_f, codelm.tok_out_head,
-                                codelm.pq_chunks, h_prev, rng, greedy, temperature, top_k)
+                                codelm.pq_chunks, h_prev, rng, greedy, temperature, top_k, top_p)
     return idx
 
 
-def _sample_tokens(logits: jnp.ndarray, rng, greedy: bool, temperature, top_k: int = 0) -> jnp.ndarray:
+def _sample_tokens(logits: jnp.ndarray, rng, greedy: bool, temperature, top_k: int = 0,
+                   top_p: float = 1.0) -> jnp.ndarray:
     # gumbel-max with safe_argmax (jnp.argmax feeding a gather is miscompiled on TPU, see safe_argmax)
     if greedy:
         return safe_argmax(logits)
@@ -3274,6 +3295,15 @@ def _sample_tokens(logits: jnp.ndarray, rng, greedy: bool, temperature, top_k: i
     if top_k and top_k < lg.shape[-1]:
         kth = jax.lax.top_k(lg, top_k)[0][..., -1:]
         lg = jnp.where(lg < kth, -jnp.inf, lg)
+    if top_p < 1.0:
+        sorted_lg = jnp.sort(lg, axis=-1)[..., ::-1]
+        sorted_probs = jax.nn.softmax(sorted_lg, axis=-1)
+        cumulative = jnp.cumsum(sorted_probs, axis=-1)
+        # Keep the token that crosses the cumulative threshold as well as all tokens before it.
+        keep_sorted = cumulative - sorted_probs < top_p
+        keep_sorted = keep_sorted.at[..., 0].set(True)
+        cutoff = jnp.min(jnp.where(keep_sorted, sorted_lg, jnp.inf), axis=-1, keepdims=True)
+        lg = jnp.where(lg >= cutoff, lg, -jnp.inf)
     return safe_argmax(lg + jax.random.gumbel(rng, lg.shape))
 
 
@@ -3303,7 +3333,7 @@ def _encoder_hidden_cached(codelm: CodeLM, tokens: jnp.ndarray, prefix: jnp.ndar
 
 def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, temperature, greedy: bool,
                       top_k: int, use_bos: bool = False, rate_id: int = 0,
-                      prefix: jnp.ndarray = None) -> jnp.ndarray:
+                      prefix: jnp.ndarray = None, top_p: float = 1.0) -> jnp.ndarray:
     # tokens (B,total_len,C) holds the prompt in [:P] (P may be traced); the rest is overwritten.
     # Real incremental KV cache (was: full-buffer recompute every step, O(T^2)) -- same blk.step
     # pattern as pardec_generate. Prefill scans the WHOLE fixed-length buffer once (positions >= P
@@ -3351,7 +3381,8 @@ def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, tempe
 
     def body(t, carry):
         tokens, caches, h_prev = carry
-        tok = codelm_sample_next(codelm, h_prev, jax.random.fold_in(rng, t), greedy, temperature, top_k)
+        tok = codelm_sample_next(codelm, h_prev, jax.random.fold_in(rng, t), greedy, temperature,
+                                 top_k, top_p)
         tokens = tokens.at[:, t].set(tok.astype(tokens.dtype))
         x_new = code_embed_proj(tok, codelm.own_input_embed, codelm.own_input_proj)
         h_new, caches = self_step(x_new, caches, prefix_len + t)
@@ -3400,7 +3431,7 @@ def encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1,
 
 def encoder_free_run(codelm: CodeLM, prompt_tokens: jnp.ndarray, total_len: int, K: int, rng, greedy: bool = False,
                      temperature: float = 1.0, top_k: int = 0, use_bos: bool = False, rate_id: int = 0,
-                     prefix: jnp.ndarray = None) -> jnp.ndarray:
+                     prefix: jnp.ndarray = None, top_p: float = 1.0) -> jnp.ndarray:
     """Free-run the SHARED CodeLM as a language model over its own input tokens (its NTP head), at
     whichever level's granularity K (a runtime grouping argument, not baked into any weight):
     keep the prompt tokens, then sample the rest. greedy=True is argmax; otherwise temperature/top_k
@@ -3417,7 +3448,7 @@ def encoder_free_run(codelm: CodeLM, prompt_tokens: jnp.ndarray, total_len: int,
     tokens = jnp.zeros((B, total_len, C), prompt_tokens.dtype).at[:, :P].set(prompt_tokens)
     return _encoder_free_run_jit(codelm, tokens, jnp.asarray(P, jnp.int32), K, rng,
                                  jnp.asarray(temperature, jnp.float32), greedy, top_k, use_bos, rate_id,
-                                 prefix)
+                                 prefix, top_p)
 
 
 def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.ndarray, total_positions: int,
@@ -4443,7 +4474,8 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
                   "downsampler_rollout_prob", "upsampler_rollout", "upsampler_rollout_prob",
                   "share_downsampler_upsampler_lm", "strides",
                   "code_vocab", "pq_chunks", "mlp_mult", "rope_base", "ntp_weight", "upsampler_ncodes",
-                  "sync", "gen_temperature", "gen_top_k", "gen_eval_encode_mode", "gen_eval_greedy_only",
+                  "sync", "gen_temperature", "gen_top_k", "gen_top_p", "gen_eval_batch_size",
+                  "gen_eval_encode_mode", "gen_eval_greedy_only",
                   "gen_eval_prompt",
                   "gen_eval_all_levels", "gen_eval_teacher_force_sanity", "ctx_stop_gradient",
                   "level_refine_passes", "level_refine_window", "level_refine_gt_drop", "level_refine_layout",
@@ -4732,7 +4764,11 @@ def main():
     p.add_argument("--gen_temperature", type=float, default=Config.gen_temperature,
                     help="temperature of the sampled (non-argmax) generation eval / decoder sampling")
     p.add_argument("--gen_top_k", type=int, default=Config.gen_top_k,
-                    help="top-k of decoder sampling (0 = off); only used when sampling, never for argmax")
+                   help="top-k of decoder sampling (0 = off); only used when sampling, never for argmax")
+    p.add_argument("--gen_top_p", type=float, default=Config.gen_top_p,
+                   help="nucleus sampling threshold in (0,1]; 1 disables top-p filtering")
+    p.add_argument("--gen_eval_batch_size", type=int, default=Config.gen_eval_batch_size,
+                   help="number of examples generated per qualitative eval call; defaults to that phase's val_batch_size")
     p.add_argument("--gen_eval_encode_mode", type=str, default=Config.gen_eval_encode_mode,
                     choices=["generate", "teacher_force"],
                     help="gen-eval forward/encode direction: 'generate' (default) self-generates each "
@@ -5134,16 +5170,17 @@ def main():
     if cfg.precision != "bf16":
         jax.config.update("jax_default_matmul_precision", "highest")
     def token_preview(tokens: np.ndarray, level: int, vocab: int = None) -> np.ndarray:
+        # tokens: (B, sequence, chunks); render every sample for batched qualitative eval.
         count = tokens.shape[1]
         side = math.isqrt(count)
         if side * side != count or tokens.shape[-1] < 3:
             raise ValueError(f"level {level}: cannot render {count} positions with {tokens.shape[-1]} chunks")
         vocab = cfg.code_vocab[level] if vocab is None else vocab
-        rgb_seq = (tokens[0, :, :3].astype(np.float32) * (255.0 / max(1, vocab - 1))).clip(0, 255).astype(np.uint8)
+        rgb_seq = (tokens[:, :, :3].astype(np.float32) * (255.0 / max(1, vocab - 1))).clip(0, 255).astype(np.uint8)
         order = zorder_pixel_order(side) if cfg.traversal == "zorder" else np.arange(count)
         raster = np.zeros_like(rgb_seq)
-        raster[order] = rgb_seq
-        return raster.reshape(1, side, side, 3)
+        raster[:, order] = rgb_seq
+        return raster.reshape(tokens.shape[0], side, side, 3)
 
     def teacher_force_level(m, level: int, tokens: jnp.ndarray, prefix=None) -> jnp.ndarray:
         return encoder_teacher_force(m.codelm_for(level), tokens, K=1, prefix=prefix)
@@ -5153,7 +5190,9 @@ def main():
             logger(f"[{tag}] QUAL skipped: image token previews require modality='image'")
             return
         m = cast_pytree(eval_model, compute_dtype)
-        sources = [("train", train_np[:1], train_labels[:1]), ("val", val_np[:1], val_labels[:1])]
+        gen_batch_size = cfg.gen_eval_batch_size or args.val_batch_size[phase - 1]
+        sources = [("train", train_np[:gen_batch_size], train_labels[:gen_batch_size]),
+                   ("val", val_np[:gen_batch_size], val_labels[:gen_batch_size])]
         for source_name, images, source_labels in sources:
             gt_image = images.astype(np.uint8)
             flat = jnp.asarray(images_to_positions(images, cfg, pixel_order))
@@ -5193,30 +5232,30 @@ def main():
                         1, round(tokens.shape[1] * cfg.gen_eval_prompt)))
                 prompt_prefixes = list(dict.fromkeys((1, long_prefix)))
                 for prefix in prompt_prefixes:
-                    gen_key = jax.random.PRNGKey(args.seed + level * 101 + prefix)
-                    if args.fsdp:
-                        gen_key = fsdp_put_array(gen_key, fsdp_replicated)
-                    generated = encoder_free_run(
-                        m.codelm_for(level), tokens[:, :prefix], tokens.shape[1], 1,
-                        gen_key,
-                        greedy=True, temperature=1.0, top_k=0,
-                        rate_id=m.codelm_bos_rate_id(level), prefix=cond_prefix)
-                    if args.fsdp:
-                        generated = fsdp_to_host(generated)
-                    preview_gen = token_preview(np.asarray(generated), level, input_vocab)
                     prompt_suffix = (f"prompt{prompt_label}" if prompt_label is not None and prefix == long_prefix
                                      else f"promptpos{prefix}")
-                    class_suffix = f"_class{int(source_labels[0])}" if cfg.class_conditional else ""
-                    sample_path = run_dir / (
-                        f"samples_{tag}_{source_name}_level{level}{class_suffix}_{prompt_suffix}.png")
-                    if jax.process_index() == 0:
-                        save_samples(preview_gen, preview_gt, sample_path, cfg)
-                    logger(f"[{tag}] QUAL source={source_name} level={level} "
-                           f"prompt_request={prompt_request} "
-                           f"prompt_positions={prefix}/{tokens.shape[1]} "
-                           f"grid={level_side}x{level_side} "
-                           f"token_chunks={chunks_per_token} kv_cache=true downsampler=false "
-                           f"saved={sample_path.name}")
+                    for mode, greedy in (("greedy", True), ("sample", False)):
+                        gen_key = jax.random.PRNGKey(args.seed + level * 101 + prefix + (0 if greedy else 7919))
+                        if args.fsdp:
+                            gen_key = fsdp_put_array(gen_key, fsdp_replicated)
+                        generated = encoder_free_run(
+                            m.codelm_for(level), tokens[:, :prefix], tokens.shape[1], 1, gen_key,
+                            greedy=greedy, temperature=cfg.gen_temperature, top_k=cfg.gen_top_k,
+                            rate_id=m.codelm_bos_rate_id(level), prefix=cond_prefix, top_p=cfg.gen_top_p)
+                        if args.fsdp:
+                            generated = fsdp_to_host(generated)
+                        preview_gen = token_preview(np.asarray(generated), level, input_vocab)
+                        class_suffix = f"_conditional_b{len(images)}" if cfg.class_conditional else ""
+                        sample_path = run_dir / (
+                            f"samples_{tag}_{source_name}_level{level}{class_suffix}_{mode}_{prompt_suffix}.png")
+                        if jax.process_index() == 0:
+                            save_samples(preview_gen, preview_gt, sample_path, cfg)
+                        logger(f"[{tag}] QUAL source={source_name} level={level} mode={mode} "
+                               f"temperature={cfg.gen_temperature:g} top_k={cfg.gen_top_k} top_p={cfg.gen_top_p:g} "
+                               f"prompt_request={prompt_request} prompt_positions={prefix}/{tokens.shape[1]} "
+                               f"batch={len(images)} grid={level_side}x{level_side} "
+                               f"token_chunks={chunks_per_token} kv_cache=true downsampler=false "
+                               f"saved={sample_path.name}")
 
                 if cfg.class_conditional:
                     null_prefix = class_condition_prefix(m, level, None, tokens.shape[0])
@@ -5225,19 +5264,23 @@ def main():
                     uncond_key = jax.random.PRNGKey(args.seed + level * 1009 + 17)
                     if args.fsdp:
                         uncond_key = fsdp_put_array(uncond_key, fsdp_replicated)
-                    uncond_tokens = encoder_free_run(
-                        m.codelm_for(level), tokens[:, :0], tokens.shape[1], 1, uncond_key,
-                        greedy=True, temperature=1.0, top_k=0,
-                        rate_id=m.codelm_bos_rate_id(level), prefix=null_prefix)
-                    if args.fsdp:
-                        uncond_tokens = fsdp_to_host(uncond_tokens)
-                    uncond_image = token_preview(np.asarray(uncond_tokens), level, input_vocab)
-                    uncond_path = run_dir / (
-                        f"samples_{tag}_{source_name}_level{level}_uncond.png")
-                    if jax.process_index() == 0:
-                        save_samples(uncond_image, preview_gt, uncond_path, cfg)
-                    logger(f"[{tag}] QUAL source={source_name} level={level} class=unconditional "
-                           f"prompt_positions=0/{tokens.shape[1]} kv_cache=true saved={uncond_path.name}")
+                    for mode, greedy in (("greedy", True), ("sample", False)):
+                        mode_key = jax.random.fold_in(uncond_key, 0 if greedy else 7919)
+                        uncond_tokens = encoder_free_run(
+                            m.codelm_for(level), tokens[:, :0], tokens.shape[1], 1, mode_key,
+                            greedy=greedy, temperature=cfg.gen_temperature, top_k=cfg.gen_top_k,
+                            rate_id=m.codelm_bos_rate_id(level), prefix=null_prefix, top_p=cfg.gen_top_p)
+                        if args.fsdp:
+                            uncond_tokens = fsdp_to_host(uncond_tokens)
+                        uncond_image = token_preview(np.asarray(uncond_tokens), level, input_vocab)
+                        uncond_path = run_dir / (
+                            f"samples_{tag}_{source_name}_level{level}_uncond_{mode}.png")
+                        if jax.process_index() == 0:
+                            save_samples(uncond_image, preview_gt, uncond_path, cfg)
+                        logger(f"[{tag}] QUAL source={source_name} level={level} class=unconditional mode={mode} "
+                               f"temperature={cfg.gen_temperature:g} top_k={cfg.gen_top_k} top_p={cfg.gen_top_p:g} "
+                               f"prompt_positions=0/{tokens.shape[1]} batch={len(images)} "
+                               f"kv_cache=true saved={uncond_path.name}")
 
                 tf_tokens = teacher_force_level(m, level, tokens, prefix=cond_prefix)
                 if args.fsdp:

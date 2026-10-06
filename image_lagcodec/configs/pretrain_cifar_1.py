@@ -1,27 +1,18 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/pretrain_in64_1_one.py
+uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/pretrain_cifar_1.py
 """
-# --- data ---
-img_size = 64
-dataset = "imagenet64"
-data_root = "/dev/shm/imagenet64"
-multihost = True
-fsdp = False
-# fsdp_mode = 
-
-traversal = "zorder"
-eval_gen_train = True
-gen_eval_all_levels = True
-gen_eval_teacher_force_sanity = True
-gen_eval_prompt = 2048
-# remat_level = True
-share_across_levels = False
-
-codelm_d_model = 2048
-codelm_n_layers = 32
-codelm_n_heads = 16
-codelm_n_kv_heads = 16
-mlp_mult = 2
+# Encoder-only CodeLM/downsampler pretraining.
+img_size = 32
+encoder_only_pretrain = True
+# log_levelwise_metrics = True
+# fsdp = True  # shard model parameters and optimizer state over the available JAX device mesh
+fsdp = False  # shard model parameters and optimizer state over the available JAX device mesh
+# share_across_levels = True
+codelm_d_model = 1024
+codelm_n_layers = 16
+codelm_n_heads = 8
+codelm_n_kv_heads = 8
+mlp_mult = 4
 
 code_vocab = 256
 pq_chunks = 3
@@ -69,8 +60,8 @@ gen_eval_teacher_force_sanity = True
 gen_eval_prompt = 512
 
 # --- training ---
-batch_size = 1
-val_batch_size = 1
+batch_size = 8
+val_batch_size = 8
 # level_steps = (20_000, 20_000, 20_000, 100_000)
 level_steps = (int(2e5),)
 seed = 0
