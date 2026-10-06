@@ -124,6 +124,19 @@ def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: boo
             return out[:, :, :T, :]
 
         replicated = jax.sharding.PartitionSpec()
+        # Hybrid intra-node FSDP/inter-node DP nests this Splash shard_map inside
+        # an outer shard_map where "dp" is already Manual and "fsdp" is Auto.
+        # The captured concrete mesh is all-Auto, so JAX rejects it as a nested
+        # mesh. Resolve the active abstract mesh only for the hybrid topology.
+        # Pure FSDP has no "dp" axis and deliberately retains its established path.
+        if "dp" in mesh.axis_names:
+            try:
+                context_mesh = jax.sharding.get_abstract_mesh()
+                if (tuple(context_mesh.axis_names) == tuple(mesh.axis_names)
+                        and dict(context_mesh.shape) == dict(mesh.shape)):
+                    mesh = context_mesh
+            except (AttributeError, ValueError):
+                pass
         y = jax.shard_map(
             run_local,
             mesh=mesh,
