@@ -10,7 +10,8 @@ Fractal Generative Models paper's own baselines):
 
 Writes flat raster-order uint8 RGB bytes (resolution*resolution*3 per image) into fixed-size
 np.memmap shards -- same shard-per-file streaming pattern as scripts/jax/generate_pathfinder.py,
-chosen for the same reason: never hold a whole split in RAM.
+chosen for the same reason: never hold a whole split in RAM. The HF `label` ClassLabel is saved
+as an aligned int32 shard in a sibling `labels/` directory; image shards keep their existing format.
 
 Non-RGB images (CMYK/L/RGBA) are resized in their native mode then converted to RGB as the last
 step, exactly matching the reference's order (see center_crop_resize's docstring). Images that
@@ -65,25 +66,37 @@ def main():
     bytes_per_image = args.resolution * args.resolution * 3
 
     ds = load_dataset("ILSVRC/imagenet-1k", split=args.split, streaming=True)
+    print(f"dataset columns: {list(ds.features.keys())}")
+    if "label" not in ds.features:
+        raise ValueError(f"expected a 'label' column, found {list(ds.features.keys())}")
 
     shard_idx = 0
     n_in_shard = 0
     n_written = 0
     n_failed = 0
     mmap = None
+    label_mmap = None
+    labels_dir = os.path.join(args.out_dir, "labels")
+    os.makedirs(labels_dir, exist_ok=True)
 
     def new_shard():
-        nonlocal mmap, n_in_shard
+        nonlocal mmap, label_mmap, n_in_shard
         path = os.path.join(
             args.out_dir, f"imagenet64_{args.split}_{shard_idx:05d}.npy"
+        )
+        label_path = os.path.join(
+            labels_dir, f"imagenet64_{args.split}_{shard_idx:05d}.npy"
         )
         mmap = np.lib.format.open_memmap(
             path, mode="w+", dtype=np.uint8, shape=(args.shard_size, bytes_per_image)
         )
+        label_mmap = np.lib.format.open_memmap(
+            label_path, mode="w+", dtype=np.int32, shape=(args.shard_size,)
+        )
         n_in_shard = 0
-        return path
+        return path, label_path
 
-    path = new_shard()
+    path, label_path = new_shard()
     pbar = tqdm(ds, desc=f"imagenet64 {args.split}")
     for i, example in enumerate(pbar):
         if args.limit is not None and n_written >= args.limit:
@@ -97,24 +110,33 @@ def main():
             continue
 
         mmap[n_in_shard] = arr.reshape(-1)
+        label_mmap[n_in_shard] = int(example["label"])
         n_in_shard += 1
         n_written += 1
 
         if n_in_shard == args.shard_size:
             mmap.flush()
+            label_mmap.flush()
             shard_idx += 1
-            path = new_shard()
+            path, label_path = new_shard()
 
     if n_in_shard > 0:
         # truncate the final partial shard down to what was actually written
         mmap.flush()
+        label_mmap.flush()
         del mmap
+        del label_mmap
         full = np.load(path, mmap_mode="r")
         trimmed = np.array(full[:n_in_shard])
         del full
         np.save(path, trimmed)
+        full_labels = np.load(label_path, mmap_mode="r")
+        trimmed_labels = np.array(full_labels[:n_in_shard])
+        del full_labels
+        np.save(label_path, trimmed_labels)
     else:
         os.remove(path)
+        os.remove(label_path)
 
     print(f"done: {n_written} images written, {n_failed} failed/skipped, "
           f"{shard_idx + (1 if n_in_shard > 0 else 0)} shards, out_dir={args.out_dir}")

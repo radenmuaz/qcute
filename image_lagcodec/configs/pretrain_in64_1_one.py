@@ -5,14 +5,14 @@ uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcod
 img_size = 64
 dataset = "imagenet64"
 data_root = "/dev/shm/imagenet64"
-multihost = True
+# multihost = True
 fsdp = True
 
 traversal = "zorder"
 eval_gen_train = True
 gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
-
+gen_eval_prompt = 2048
 # remat_level = True
 share_across_levels = False
 # share_downsampler_upsampler_lm = True
@@ -22,16 +22,10 @@ share_across_levels = False
 # codelm_d_model = 1024
 # codelm_n_layers = 16
 
-# codelm_d_model = (512,512,256,256,128)
-# codelm_n_layers = (16,16,8,8,4)
-# codelm_n_heads = (8,8,4,4,2)
-# codelm_n_kv_heads = (8,8,4,4,2)
-# mlp_mult = 8
-
-codelm_d_model = (2048,1024,512,256,128)
-codelm_n_layers = (32,16,8,4,2)
-codelm_n_heads = (16,8,4,2,1)
-codelm_n_kv_heads = (16,8,4,2,1)
+codelm_d_model = 2048
+codelm_n_layers = 32
+codelm_n_heads = 16
+codelm_n_kv_heads = 16
 mlp_mult = 4
 
 code_vocab = 256
@@ -48,21 +42,21 @@ label_reg_weight = 1.0
 label_fn = "rgb_label_fn_jax"
 # bos_rate_mode = "relative"
 bos_rate_mode = "absolute"
-strides = (4, 4, 4, 4, 4)
+strides = None
 # attn_window = 1024
 attn_window = -1
 attn_lookahead = 0
 
 
-downsampler_d_model = 128
-downsampler_n_layers = 1
-downsampler_n_heads = 1
-downsampler_n_kv_heads = 1
-downsampler_window = 1
-downsampler_rollout = True
-downsampler_rollout_prob = 0.8
+# downsampler_d_model = 128
+# downsampler_n_layers = 1
+# downsampler_n_heads = 1
+# downsampler_n_kv_heads = 1
+# downsampler_window = 1
+# downsampler_rollout = True
+# downsampler_rollout_prob = 0.8
 
-context_source = "own_embed"
+# context_source = "own_embed"
 # context_source = "codelm_upper"
 # upsampler_decode_past = 0
 # upsampler_decode_future = 0

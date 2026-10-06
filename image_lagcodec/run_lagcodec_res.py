@@ -1208,7 +1208,8 @@ def resolve_label_fn(spec, modality: str):
 
 class BatchIterator:
     def __init__(self, images: np.ndarray, labels: np.ndarray, batch_size: int, n_devices: int,
-                 shuffle: bool, seed: int, cfg: Config, fsdp: bool = False):
+                 shuffle: bool, seed: int, cfg: Config, fsdp: bool = False,
+                 data_parallel: bool = False):
         self.images, self.labels = images, labels
         self.batch_size, self.n_devices = batch_size, n_devices
         self.shuffle = shuffle
@@ -1221,13 +1222,15 @@ class BatchIterator:
         self.pos = 0  # batches already yielded this epoch -- resume continues here, no reshuffle
         self.pc, self.pi = jax.process_count(), jax.process_index()
         self.fsdp = fsdp
+        self.data_parallel = data_parallel
         self.total = batch_size * (1 if fsdp else n_devices)
         self.cfg = cfg
         self.pixel_order = pixel_order_for(cfg)
         self.n_positions = n_positions_of(cfg)
 
     def __len__(self):
-        return len(self.images) // (self.total * (1 if self.fsdp else self.pc))
+        process_multiplier = self.pc if self.data_parallel or not self.fsdp else 1
+        return len(self.images) // (self.total * process_multiplier)
 
     def __iter__(self):
         n = len(self.images)
@@ -1235,11 +1238,12 @@ class BatchIterator:
             self.epoch_seed = int(self.epoch_rng.integers(0, 2 ** 31 - 1))
             self.pos = 0
         idx = np.random.default_rng(self.epoch_seed).permutation(n) if self.shuffle else np.arange(n)
-        g = self.total * (1 if self.fsdp else self.pc)
+        process_multiplier = self.pc if self.data_parallel or not self.fsdp else 1
+        g = self.total * process_multiplier
         starts = list(range(0, n - g + 1, g))
         for bi in range(self.pos, len(starts)):
             start = starts[bi]
-            process_offset = 0 if self.fsdp else self.pi * self.total
+            process_offset = self.pi * self.total if self.data_parallel or not self.fsdp else 0
             sel = idx[start + process_offset:start + process_offset + self.total]
             img = self.images[sel]
             positions = images_to_positions(img, self.cfg, self.pixel_order)
@@ -3907,7 +3911,7 @@ def replicate(pytree, n_devices: int):
 
 def fsdp_sharding_for_array(x, mesh):
     spec = jax.sharding.PartitionSpec()
-    n_devices = mesh.devices.size
+    n_devices = mesh.shape["fsdp"] if "fsdp" in mesh.axis_names else mesh.devices.size
     candidates = [(size, axis) for axis, size in enumerate(x.shape)
                   if size >= n_devices and size % n_devices == 0]
     if candidates:
@@ -3923,7 +3927,7 @@ def fsdp_shardings(tree, mesh):
         lambda x: fsdp_sharding_for_array(x, mesh) if eqx.is_array(x) else None, tree)
 
 
-def fsdp_put_array(x, sharding):
+def fsdp_put_array(x, sharding, global_shape=None):
     if getattr(x, "is_fully_addressable", True):
         host_value = np.asarray(jax.device_get(x))
     elif x.sharding == sharding:
@@ -3934,7 +3938,7 @@ def fsdp_put_array(x, sharding):
     if jax.process_count() == 1:
         return jax.device_put(host_value, sharding)
     return jax.make_array_from_process_local_data(
-        sharding, host_value, global_shape=host_value.shape)
+        sharding, host_value, global_shape=host_value.shape if global_shape is None else global_shape)
 
 
 def fsdp_put_tree(tree, mesh):
@@ -4350,12 +4354,16 @@ def main():
                          "tuple gives one value per phase (length must equal n_phases)")
     p.add_argument("--n_devices", type=int, default=None)
     p.add_argument("--fsdp", type=lambda x: x.lower() != "false", default=False,
-                   help="shard eligible parameter and optimizer-state arrays across all JAX devices "
-                        "with NamedSharding; batches are replicated across the shard mesh, so "
-                        "batch_size is the global batch")
+                   help="enable FSDP parameter and optimizer-state sharding")
+    p.add_argument("--fsdp_mode", choices=("pure", "intra_node_fsdp_inter_node_dp"), default="pure",
+                   help="FSDP topology: pure shards parameters across the whole mesh and replicates "
+                        "batches (batch_size is global); intra_node_fsdp_inter_node_dp shards "
+                        "parameters within each host and data-parallelizes across hosts "
+                        "(batch_size is per host). Requires --fsdp and --multihost")
     p.add_argument("--multihost", type=lambda x: x.lower() != "false", default=False,
-                    help="jax.distributed.initialize() for a multi-host TPU slice: run the same command on every host; "
-                         "batch_size stays per device, each host feeds its own slice of the global batch")
+                    help="initialize a multi-host TPU slice; run the same command on every host. "
+                         "For --fsdp_mode=intra_node_fsdp_inter_node_dp, batch_size is per host "
+                         "and hosts receive disjoint data batches")
     p.add_argument("--level_steps", type=_tuple_arg, default=None,
                     help="steps per phase -- a bare int applies uniformly to every phase; a "
                          "tuple gives one value per phase. At most one of --level_steps/"
@@ -4797,20 +4805,41 @@ def main():
 
     if args.multihost:
         jax.distributed.initialize()
+    if args.fsdp_mode != "pure" and not args.fsdp:
+        raise ValueError("--fsdp_mode requires --fsdp")
+    hybrid_fsdp = args.fsdp and args.fsdp_mode == "intra_node_fsdp_inter_node_dp"
+    if hybrid_fsdp and not args.multihost:
+        raise ValueError("intra_node_fsdp_inter_node_dp requires --multihost")
+    if hybrid_fsdp and jax.process_count() < 2:
+        raise ValueError("intra_node_fsdp_inter_node_dp requires at least two hosts")
     n_devices = args.n_devices or jax.local_device_count()
     print(f"jax devices ({n_devices} used of {jax.local_device_count()} local): {jax.devices()}")
     fsdp_mesh = None
     fsdp_replicated = None
+    fsdp_batch_sharding = None
     fsdp_init_device = None
     if args.fsdp:
         if args.n_devices is not None and args.n_devices != jax.local_device_count():
             raise ValueError("--fsdp uses every JAX device; do not set --n_devices to a subset")
-        fsdp_mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("fsdp",))
-        set_splash_shard_map_mesh(fsdp_mesh)
+        if hybrid_fsdp:
+            per_host_devices = [jax.local_devices(process_index=i) for i in range(jax.process_count())]
+            local_counts = {len(d) for d in per_host_devices}
+            if len(local_counts) != 1:
+                raise ValueError("hybrid FSDP requires the same number of JAX devices on each host")
+            fsdp_devices = np.asarray(per_host_devices)
+            fsdp_mesh = jax.sharding.Mesh(fsdp_devices, ("dp", "fsdp"))
+            set_splash_shard_map_mesh(fsdp_mesh, axis_names={"fsdp"})
+            fsdp_batch_sharding = jax.sharding.NamedSharding(
+                fsdp_mesh, jax.sharding.PartitionSpec("dp"))
+        else:
+            fsdp_mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("fsdp",))
+            set_splash_shard_map_mesh(fsdp_mesh)
+            fsdp_batch_sharding = jax.sharding.NamedSharding(
+                fsdp_mesh, jax.sharding.PartitionSpec())
         fsdp_replicated = jax.sharding.NamedSharding(
             fsdp_mesh, jax.sharding.PartitionSpec())
         fsdp_init_device = jax.local_devices()[0]
-        logger_device_count = fsdp_mesh.devices.size
+        logger_device_count = fsdp_mesh.shape["fsdp"]
     else:
         set_splash_shard_map_mesh(None)
         logger_device_count = n_devices
@@ -4900,7 +4929,8 @@ def main():
     if args.fsdp:
         total_params, sharded_params, params_per_device = fsdp_parameter_stats(
             model, logger_device_count)
-        logger(f"fsdp enabled: mesh_devices={logger_device_count} "
+        logger(f"fsdp enabled: mode={args.fsdp_mode} mesh_devices={fsdp_mesh.devices.size} "
+               f"dp_hosts={fsdp_mesh.shape.get('dp', 1)} fsdp_devices_per_host={logger_device_count} "
                f"sharded_params={sharded_params / 1e6:.2f}/{total_params / 1e6:.2f}M "
                f"estimated_params_per_device={params_per_device / 1e6:.2f}M")
         if logger_device_count == 1:
@@ -5275,7 +5305,8 @@ def main():
     total_all_steps = sum(
         _phase_total_steps(p - 1, len(BatchIterator(
             train_np, train_labels[:len(train_np)], args.batch_size[p - 1], n_devices,
-            shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp)))
+            shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp,
+            data_parallel=hybrid_fsdp)))
         for p in all_phases)
     step_w = len(str(total_all_steps))
     global_pbar = tqdm(total=total_all_steps, initial=step, desc="total", dynamic_ncols=True, position=1, leave=True)
@@ -5285,7 +5316,8 @@ def main():
         resume_phase = resume_meta["phase"]
         steps_per_epoch_resume = len(BatchIterator(
             train_np, train_labels[:len(train_np)], args.batch_size[resume_phase - 1], n_devices,
-            shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp))
+            shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp,
+            data_parallel=hybrid_fsdp))
         phase_steps_resume = _phase_total_steps(resume_phase - 1, steps_per_epoch_resume)
         phase_complete = resume_meta["phase_step"] >= phase_steps_resume
         phase_iter = [p for p in phase_iter if p > resume_phase] if phase_complete \
@@ -5308,7 +5340,8 @@ def main():
             logger(f"level{phase - 1}: level_epochs=0, skipping phase entirely")
             continue
         train_iter = BatchIterator(train_np, train_labels[:len(train_np)], args.batch_size[phase - 1],
-                                    n_devices, shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp)
+                                    n_devices, shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp,
+                                    data_parallel=hybrid_fsdp)
         recon_prompt = val_np[:args.val_batch_size[phase - 1]]
         flat_prompt_np = images_to_positions(recon_prompt, cfg, pixel_order)
         flat_prompt = fsdp_put_array(flat_prompt_np, fsdp_replicated) if args.fsdp \
@@ -5374,6 +5407,10 @@ def main():
 
         def train_step_impl(diff_model, opt_state, rng, flat_bytes, static_model):
             rng, level_rng, cascade_rng = jax.random.split(rng, 3)
+            if hybrid_fsdp:
+                dp_index = jax.lax.axis_index("dp")
+                level_rng = jax.random.fold_in(level_rng, dp_index)
+                cascade_rng = jax.random.fold_in(cascade_rng, dp_index)
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
                 diff_model, static_model, flat_bytes, level_rng, cascade_rng)
             grads = tie_shared_grads(grads, cfg)
@@ -5381,6 +5418,10 @@ def main():
                 grads = jax.lax.pmean(grads, axis_name="d")
                 loss = jax.lax.pmean(loss, axis_name="d")
                 aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
+            elif hybrid_fsdp:
+                grads = jax.lax.pmean(grads, axis_name="dp")
+                loss = jax.lax.pmean(loss, axis_name="dp")
+                aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="dp"), aux)
             # no gradient tying needed: with cfg.share_across_levels=True (default), codelm_for/
             # downsampler_for/upsampler_for all resolve to the SAME singleton instance regardless of
             # level index -- level_forward calling it at several different level indices within this
@@ -5403,15 +5444,28 @@ def main():
             opt_shardings = fsdp_shardings(opt_state, fsdp_mesh)
             static_shardings = fsdp_shardings(static_model, fsdp_mesh)
 
+            def jit_fsdp_step(step_fn):
+                if hybrid_fsdp:
+                    P = jax.sharding.PartitionSpec
+                    step_fn = jax.shard_map(
+                        step_fn,
+                        mesh=fsdp_mesh,
+                        in_specs=(P(), P(), P(), P("dp"), P()),
+                        out_specs=(P(), P(), P(), P(), P()),
+                        axis_names={"dp"},
+                        check_vma=False,
+                    )
+                return jax.jit(
+                    step_fn,
+                    in_shardings=(diff_shardings, opt_shardings, fsdp_replicated,
+                                  fsdp_batch_sharding, static_shardings),
+                    out_shardings=(diff_shardings, opt_shardings, fsdp_replicated, None, None),
+                    donate_argnums=(0, 1, 2))
+
             def train_step(diff_model, opt_state, rng, flat_bytes, static_model):
                 return train_step_impl(diff_model, opt_state, rng, flat_bytes, static_model)
 
-            train_step = jax.jit(
-                train_step,
-                in_shardings=(diff_shardings, opt_shardings, fsdp_replicated,
-                              fsdp_replicated, static_shardings),
-                out_shardings=(diff_shardings, opt_shardings, fsdp_replicated, None, None),
-                donate_argnums=(0, 1, 2))
+            train_step = jit_fsdp_step(train_step)
         else:
             train_step = jax.pmap(
                 lambda diff_model, opt_state, rng, flat_bytes:
@@ -5439,6 +5493,10 @@ def main():
 
             def train_step_sd_impl(diff_model, opt_state, rng, flat_bytes, static_model):
                 rng, level_rng, cascade_rng = jax.random.split(rng, 3)
+                if hybrid_fsdp:
+                    dp_index = jax.lax.axis_index("dp")
+                    level_rng = jax.random.fold_in(level_rng, dp_index)
+                    cascade_rng = jax.random.fold_in(cascade_rng, dp_index)
                 (loss, aux), grads = jax.value_and_grad(loss_fn_sd, has_aux=True)(
                     diff_model, static_model, flat_bytes, level_rng, cascade_rng)
                 grads = tie_shared_grads(grads, cfg)
@@ -5446,6 +5504,10 @@ def main():
                     grads = jax.lax.pmean(grads, axis_name="d")
                     loss = jax.lax.pmean(loss, axis_name="d")
                     aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
+                elif hybrid_fsdp:
+                    grads = jax.lax.pmean(grads, axis_name="dp")
+                    loss = jax.lax.pmean(loss, axis_name="dp")
+                    aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="dp"), aux)
                 grad_norm = optax.global_norm(grads)
                 aux = aux + (grad_norm,)
                 updates, opt_state = optimizer.update(grads, opt_state, diff_model)
@@ -5456,12 +5518,7 @@ def main():
                 def train_step_sd(diff_model, opt_state, rng, flat_bytes, static_model):
                     return train_step_sd_impl(diff_model, opt_state, rng, flat_bytes, static_model)
 
-                return jax.jit(
-                    train_step_sd,
-                    in_shardings=(diff_shardings, opt_shardings, fsdp_replicated,
-                                  fsdp_replicated, static_shardings),
-                    out_shardings=(diff_shardings, opt_shardings, fsdp_replicated, None, None),
-                    donate_argnums=(0, 1, 2))
+                return jit_fsdp_step(train_step_sd)
             return jax.pmap(
                 lambda diff_model, opt_state, rng, flat_bytes:
                     train_step_sd_impl(diff_model, opt_state, rng, flat_bytes, static_model),
@@ -5525,8 +5582,16 @@ def main():
             for flat in train_iter:
                 if phase_step >= phase_total_steps:
                     break
-                flat = fsdp_put_array(np.asarray(flat[0]), fsdp_replicated) if args.fsdp \
-                    else jnp.array(flat)
+                if args.fsdp:
+                    local_flat = np.asarray(flat[0])
+                    if hybrid_fsdp:
+                        batch_global_shape = (local_flat.shape[0] * jax.process_count(),) + local_flat.shape[1:]
+                        flat = fsdp_put_array(local_flat, fsdp_batch_sharding,
+                                              global_shape=batch_global_shape)
+                    else:
+                        flat = fsdp_put_array(local_flat, fsdp_batch_sharding)
+                else:
+                    flat = jnp.array(flat)
                 if not jit_timed:
                     jit_t0 = time.monotonic()
                 if multires_active:

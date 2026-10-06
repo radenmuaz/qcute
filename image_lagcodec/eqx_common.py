@@ -20,14 +20,17 @@ from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_ma
 
 _SPLASH_BLOCK = 128  # Pallas TPU lane width -- block_kv_compute must be a multiple of this.
 _SPLASH_SHARD_MAP_MESH = None
+_SPLASH_SHARD_MAP_AXIS_NAMES = frozenset()
 
 
-def set_splash_shard_map_mesh(mesh) -> None:
+def set_splash_shard_map_mesh(mesh, axis_names=None) -> None:
     """Set the explicit mesh used to run Mosaic Splash kernels in multihost FSDP."""
-    global _SPLASH_SHARD_MAP_MESH
+    global _SPLASH_SHARD_MAP_MESH, _SPLASH_SHARD_MAP_AXIS_NAMES
     # A concrete Mesh works outside jit, but shard_map is created while tracing a
     # jitted training step. Its AbstractMesh is the form JAX expects in that context.
     _SPLASH_SHARD_MAP_MESH = None if mesh is None else mesh.abstract_mesh
+    _SPLASH_SHARD_MAP_AXIS_NAMES = (frozenset() if mesh is None else
+                                    frozenset(mesh.axis_names if axis_names is None else axis_names))
 
 
 def splash_shard_map_enabled() -> bool:
@@ -121,6 +124,7 @@ def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: boo
             in_specs=(replicated, replicated, replicated,
                       None if sink is None else replicated),
             out_specs=replicated,
+            axis_names=_SPLASH_SHARD_MAP_AXIS_NAMES,
             check_vma=False,
         )(q_p, k_p, v_p, sink)
     return y[:, :, :T, :]

@@ -53,7 +53,7 @@ from tqdm import tqdm
 from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, SwiGLU, apply_rope, apply_xsa, init_matrix,
                                         init_vector, make_lr_schedule, rmsnorm, rope_cos_sin,
                                         rope_cos_sin_pos, rotate_half, set_splash_shard_map_mesh,
-                                        sinkgd, splash_shard_map_enabled)
+                                        sinkgd)
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
@@ -84,6 +84,7 @@ def n_blocks_for_level(cfg, j: int) -> int:
 
 @dataclass
 class Config:
+    simple_ntp: bool = False  # derived from strides=None/empty; one CodeLM, no downsampler
     img_size: int = 32
     # data: image (img_size^2 RGB pixels) | text | audio | binary (1D: seq_len positions of byte_group bytes,
     # traversal "raster"). dataset="folder" reads every file under data_root (see load_folder)
@@ -267,6 +268,12 @@ class Config:
     codelm_bos_prob: float = 0.1
     codelm_bos_rates: tuple = 1  # per-level n_rates for the bos_embed table; 1 (default) = single
     # generic anchor. No effect when use_codelm_bos=False.
+    class_conditional: bool = False  # add trainable class/null BOS tokens to CodeLM inputs
+    class_num_classes: int = 1000
+    class_drop_prob: float = 0.1  # classifier-free dropout to the learned null-class token
+    class_bos_order: str = "level_then_class"  # last prefix token predicts the first target
+    class_ntp_weight: float = 1.0  # direct CodeLM NTP objective, enabled only for class_conditional
+    level_gt_input_prob: tuple = 0.0  # per level: use label_fn(image) codes instead of lower model codes
 
     remat: bool = False
     remat_level: bool = False
@@ -399,6 +406,13 @@ class Config:
         if self.remat and self.remat_level:
             warnings.warn("remat and remat_level both set: remat_level wins (whole encoder/decoder stacks are "
                           "checkpointed, not individual blocks)")
+        self.simple_ntp = self.strides is None or len(self.strides) == 0
+        if self.simple_ntp:
+            # Keep downstream per-level config broadcasting and output shapes uniform. The sentinel
+            # is consumed here; main() reports simple_ntp explicitly and the model skips PardecLM.
+            self.strides = (1,)
+        else:
+            self.strides = tuple(self.strides)
         n = len(self.strides)
 
         def bcast(name, types):
@@ -464,6 +478,7 @@ class Config:
         bcast("level_cycles", int)
         bcast("upsampler_pss_passes", int)
         bcast("downsampler_pss_passes", int)
+        bcast("level_gt_input_prob", (int, float))
         if self.gen_level_cycles is None:
             self.gen_level_cycles = self.level_cycles
         bcast("gen_level_cycles", int)
@@ -700,6 +715,20 @@ class Config:
         assert all(c >= 1 for c in self.downsampler_remat_chunks + self.upsampler_remat_chunks), \
             (self.downsampler_remat_chunks, self.upsampler_remat_chunks)
         assert self.init_scheme in ("llama", "zero")
+        if not 0.0 <= self.class_drop_prob <= 1.0:
+            raise ValueError(f"class_drop_prob must be in [0,1], got {self.class_drop_prob}")
+        if self.class_num_classes < 1:
+            raise ValueError("class_num_classes must be positive")
+        if self.class_bos_order not in ("level_then_class", "class_then_level"):
+            raise ValueError("class_bos_order must be 'level_then_class' or 'class_then_level'")
+        if self.class_ntp_weight < 0:
+            raise ValueError("class_ntp_weight must be nonnegative")
+        if any(not 0.0 <= p <= 1.0 for p in self.level_gt_input_prob):
+            raise ValueError("level_gt_input_prob values must be in [0,1]")
+        if len(self.level_gt_input_prob) != n:
+            raise ValueError(f"level_gt_input_prob needs {n} entries, got {len(self.level_gt_input_prob)}")
+        if (self.class_conditional or self.simple_ntp) and any(self.attn_lookahead):
+            raise ValueError("conditional/simple NTP generation requires attn_lookahead=0 at every level")
         resolved_kv = []
         for i in range(n):
             kv = self.codelm_n_kv_heads[i] if self.codelm_n_kv_heads[i] is not None else max(1, self.codelm_n_heads[i] // 4)
@@ -780,35 +809,161 @@ def load_cifar10(data_root: Path) -> tuple:
     return (train, train_labels), (test, test_labels)
 
 
-def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = None) -> tuple:
-    def load_split(split: str, limit=None) -> np.ndarray:
+class ImageNetJXLByteDataset:
+    """Array-like random access to concatenated JPEG XL byte shards.
+
+    Integer indexing returns one decoded uint8 HWC image. Slice or integer-array indexing
+    returns a batch with shape (N, H, W, 3), matching the ndarray API used by train_np.
+    Payload bytes and offsets stay memory-mapped; only requested images are decoded.
+    """
+
+    def __init__(self, data_root: Path, resolution: int, shard_records: list):
+        self.data_root = Path(data_root)
+        self.resolution = int(resolution)
+        self.shards = []
+        counts = []
+        for record in shard_records:
+            payload_path = self.data_root / record["payload"]
+            offsets_path = self.data_root / record["offsets"]
+            payload_size = payload_path.stat().st_size
+            offsets = np.load(offsets_path, mmap_mode="r")
+            if offsets.dtype != np.uint64 or offsets.ndim != 1 or len(offsets) != int(record["count"]) + 1:
+                raise ValueError(f"invalid JXL offsets metadata: {offsets_path}")
+            if int(offsets[0]) != 0 or int(offsets[-1]) != payload_size:
+                raise ValueError(f"offsets do not span payload {payload_path}")
+            if np.any(offsets[1:] < offsets[:-1]):
+                raise ValueError(f"JXL offsets are not monotonic: {offsets_path}")
+            payload = np.memmap(payload_path, mode="r", dtype=np.uint8)
+            labels_path = self.data_root / record["labels"]
+            labels = np.load(labels_path, mmap_mode="r")
+            if labels.ndim != 1 or len(labels) != int(record["count"]):
+                raise ValueError(f"label count does not match JXL records: {labels_path}")
+            self.shards.append((payload, offsets, labels))
+            counts.append(int(record["count"]))
+        self.counts = np.asarray(counts, dtype=np.int64)
+        self.ends = np.cumsum(self.counts)
+        self._length = int(self.ends[-1]) if len(self.ends) else 0
+        self.labels = np.concatenate([np.asarray(shard[2]) for shard in self.shards]).astype(np.int32) \
+            if self.shards else np.empty((0,), dtype=np.int32)
+
+    def __len__(self):
+        return self._length
+
+    @property
+    def shape(self):
+        return (len(self), self.resolution, self.resolution, 3)
+
+    def _decode_one(self, index: int) -> np.ndarray:
+        import imagecodecs
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        shard_idx = int(np.searchsorted(self.ends, index, side="right"))
+        shard_start = 0 if shard_idx == 0 else int(self.ends[shard_idx - 1])
+        local_idx = index - shard_start
+        payload, offsets, _ = self.shards[shard_idx]
+        start, end = int(offsets[local_idx]), int(offsets[local_idx + 1])
+        decoded = np.asarray(imagecodecs.jpegxl_decode(payload[start:end]))
+        expected = (self.resolution, self.resolution, 3)
+        if decoded.shape != expected or decoded.dtype != np.uint8:
+            raise ValueError(f"decoded JXL image {index} has {decoded.shape}/{decoded.dtype}, expected "
+                             f"{expected}/uint8")
+        return decoded
+
+    def __getitem__(self, index):
+        if isinstance(index, (int, np.integer)):
+            return self._decode_one(int(index))
+        if isinstance(index, slice):
+            indices = range(*index.indices(len(self)))
+        else:
+            indices = np.asarray(index)
+            if indices.dtype == np.bool_:
+                if indices.ndim != 1 or len(indices) != len(self):
+                    raise IndexError("boolean index must match dataset length")
+                indices = np.flatnonzero(indices)
+            elif indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+                raise IndexError("JXL dataset indices must be integers, slices, or 1D integer arrays")
+        images = [self._decode_one(int(i)) for i in indices]
+        return np.stack(images, axis=0) if images else np.empty((0, *self.shape[1:]), dtype=np.uint8)
+
+
+def load_imagenet_jxl(data_root: Path, resolution: int, split: str, shard_limit=None):
+    manifest_path = data_root / f"imagenet{resolution}_{split}_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"JXL dataset manifest not found: {manifest_path}")
+    with manifest_path.open() as f:
+        manifest = json.load(f)
+    if manifest.get("format") != "jpeg-xl-lossless-concatenated":
+        raise ValueError(f"unsupported JXL dataset format in {manifest_path}: {manifest.get('format')}")
+    if manifest.get("resolution") != resolution or manifest.get("split") != split:
+        raise ValueError(f"JXL dataset manifest resolution/split mismatch: {manifest_path}")
+    shard_records = manifest["shards"][:shard_limit]
+    dataset = ImageNetJXLByteDataset(data_root, resolution, shard_records)
+    if len(dataset) == 0:
+        raise ValueError(f"JXL dataset has no images: {manifest_path}")
+    return dataset, dataset.labels
+
+
+def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = None,
+                  require_labels: bool = False) -> tuple:
+    def load_split(split: str, limit=None) -> tuple:
         shards = sorted(data_root.glob(f"imagenet{resolution}_{split}_*.npy"))
+        if not shards and (data_root / f"imagenet{resolution}_{split}_manifest.json").is_file():
+            return load_imagenet_jxl(data_root, resolution, split, limit)
         assert shards, f"no imagenet{resolution}_{split}_*.npy shards under {data_root} -- run " \
             f"image_lagcodec/scripts/imagenet/download_imagenet{resolution}.py --split {split} --out_dir {data_root}"
-        parts = [np.load(s, mmap_mode="r") for s in shards[:limit]]
-        return np.concatenate(parts, axis=0).reshape(-1, resolution, resolution, 3)
+        shards = shards[:limit]
+        label_paths = [data_root / "labels" / s.name for s in shards]
+        missing = [str(p) for p in label_paths if not p.is_file()]
+        if require_labels and missing:
+            raise FileNotFoundError(
+                f"class_conditional=True but ImageNet label shards are missing (e.g. {missing[0]}). "
+                f"Re-run download_imagenet{resolution}.py to create aligned labels/ shards.")
+        image_parts = [np.load(s, mmap_mode="r") for s in shards]
+        images = np.concatenate(image_parts, axis=0).reshape(-1, resolution, resolution, 3)
+        if not missing:
+            labels = np.concatenate([np.load(p, mmap_mode="r") for p in label_paths]).astype(np.int32)
+        elif require_labels:
+            raise AssertionError("unreachable: missing class labels")
+        else:
+            labels = np.zeros(len(images), dtype=np.int32)
+        if len(labels) != len(images):
+            raise ValueError(f"{split} image/label count mismatch: {len(images)} images, {len(labels)} labels")
+        return images, labels
 
-    train = load_split("train", train_shards)
-    val = load_split("validation")
-    return (train, np.zeros(len(train), dtype=np.int32)), (val, np.zeros(len(val), dtype=np.int32))
+    train, train_labels = load_split("train", train_shards)
+    val, val_labels = load_split("validation")
+    return (train, train_labels), (val, val_labels)
 
 
-def load_imagenet64(data_root: Path, resolution: int = 64) -> tuple:
-    return load_imagenet(data_root, resolution)
+def load_imagenet64(data_root: Path, resolution: int = 64, require_labels: bool = False) -> tuple:
+    return load_imagenet(data_root, resolution, require_labels=require_labels)
 
 
-def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards: int = None, cfg=None) -> tuple:
+def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards: int = None,
+                 cfg=None, require_labels: bool = False) -> tuple:
     # train_shards: only load the first N imagenet train shards (off-training scripts need a few images, not 15GB)
     if name == "folder":
+        if require_labels:
+            raise ValueError("class_conditional training is not supported for dataset='folder' without class labels")
         assert cfg is not None, "dataset='folder' needs the Config (modality/seq_len/...)"
         return load_folder(data_root, cfg)
     if name == "cifar":
         res = 32
+    elif name == "imagenet256_jxl":
+        res = 256
     else:
         assert name.startswith("imagenet"), f"unknown dataset {name!r}"
         res = int(name[len("imagenet"):])
     assert img_size is None or img_size == res, f"dataset {name} is {res}px but img_size={img_size}"
-    return load_cifar10(data_root) if name == "cifar" else load_imagenet(data_root, res, train_shards)
+    if name == "cifar":
+        return load_cifar10(data_root)
+    if name == "imagenet256_jxl":
+        train = load_imagenet_jxl(data_root, res, "train", train_shards)
+        val = load_imagenet_jxl(data_root, res, "validation")
+        return train, val
+    return load_imagenet(data_root, res, train_shards, require_labels=require_labels)
 
 
 def dataset_from_config(cv: dict, repo_root: Path, train_shards: int = 1) -> tuple:
@@ -1197,7 +1352,8 @@ def resolve_label_fn(spec, modality: str):
 
 class BatchIterator:
     def __init__(self, images: np.ndarray, labels: np.ndarray, batch_size: int, n_devices: int,
-                 shuffle: bool, seed: int, cfg: Config, fsdp: bool = False):
+                 shuffle: bool, seed: int, cfg: Config, fsdp: bool = False,
+                 data_parallel: bool = False):
         self.images, self.labels = images, labels
         self.batch_size, self.n_devices = batch_size, n_devices
         self.shuffle = shuffle
@@ -1210,13 +1366,15 @@ class BatchIterator:
         self.pos = 0  # batches already yielded this epoch -- resume continues here, no reshuffle
         self.pc, self.pi = jax.process_count(), jax.process_index()
         self.fsdp = fsdp
+        self.data_parallel = data_parallel
         self.total = batch_size * (1 if fsdp else n_devices)
         self.cfg = cfg
         self.pixel_order = pixel_order_for(cfg)
         self.n_positions = n_positions_of(cfg)
 
     def __len__(self):
-        return len(self.images) // (self.total * (1 if self.fsdp else self.pc))
+        process_multiplier = self.pc if self.data_parallel or not self.fsdp else 1
+        return len(self.images) // (self.total * process_multiplier)
 
     def __iter__(self):
         n = len(self.images)
@@ -1224,18 +1382,22 @@ class BatchIterator:
             self.epoch_seed = int(self.epoch_rng.integers(0, 2 ** 31 - 1))
             self.pos = 0
         idx = np.random.default_rng(self.epoch_seed).permutation(n) if self.shuffle else np.arange(n)
-        g = self.total * (1 if self.fsdp else self.pc)
+        process_multiplier = self.pc if self.data_parallel or not self.fsdp else 1
+        g = self.total * process_multiplier
         starts = list(range(0, n - g + 1, g))
         for bi in range(self.pos, len(starts)):
             start = starts[bi]
-            # The model-shard mesh needs the same replicated batch on every process.
-            process_offset = 0 if self.fsdp else self.pi * self.total
+            # Pure FSDP repeats the same batch on every process; hybrid FSDP/DP takes
+            # a distinct process slice while retaining a local FSDP replica group.
+            process_offset = self.pi * self.total if self.data_parallel or not self.fsdp else 0
             sel = idx[start + process_offset:start + process_offset + self.total]
             img = self.images[sel]
+            labels = self.labels[sel].astype(np.int32)
             positions = images_to_positions(img, self.cfg, self.pixel_order)
             self.pos = bi + 1
-            yield positions.reshape(1 if self.fsdp else self.n_devices, self.batch_size,
-                                    self.n_positions, self.cfg.byte_group)
+            yield (positions.reshape(1 if self.fsdp else self.n_devices, self.batch_size,
+                                    self.n_positions, self.cfg.byte_group),
+                   labels.reshape(1 if self.fsdp else self.n_devices, self.batch_size))
         self.epoch_seed = None
         self.pos = 0
 
@@ -2620,7 +2782,7 @@ def codelm_bos_substitute(codelm: CodeLM, x: jnp.ndarray, rate_id: int, rng, gro
 
 def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cfg: "Config",
                            rate_id: int, rng, group_size: int,
-                           context_source: str = None) -> jnp.ndarray:
+                           context_source: str = None, prefix: jnp.ndarray = None) -> jnp.ndarray:
     # Single source of truth for how a PardecLM gets its CONTEXT. `context_source` defaults to the
     # configured upsampler source; downsampler callsites explicitly pass "codelm". `raw` is the
     # pre-embedding representation of
@@ -2630,29 +2792,8 @@ def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cf
     # "own_embed"/"shared_embed" modes can bypass CodeLM's own embedding table entirely too.
     source = cfg.context_source if context_source is None else context_source
     if source in ("codelm", "codelm_upper"):  # which CodeLM is the caller's choice
-        x = code_embed_proj(raw, codelm.own_input_embed, codelm.own_input_proj)
-        # NOT bos-substituted (removed 2026-10-03): every caller of pardec_context_hidden
-        # (encode_pardec_downsampler[_generate], decode_logits_and_target_multipass,
-        # _decode_generate_pardec_call) always has real content available at position 0 -- none of
-        # them is the true "zero real content" unconditional case (that's _encoder_free_run's own,
-        # fully independent use_bos path). With codelm_bos_prob=1.0, substituting here permanently
-        # discarded real position-0 signal on every encode/decode-context call, train and eval alike
-        # -- root cause of total top-level codebook collapse (confirmed: cifar_overfit_3_1layer vs
-        # _nobos, identical except use_codelm_bos; bos run: 1 unique code across 8 train samples,
-        # gen_byte_acc=0.005 (chance); nobos run: gen_byte_acc=0.88, 7/8 train samples mse=0.00).
-        h = x
-        def _enc_stack(h):
-            for blk in codelm.blocks:
-                h = run_block(blk, h, codelm.remat and not codelm.remat_level)
-            return h
-        if rng is None and splash_shard_map_enabled() and jax.process_count() > 1:
-            # Validation runs with globally sharded FSDP arrays. SplashAttention's Pallas
-            # kernel cannot be auto-partitioned in the multihost training mesh; use its
-            # per-position cache path there. Single-host validation keeps the original parallel
-            # Splash path, avoiding a slow token-by-token encoder pass.
-            return _encoder_hidden_cached(codelm, raw)
-        h = jax.checkpoint(_enc_stack)(h) if codelm.remat_level else _enc_stack(h)
-        return codelm.ln_f(h)
+        h = codelm_hidden_from_raw(codelm, raw, prefix)
+        return h if prefix is None else h[:, prefix.shape[1]:]
         # "own_embed"/"shared_embed": plain per-position embedding, NO self-attention/contextualization
     # at all -- CodeLM's own block stack is skipped entirely (codelm_bos is therefore also moot here,
     # it only ever modulated CodeLM's own forward pass).
@@ -2689,7 +2830,7 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
                                flat_bytes: jnp.ndarray, cfg: "Config", pixel_order, label_fn,
                                K: int, rate_id: int = 0, rng=None, downsampler_ncodes: int = 1,
                                encode_temperature: float = 1.0, codelm_rate_id: int = None,
-                               pss_passes: int = 1) -> dict:
+                               pss_passes: int = 1, class_prefix: jnp.ndarray = None) -> dict:
     # CodeLM forward (same as CodeLM.encode()'s first half), then the SHARED downsampler PardecLM
     # teacher-forced against label_fn's real downsampled-image target (context_group_size=K,
     # output_group_size=1 -- one code per K-block, genuinely autoregressive over context).
@@ -2712,7 +2853,8 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
     # only upsampler context.
     codelm_rate_id = rate_id if codelm_rate_id is None else codelm_rate_id
     h = pardec_context_hidden(codelm, downsampler, raw, cfg, codelm_rate_id, rng,
-                              group_size=K * downsampler_ncodes, context_source="codelm")
+                              group_size=K * downsampler_ncodes, context_source="codelm",
+                              prefix=class_prefix)
     M, L, D = h.shape
     n_blocks = L // K
     # context_group_size=K*downsampler_ncodes, output_group_size=downsampler_ncodes, rate_id=this
@@ -2783,11 +2925,25 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
                 entropy_loss=entropy_loss, logits=logits)
 
 
-def codelm_ntp_loss(codelm: CodeLM, raw: jnp.ndarray, target: jnp.ndarray, cfg: "Config") -> tuple:
+def codelm_ntp_loss(codelm: CodeLM, raw: jnp.ndarray, target: jnp.ndarray, cfg: "Config",
+                    prefix: jnp.ndarray = None) -> tuple:
     # next-token loss/acc of `codelm` over its own input sequence (codelm_upper: the CodeLM one level up
     # over the top code -- the decoderless level's only objective)
-    h = pardec_context_hidden(codelm, None, raw, cfg, 0, None, group_size=1)
+    h = codelm_hidden_from_raw(codelm, raw, prefix)
     shift = 1 + codelm.attn_lookahead
+    if prefix is not None:
+        if codelm.attn_lookahead != 0:
+            raise ValueError("prefixed CodeLM NTP requires attn_lookahead=0")
+        n = target.shape[1]
+        p = prefix.shape[1]
+        # Prefix positions are context only. The last prefix state predicts target position 0;
+        # subsequent token states predict the following target. The target tensor is never fed at
+        # its own position when producing its logits, so this alignment has no target leakage.
+        h = h[:, p - 1:p + n - 1, :]
+        logits = codelm_ntp_logits_tf(codelm, h, target)
+        logp = jax.nn.log_softmax(logits, axis=-1)
+        loss = -jnp.mean(jnp.take_along_axis(logp, target[..., None], axis=-1))
+        return loss, jnp.mean(jnp.argmax(logits, axis=-1) == target)
     if h.shape[1] <= shift:
         return jnp.array(0.0, dtype=h.dtype), jnp.array(0.0, dtype=h.dtype)
     tgt = target[:, shift:]
@@ -3121,10 +3277,14 @@ def _sample_tokens(logits: jnp.ndarray, rng, greedy: bool, temperature, top_k: i
     return safe_argmax(lg + jax.random.gumbel(rng, lg.shape))
 
 
-def _encoder_hidden_cached(codelm: CodeLM, tokens: jnp.ndarray) -> jnp.ndarray:
+def _encoder_hidden_cached(codelm: CodeLM, tokens: jnp.ndarray, prefix: jnp.ndarray = None) -> jnp.ndarray:
     """Compute causal CodeLM states via incremental attention/recurrent caches, without Splash."""
     B, total_len, _ = tokens.shape
     x = code_embed_proj(tokens, codelm.own_input_embed, codelm.own_input_proj)
+    prefix_len = 0 if prefix is None else prefix.shape[1]
+    if prefix is not None:
+        x = jnp.concatenate((prefix.astype(x.dtype), x), axis=1)
+        total_len += prefix_len
     caches0 = [block_cache_init(blk, B, total_len) for blk in codelm.blocks]
 
     def step(caches, x_and_pos):
@@ -3142,7 +3302,8 @@ def _encoder_hidden_cached(codelm: CodeLM, tokens: jnp.ndarray) -> jnp.ndarray:
 
 
 def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, temperature, greedy: bool,
-                      top_k: int, use_bos: bool = False, rate_id: int = 0) -> jnp.ndarray:
+                      top_k: int, use_bos: bool = False, rate_id: int = 0,
+                      prefix: jnp.ndarray = None) -> jnp.ndarray:
     # tokens (B,total_len,C) holds the prompt in [:P] (P may be traced); the rest is overwritten.
     # Real incremental KV cache (was: full-buffer recompute every step, O(T^2)) -- same blk.step
     # pattern as pardec_generate. Prefill scans the WHOLE fixed-length buffer once (positions >= P
@@ -3151,8 +3312,13 @@ def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, tempe
     # any later (strictly causal) position ever attends to it -- Block.step/Attention.step write
     # via jax.lax.dynamic_update_slice at the given pos, so a repeat call at the same pos correctly
     # replaces the placeholder rather than appending.
-    B, total_len, C = tokens.shape
+    B, token_len, C = tokens.shape
+    total_len = token_len
     x = code_embed_proj(tokens, codelm.own_input_embed, codelm.own_input_proj)
+    prefix_len = 0 if prefix is None else prefix.shape[1]
+    if prefix is not None:
+        x = jnp.concatenate((prefix.astype(x.dtype), x), axis=1)
+        total_len += prefix_len
     if use_bos:
         # position 0's discrete `tokens[:,0]` value is meaningless once its embedding is replaced --
         # only the embedding matters for this level's own free-run (P=1, everything after is genuinely
@@ -3160,7 +3326,8 @@ def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, tempe
         # real prompt). Downstream re-encoding of the returned tokens is the caller's concern.
         x = x.at[:, 0, :].set(codelm.bos_embed[rate_id])
     # recurrent blocks can't overwrite a placeholder: their prefill only consumes the prompt (pos < P)
-    prompt_valid = jnp.broadcast_to((jnp.arange(total_len) < P)[None], (B, total_len))
+    prompt_len = prefix_len + P
+    prompt_valid = jnp.broadcast_to((jnp.arange(total_len) < prompt_len)[None], (B, total_len))
 
     def self_step(x_new, caches, pos, prefill=False):
         new_caches = []
@@ -3180,33 +3347,41 @@ def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, tempe
 
     positions = jnp.arange(total_len)
     caches, h_all = jax.lax.scan(prefill_step, caches0, (jnp.swapaxes(x, 0, 1), positions))
-    h_prev0 = jax.lax.dynamic_index_in_dim(h_all, P - 1, axis=0, keepdims=False)
+    h_prev0 = jax.lax.dynamic_index_in_dim(h_all, prompt_len - 1, axis=0, keepdims=False)
 
     def body(t, carry):
         tokens, caches, h_prev = carry
         tok = codelm_sample_next(codelm, h_prev, jax.random.fold_in(rng, t), greedy, temperature, top_k)
         tokens = tokens.at[:, t].set(tok.astype(tokens.dtype))
         x_new = code_embed_proj(tok, codelm.own_input_embed, codelm.own_input_proj)
-        h_new, caches = self_step(x_new, caches, t)
+        h_new, caches = self_step(x_new, caches, prefix_len + t)
         return tokens, caches, h_new
 
-    tokens, _, _ = jax.lax.fori_loop(P, total_len, body, (tokens, caches, h_prev0))
+    tokens, _, _ = jax.lax.fori_loop(P, token_len, body, (tokens, caches, h_prev0))
     return tokens
 
 
 _encoder_free_run_jit = eqx.filter_jit(_encoder_free_run)
 
 
-def _encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1) -> jnp.ndarray:
+def _encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1,
+                           prefix: jnp.ndarray = None) -> jnp.ndarray:
     """Teacher-force CodeLM over its own tokens using incremental block caches.
 
     Stepping position by position avoids the full-sequence TPU SplashAttention call, which cannot
     be auto-partitioned by JAX on a multi-host FSDP mesh. K is accepted to parallel the free-run
     API; NTP generation itself is position-based.
     """
+    if tokens.shape[1] == 0:
+        return tokens
+    prefix_len = 0 if prefix is None else prefix.shape[1]
+    h_all = _encoder_hidden_cached(codelm, tokens, prefix)
+    if prefix is not None:
+        logits = codelm_ntp_logits_tf(codelm, h_all[:, prefix_len - 1:prefix_len + tokens.shape[1] - 1], tokens)
+        predicted = jnp.argmax(logits, axis=-1).astype(tokens.dtype)
+        return predicted
     if tokens.shape[1] <= 1:
         return tokens
-    h_all = _encoder_hidden_cached(codelm, tokens)
     logits = codelm_ntp_logits_tf(codelm, h_all[:, :-1], tokens[:, 1:])
     predicted = jnp.argmax(logits, axis=-1).astype(tokens.dtype)
     return tokens.at[:, 1:].set(predicted)
@@ -3215,15 +3390,17 @@ def _encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1) -> j
 _encoder_teacher_force_jit = eqx.filter_jit(_encoder_teacher_force)
 
 
-def encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1) -> jnp.ndarray:
-    """Return the sequence with position 0 retained and all later tokens NTP-predicted."""
+def encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1,
+                          prefix: jnp.ndarray = None) -> jnp.ndarray:
+    """Return NTP predictions; with a prefix, every position including zero is predicted."""
     assert codelm.attn_lookahead == 0, \
         f"encoder teacher-forcing needs attn_lookahead=0 (got {codelm.attn_lookahead})"
-    return _encoder_teacher_force_jit(codelm, tokens, K)
+    return _encoder_teacher_force_jit(codelm, tokens, K, prefix)
 
 
 def encoder_free_run(codelm: CodeLM, prompt_tokens: jnp.ndarray, total_len: int, K: int, rng, greedy: bool = False,
-                     temperature: float = 1.0, top_k: int = 0, use_bos: bool = False, rate_id: int = 0) -> jnp.ndarray:
+                     temperature: float = 1.0, top_k: int = 0, use_bos: bool = False, rate_id: int = 0,
+                     prefix: jnp.ndarray = None) -> jnp.ndarray:
     """Free-run the SHARED CodeLM as a language model over its own input tokens (its NTP head), at
     whichever level's granularity K (a runtime grouping argument, not baked into any weight):
     keep the prompt tokens, then sample the rest. greedy=True is argmax; otherwise temperature/top_k
@@ -3235,10 +3412,12 @@ def encoder_free_run(codelm: CodeLM, prompt_tokens: jnp.ndarray, total_len: int,
     assert not use_bos or codelm.use_codelm_bos, \
         "use_bos=True needs cfg.use_codelm_bos=True (bos_embed was never trained)"
     B, P, C = prompt_tokens.shape
-    assert 1 <= P <= total_len, f"prompt length {P} must be in [1, {total_len}]"
+    assert (0 if prefix is not None else 1) <= P <= total_len, \
+        f"prompt length {P} must be in [{0 if prefix is not None else 1}, {total_len}]"
     tokens = jnp.zeros((B, total_len, C), prompt_tokens.dtype).at[:, :P].set(prompt_tokens)
     return _encoder_free_run_jit(codelm, tokens, jnp.asarray(P, jnp.int32), K, rng,
-                                 jnp.asarray(temperature, jnp.float32), greedy, top_k, use_bos, rate_id)
+                                 jnp.asarray(temperature, jnp.float32), greedy, top_k, use_bos, rate_id,
+                                 prefix)
 
 
 def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.ndarray, total_positions: int,
@@ -3318,6 +3497,7 @@ class LagCodecModel(eqx.Module):
     # Shared mode stores one CodeLM/Downsampler; unshared mode stores one per level.
     codelms: tuple
     downsamplers: tuple
+    class_bos_embeds: tuple  # per CodeLM: (class_num_classes + null_class, D_enc)
     cfg: Config = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config):
@@ -3330,6 +3510,8 @@ class LagCodecModel(eqx.Module):
             # index singleton_uniform_fields already enforces uniformity against); share=False:
             # level_idx==j, this instance's own dedicated level.
             codelms.append(CodeLM(jax.random.fold_in(key, 10 + j), cfg, level_idx=level_idx))
+            if cfg.simple_ntp:
+                continue
             D_enc = cfg.codelm_d_model[level_idx]
             pq_dim, code_vocab, pq_chunks = cfg.pq_dim[level_idx], cfg.code_vocab[level_idx], cfg.pq_chunks[level_idx]
             scheme, use_xsa, use_qknorm = cfg.init_scheme, cfg.use_xsa, cfg.use_qknorm
@@ -3358,12 +3540,25 @@ class LagCodecModel(eqx.Module):
             codelms.append(CodeLM(jax.random.fold_in(key, 1000), cfg, level_idx=n - 1))
         self.codelms = tuple(codelms)
         self.downsamplers = tuple(downsamplers)
+        if cfg.class_conditional:
+            self.class_bos_embeds = tuple(
+                init_matrix(jax.random.fold_in(key, 2000 + i),
+                            (cfg.class_num_classes + 1, codelm.own_input_proj.shape[-1]), cfg.init_scheme)
+                for i, codelm in enumerate(codelms))
+        else:
+            self.class_bos_embeds = ()
 
     def codelm_for(self, level_idx: int) -> CodeLM:
         return self.codelms[0] if self.cfg.share_across_levels else self.codelms[level_idx]
 
     def downsampler_for(self, level_idx: int) -> "PardecLM":
         return self.downsamplers[0] if self.cfg.share_across_levels else self.downsamplers[level_idx]
+
+    def class_bos_for(self, level_idx: int) -> jnp.ndarray:
+        if not self.cfg.class_conditional:
+            raise ValueError("class BOS requested while class_conditional=False")
+        model_idx = 0 if self.cfg.share_across_levels else level_idx
+        return self.class_bos_embeds[model_idx]
 
     def bos_rate_id(self, level_idx: int) -> int:
         # Downsampler's own BOS identifies its contraction rate.
@@ -3384,6 +3579,58 @@ class LagCodecModel(eqx.Module):
 
     def K(self, level: int) -> int:
         return self.cfg.strides[level] if self.cfg.strides[level] != -1 else 1
+
+
+def class_condition_prefix(model: LagCodecModel, level_idx: int, class_labels, batch_size: int,
+                           rng=None) -> jnp.ndarray | None:
+    """Return virtual BOS embeddings in the exact order used by train/eval/generation.
+
+    A missing label selects the learned null-class row. During training, one class-dropout draw
+    per example replaces the real class with that same null row. If both BOS types are active,
+    class_bos_order controls which one is last and therefore predicts token zero.
+    """
+    cfg = model.cfg
+    codelm = model.codelm_for(level_idx)
+    if not cfg.class_conditional:
+        if cfg.simple_ntp and cfg.use_codelm_bos:
+            level_token = jnp.broadcast_to(codelm.bos_embed[model.codelm_bos_rate_id(level_idx)],
+                                           (batch_size, codelm.bos_embed.shape[-1]))
+            return level_token[:, None, :]
+        return None
+    class_table = model.class_bos_for(level_idx)
+    null_id = cfg.class_num_classes
+    if class_labels is None:
+        ids = jnp.full((batch_size,), null_id, dtype=jnp.int32)
+    else:
+        ids = jnp.asarray(class_labels, dtype=jnp.int32).reshape((batch_size,))
+        if rng is not None and cfg.class_drop_prob > 0.0:
+            if cfg.class_drop_prob >= 1.0:
+                ids = jnp.full_like(ids, null_id)
+            else:
+                drop = jax.random.bernoulli(jax.random.fold_in(rng, 701),
+                                            p=cfg.class_drop_prob, shape=(batch_size,))
+                ids = jnp.where(drop, null_id, ids)
+    class_token = class_table[ids]
+    if cfg.use_codelm_bos:
+        level_token = jnp.broadcast_to(codelm.bos_embed[model.codelm_bos_rate_id(level_idx)],
+                                       class_token.shape)
+        ordered = (level_token, class_token) if cfg.class_bos_order == "level_then_class" \
+            else (class_token, level_token)
+        return jnp.stack(ordered, axis=1)
+    return class_token[:, None, :]
+
+
+def codelm_hidden_from_raw(codelm: CodeLM, raw: jnp.ndarray, prefix: jnp.ndarray = None) -> jnp.ndarray:
+    x = code_embed_proj(raw, codelm.own_input_embed, codelm.own_input_proj)
+    if prefix is not None:
+        x = jnp.concatenate((prefix.astype(x.dtype), x), axis=1)
+    h = x
+    def _enc_stack(h):
+        for blk in codelm.blocks:
+            h = run_block(blk, h, codelm.remat and not codelm.remat_level)
+        return h
+    h = jax.checkpoint(_enc_stack)(h) if codelm.remat_level else _enc_stack(h)
+    return codelm.ln_f(h)
 
 
 def dec_loss_acc(logits: jnp.ndarray, target: jnp.ndarray, mask: jnp.ndarray = None) -> tuple:
@@ -3427,7 +3674,7 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
                    layer_drop_prob=None, label_reg_weight: float = 0.0, label_fn=None,
                    pixel_order=None, byte_pq_fn=None, digit_teacher_force: bool = False,
                    return_recon: bool = False, return_levelwise: bool = False,
-                   ctx_ablation: str = None) -> tuple:
+                   ctx_ablation: str = None, class_labels=None) -> tuple:
     if not model.cfg.encoder_only_pretrain:
         raise ValueError("the pretrain runner supports encoder-only training")
     if return_recon or ctx_ablation is not None:
@@ -3440,18 +3687,34 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     # input/NTP-target and levels>0's own input/NTP-target now share this exact representation,
     # which is what lets a single shared CodeLM process every level.
     tok0 = byte_pq_fn(flat_bytes, codelm0.pq_chunks, codelm0.code_vocab)
+    if model.cfg.simple_ntp:
+        if class_labels is None and model.cfg.class_conditional:
+            raise ValueError("class_conditional simple NTP needs class_labels for each image")
+        prefix = class_condition_prefix(model, 0, class_labels, tok0.shape[0], rng)
+        ntp_loss, ntp_acc = codelm_ntp_loss(codelm0, tok0, tok0, model.cfg, prefix=prefix)
+        zero = jnp.array(0.0, dtype=ntp_loss.dtype)
+        util = codebook_utilization(tok0, codelm0.code_vocab)
+        loss = model.cfg.ntp_weight * ntp_loss
+        aux = (zero, zero, ntp_loss, ntp_acc, util, zero, ntp_loss, ntp_acc, zero)
+        if return_levelwise:
+            aux = aux + (jnp.asarray([ntp_loss]), jnp.asarray([ntp_acc]),
+                         jnp.asarray([zero]), jnp.asarray([zero]))
+        return loss, aux
     raw, target = tok0, tok0
     codes, codes_soft = [], []
     enc_losses, enc_accs, utils, entropy_losses, label_losses = [], [], [], [], []
+    class_ntp_losses, class_ntp_accs = [], []
     label_mses, label_mse_losses = [], []
     level_rngs = [None] * phase if rng is None else list(jax.random.split(rng, phase))
     for i in range(phase):
         codelm = model.codelm_for(i)
+        class_prefix = class_condition_prefix(model, i, class_labels, raw.shape[0], level_rngs[i])
         out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, model.cfg,
                                          pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                          codelm_rate_id=model.codelm_bos_rate_id(i),
                                          rng=level_rngs[i], downsampler_ncodes=model.cfg.downsampler_ncodes[i],
-                                        pss_passes=model.cfg.downsampler_pss_passes[i])
+                                        pss_passes=model.cfg.downsampler_pss_passes[i],
+                                        class_prefix=class_prefix)
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
         enc_losses.append(out["ntp_loss"])
@@ -3475,9 +3738,31 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
             label_values_i = jnp.arange(label_probs_i.shape[-1], dtype=label_probs_i.dtype)
             pred_label_soft = jnp.sum(label_probs_i * label_values_i, axis=-1)
             label_mse_losses.append(jnp.mean((pred_label_soft - label_tgt.astype(jnp.float32)) ** 2))
+        if model.cfg.class_conditional:
+            class_ntp_loss_i, class_ntp_acc_i = codelm_ntp_loss(codelm, raw, target, model.cfg,
+                                                                 prefix=class_prefix)
+            class_ntp_losses.append(class_ntp_loss_i)
+            class_ntp_accs.append(class_ntp_acc_i)
         if i < phase - 1:
-            raw = out["code_soft"]
-            target = out["code_idx"]
+            gt_prob = model.cfg.level_gt_input_prob[i + 1]
+            if rng is None or gt_prob == 0.0:
+                raw = out["code_soft"]
+                target = out["code_idx"]
+            elif gt_prob == 1.0:
+                n_gt_positions = n_blocks_for_level(model.cfg, i)
+                gt_codes = label_fn(flat_bytes, model.cfg, pixel_order, n_gt_positions,
+                                    model.cfg.pq_chunks[i], model.cfg.code_vocab[i])
+                raw = gt_codes
+                target = gt_codes
+            else:
+                n_gt_positions = n_blocks_for_level(model.cfg, i)
+                gt_codes = label_fn(flat_bytes, model.cfg, pixel_order, n_gt_positions,
+                                    model.cfg.pq_chunks[i], model.cfg.code_vocab[i])
+                choose_gt = jax.random.bernoulli(jax.random.fold_in(level_rngs[i], 733),
+                                                  p=gt_prob, shape=(raw.shape[0],))
+                gt_soft = jax.nn.one_hot(gt_codes, model.cfg.code_vocab[i], dtype=out["code_soft"].dtype)
+                raw = jnp.where(choose_gt[:, None, None, None], gt_soft, out["code_soft"])
+                target = jnp.where(choose_gt[:, None, None], gt_codes, out["code_idx"])
     if model.cfg.context_source == "codelm_upper":
         ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(phase), codes_soft[phase - 1], codes[phase - 1], model.cfg)
         enc_losses.append(ntp_up)
@@ -3488,15 +3773,19 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
         encoder_levels.append(phase)
     ntp_loss_total = weighted_level_mean(
         enc_losses, model.cfg.encoder_level_loss_weights, encoder_levels)
+    class_ntp_loss_total = jnp.mean(jnp.stack(class_ntp_losses)) if class_ntp_losses else 0.0
+    class_ntp_acc_total = jnp.mean(jnp.stack(class_ntp_accs)) if class_ntp_accs else jnp.array(0.0)
     entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
     label_loss_total = jnp.mean(jnp.stack(label_losses)) if label_losses else 0.0
     label_mse_total = jnp.mean(jnp.stack(label_mses)) if label_mses else jnp.array(0.0)
     label_mse_loss_total = jnp.mean(jnp.stack(label_mse_losses)) if label_mse_losses else 0.0
-    loss = model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
+    loss = model.cfg.ntp_weight * ntp_loss_total \
+        + (model.cfg.class_ntp_weight * class_ntp_loss_total if model.cfg.class_conditional else 0.0) \
+        + model.cfg.entropy_weight * entropy_loss_total \
         + label_reg_weight * label_loss_total + model.cfg.label_mse_weight * label_mse_loss_total
     zero = jnp.array(0.0, dtype=ntp_loss_total.dtype)
     aux = (zero, zero, ntp_loss_total, jnp.mean(jnp.stack(enc_accs)),
-           jnp.mean(jnp.stack(utils)), zero, zero, zero,
+           jnp.mean(jnp.stack(utils)), zero, class_ntp_loss_total, class_ntp_acc_total,
            label_mse_total)
     if return_levelwise:
         dec_zeros = jnp.zeros((phase,), dtype=ntp_loss_total.dtype)
@@ -3543,7 +3832,8 @@ def sample_level_range(py_rng, probs: tuple) -> tuple:
     return s, e - s + 1
 
 
-def _encode_chain_upto(model, flat_bytes, upto_level, cfg, label_fn, pixel_order, byte_pq_fn, rng):
+def _encode_chain_upto(model, flat_bytes, upto_level, cfg, label_fn, pixel_order, byte_pq_fn, rng,
+                       class_labels=None):
     # Runs the REAL encoder chain through levels 0..upto_level-1 (upto_level steps), returning the
     # resulting (code_idx, code_soft) -- level `upto_level`'s own real native input, as the shared
     # encoder actually produces it end-to-end, not label_fn's resize-based shortcut. Used only by
@@ -3556,11 +3846,13 @@ def _encode_chain_upto(model, flat_bytes, upto_level, cfg, label_fn, pixel_order
     code_idx = code_soft = None
     for i in range(upto_level):
         codelm = model.codelm_for(i)
+        class_prefix = class_condition_prefix(model, i, class_labels, raw.shape[0], level_rngs[i])
         out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, cfg,
                                          pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                          codelm_rate_id=model.codelm_bos_rate_id(i), rng=level_rngs[i],
                                          downsampler_ncodes=cfg.downsampler_ncodes[i],
-                                        pss_passes=cfg.downsampler_pss_passes[i])
+                                        pss_passes=cfg.downsampler_pss_passes[i],
+                                        class_prefix=class_prefix)
         code_idx, code_soft = out["code_idx"], out["code_soft"]
         raw, target = code_soft, code_idx
     return code_idx, code_soft
@@ -3568,7 +3860,8 @@ def _encode_chain_upto(model, flat_bytes, upto_level, cfg, label_fn, pixel_order
 
 def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_level: int, depth: int,
                             rng=None, encode_temperature: float = 1.0, label_reg_weight: float = 0.0,
-                            label_fn=None, pixel_order=None, byte_pq_fn=None, entry_gt_drop: float = None) -> tuple:
+                            label_fn=None, pixel_order=None, byte_pq_fn=None, entry_gt_drop: float = None,
+                            class_labels=None) -> tuple:
     # Same idea as level_forward, but the encode cascade starts at entry_level (not always 0) and
     # runs only `depth` further steps. entry_level=0 is equivalent to level_forward(..., phase=depth)
     # in spirit (though the aux tuple shape differs slightly, see below). entry_level>0's input is
@@ -3590,20 +3883,43 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
             n_blocks_entry = n_blocks_for_level(model.cfg, entry_level - 1)
             label_shortcut = label_fn(flat_bytes, model.cfg, pixel_order, n_blocks_entry,
                                        model.cfg.pq_chunks[entry_level - 1], model.cfg.code_vocab[entry_level - 1])
-            raw, target = label_shortcut, label_shortcut
+            # At a nonzero entry, choose between the true resized/label_fn input and the real
+            # lower-level model rollout. Endpoints are direct paths; only intermediate values draw
+            # a per-example mask. `multires_entry_gt_drop` retains its historical meaning as the
+            # probability of using the predicted rollout (hence p_gt = 1 - entry_gt_drop).
+            p_gt = model.cfg.level_gt_input_prob[entry_level] if entry_gt_drop is None \
+                else 1.0 - entry_gt_drop
+            if rng is None or p_gt >= 1.0:
+                raw, target = label_shortcut, label_shortcut
+            else:
+                pred_idx, pred_soft = _encode_chain_upto(
+                    model, flat_bytes, entry_level, model.cfg, label_fn, pixel_order, byte_pq_fn, rng,
+                    class_labels=class_labels)
+                if p_gt <= 0.0:
+                    raw, target = pred_soft, pred_idx
+                else:
+                    choose_gt = jax.random.bernoulli(jax.random.fold_in(rng, 1773),
+                                                      p=p_gt, shape=(flat_bytes.shape[0],))
+                    gt_soft = jax.nn.one_hot(label_shortcut, model.cfg.code_vocab[entry_level - 1],
+                                             dtype=pred_soft.dtype)
+                    raw = jnp.where(choose_gt[:, None, None, None], gt_soft, pred_soft)
+                    target = jnp.where(choose_gt[:, None, None], label_shortcut, pred_idx)
         entry_code = target
         codes, codes_soft = [], []
         enc_losses, enc_accs, utils, entropy_losses, label_losses, label_mses, label_mse_losses = \
             [], [], [], [], [], [], []
+        class_ntp_losses, class_ntp_accs = [], []
         level_rngs = [None] * depth if rng is None else list(jax.random.split(rng, depth))
         for d in range(depth):
             i = entry_level + d
             codelm = model.codelm_for(i)
+            class_prefix = class_condition_prefix(model, i, class_labels, raw.shape[0], level_rngs[d])
             out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, model.cfg,
                                              pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                              codelm_rate_id=model.codelm_bos_rate_id(i),
                                              rng=level_rngs[d], downsampler_ncodes=model.cfg.downsampler_ncodes[i],
-                                            pss_passes=model.cfg.downsampler_pss_passes[i])
+                                            pss_passes=model.cfg.downsampler_pss_passes[i],
+                                            class_prefix=class_prefix)
             codes.append(out["code_idx"])
             codes_soft.append(out["code_soft"])
             enc_losses.append(out["ntp_loss"])
@@ -3623,9 +3939,30 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
                 label_values_i = jnp.arange(label_probs_i.shape[-1], dtype=label_probs_i.dtype)
                 pred_label_soft = jnp.sum(label_probs_i * label_values_i, axis=-1)
                 label_mse_losses.append(jnp.mean((pred_label_soft - label_tgt.astype(jnp.float32)) ** 2))
+            if model.cfg.class_conditional:
+                ntp_i, acc_i = codelm_ntp_loss(codelm, raw, target, model.cfg, prefix=class_prefix)
+                class_ntp_losses.append(ntp_i)
+                class_ntp_accs.append(acc_i)
             if d < depth - 1:
-                raw = out["code_soft"]
-                target = out["code_idx"]
+                gt_prob = model.cfg.level_gt_input_prob[i + 1]
+                if rng is None or gt_prob == 0.0:
+                    raw = out["code_soft"]
+                    target = out["code_idx"]
+                elif gt_prob == 1.0:
+                    n_gt_positions = n_blocks_for_level(model.cfg, i)
+                    raw = label_fn(flat_bytes, model.cfg, pixel_order, n_gt_positions,
+                                   model.cfg.pq_chunks[i], model.cfg.code_vocab[i])
+                    target = raw
+                else:
+                    n_gt_positions = n_blocks_for_level(model.cfg, i)
+                    gt_codes = label_fn(flat_bytes, model.cfg, pixel_order, n_gt_positions,
+                                        model.cfg.pq_chunks[i], model.cfg.code_vocab[i])
+                    choose_gt = jax.random.bernoulli(jax.random.fold_in(level_rngs[d], 733),
+                                                      p=gt_prob, shape=(raw.shape[0],))
+                    gt_soft = jax.nn.one_hot(gt_codes, model.cfg.code_vocab[i],
+                                             dtype=out["code_soft"].dtype)
+                    raw = jnp.where(choose_gt[:, None, None, None], gt_soft, out["code_soft"])
+                    target = jnp.where(choose_gt[:, None, None], gt_codes, out["code_idx"])
         if model.cfg.context_source == "codelm_upper":
             ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(entry_level + depth), codes_soft[depth - 1],
                                              codes[depth - 1], model.cfg)
@@ -3636,17 +3973,21 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
             encoder_levels.append(entry_level + depth)
         ntp_loss_total = weighted_level_mean(
             enc_losses, model.cfg.encoder_level_loss_weights, encoder_levels)
+        class_ntp_loss_total = jnp.mean(jnp.stack(class_ntp_losses)) if class_ntp_losses else 0.0
+        class_ntp_acc_total = jnp.mean(jnp.stack(class_ntp_accs)) if class_ntp_accs else jnp.array(0.0)
         entropy_loss_total = jnp.mean(jnp.stack(entropy_losses))
         label_loss_total = jnp.mean(jnp.stack(label_losses)) if label_losses else 0.0
         label_mse_total = jnp.mean(jnp.stack(label_mses)) if label_mses else jnp.array(0.0)
         label_mse_loss_total = jnp.mean(jnp.stack(label_mse_losses)) if label_mse_losses else 0.0
-        loss = model.cfg.ntp_weight * ntp_loss_total + model.cfg.entropy_weight * entropy_loss_total \
+        loss = model.cfg.ntp_weight * ntp_loss_total \
+            + (model.cfg.class_ntp_weight * class_ntp_loss_total if model.cfg.class_conditional else 0.0) \
+            + model.cfg.entropy_weight * entropy_loss_total \
             + label_reg_weight * label_loss_total + model.cfg.label_mse_weight * label_mse_loss_total
         bpb = jnp.array(0.0, dtype=jnp.float32)
         byte_acc = jnp.array(0.0, dtype=jnp.float32)
         aux = (bpb, byte_acc, ntp_loss_total, jnp.mean(jnp.stack(enc_accs)),
                jnp.mean(jnp.stack(utils)), jnp.array(0.0, dtype=jnp.float32),
-               jnp.array(0.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32), label_mse_total)
+               class_ntp_loss_total, class_ntp_acc_total, label_mse_total)
         if model.cfg.log_levelwise_metrics:
             aux = aux + (jnp.stack(enc_losses), jnp.stack(enc_accs), jnp.stack([jnp.array(0.0, dtype=jnp.float32)] * len(enc_losses)),
                          jnp.stack([jnp.array(0.0, dtype=jnp.float32)] * len(enc_accs)))
@@ -3682,7 +4023,7 @@ def replicate(pytree, n_devices: int):
 
 def fsdp_sharding_for_array(x, mesh):
     spec = jax.sharding.PartitionSpec()
-    n_devices = mesh.devices.size
+    n_devices = mesh.shape["fsdp"] if "fsdp" in mesh.axis_names else mesh.devices.size
     candidates = [(size, axis) for axis, size in enumerate(x.shape)
                  if size >= n_devices and size % n_devices == 0]
     if candidates:
@@ -3698,7 +4039,7 @@ def fsdp_shardings(tree, mesh):
         lambda x: fsdp_sharding_for_array(x, mesh) if eqx.is_array(x) else None, tree)
 
 
-def fsdp_put_array(x, sharding):
+def fsdp_put_array(x, sharding, global_shape=None):
     if getattr(x, "is_fully_addressable", True):
         host_value = np.asarray(jax.device_get(x))
     elif x.sharding == sharding:
@@ -3709,7 +4050,7 @@ def fsdp_put_array(x, sharding):
     if jax.process_count() == 1:
         return jax.device_put(host_value, sharding)
     return jax.make_array_from_process_local_data(
-        sharding, host_value, global_shape=host_value.shape)
+        sharding, host_value, global_shape=host_value.shape if global_shape is None else global_shape)
 
 
 def fsdp_put_tree(tree, mesh):
@@ -3806,7 +4147,10 @@ def load_encoder_only_checkpoint(model, ckpt_path: Path):
         encoder_path = ckpt_path.with_name("encoder.eqx")
         model_path = ckpt_path
 
-    if encoder_path.is_file():
+    if encoder_path.is_file() and not (model.cfg.simple_ntp and model_path.is_file()):
+        if model.cfg.simple_ntp:
+            raise ValueError("simple NTP mode cannot load a standalone encoder.eqx tuple containing "
+                             "downsamplers; provide the full model.eqx checkpoint")
         loaded_encoder = eqx.tree_deserialise_leaves(
             encoder_path, (model.codelms, model.downsamplers))
         return eqx.tree_at(lambda m: (m.codelms, m.downsamplers), model,
@@ -3821,6 +4165,10 @@ def load_encoder_only_checkpoint(model, ckpt_path: Path):
         root_field = getattr(path[0], "name", None) if path else None
         if root_field in ("codelms", "downsamplers"):
             return eqx.default_deserialise_filter_spec
+        if root_field == "class_bos_embeds":
+            # This leaf is deliberately initialized fresh when starting from an older unconditional
+            # checkpoint; it did not exist in that checkpoint's serialized tree.
+            return lambda file, template: template
 
         def skip_leaf(file, template):
             np.load(file)
@@ -4044,6 +4392,12 @@ def _tuple_arg(s: str) -> tuple:
     return tuple(None if x.strip().lower() == "none" else int(x) for x in s.split(","))
 
 
+def _strides_arg(s: str):
+    if s.strip().lower() in ("none", "()", "[]", ""):
+        return None if s.strip().lower() == "none" else ()
+    return _tuple_arg(s)
+
+
 def _float_tuple_arg(s: str) -> tuple:
     return tuple(float(x) for x in s.split(","))
 
@@ -4104,6 +4458,8 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
                   "use_qknorm", "remat", "remat_level", "attn_window", "attn_lookahead",
                   "encoder_attn_window", "decoder_attn_window", "use_sink",
                   "use_codelm_bos", "codelm_bos_prob", "codelm_bos_rates",
+                  "class_conditional", "class_num_classes", "class_drop_prob", "class_bos_order",
+                  "class_ntp_weight", "level_gt_input_prob",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "entropy_weight", "mse_weight",
                   "mse_softmax_tau", "traversal", "label_reg_weight", "label_mse_weight",
@@ -4115,10 +4471,12 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=Path, required=True)
-    p.add_argument("--dataset", type=str, default="cifar", choices=["cifar", "imagenet64", "imagenet256", "folder"],
+    p.add_argument("--dataset", type=str, default="cifar", choices=["cifar", "imagenet64", "imagenet256",
+                                                                       "imagenet256_jxl", "folder"],
                     help="cifar (default): downloads/caches under --data_root. imagenetN: reads "
                          "pre-built shards from --data_root (scripts/imagenet/download_imagenetN.py; "
                          "does not download itself). Config.img_size must match (32 cifar, N imagenetN). "
+                         "imagenet256_jxl reads JPEG XL byte shards and decodes requested batches lazily. "
                          "TODO(modality-generalization): 'text'/'audio' choices + a modality: str "
                          "Config field bundling {load_fn, pixel_order_fn, label_fn/byte_pq_fn "
                          "defaults} -- see load_text/load_audio/bpe_label_fn/resample_label_fn stubs "
@@ -4130,12 +4488,16 @@ def main():
                          "tuple gives one value per phase (length must equal n_phases)")
     p.add_argument("--n_devices", type=int, default=None)
     p.add_argument("--fsdp", type=lambda x: x.lower() != "false", default=False,
-                   help="shard eligible parameter and optimizer-state arrays across all JAX devices "
-                        "with NamedSharding; batches are replicated across the shard mesh, so "
-                        "batch_size is the global batch")
+                   help="enable FSDP parameter and optimizer-state sharding")
+    p.add_argument("--fsdp_mode", choices=("pure", "intra_node_fsdp_inter_node_dp"), default="pure",
+                   help="FSDP topology: pure shards parameters across the whole mesh and replicates "
+                        "batches (batch_size is global); intra_node_fsdp_inter_node_dp shards "
+                        "parameters within each host and data-parallelizes across hosts "
+                        "(batch_size is per host). Requires --fsdp and --multihost")
     p.add_argument("--multihost", type=lambda x: x.lower() != "false", default=False,
-                    help="jax.distributed.initialize() for a multi-host TPU slice: run the same command on every host; "
-                         "batch_size stays per device, each host feeds its own slice of the global batch")
+                    help="initialize a multi-host TPU slice; run the same command on every host. "
+                         "For --fsdp_mode=intra_node_fsdp_inter_node_dp, batch_size is per host "
+                         "and hosts receive disjoint data batches")
     p.add_argument("--level_steps", type=_tuple_arg, default=None,
                     help="steps per phase -- a bare int applies uniformly to every phase; a "
                          "tuple gives one value per phase. At most one of --level_steps/"
@@ -4356,7 +4718,9 @@ def main():
                          "context_proj/bos_embed/target_embed/token_* AR head/output_head_linear "
                          "stay independent. Needs downsampler_d_model/n_layers/n_heads/n_kv_heads "
                          "== the matching upsampler_* values")
-    p.add_argument("--strides", type=_tuple_arg, default=Config.strides)
+    p.add_argument("--strides", type=_strides_arg, default=Config.strides,
+                   help="downsampling strides; pass 'none', an empty value, or configure None/() to "
+                        "select simple NTP mode with no downsampler")
     p.add_argument("--code_vocab", type=_tuple_arg, default=Config.code_vocab)
     p.add_argument("--pq_chunks", type=_tuple_arg, default=Config.pq_chunks)
     p.add_argument("--mlp_mult", type=_tuple_arg, default=Config.mlp_mult)
@@ -4510,6 +4874,21 @@ def main():
     p.add_argument("--codelm_bos_rates", type=_tuple_arg, default=Config.codelm_bos_rates,
                     help="per-level n_rates for the bos_embed table (1 default = single generic "
                          "anchor). No effect when --use_codelm_bos=False")
+    p.add_argument("--class_conditional", type=lambda x: x.lower() != "false",
+                   default=Config.class_conditional,
+                   help="enable trainable class BOS conditioning, null-class dropout, and class-conditional NTP")
+    p.add_argument("--class_num_classes", type=int, default=Config.class_num_classes,
+                   help="number of class IDs; an extra learned null-class BOS row is allocated")
+    p.add_argument("--class_drop_prob", type=float, default=Config.class_drop_prob,
+                   help="training probability of replacing the real class BOS with the learned null-class BOS")
+    p.add_argument("--class_bos_order", choices=("level_then_class", "class_then_level"),
+                   default=Config.class_bos_order,
+                   help="when both BOS types are enabled, which comes last and predicts byte/code position zero")
+    p.add_argument("--class_ntp_weight", type=float, default=Config.class_ntp_weight,
+                   help="weight of direct CodeLM next-token loss; active only with --class_conditional")
+    p.add_argument("--level_gt_input_prob", type=_tuple_arg, default=Config.level_gt_input_prob,
+                   help="per-level probability (0..1) to feed level>0 the image-derived label_fn codes "
+                        "instead of the previous level's predicted codes; scalar broadcasts to all levels")
     p.add_argument("--byte_group", type=int, default=Config.byte_group)
     p.add_argument("--token_head_type", type=str, default=Config.token_head_type)
     p.add_argument("--token_dim", type=_tuple_arg, default=Config.token_dim)
@@ -4577,28 +4956,50 @@ def main():
 
     if args.multihost:
         jax.distributed.initialize()
+    if args.fsdp_mode != "pure" and not args.fsdp:
+        raise ValueError("--fsdp_mode requires --fsdp")
+    hybrid_fsdp = args.fsdp and args.fsdp_mode == "intra_node_fsdp_inter_node_dp"
+    if hybrid_fsdp and not args.multihost:
+        raise ValueError("intra_node_fsdp_inter_node_dp requires --multihost")
+    if hybrid_fsdp and jax.process_count() < 2:
+        raise ValueError("intra_node_fsdp_inter_node_dp requires at least two hosts")
     n_devices = args.n_devices or jax.local_device_count()
     print(f"jax devices ({n_devices} used of {jax.local_device_count()} local): {jax.devices()}")
     fsdp_mesh = None
     fsdp_replicated = None
+    fsdp_batch_sharding = None
     fsdp_init_device = None
     if args.fsdp:
         if args.n_devices is not None and args.n_devices != jax.local_device_count():
             raise ValueError("--fsdp uses every JAX device; do not set --n_devices to a subset")
-        fsdp_mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("fsdp",))
-        # FSDP shards arrays across devices even on a single host. Splash's Mosaic
-        # custom call therefore needs shard_map for every FSDP mesh, not only
-        # multihost meshes.
-        set_splash_shard_map_mesh(fsdp_mesh)
+        if hybrid_fsdp:
+            per_host_devices = [jax.local_devices(process_index=i) for i in range(jax.process_count())]
+            local_counts = {len(d) for d in per_host_devices}
+            if len(local_counts) != 1:
+                raise ValueError("hybrid FSDP requires the same number of JAX devices on each host")
+            fsdp_devices = np.asarray(per_host_devices)
+            fsdp_mesh = jax.sharding.Mesh(fsdp_devices, ("dp", "fsdp"))
+            set_splash_shard_map_mesh(fsdp_mesh, axis_names={"fsdp"})
+            fsdp_batch_sharding = jax.sharding.NamedSharding(
+                fsdp_mesh, jax.sharding.PartitionSpec("dp"))
+        else:
+            fsdp_mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("fsdp",))
+            set_splash_shard_map_mesh(fsdp_mesh)
+            fsdp_batch_sharding = jax.sharding.NamedSharding(
+                fsdp_mesh, jax.sharding.PartitionSpec())
         fsdp_replicated = jax.sharding.NamedSharding(
             fsdp_mesh, jax.sharding.PartitionSpec())
         # Each host must initialize locally; a global CPU device may be owned only by process 0.
         fsdp_init_device = jax.local_devices()[0]
-        logger_device_count = fsdp_mesh.devices.size
+        logger_device_count = fsdp_mesh.shape["fsdp"]
     else:
         set_splash_shard_map_mesh(None)
         logger_device_count = n_devices
     cfg = Config(**{k: getattr(args, k) for k in CONFIG_FIELDS})
+    if cfg.simple_ntp:
+        print("SIMPLE NTP MODE: strides are empty; training CodeLM directly with no downsampler.")
+        if args.level_select_prob is not None:
+            raise ValueError("level_select_prob is unavailable in simple NTP mode")
     label_fn = resolve_label_fn(label_fn_raw, cfg.modality)
     n_levels = len(cfg.strides)
     top_level_trainable = cfg.strides[-1] != -1
@@ -4663,7 +5064,14 @@ def main():
                           f"decoders get predicted ctx from the new level and can't adapt to it")
 
     (train_np, train_labels), (val_np, val_labels) = load_dataset(
-        args.dataset, Path(args.data_root), cfg.img_size if cfg.modality == "image" else None, cfg=cfg)
+        args.dataset, Path(args.data_root), cfg.img_size if cfg.modality == "image" else None,
+        cfg=cfg, require_labels=cfg.class_conditional)
+    if cfg.class_conditional:
+        if (np.any(train_labels < 0) or np.any(train_labels >= cfg.class_num_classes)
+                or np.any(val_labels < 0) or np.any(val_labels >= cfg.class_num_classes)):
+            raise ValueError(f"class labels must be in [0,{cfg.class_num_classes}); got train range "
+                             f"[{train_labels.min()},{train_labels.max()}], val range "
+                             f"[{val_labels.min()},{val_labels.max()}]")
     if args.train_subset_n:
         train_np = train_np[:args.train_subset_n]
     if args.val_subset_n:
@@ -4681,6 +5089,8 @@ def main():
     (run_dir / f"config_{args.config.name}").write_text(args.config.read_text())
     logger(f"n_levels={n_levels} n_phases={n_phases} n_positions={n_positions} "
            f"params={n_params / 1e6:.2f}M")
+    if cfg.simple_ntp:
+        logger("SIMPLE NTP MODE: no downsampler is constructed or called; CodeLM trains directly on tokens.")
     resolved = {k: v for k, v in sorted(vars(args).items()) if k != "config"}
     logger(f"resolved_config:{_pretty_dict(_round_floats(resolved))}")
 
@@ -4703,13 +5113,15 @@ def main():
             if not ckpt_path.exists():
                 raise FileNotFoundError(f"encoder checkpoint not found: {ckpt_path}")
             model = load_encoder_only_checkpoint(model, ckpt_path)
-            logger(f"loaded CodeLM + Downsampler state from {ckpt_path}")
+            logger(f"loaded CodeLM + available Downsampler state from {ckpt_path}; "
+                   f"new class BOS embeddings remain freshly initialized")
 
     if args.fsdp:
         model = fsdp_put_tree(model, fsdp_mesh)
         total_params, sharded_params, params_per_device = fsdp_parameter_stats(
             model, logger_device_count)
-        logger(f"fsdp enabled: mesh_devices={logger_device_count} "
+        logger(f"fsdp enabled: mode={args.fsdp_mode} mesh_devices={fsdp_mesh.devices.size} "
+               f"dp_hosts={fsdp_mesh.shape.get('dp', 1)} fsdp_devices_per_host={logger_device_count} "
                f"sharded_params={sharded_params / 1e6:.2f}/{total_params / 1e6:.2f}M "
                f"estimated_params_per_device={params_per_device / 1e6:.2f}M")
         if logger_device_count == 1:
@@ -4733,20 +5145,21 @@ def main():
         raster[order] = rgb_seq
         return raster.reshape(1, side, side, 3)
 
-    def teacher_force_level(m, level: int, tokens: jnp.ndarray) -> jnp.ndarray:
-        return encoder_teacher_force(m.codelm_for(level), tokens, K=1)
+    def teacher_force_level(m, level: int, tokens: jnp.ndarray, prefix=None) -> jnp.ndarray:
+        return encoder_teacher_force(m.codelm_for(level), tokens, K=1, prefix=prefix)
 
     def run_qual_eval(eval_model, phase: int, tag: str) -> None:
         if cfg.modality != "image":
             logger(f"[{tag}] QUAL skipped: image token previews require modality='image'")
             return
         m = cast_pytree(eval_model, compute_dtype)
-        sources = [("train", train_np[:1]), ("val", val_np[:1])]
-        for source_name, images in sources:
+        sources = [("train", train_np[:1], train_labels[:1]), ("val", val_np[:1], val_labels[:1])]
+        for source_name, images, source_labels in sources:
             gt_image = images.astype(np.uint8)
             flat = jnp.asarray(images_to_positions(images, cfg, pixel_order))
             if args.fsdp:
                 flat = fsdp_put_array(flat, fsdp_replicated)
+            class_ids = jnp.asarray(source_labels, dtype=jnp.int32)
             # Match each CodeLM's native input distribution without invoking any downsampler:
             # level 0 sees original RGB bytes; level i>0 sees the image-derived code sequence
             # targeted by downsampler i-1 (the same label_fn representation used in training).
@@ -4760,6 +5173,9 @@ def main():
                     cfg.pq_chunks[prev], cfg.code_vocab[prev]))
 
             for level, tokens in enumerate(level_tokens):
+                cond_prefix = class_condition_prefix(m, level, class_ids, tokens.shape[0])
+                if args.fsdp and cond_prefix is not None:
+                    cond_prefix = fsdp_put_array(cond_prefix, fsdp_replicated)
                 host_tokens = fsdp_to_host(tokens) if args.fsdp else tokens
                 input_vocab = m.codelm_for(level).code_vocab
                 preview_gt = token_preview(np.asarray(host_tokens), level, input_vocab)
@@ -4784,14 +5200,15 @@ def main():
                         m.codelm_for(level), tokens[:, :prefix], tokens.shape[1], 1,
                         gen_key,
                         greedy=True, temperature=1.0, top_k=0,
-                        rate_id=m.codelm_bos_rate_id(level))
+                        rate_id=m.codelm_bos_rate_id(level), prefix=cond_prefix)
                     if args.fsdp:
                         generated = fsdp_to_host(generated)
                     preview_gen = token_preview(np.asarray(generated), level, input_vocab)
                     prompt_suffix = (f"prompt{prompt_label}" if prompt_label is not None and prefix == long_prefix
                                      else f"promptpos{prefix}")
+                    class_suffix = f"_class{int(source_labels[0])}" if cfg.class_conditional else ""
                     sample_path = run_dir / (
-                        f"samples_{tag}_{source_name}_level{level}_{prompt_suffix}.png")
+                        f"samples_{tag}_{source_name}_level{level}{class_suffix}_{prompt_suffix}.png")
                     if jax.process_index() == 0:
                         save_samples(preview_gen, preview_gt, sample_path, cfg)
                     logger(f"[{tag}] QUAL source={source_name} level={level} "
@@ -4801,17 +5218,39 @@ def main():
                            f"token_chunks={chunks_per_token} kv_cache=true downsampler=false "
                            f"saved={sample_path.name}")
 
-                tf_tokens = teacher_force_level(m, level, tokens)
+                if cfg.class_conditional:
+                    null_prefix = class_condition_prefix(m, level, None, tokens.shape[0])
+                    if args.fsdp and null_prefix is not None:
+                        null_prefix = fsdp_put_array(null_prefix, fsdp_replicated)
+                    uncond_key = jax.random.PRNGKey(args.seed + level * 1009 + 17)
+                    if args.fsdp:
+                        uncond_key = fsdp_put_array(uncond_key, fsdp_replicated)
+                    uncond_tokens = encoder_free_run(
+                        m.codelm_for(level), tokens[:, :0], tokens.shape[1], 1, uncond_key,
+                        greedy=True, temperature=1.0, top_k=0,
+                        rate_id=m.codelm_bos_rate_id(level), prefix=null_prefix)
+                    if args.fsdp:
+                        uncond_tokens = fsdp_to_host(uncond_tokens)
+                    uncond_image = token_preview(np.asarray(uncond_tokens), level, input_vocab)
+                    uncond_path = run_dir / (
+                        f"samples_{tag}_{source_name}_level{level}_uncond.png")
+                    if jax.process_index() == 0:
+                        save_samples(uncond_image, preview_gt, uncond_path, cfg)
+                    logger(f"[{tag}] QUAL source={source_name} level={level} class=unconditional "
+                           f"prompt_positions=0/{tokens.shape[1]} kv_cache=true saved={uncond_path.name}")
+
+                tf_tokens = teacher_force_level(m, level, tokens, prefix=cond_prefix)
                 if args.fsdp:
                     tf_tokens = fsdp_to_host(tf_tokens)
                 tf_image = token_preview(np.asarray(tf_tokens), level, input_vocab)
                 # Compare at this level's native spatial resolution/sequence length. preview_gt
                 # is the image-derived target sequence rendered on exactly the same grid.
                 mse = pixel_mse(tf_image, preview_gt)
+                tf_class_suffix = f"_class{int(source_labels[0])}" if cfg.class_conditional else ""
                 if jax.process_index() == 0:
                     save_samples(
                         tf_image, preview_gt,
-                        run_dir / f"samples_{tag}_{source_name}_level{level}_teacher_force.png", cfg)
+                        run_dir / f"samples_{tag}_{source_name}_level{level}{tf_class_suffix}_teacher_force.png", cfg)
                 logger(f"[{tag}] TF_SANITY source={source_name} level={level} "
                        f"mse={mse:.3f} grid={level_side}x{level_side} "
                        f"seq_len={tokens.shape[1]} downsampler=false",
@@ -4838,10 +5277,12 @@ def main():
             batch_imgs = val_np[start:start + bs]
             bn = len(batch_imgs)
             batch_flat = jnp.array(images_to_positions(batch_imgs, cfg, pixel_order))
+            batch_class_labels = jnp.asarray(val_labels[start:start + bn], dtype=jnp.int32)
             if args.fsdp:
                 batch_flat = fsdp_put_array(batch_flat, fsdp_replicated)
             batch_t0 = time.monotonic()
             loss_b, aux_b = val_eval_jit(m, batch_flat, phase, rng=None,
+                                          class_labels=batch_class_labels,
                                           encode_temperature=args.encode_temperature[phase - 1],
                                           label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
                                           pixel_order=pixel_order,
@@ -4917,6 +5358,8 @@ def main():
         return step_val if step_val is not None else round(epoch_val * steps_per_epoch)
 
     def _samples_per_global_step(batch_size):
+        if hybrid_fsdp:
+            return batch_size * jax.process_count()
         return batch_size if args.fsdp else batch_size * n_devices * jax.process_count()
 
     step = resume_meta["step"] if resume_meta else 0
@@ -4932,7 +5375,8 @@ def main():
         resume_phase = resume_meta["phase"]
         steps_per_epoch_resume = len(BatchIterator(
             train_np, train_labels[:len(train_np)], args.batch_size[resume_phase - 1],
-            1 if args.fsdp else n_devices, shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp))
+            1 if args.fsdp else n_devices, shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp,
+            data_parallel=hybrid_fsdp))
         phase_steps_resume = _phase_total_steps(resume_phase - 1, steps_per_epoch_resume)
         phase_complete = resume_meta["phase_step"] >= phase_steps_resume
         phase_iter = [p for p in phase_iter if p > resume_phase] if phase_complete \
@@ -4956,7 +5400,7 @@ def main():
             continue
         train_iter = BatchIterator(train_np, train_labels[:len(train_np)], args.batch_size[phase - 1],
                                     1 if args.fsdp else n_devices, shuffle=True, seed=args.seed,
-                                    cfg=cfg, fsdp=args.fsdp)
+                                    cfg=cfg, fsdp=args.fsdp, data_parallel=hybrid_fsdp)
 
         filter_spec = phase_trainable_filter(model, phase)
         diff_model, static_model = eqx.partition(model, filter_spec)
@@ -4964,7 +5408,7 @@ def main():
         encode_temperature_phase = args.encode_temperature[phase - 1]
         level_gt_drop_phase = args.level_gt_drop[phase - 1]
         layer_drop_prob_phase = args.layer_drop_prob[phase - 1]
-        def loss_fn(diff_model, static_model, flat_bytes, rng, cascade_rng, phase=phase):
+        def loss_fn(diff_model, static_model, flat_bytes, class_labels, rng, cascade_rng, phase=phase):
             m = eqx.combine(diff_model, static_model)
             m = cast_pytree(m, compute_dtype)
             return level_forward(m, flat_bytes, phase, rng=rng,
@@ -4973,6 +5417,7 @@ def main():
                                      layer_drop_prob=layer_drop_prob_phase,
                                      label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
                                      pixel_order=pixel_order,
+                                     class_labels=class_labels,
                                      return_levelwise=cfg.log_levelwise_metrics)
 
         steps_per_epoch_lr = len(train_iter)
@@ -5009,14 +5454,40 @@ def main():
             optimizer = optax.chain(optax.clip_by_global_norm(args.grad_clip), optimizer)
         opt_state = optimizer.init(diff_model)
 
-        def train_step(diff_model, opt_state, rng, flat_bytes, static_model=static_model):
+        def jit_fsdp_step(step_fn, diff_shardings, opt_shardings):
+            if hybrid_fsdp:
+                P = jax.sharding.PartitionSpec
+                step_fn = jax.shard_map(
+                    step_fn,
+                    mesh=fsdp_mesh,
+                    in_specs=(P(), P(), P(), P("dp"), P("dp")),
+                    out_specs=(P(), P(), P(), P(), P()),
+                    axis_names={"dp"},
+                    check_vma=False,
+                )
+            return jax.jit(
+                step_fn,
+                in_shardings=(diff_shardings, opt_shardings, fsdp_replicated,
+                              fsdp_batch_sharding, fsdp_batch_sharding),
+                out_shardings=(diff_shardings, opt_shardings, fsdp_replicated, None, None),
+                donate_argnums=(0, 1, 2))
+
+        def train_step(diff_model, opt_state, rng, flat_bytes, class_labels, static_model=static_model):
             rng, level_rng, cascade_rng = jax.random.split(rng, 3)
+            if hybrid_fsdp:
+                dp_index = jax.lax.axis_index("dp")
+                level_rng = jax.random.fold_in(level_rng, dp_index)
+                cascade_rng = jax.random.fold_in(cascade_rng, dp_index)
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-                diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+                diff_model, static_model, flat_bytes, class_labels, level_rng, cascade_rng)
             if not args.fsdp:
                 grads = jax.lax.pmean(grads, axis_name="d")
                 loss = jax.lax.pmean(loss, axis_name="d")
                 aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
+            elif hybrid_fsdp:
+                grads = jax.lax.pmean(grads, axis_name="dp")
+                loss = jax.lax.pmean(loss, axis_name="dp")
+                aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="dp"), aux)
             # no gradient tying needed: with cfg.share_across_levels=True (default), codelm_for/
             # downsampler_for resolve to the SAME singleton instance regardless of
             # level index -- level_forward calling it at several different level indices within this
@@ -5034,11 +5505,7 @@ def main():
         if args.fsdp:
             diff_shardings = fsdp_shardings(diff_model, fsdp_mesh)
             opt_shardings = fsdp_shardings(opt_state, fsdp_mesh)
-            train_step = jax.jit(
-                train_step,
-                in_shardings=(diff_shardings, opt_shardings, fsdp_replicated, fsdp_replicated),
-                out_shardings=(diff_shardings, opt_shardings, fsdp_replicated, None, None),
-                donate_argnums=(0, 1, 2))
+            train_step = jit_fsdp_step(train_step, diff_shardings, opt_shardings)
         else:
             train_step = jax.pmap(train_step, axis_name="d", donate_argnums=(0, 1, 2))
 
@@ -5053,22 +5520,31 @@ def main():
             entry_gt_drop_sd = (args.multires_entry_gt_drop[entry_level]
                                  if args.multires_entry_gt_drop is not None and entry_level > 0 else None)
 
-            def loss_fn_sd(diff_model, static_model, flat_bytes, rng, cascade_rng):
+            def loss_fn_sd(diff_model, static_model, flat_bytes, class_labels, rng, cascade_rng):
                 m = eqx.combine(diff_model, static_model)
                 m = cast_pytree(m, compute_dtype)
                 return level_forward_multires(m, flat_bytes, entry_level=entry_level, depth=depth, rng=rng,
                                                encode_temperature=encode_temperature_phase,
                                                label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
-                                               pixel_order=pixel_order, entry_gt_drop=entry_gt_drop_sd)
+                                               pixel_order=pixel_order, entry_gt_drop=entry_gt_drop_sd,
+                                               class_labels=class_labels)
 
-            def train_step_sd(diff_model, opt_state, rng, flat_bytes, static_model=static_model):
+            def train_step_sd(diff_model, opt_state, rng, flat_bytes, class_labels, static_model=static_model):
                 rng, level_rng, cascade_rng = jax.random.split(rng, 3)
+                if hybrid_fsdp:
+                    dp_index = jax.lax.axis_index("dp")
+                    level_rng = jax.random.fold_in(level_rng, dp_index)
+                    cascade_rng = jax.random.fold_in(cascade_rng, dp_index)
                 (loss, aux), grads = jax.value_and_grad(loss_fn_sd, has_aux=True)(
-                    diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+                    diff_model, static_model, flat_bytes, class_labels, level_rng, cascade_rng)
                 if not args.fsdp:
                     grads = jax.lax.pmean(grads, axis_name="d")
                     loss = jax.lax.pmean(loss, axis_name="d")
                     aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
+                elif hybrid_fsdp:
+                    grads = jax.lax.pmean(grads, axis_name="dp")
+                    loss = jax.lax.pmean(loss, axis_name="dp")
+                    aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="dp"), aux)
                 grad_norm = optax.global_norm(grads)
                 aux = aux + (grad_norm,)
                 updates, opt_state = optimizer.update(grads, opt_state, diff_model)
@@ -5076,11 +5552,7 @@ def main():
                 return diff_model, opt_state, rng, loss, aux
 
             if args.fsdp:
-                return jax.jit(
-                    train_step_sd,
-                    in_shardings=(diff_shardings, opt_shardings, fsdp_replicated, fsdp_replicated),
-                    out_shardings=(diff_shardings, opt_shardings, fsdp_replicated, None, None),
-                    donate_argnums=(0, 1, 2))
+                return jit_fsdp_step(train_step_sd, diff_shardings, opt_shardings)
             return jax.pmap(train_step_sd, axis_name="d", donate_argnums=(0, 1, 2))
 
         p_diff_model = diff_model if args.fsdp else replicate(diff_model, n_devices)
@@ -5137,11 +5609,25 @@ def main():
                 logger(f"{active_desc}: epoch {epoch_num} (step {step})")
             global_pbar.update(step - last_global_step)
             last_global_step = step
-            for flat in train_iter:
+            for flat, class_labels in train_iter:
                 if phase_step >= phase_total_steps:
                     break
-                flat = fsdp_put_array(jnp.asarray(flat[0]), fsdp_replicated) if args.fsdp \
-                    else jnp.array(flat)
+                if args.fsdp:
+                    local_flat = jnp.asarray(flat[0])
+                    local_class_labels = jnp.asarray(class_labels[0], dtype=jnp.int32)
+                    if hybrid_fsdp:
+                        batch_global_shape = (local_flat.shape[0] * jax.process_count(),) + local_flat.shape[1:]
+                        flat = fsdp_put_array(local_flat, fsdp_batch_sharding,
+                                              global_shape=batch_global_shape)
+                        label_global_shape = (local_class_labels.shape[0] * jax.process_count(),) + local_class_labels.shape[1:]
+                        class_labels = fsdp_put_array(local_class_labels, fsdp_batch_sharding,
+                                                      global_shape=label_global_shape)
+                    else:
+                        flat = fsdp_put_array(local_flat, fsdp_batch_sharding)
+                        class_labels = fsdp_put_array(local_class_labels, fsdp_batch_sharding)
+                else:
+                    flat = jnp.array(flat)
+                    class_labels = jnp.asarray(class_labels, dtype=jnp.int32)
                 if not jit_timed:
                     jit_t0 = time.monotonic()
                 if multires_active:
@@ -5151,10 +5637,10 @@ def main():
                         step_fn = _build_multires_step(s_lvl, d_lvl)
                         multires_step_cache[(s_lvl, d_lvl)] = step_fn
                     p_diff_model, p_opt_state, p_rng, loss, aux = step_fn(
-                        p_diff_model, p_opt_state, p_rng, flat)
+                        p_diff_model, p_opt_state, p_rng, flat, class_labels)
                 else:
                     p_diff_model, p_opt_state, p_rng, loss, aux = train_step(
-                        p_diff_model, p_opt_state, p_rng, flat)
+                        p_diff_model, p_opt_state, p_rng, flat, class_labels)
                 if args.fsdp:
                     loss, aux = fsdp_to_host((loss, aux))
                 step += 1

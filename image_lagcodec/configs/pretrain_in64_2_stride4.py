@@ -12,7 +12,7 @@ traversal = "zorder"
 eval_gen_train = True
 gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
-
+gen_eval_prompt = 2048
 # remat_level = True
 share_across_levels = False
 # share_downsampler_upsampler_lm = True
@@ -22,16 +22,10 @@ share_across_levels = False
 # codelm_d_model = 1024
 # codelm_n_layers = 16
 
-# codelm_d_model = (512,512,256,256,128)
-# codelm_n_layers = (16,16,8,8,4)
-# codelm_n_heads = (8,8,4,4,2)
-# codelm_n_kv_heads = (8,8,4,4,2)
-# mlp_mult = 8
-
-codelm_d_model = (2048,1024,512,256,128)
-codelm_n_layers = (32,16,8,4,2)
-codelm_n_heads = (16,8,4,2,1)
-codelm_n_kv_heads = (16,8,4,2,1)
+codelm_d_model = 2048
+codelm_n_layers = 32
+codelm_n_heads = 16
+codelm_n_kv_heads = 16
 mlp_mult = 4
 
 code_vocab = 256
