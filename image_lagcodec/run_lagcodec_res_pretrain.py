@@ -4425,10 +4425,11 @@ def _round_floats(obj, ndigits: int = 4):
     return obj
 
 
-def _pretty_dict(d: dict, per_line: int = 4) -> str:
-    items = [f"{k}={v}" for k, v in d.items()]
-    lines = ["\t".join(items[i:i + per_line]) for i in range(0, len(items), per_line)]
-    return "\n" + "\n".join(lines)
+def _pretty_dict(d: dict) -> str:
+    grouped = {}
+    for key in sorted(d, key=str):
+        grouped.setdefault(str(key)[:1].lower(), []).append(f"{key}={d[key]}")
+    return "\n" + "\n".join("\t".join(items) for items in grouped.values())
 
 
 def _tuple_arg(s: str) -> tuple:
@@ -5129,22 +5130,22 @@ def main():
     if args.val_subset_n:
         val_np = val_np[:args.val_subset_n]
 
+    run_dir = MODULE_DIR / "logs" / args.run_name
+    logger = Logger(run_dir)
+    write_resolved_config(run_dir, args)
+    (run_dir / f"config_{args.config.name}").write_text(args.config.read_text())
+    resolved = {k: v for k, v in sorted(vars(args).items()) if k != "config"}
+    logger(f"resolved_config:\n{_pretty_dict(_round_floats(resolved))}")
+
     init_context = jax.default_device(fsdp_init_device) if args.fsdp else nullcontext()
     with init_context:
         rng = jax.random.PRNGKey(args.seed)
         model = LagCodecModel(rng, cfg)
     n_params = count_params(model)
-
-    run_dir = MODULE_DIR / "logs" / args.run_name
-    logger = Logger(run_dir)
-    write_resolved_config(run_dir, args)
-    (run_dir / f"config_{args.config.name}").write_text(args.config.read_text())
-    logger(f"n_levels={n_levels} n_phases={n_phases} n_positions={n_positions} "
-           f"params={n_params / 1e6:.2f}M")
+    logger(f"n_levels={n_levels} n_phases={n_phases} n_positions={n_positions}")
+    logger(f"model_params={n_params / 1e6:.2f}M")
     if cfg.simple_ntp:
         logger("SIMPLE NTP MODE: no downsampler is constructed or called; CodeLM trains directly on tokens.")
-    resolved = {k: v for k, v in sorted(vars(args).items()) if k != "config"}
-    logger(f"resolved_config:{_pretty_dict(_round_floats(resolved))}")
 
     resume_meta, resume_ckpt_dir = None, None
     init_context = jax.default_device(fsdp_init_device) if args.fsdp else nullcontext()

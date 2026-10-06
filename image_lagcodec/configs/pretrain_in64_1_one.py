@@ -7,7 +7,7 @@ dataset = "imagenet64"
 data_root = "/dev/shm/imagenet64"
 multihost = True
 fsdp = True
-# fsdp_mode = "intra_node_fsdp_inter_node_dp"
+fsdp_mode = "intra_node_fsdp_inter_node_dp"
 
 traversal = "zorder"
 eval_gen_train = True
@@ -17,11 +17,11 @@ gen_eval_prompt = 2048
 # remat_level = True
 share_across_levels = False
 
-codelm_d_model = 2048
-codelm_n_layers = 32
-codelm_n_heads = 16
-codelm_n_kv_heads = 16
-mlp_mult = 2
+codelm_d_model = 1024
+codelm_n_layers = 16
+codelm_n_heads = 8
+codelm_n_kv_heads = 8
+mlp_mult = 4
 
 code_vocab = 256
 pq_chunks = 3
@@ -92,7 +92,7 @@ optimizer_kwargs = dict(weight_decay=1e-2)
 wa_verbose = False
 
 # --- logging ---
-log_every = 100
+log_every = 1000
 ckpt_every_step = 10_000
 # ckpt_every_step = int(2e5)
 ckpt_keep = 1
