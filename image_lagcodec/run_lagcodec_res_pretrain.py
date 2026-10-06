@@ -3655,19 +3655,10 @@ def fsdp_to_host(tree):
     def gather(x):
         if not eqx.is_array(x) or not hasattr(x, "sharding"):
             return x
-        spec = getattr(x.sharding, "spec", ())
-        if "fsdp" not in spec:
-            if getattr(x, "is_fully_addressable", True):
-                return np.asarray(jax.device_get(x))
-            return np.asarray(jax.device_get(x.addressable_shards[0].data))
-        shard_axis = spec.index("fsdp")
-        local = np.stack([np.asarray(shard.data) for shard in x.addressable_shards])
-        if jax.process_count() > 1:
+        if not x.is_fully_addressable:
             from jax.experimental.multihost_utils import process_allgather
-            local = process_allgather(local, tiled=True)
-        local_shape = local.shape[1:]
-        gathered = np.moveaxis(local.reshape((local.shape[0],) + local_shape), 0, shard_axis)
-        return gathered.reshape(x.shape)
+            return np.asarray(process_allgather(x, tiled=True))
+        return np.asarray(jax.device_get(x))
 
     return jax.tree_util.tree_map(gather, tree)
 
@@ -3714,18 +3705,28 @@ def to_single_device(tree, device=None):
 
 def save_checkpoint(ckpt_dir: Path, model, opt_state, p_rng, train_iter: "BatchIterator",
                      phase: int, phase_step: int, step: int, seed: int, schedule_meta: dict = None) -> None:
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    eqx.tree_serialise_leaves(ckpt_dir / "model.eqx", model)
-    eqx.tree_serialise_leaves(ckpt_dir / "encoder.eqx", (model.codelms, model.downsamplers))
-    eqx.tree_serialise_leaves(ckpt_dir / "opt_state.eqx", opt_state)
-    eqx.tree_serialise_leaves(ckpt_dir / "p_rng.eqx", p_rng)
-    (ckpt_dir / "dataloader_state.json").write_text(json.dumps(dict(
-        epoch_rng_state=train_iter.epoch_rng.bit_generator.state,
-        epoch_seed=train_iter.epoch_seed, pos=train_iter.pos)))
-    meta = dict(phase=phase, phase_step=phase_step, step=step, seed=seed)
-    if schedule_meta is not None:
-        meta["schedule"] = schedule_meta
-    (ckpt_dir / "meta.json").write_text(json.dumps(meta))
+    tmp_dir = ckpt_dir.with_name(f".{ckpt_dir.name}.tmp")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+    try:
+        eqx.tree_serialise_leaves(tmp_dir / "model.eqx", model)
+        eqx.tree_serialise_leaves(tmp_dir / "encoder.eqx", (model.codelms, model.downsamplers))
+        eqx.tree_serialise_leaves(tmp_dir / "opt_state.eqx", opt_state)
+        eqx.tree_serialise_leaves(tmp_dir / "p_rng.eqx", p_rng)
+        (tmp_dir / "dataloader_state.json").write_text(json.dumps(dict(
+            epoch_rng_state=train_iter.epoch_rng.bit_generator.state,
+            epoch_seed=train_iter.epoch_seed, pos=train_iter.pos)))
+        meta = dict(phase=phase, phase_step=phase_step, step=step, seed=seed)
+        if schedule_meta is not None:
+            meta["schedule"] = schedule_meta
+        (tmp_dir / "meta.json").write_text(json.dumps(meta))
+        if ckpt_dir.exists():
+            shutil.rmtree(ckpt_dir)
+        tmp_dir.rename(ckpt_dir)
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
 
 
 def load_encoder_only_checkpoint(model, ckpt_path: Path):
@@ -3770,6 +3771,9 @@ def prune_checkpoints(run_dir: Path, keep: int) -> None:
     ckpt_root = run_dir / "checkpoints"
     if not ckpt_root.exists():
         return
+    for d in ckpt_root.iterdir():
+        if d.is_dir() and d.name.startswith(".phase_") and d.name.endswith(".tmp"):
+            shutil.rmtree(d)
     candidates = []
     for d in ckpt_root.iterdir():
         if d.name == "wa":
@@ -5007,6 +5011,7 @@ def main():
         pbar = tqdm(total=phase_total_steps, initial=start_phase_step, desc=active_desc, dynamic_ncols=True, position=0)
         jit_timed = False
         phase_step = start_phase_step
+        last_checkpoint_step = step if resuming_this_phase and start_phase_step == phase_total_steps else None
         epoch_num = start_phase_step // steps_per_epoch
         while phase_step < phase_total_steps:
             epoch_num += 1
@@ -5092,10 +5097,13 @@ def main():
                         ckpt_opt_state = to_host(unreplicate(p_opt_state))
                         ckpt_rng = to_host(p_rng)
                     if jax.process_index() == 0:
+                        if args.ckpt_keep is not None:
+                            prune_checkpoints(run_dir, max(0, args.ckpt_keep - 1))
                         save_checkpoint(ckpt_dir, ckpt_model, ckpt_opt_state, ckpt_rng, train_iter,
                                          phase=phase, phase_step=phase_step, step=step, seed=args.seed,
                                          schedule_meta=schedule_meta)
                         prune_checkpoints(run_dir, args.ckpt_keep)
+                    last_checkpoint_step = step
                     logger(f"checkpoint saved: {ckpt_dir}")
 
                 if args.wa_mode != "none" and step % wa_every_steps == 0:
@@ -5118,25 +5126,28 @@ def main():
                             if args.wa_verbose and jax.process_index() == 0:
                                 logger(f"wa (wma, n={len(wa_stack)}) average saved at step {step}")
 
-        if args.fsdp:
-            model = eqx.combine(p_diff_model, static_model)
-            ckpt_model = fsdp_to_host(model)
-            ckpt_opt_state = fsdp_to_host(p_opt_state)
-            ckpt_rng = fsdp_to_host(p_rng)
-        else:
-            diff_model = to_host(unreplicate(p_diff_model))
-            model = eqx.combine(diff_model, static_model)
-            ckpt_model = model
-            ckpt_opt_state = to_host(unreplicate(p_opt_state))
-            ckpt_rng = to_host(p_rng)
         freeze_msg = "no freeze (no_freeze mode)" if cfg.curriculum_mode == "no_freeze" else f"freezing level {phase - 1}"
         logger(f"=== {active_desc} done, {freeze_msg} ===")
         ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_step{step}"
-        if jax.process_index() == 0:
-            save_checkpoint(ckpt_dir, ckpt_model, ckpt_opt_state, ckpt_rng, train_iter,
-                             phase=phase, phase_step=phase_total_steps, step=step, seed=args.seed,
-                             schedule_meta=schedule_meta)
-            prune_checkpoints(run_dir, args.ckpt_keep)
+        if last_checkpoint_step != step:
+            if args.fsdp:
+                model = eqx.combine(p_diff_model, static_model)
+                ckpt_model = fsdp_to_host(model)
+                ckpt_opt_state = fsdp_to_host(p_opt_state)
+                ckpt_rng = fsdp_to_host(p_rng)
+            else:
+                diff_model = to_host(unreplicate(p_diff_model))
+                model = eqx.combine(diff_model, static_model)
+                ckpt_model = model
+                ckpt_opt_state = to_host(unreplicate(p_opt_state))
+                ckpt_rng = to_host(p_rng)
+            if jax.process_index() == 0:
+                if args.ckpt_keep is not None:
+                    prune_checkpoints(run_dir, max(0, args.ckpt_keep - 1))
+                save_checkpoint(ckpt_dir, ckpt_model, ckpt_opt_state, ckpt_rng, train_iter,
+                                 phase=phase, phase_step=phase_total_steps, step=step, seed=args.seed,
+                                 schedule_meta=schedule_meta)
+                prune_checkpoints(run_dir, args.ckpt_keep)
         if args.final_eval:
             run_val_eval(model, phase, tag=f"level{phase - 1}_final")
 
