@@ -1254,6 +1254,18 @@ class BatchIterator:
         self.pos = 0
 
 
+def grouped_batches(iterable, group_size: int):
+    """Yield consecutive microbatch groups, including a final partial group."""
+    group = []
+    for batch in iterable:
+        group.append(batch)
+        if len(group) == group_size:
+            yield group
+            group = []
+    if group:
+        yield group
+
+
 def safe_argmax(x: jnp.ndarray) -> jnp.ndarray:
     # first index of the max over the last axis. jnp.argmax fused into a following gather returns the max
     # value's float bits instead of the index under jit on TPU (XLA bug; seen at >=256 rows in generation),
@@ -4352,6 +4364,8 @@ def main():
     p.add_argument("--batch_size", type=_tuple_arg, default=(16,),
                     help="training batch size -- a bare int applies uniformly to every phase; a "
                          "tuple gives one value per phase (length must equal n_phases)")
+    p.add_argument("--grad_accum_steps", type=int, default=1,
+                   help="number of microbatches per optimizer update (default 1)")
     p.add_argument("--n_devices", type=int, default=None)
     p.add_argument("--fsdp", type=lambda x: x.lower() != "false", default=False,
                    help="enable FSDP parameter and optimizer-state sharding")
@@ -4778,6 +4792,8 @@ def main():
     config_vars = {k: v for k, v in config_vars.items() if k in known}
     p.set_defaults(**config_vars)
     args = p.parse_args()
+    if args.grad_accum_steps < 1:
+        p.error("--grad_accum_steps must be >= 1")
     if args.run_name is None:
         args.run_name = pre_args.config.stem
 
@@ -5300,14 +5316,15 @@ def main():
     def _every_steps(step_val, epoch_val, steps_per_epoch):
         return step_val if step_val is not None else round(epoch_val * steps_per_epoch)
 
+    def _optimizer_steps_per_epoch(microbatches):
+        return (microbatches + args.grad_accum_steps - 1) // args.grad_accum_steps
+
     step = resume_meta["step"] if resume_meta else 0
     all_phases = [n_phases] if args.no_curriculum else list(range(1, n_phases + 1))
-    total_all_steps = sum(
-        _phase_total_steps(p - 1, len(BatchIterator(
+    total_all_steps = sum(_phase_total_steps(p - 1, _optimizer_steps_per_epoch(len(BatchIterator(
             train_np, train_labels[:len(train_np)], args.batch_size[p - 1], n_devices,
             shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp,
-            data_parallel=hybrid_fsdp)))
-        for p in all_phases)
+            data_parallel=hybrid_fsdp)))) for p in all_phases)
     step_w = len(str(total_all_steps))
     global_pbar = tqdm(total=total_all_steps, initial=step, desc="total", dynamic_ncols=True, position=1, leave=True)
     last_global_step = step
@@ -5318,7 +5335,8 @@ def main():
             train_np, train_labels[:len(train_np)], args.batch_size[resume_phase - 1], n_devices,
             shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp,
             data_parallel=hybrid_fsdp))
-        phase_steps_resume = _phase_total_steps(resume_phase - 1, steps_per_epoch_resume)
+        phase_steps_resume = _phase_total_steps(
+            resume_phase - 1, _optimizer_steps_per_epoch(steps_per_epoch_resume))
         phase_complete = resume_meta["phase_step"] >= phase_steps_resume
         phase_iter = [p for p in phase_iter if p > resume_phase] if phase_complete \
             else [p for p in phase_iter if p >= resume_phase]
@@ -5371,7 +5389,35 @@ def main():
                                      pixel_order=pixel_order,
                                      return_levelwise=cfg.log_levelwise_metrics)
 
-        steps_per_epoch_lr = len(train_iter)
+        def accumulated_value_and_grad(loss_fn_use, diff_model, static_model, rng, flat_bytes):
+            """Average gradients online across microbatches without retaining their activations."""
+            def micro_step(rng, flat):
+                rng, level_rng, cascade_rng = jax.random.split(rng, 3)
+                if hybrid_fsdp:
+                    dp_index = jax.lax.axis_index("dp")
+                    level_rng = jax.random.fold_in(level_rng, dp_index)
+                    cascade_rng = jax.random.fold_in(cascade_rng, dp_index)
+                (loss, aux), grads = jax.value_and_grad(loss_fn_use, has_aux=True)(
+                    diff_model, static_model, flat, level_rng, cascade_rng)
+                return rng, loss, aux, grads
+
+            rng, loss_sum, aux_sum, grad_sum = micro_step(rng, flat_bytes[0])
+            if flat_bytes.shape[0] > 1:
+                def scan_step(carry, flat):
+                    rng, loss_sum, aux_sum, grad_sum = carry
+                    rng, loss, aux, grads = micro_step(rng, flat)
+                    aux_sum = jax.tree_util.tree_map(lambda a, b: a + b, aux_sum, aux)
+                    grad_sum = jax.tree_util.tree_map(lambda a, b: a + b, grad_sum, grads)
+                    return (rng, loss_sum + loss, aux_sum, grad_sum), None
+
+                (rng, loss_sum, aux_sum, grad_sum), _ = jax.lax.scan(
+                    scan_step, (rng, loss_sum, aux_sum, grad_sum), flat_bytes[1:])
+            count = flat_bytes.shape[0]
+            return (rng, loss_sum / count,
+                    jax.tree_util.tree_map(lambda x: x / count, aux_sum),
+                    jax.tree_util.tree_map(lambda x: x / count, grad_sum))
+
+        steps_per_epoch_lr = _optimizer_steps_per_epoch(len(train_iter))
         phase_total_steps = _phase_total_steps(phase - 1, steps_per_epoch_lr)
         total_steps = phase_total_steps
         warmup_steps_resolved = _every_steps(args.warmup_steps, args.warmup_epochs, steps_per_epoch_lr)
@@ -5406,13 +5452,17 @@ def main():
         opt_state = optimizer.init(diff_model)
 
         def train_step_impl(diff_model, opt_state, rng, flat_bytes, static_model):
-            rng, level_rng, cascade_rng = jax.random.split(rng, 3)
-            if hybrid_fsdp:
-                dp_index = jax.lax.axis_index("dp")
-                level_rng = jax.random.fold_in(level_rng, dp_index)
-                cascade_rng = jax.random.fold_in(cascade_rng, dp_index)
-            (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-                diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+            if args.grad_accum_steps == 1:
+                rng, level_rng, cascade_rng = jax.random.split(rng, 3)
+                if hybrid_fsdp:
+                    dp_index = jax.lax.axis_index("dp")
+                    level_rng = jax.random.fold_in(level_rng, dp_index)
+                    cascade_rng = jax.random.fold_in(cascade_rng, dp_index)
+                (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+                    diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+            else:
+                rng, loss, aux, grads = accumulated_value_and_grad(
+                    loss_fn, diff_model, static_model, rng, flat_bytes)
             grads = tie_shared_grads(grads, cfg)
             if not args.fsdp:
                 grads = jax.lax.pmean(grads, axis_name="d")
@@ -5445,12 +5495,16 @@ def main():
             static_shardings = fsdp_shardings(static_model, fsdp_mesh)
 
             def jit_fsdp_step(step_fn):
+                train_batch_sharding = fsdp_batch_sharding
                 if hybrid_fsdp:
                     P = jax.sharding.PartitionSpec
+                    batch_spec = P(None, "dp") if args.grad_accum_steps > 1 else P("dp")
+                    if args.grad_accum_steps > 1:
+                        train_batch_sharding = jax.sharding.NamedSharding(fsdp_mesh, batch_spec)
                     step_fn = jax.shard_map(
                         step_fn,
                         mesh=fsdp_mesh,
-                        in_specs=(P(), P(), P(), P("dp"), P()),
+                        in_specs=(P(), P(), P(), batch_spec, P()),
                         out_specs=(P(), P(), P(), P(), P()),
                         axis_names={"dp"},
                         check_vma=False,
@@ -5458,7 +5512,7 @@ def main():
                 return jax.jit(
                     step_fn,
                     in_shardings=(diff_shardings, opt_shardings, fsdp_replicated,
-                                  fsdp_batch_sharding, static_shardings),
+                                  train_batch_sharding, static_shardings),
                     out_shardings=(diff_shardings, opt_shardings, fsdp_replicated, None, None),
                     donate_argnums=(0, 1, 2))
 
@@ -5492,13 +5546,17 @@ def main():
                                                pixel_order=pixel_order, entry_gt_drop=entry_gt_drop_sd)
 
             def train_step_sd_impl(diff_model, opt_state, rng, flat_bytes, static_model):
-                rng, level_rng, cascade_rng = jax.random.split(rng, 3)
-                if hybrid_fsdp:
-                    dp_index = jax.lax.axis_index("dp")
-                    level_rng = jax.random.fold_in(level_rng, dp_index)
-                    cascade_rng = jax.random.fold_in(cascade_rng, dp_index)
-                (loss, aux), grads = jax.value_and_grad(loss_fn_sd, has_aux=True)(
-                    diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+                if args.grad_accum_steps == 1:
+                    rng, level_rng, cascade_rng = jax.random.split(rng, 3)
+                    if hybrid_fsdp:
+                        dp_index = jax.lax.axis_index("dp")
+                        level_rng = jax.random.fold_in(level_rng, dp_index)
+                        cascade_rng = jax.random.fold_in(cascade_rng, dp_index)
+                    (loss, aux), grads = jax.value_and_grad(loss_fn_sd, has_aux=True)(
+                        diff_model, static_model, flat_bytes, level_rng, cascade_rng)
+                else:
+                    rng, loss, aux, grads = accumulated_value_and_grad(
+                        loss_fn_sd, diff_model, static_model, rng, flat_bytes)
                 grads = tie_shared_grads(grads, cfg)
                 if not args.fsdp:
                     grads = jax.lax.pmean(grads, axis_name="d")
@@ -5559,7 +5617,7 @@ def main():
                (f" -- any-level training active, level_select_prob={args.level_select_prob}"
                 if multires_active else ""))
 
-        steps_per_epoch = len(train_iter)
+        steps_per_epoch = _optimizer_steps_per_epoch(len(train_iter))
         gen_eval_every_steps = _every_steps(args.gen_eval_every_step, args.gen_eval_every_epoch, steps_per_epoch)
         ckpt_every_steps = _every_steps(args.ckpt_every_step, args.ckpt_every_epoch, steps_per_epoch)
         wa_every_steps = _every_steps(args.wa_every_step, args.wa_every_epoch, steps_per_epoch)
@@ -5579,14 +5637,28 @@ def main():
                 logger(f"{active_desc}: epoch {epoch_num} (step {step})")
             global_pbar.update(step - last_global_step)
             last_global_step = step
-            for flat in train_iter:
+            for micro_group in grouped_batches(train_iter, args.grad_accum_steps):
                 if phase_step >= phase_total_steps:
                     break
+                if args.grad_accum_steps == 1:
+                    flat = micro_group[0]
+                elif args.fsdp:
+                    flat = np.stack([np.asarray(batch[0]) for batch in micro_group], axis=0)
+                else:
+                    # Keep pmap's device axis first; train_step scans the next axis.
+                    flat = np.stack(micro_group, axis=1)
                 if args.fsdp:
-                    local_flat = np.asarray(flat[0])
+                    local_flat = np.asarray(flat if args.grad_accum_steps > 1 else flat[0])
                     if hybrid_fsdp:
-                        batch_global_shape = (local_flat.shape[0] * jax.process_count(),) + local_flat.shape[1:]
-                        flat = fsdp_put_array(local_flat, fsdp_batch_sharding,
+                        if args.grad_accum_steps > 1:
+                            batch_global_shape = (local_flat.shape[0],
+                                                  local_flat.shape[1] * jax.process_count()) + local_flat.shape[2:]
+                            train_batch_sharding = jax.sharding.NamedSharding(
+                                fsdp_mesh, jax.sharding.PartitionSpec(None, "dp"))
+                        else:
+                            batch_global_shape = (local_flat.shape[0] * jax.process_count(),) + local_flat.shape[1:]
+                            train_batch_sharding = fsdp_batch_sharding
+                        flat = fsdp_put_array(local_flat, train_batch_sharding,
                                               global_shape=batch_global_shape)
                     else:
                         flat = fsdp_put_array(local_flat, fsdp_batch_sharding)
