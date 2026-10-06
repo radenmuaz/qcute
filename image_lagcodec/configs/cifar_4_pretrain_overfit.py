@@ -88,7 +88,7 @@ gen_eval_prompt = 512
 
 
 # --- training ---
-batch_size = 16
+batch_size = 8
 val_batch_size = 8
 # level_steps = (20_000, 20_000, 20_000, 100_000)
 level_steps = (0,)*4+ (int(1e6),)

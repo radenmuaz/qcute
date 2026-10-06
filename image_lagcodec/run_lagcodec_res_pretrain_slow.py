@@ -52,8 +52,7 @@ from tqdm import tqdm
 # jax.config.update("jax_memory_fitting_level", "O3")
 from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, SwiGLU, apply_rope, apply_xsa, init_matrix,
                                         init_vector, make_lr_schedule, rmsnorm, rope_cos_sin,
-                                        rope_cos_sin_pos, rotate_half, set_splash_shard_map_mesh,
-                                        sinkgd, splash_shard_map_enabled)
+                                        rope_cos_sin_pos, rotate_half, set_splash_shard_map_mesh, sinkgd)
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
@@ -2645,11 +2644,10 @@ def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cf
             for blk in codelm.blocks:
                 h = run_block(blk, h, codelm.remat and not codelm.remat_level)
             return h
-        if rng is None and splash_shard_map_enabled() and jax.process_count() > 1:
+        if rng is None:
             # Validation runs with globally sharded FSDP arrays. SplashAttention's Pallas
-            # kernel cannot be auto-partitioned in the multihost training mesh; use its
-            # per-position cache path there. Single-host validation keeps the original parallel
-            # Splash path, avoiding a slow token-by-token encoder pass.
+            # kernel cannot be auto-partitioned across a multi-host mesh, so evaluate the same
+            # causal encoder with its per-position cache path instead.
             return _encoder_hidden_cached(codelm, raw)
         h = jax.checkpoint(_enc_stack)(h) if codelm.remat_level else _enc_stack(h)
         return codelm.ln_f(h)

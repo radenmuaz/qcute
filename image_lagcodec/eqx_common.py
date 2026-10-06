@@ -30,6 +30,10 @@ def set_splash_shard_map_mesh(mesh) -> None:
     _SPLASH_SHARD_MAP_MESH = None if mesh is None else mesh.abstract_mesh
 
 
+def splash_shard_map_enabled() -> bool:
+    return _SPLASH_SHARD_MAP_MESH is not None
+
+
 def _splash_pad(x: jnp.ndarray, block: int) -> jnp.ndarray:
     """Pads x's seq axis (-2) to a multiple of block; causal-safe (padded kv sits past any real
     query, padded query rows get sliced off by the caller) -- needed for T<128 or non-128-multiple
