@@ -113,9 +113,15 @@ def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: boo
     else:
         def run_local(qq, kk, vv, ss):
             if ss is not None:
-                return jax.vmap(lambda qh, kh, vh: kernel(qh, kh, vh, sinks=ss))(
+                out = jax.vmap(lambda qh, kh, vh: kernel(qh, kh, vh, sinks=ss))(
                     qq * sm_scale, kk, vv)
-            return jax.vmap(kernel)(qq * sm_scale, kk, vv)
+            else:
+                out = jax.vmap(kernel)(qq * sm_scale, kk, vv)
+            # Keep the logical (unpadded) sequence shape inside shard_map. Slicing
+            # the padded Mosaic result after shard_map can be incorrectly folded
+            # into a TPU bitcast during the transpose of single-host FSDP training
+            # (e.g. T=4097 -> padded T=4224).
+            return out[:, :, :T, :]
 
         replicated = jax.sharding.PartitionSpec()
         y = jax.shard_map(
@@ -127,6 +133,7 @@ def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: boo
             axis_names=_SPLASH_SHARD_MAP_AXIS_NAMES,
             check_vma=False,
         )(q_p, k_p, v_p, sink)
+        return y
     return y[:, :, :T, :]
 
 

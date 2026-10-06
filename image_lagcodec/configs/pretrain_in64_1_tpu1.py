@@ -1,11 +1,11 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/pretrain_in64_1_one.py
+uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/pretrain_in64_1_tpu1.py
 """
 # --- data ---
 img_size = 64
 dataset = "imagenet64"
 data_root = "/dev/shm/imagenet64"
-multihost = True
+multihost = False
 fsdp = True
 # fsdp_mode = "intra_node_fsdp_inter_node_dp"
 
@@ -18,7 +18,7 @@ gen_eval_prompt = 2048
 share_across_levels = False
 
 codelm_d_model = 2048
-codelm_n_layers = 32
+codelm_n_layers = 16
 codelm_n_heads = 16
 codelm_n_kv_heads = 16
 mlp_mult = 2
