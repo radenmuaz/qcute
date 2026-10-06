@@ -53,7 +53,7 @@ from tqdm import tqdm
 
 from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, SwiGLU, apply_rope, apply_xsa, init_matrix,
                                         init_vector, make_lr_schedule, rmsnorm, rope_cos_sin,
-                                        rope_cos_sin_pos, rotate_half, sinkgd)
+                                        rope_cos_sin_pos, rotate_half, set_splash_shard_map_mesh, sinkgd)
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
@@ -4806,11 +4806,13 @@ def main():
         if args.n_devices is not None and args.n_devices != jax.local_device_count():
             raise ValueError("--fsdp uses every JAX device; do not set --n_devices to a subset")
         fsdp_mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("fsdp",))
+        set_splash_shard_map_mesh(fsdp_mesh)
         fsdp_replicated = jax.sharding.NamedSharding(
             fsdp_mesh, jax.sharding.PartitionSpec())
         fsdp_init_device = jax.local_devices()[0]
         logger_device_count = fsdp_mesh.devices.size
     else:
+        set_splash_shard_map_mesh(None)
         logger_device_count = n_devices
     cfg = Config(**{k: getattr(args, k) for k in CONFIG_FIELDS})
     label_fn = resolve_label_fn(label_fn_raw, cfg.modality)
