@@ -6,11 +6,11 @@ img_size = 32
 encoder_only_pretrain = True
 log_levelwise_metrics = True
 fsdp = True  # shard model parameters and optimizer state over the available JAX device mesh
-share_across_levels = False
-codelm_d_model = (2048,1024,512,256,128)
-codelm_n_layers = (32,16,8,4,2)
-codelm_n_heads = (16,8,4,2,1)
-codelm_n_kv_heads = (16,8,4,2,1)
+share_across_levels = True
+codelm_d_model = 1024
+codelm_n_layers = 16
+codelm_n_heads = 8
+codelm_n_kv_heads = 8
 mlp_mult = 4
 
 code_vocab = 256
@@ -76,8 +76,9 @@ pardec_token_head = "ar"    # downsampler/upsampler digit head: all digits in on
 token_dim = 128
 token_n_heads = 2
 traversal = "zorder"
-gen_eval_all_levels = False
-gen_eval_teacher_force_sanity = False
+eval_gen_train = True
+gen_eval_all_levels = True
+gen_eval_teacher_force_sanity = True
 
 
 # --- training ---
@@ -98,7 +99,7 @@ lr_min = 1e-5
 # lr_min_step = int(100e3)
 warmup_steps = 1000
 optimizer = "adamw"
-optimizer_kwargs = dict(weight_decay=0)
+optimizer_kwargs = dict(weight_decay=1e-5)
 
 wa_verbose = False
 
@@ -116,5 +117,6 @@ wa_verbose = False
 
 # --- logging ---
 log_every = 500
-ckpt_every_step = int(2e5)
-ckpt_keep = 10
+ckpt_every_step = 5000
+# ckpt_every_step = int(2e5)
+ckpt_keep = 1

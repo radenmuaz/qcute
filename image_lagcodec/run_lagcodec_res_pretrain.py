@@ -53,7 +53,6 @@ from tqdm import tqdm
 from image_lagcodec.eqx_common import (Attention, Block, RMSNorm, SwiGLU, apply_rope, apply_xsa, init_matrix,
                                         init_vector, make_lr_schedule, rmsnorm, rope_cos_sin,
                                         rope_cos_sin_pos, rotate_half, sinkgd)
-from image_lagcodec import run_lagcodec_res as full_runner
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
@@ -3711,7 +3710,6 @@ def save_checkpoint(ckpt_dir: Path, model, opt_state, p_rng, train_iter: "BatchI
     tmp_dir.mkdir(parents=True)
     try:
         eqx.tree_serialise_leaves(tmp_dir / "model.eqx", model)
-        eqx.tree_serialise_leaves(tmp_dir / "encoder.eqx", (model.codelms, model.downsamplers))
         eqx.tree_serialise_leaves(tmp_dir / "opt_state.eqx", opt_state)
         eqx.tree_serialise_leaves(tmp_dir / "p_rng.eqx", p_rng)
         (tmp_dir / "dataloader_state.json").write_text(json.dumps(dict(
@@ -3730,20 +3728,43 @@ def save_checkpoint(ckpt_dir: Path, model, opt_state, p_rng, train_iter: "BatchI
 
 
 def load_encoder_only_checkpoint(model, ckpt_path: Path):
-    encoder_path = ckpt_path / "encoder.eqx" if ckpt_path.is_dir() else ckpt_path
-    if encoder_path.name == "encoder.eqx" and encoder_path.is_file():
+    if ckpt_path.is_dir():
+        encoder_path = ckpt_path / "encoder.eqx"
+        model_path = ckpt_path / "model.eqx"
+    elif ckpt_path.name == "encoder.eqx":
+        encoder_path = ckpt_path
+        model_path = ckpt_path.with_name("model.eqx")
+    else:
+        encoder_path = ckpt_path.with_name("encoder.eqx")
+        model_path = ckpt_path
+
+    if encoder_path.is_file():
         loaded_encoder = eqx.tree_deserialise_leaves(
             encoder_path, (model.codelms, model.downsamplers))
         return eqx.tree_at(lambda m: (m.codelms, m.downsamplers), model,
                            replace=loaded_encoder, is_leaf=lambda x: False)
 
-    model_path = ckpt_path / "model.eqx" if ckpt_path.is_dir() else ckpt_path
     if not model_path.is_file():
         raise FileNotFoundError(f"encoder checkpoint needs encoder.eqx or model.eqx: {ckpt_path}")
-    legacy_model = full_runner.LagCodecModel(jax.random.PRNGKey(0), model.cfg)
-    loaded_encoder = eqx.tree_deserialise_leaves(model_path, legacy_model)
+
+    def filter_spec(path, leaf):
+        if not eqx.is_array(leaf):
+            return eqx.default_deserialise_filter_spec
+        root_field = getattr(path[0], "name", None) if path else None
+        if root_field in ("codelms", "downsamplers"):
+            return eqx.default_deserialise_filter_spec
+
+        def skip_leaf(file, template):
+            np.load(file)
+            return template
+
+        return skip_leaf
+
+    filter_spec_tree = jax.tree_util.tree_map_with_path(filter_spec, model)
+    loaded_model = eqx.tree_deserialise_leaves(
+        model_path, model, filter_spec=filter_spec_tree)
     return eqx.tree_at(lambda m: (m.codelms, m.downsamplers), model,
-                       replace=(loaded_encoder.codelms, loaded_encoder.downsamplers),
+                       replace=(loaded_model.codelms, loaded_model.downsamplers),
                        is_leaf=lambda x: False)
 
 
@@ -4620,8 +4641,6 @@ def main():
     if cfg.precision != "bf16":
         jax.config.update("jax_default_matmul_precision", "highest")
     def token_preview(tokens: np.ndarray, level: int) -> np.ndarray:
-        if level == 0:
-            return positions_to_image(tokens, cfg, pixel_order)
         count = tokens.shape[1]
         side = math.isqrt(count)
         if side * side != count or tokens.shape[-1] < 3:
@@ -4646,6 +4665,9 @@ def main():
         return tokens.at[:, 1:].set(predicted)
 
     def run_qual_eval(eval_model, phase: int, tag: str) -> None:
+        if cfg.modality != "image":
+            logger(f"[{tag}] QUAL skipped: image token previews require modality='image'")
+            return
         m = cast_pytree(eval_model, compute_dtype)
         sources = [("train", train_np[:1]), ("val", val_np[:1])]
         for source_name, images in sources:
@@ -4670,8 +4692,15 @@ def main():
             for level, tokens in enumerate(level_tokens):
                 host_tokens = fsdp_to_host(tokens) if args.fsdp else tokens
                 preview_gt = token_preview(np.asarray(host_tokens), level)
-                for requested_prefix in (1, 128):
-                    prefix = min(requested_prefix, tokens.shape[1])
+                # A sequence position is one modeled RGB/code token containing C chunks.
+                # Convert requested byte counts to whole-token prefixes, rounding up so even
+                # a one-byte request retains one complete token. At level 0 with byte_group=3,
+                # these are RGB pixels; at coarser levels they are RGB code vectors.
+                chunks_per_token = tokens.shape[-1]
+                for requested_prefix_bytes in (1, 128):
+                    requested_positions = max(
+                        1, math.ceil(requested_prefix_bytes / chunks_per_token))
+                    prefix = min(requested_positions, tokens.shape[1])
                     gen_key = jax.random.PRNGKey(args.seed + level * 101 + prefix)
                     if args.fsdp:
                         gen_key = fsdp_put_array(gen_key, fsdp_replicated)
@@ -4683,18 +4712,22 @@ def main():
                     if args.fsdp:
                         generated = fsdp_to_host(generated)
                     preview_gen = token_preview(np.asarray(generated), level)
-                    sample_path = run_dir / f"samples_{tag}_{source_name}_level{level}_prompt{prefix}.png"
+                    sample_path = run_dir / (
+                        f"samples_{tag}_{source_name}_level{level}_"
+                        f"promptbytes{requested_prefix_bytes}.png")
                     if jax.process_index() == 0:
                         save_samples(preview_gen, preview_gt, sample_path, cfg)
                     logger(f"[{tag}] QUAL source={source_name} level={level} "
-                           f"prompt_positions={prefix}/{tokens.shape[1]} kv_cache=true "
+                           f"prompt_bytes={requested_prefix_bytes} "
+                           f"prompt_positions={prefix}/{tokens.shape[1]} "
+                           f"token_chunks={chunks_per_token} kv_cache=true "
                            f"saved={sample_path.name}")
 
                 if level == 0:
                     tf_tokens = teacher_force_level0(m, tokens)
                     if args.fsdp:
                         tf_tokens = fsdp_to_host(tf_tokens)
-                    tf_image = positions_to_image(np.asarray(tf_tokens), cfg, pixel_order)
+                    tf_image = token_preview(np.asarray(tf_tokens), level)
                     mse = pixel_mse(tf_image, gt_image)
                     if jax.process_index() == 0:
                         save_samples(tf_image, gt_image,
@@ -5001,6 +5034,8 @@ def main():
                 if multires_active else ""))
 
         steps_per_epoch = len(train_iter)
+        gen_eval_every_steps = max(1, _every_steps(
+            args.gen_eval_every_step, args.gen_eval_every_epoch, steps_per_epoch))
         ckpt_every_steps = _every_steps(args.ckpt_every_step, args.ckpt_every_epoch, steps_per_epoch)
         wa_every_steps = _every_steps(args.wa_every_step, args.wa_every_epoch, steps_per_epoch)
 
@@ -5085,6 +5120,13 @@ def main():
                            f"label_mse={label_mse:.2f} "
                            f"lr={lr_str} grad_norm={grad_norm:.2f}{levelwise_suffix}",
                            **log_kwargs)
+
+                if step % gen_eval_every_steps == 0:
+                    snapshot = eqx.combine(p_diff_model, static_model) if args.fsdp else \
+                        eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
+                    st = f"{step:0{step_w}d}"
+                    run_val_eval(snapshot, phase, tag=f"level{phase - 1}_step{st}")
+                    run_qual_eval(snapshot, phase, tag=f"step{st}")
 
                 if step % ckpt_every_steps == 0:
                     ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_step{step}"

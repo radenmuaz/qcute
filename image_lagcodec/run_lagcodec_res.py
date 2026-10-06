@@ -38,7 +38,9 @@ import sys
 import tarfile
 import time
 import warnings
+import zlib
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1206,7 +1208,7 @@ def resolve_label_fn(spec, modality: str):
 
 class BatchIterator:
     def __init__(self, images: np.ndarray, labels: np.ndarray, batch_size: int, n_devices: int,
-                 shuffle: bool, seed: int, cfg: Config):
+                 shuffle: bool, seed: int, cfg: Config, fsdp: bool = False):
         self.images, self.labels = images, labels
         self.batch_size, self.n_devices = batch_size, n_devices
         self.shuffle = shuffle
@@ -1218,13 +1220,14 @@ class BatchIterator:
         self.epoch_seed = None
         self.pos = 0  # batches already yielded this epoch -- resume continues here, no reshuffle
         self.pc, self.pi = jax.process_count(), jax.process_index()
-        self.total = batch_size * n_devices
+        self.fsdp = fsdp
+        self.total = batch_size * (1 if fsdp else n_devices)
         self.cfg = cfg
         self.pixel_order = pixel_order_for(cfg)
         self.n_positions = n_positions_of(cfg)
 
     def __len__(self):
-        return len(self.images) // (self.total * self.pc)
+        return len(self.images) // (self.total * (1 if self.fsdp else self.pc))
 
     def __iter__(self):
         n = len(self.images)
@@ -1232,15 +1235,17 @@ class BatchIterator:
             self.epoch_seed = int(self.epoch_rng.integers(0, 2 ** 31 - 1))
             self.pos = 0
         idx = np.random.default_rng(self.epoch_seed).permutation(n) if self.shuffle else np.arange(n)
-        g = self.total * self.pc
+        g = self.total * (1 if self.fsdp else self.pc)
         starts = list(range(0, n - g + 1, g))
         for bi in range(self.pos, len(starts)):
             start = starts[bi]
-            sel = idx[start + self.pi * self.total:start + (self.pi + 1) * self.total]
+            process_offset = 0 if self.fsdp else self.pi * self.total
+            sel = idx[start + process_offset:start + process_offset + self.total]
             img = self.images[sel]
             positions = images_to_positions(img, self.cfg, self.pixel_order)
             self.pos = bi + 1
-            yield positions.reshape(self.n_devices, self.batch_size, self.n_positions, self.cfg.byte_group)
+            yield positions.reshape(1 if self.fsdp else self.n_devices, self.batch_size,
+                                    self.n_positions, self.cfg.byte_group)
         self.epoch_seed = None
         self.pos = 0
 
@@ -3878,6 +3883,19 @@ def count_params(tree) -> int:
     return total
 
 
+def fsdp_parameter_stats(tree, n_devices: int) -> tuple:
+    total = sharded = 0
+    seen = set()
+    for x in jax.tree_util.tree_leaves(tree):
+        if not eqx.is_array(x) or id(x) in seen:
+            continue
+        seen.add(id(x))
+        total += x.size
+        if any(size >= n_devices and size % n_devices == 0 for size in x.shape):
+            sharded += x.size
+    return total, sharded, (total - sharded) + sharded / n_devices
+
+
 def cast_pytree(tree, dtype):
     return jax.tree_util.tree_map(lambda x: x.astype(dtype) if eqx.is_inexact_array(x) else x, tree)
 
@@ -3885,6 +3903,56 @@ def cast_pytree(tree, dtype):
 def replicate(pytree, n_devices: int):
     return jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (n_devices,) + x.shape)
                                    if eqx.is_array(x) else x, pytree)
+
+
+def fsdp_sharding_for_array(x, mesh):
+    spec = jax.sharding.PartitionSpec()
+    n_devices = mesh.devices.size
+    candidates = [(size, axis) for axis, size in enumerate(x.shape)
+                  if size >= n_devices and size % n_devices == 0]
+    if candidates:
+        _, axis = max(candidates)
+        axes = [None] * x.ndim
+        axes[axis] = "fsdp"
+        spec = jax.sharding.PartitionSpec(*axes)
+    return jax.sharding.NamedSharding(mesh, spec)
+
+
+def fsdp_shardings(tree, mesh):
+    return jax.tree_util.tree_map(
+        lambda x: fsdp_sharding_for_array(x, mesh) if eqx.is_array(x) else None, tree)
+
+
+def fsdp_put_array(x, sharding):
+    if getattr(x, "is_fully_addressable", True):
+        host_value = np.asarray(jax.device_get(x))
+    elif x.sharding == sharding:
+        return x
+    else:
+        from jax.experimental.multihost_utils import process_allgather
+        host_value = np.asarray(process_allgather(x, tiled=True))
+    if jax.process_count() == 1:
+        return jax.device_put(host_value, sharding)
+    return jax.make_array_from_process_local_data(
+        sharding, host_value, global_shape=host_value.shape)
+
+
+def fsdp_put_tree(tree, mesh):
+    return jax.tree_util.tree_map(
+        lambda x: fsdp_put_array(x, fsdp_sharding_for_array(x, mesh))
+        if eqx.is_array(x) else x, tree)
+
+
+def fsdp_to_host(tree):
+    def gather(x):
+        if not eqx.is_array(x) or not hasattr(x, "sharding"):
+            return x
+        if not x.is_fully_addressable:
+            from jax.experimental.multihost_utils import process_allgather
+            return np.asarray(process_allgather(x, tiled=True))
+        return np.asarray(jax.device_get(x))
+
+    return jax.tree_util.tree_map(gather, tree)
 
 
 def local_array(x):
@@ -3929,27 +3997,33 @@ def to_single_device(tree, device=None):
 
 def save_checkpoint(ckpt_dir: Path, model, opt_state, p_rng, train_iter: "BatchIterator",
                      phase: int, phase_step: int, step: int, seed: int, schedule_meta: dict = None) -> None:
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    eqx.tree_serialise_leaves(ckpt_dir / "model.eqx", model)
-    eqx.tree_serialise_leaves(ckpt_dir / "encoder.eqx", (model.codelms, model.downsamplers))
-    eqx.tree_serialise_leaves(ckpt_dir / "opt_state.eqx", opt_state)
-    eqx.tree_serialise_leaves(ckpt_dir / "p_rng.eqx", p_rng)
-    (ckpt_dir / "dataloader_state.json").write_text(json.dumps(dict(
-        epoch_rng_state=train_iter.epoch_rng.bit_generator.state,
-        epoch_seed=train_iter.epoch_seed, pos=train_iter.pos)))
-    meta = dict(phase=phase, phase_step=phase_step, step=step, seed=seed)
-    if schedule_meta is not None:
-        meta["schedule"] = schedule_meta
-    (ckpt_dir / "meta.json").write_text(json.dumps(meta))
+    tmp_dir = ckpt_dir.with_name(f".{ckpt_dir.name}.tmp")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+    try:
+        eqx.tree_serialise_leaves(tmp_dir / "model.eqx", model)
+        eqx.tree_serialise_leaves(tmp_dir / "opt_state.eqx", opt_state)
+        eqx.tree_serialise_leaves(tmp_dir / "p_rng.eqx", p_rng)
+        (tmp_dir / "dataloader_state.json").write_text(json.dumps(dict(
+            epoch_rng_state=train_iter.epoch_rng.bit_generator.state,
+            epoch_seed=train_iter.epoch_seed, pos=train_iter.pos)))
+        meta = dict(phase=phase, phase_step=phase_step, step=step, seed=seed)
+        if schedule_meta is not None:
+            meta["schedule"] = schedule_meta
+        (tmp_dir / "meta.json").write_text(json.dumps(meta))
+        if ckpt_dir.exists():
+            shutil.rmtree(ckpt_dir)
+        tmp_dir.rename(ckpt_dir)
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
 
 
 def load_encoder_only_checkpoint(model, ckpt_path: Path):
-    encoder_path = ckpt_path / "encoder.eqx" if ckpt_path.is_dir() else ckpt_path
-    if encoder_path.name == "encoder.eqx":
-        loaded_encoder = eqx.tree_deserialise_leaves(
-            encoder_path, (model.codelms, model.downsamplers))
-        return eqx.tree_at(lambda m: (m.codelms, m.downsamplers), model,
-                           replace=loaded_encoder, is_leaf=lambda x: False)
+    model_path = ckpt_path / "model.eqx" if ckpt_path.is_dir() else ckpt_path
+    if not model_path.is_file():
+        raise FileNotFoundError(f"model checkpoint not found: {model_path}")
 
     def filter_spec(path, leaf):
         if not eqx.is_array(leaf):
@@ -3967,8 +4041,7 @@ def load_encoder_only_checkpoint(model, ckpt_path: Path):
 
     filter_spec_tree = jax.tree_util.tree_map_with_path(filter_spec, model)
     loaded_encoder = eqx.tree_deserialise_leaves(
-        (ckpt_path / "model.eqx") if ckpt_path.is_dir() else ckpt_path,
-        model, filter_spec=filter_spec_tree)
+        model_path, model, filter_spec=filter_spec_tree)
     return eqx.tree_at(lambda m: (m.codelms, m.downsamplers), model,
                        replace=(loaded_encoder.codelms, loaded_encoder.downsamplers),
                        is_leaf=lambda x: False)
@@ -3998,6 +4071,9 @@ def prune_checkpoints(run_dir: Path, keep: int) -> None:
     ckpt_root = run_dir / "checkpoints"
     if not ckpt_root.exists():
         return
+    for d in ckpt_root.iterdir():
+        if d.is_dir() and d.name.startswith(".phase_") and d.name.endswith(".tmp"):
+            shutil.rmtree(d)
     candidates = []
     for d in ckpt_root.iterdir():
         if d.name == "wa":
@@ -4034,7 +4110,7 @@ def pixel_mse(gen: np.ndarray, gt: np.ndarray) -> float:
 
 
 def plot_encoder_outs(model: "LagCodecModel", cfg: Config, imgs: np.ndarray, pixel_order: np.ndarray,
-                       path: Path, level: int = 0, label_fn=None):
+                       path: Path, level: int = 0, label_fn=None, fsdp_replicated=None):
     # Encodes real images with `level`'s own encoder and plots GT | target downsample (from
     # label_fn, the same target label_reg_weight/label_mse supervise against) | pred downsample
     # (code_idx read directly as RGB bytes, no upsampling). Only meaningful when pq_chunks[level]==3
@@ -4044,7 +4120,11 @@ def plot_encoder_outs(model: "LagCodecModel", cfg: Config, imgs: np.ndarray, pix
     if cfg.pq_chunks[level] != 3 or cfg.code_vocab[level] != 256:
         return None
     codelm = model.codelm_for(level)
-    flat_raw = jnp.array(images_to_positions(imgs, cfg, pixel_order))
+    flat_raw = images_to_positions(imgs, cfg, pixel_order)
+    if fsdp_replicated is not None:
+        flat_raw = fsdp_put_array(flat_raw, fsdp_replicated)
+    else:
+        flat_raw = jnp.array(flat_raw)
     codelm0 = model.codelm_for(0)
     tok0 = rgb_byte_pq_fn(flat_raw, codelm0.pq_chunks, codelm0.code_vocab)
     # For level>0, `level`'s own real input is level (level-1)'s own REAL encoded code output, not
@@ -4073,8 +4153,12 @@ def plot_encoder_outs(model: "LagCodecModel", cfg: Config, imgs: np.ndarray, pix
                                      codelm_rate_id=model.codelm_bos_rate_id(level),
                                      downsampler_ncodes=cfg.downsampler_ncodes[level],
                                         pss_passes=cfg.downsampler_pss_passes[level])
-    code_idx = np.asarray(out["code_idx"])
-    util = float(out["util"])
+    if fsdp_replicated is not None:
+        code_idx, util = fsdp_to_host((out["code_idx"], out["util"]))
+    else:
+        code_idx, util = out["code_idx"], out["util"]
+    code_idx = np.asarray(code_idx)
+    util = float(util)
     M, n_blocks, C = code_idx.shape
     side = round(n_blocks ** 0.5)
     if side * side != n_blocks:
@@ -4094,13 +4178,19 @@ def plot_encoder_outs(model: "LagCodecModel", cfg: Config, imgs: np.ndarray, pix
         # label_fn ALWAYS resizes from the true raw image (flat_raw), regardless of level -- `flat`
         # is this level's own chained input (level-1's code for level>0, not the raw image), so
         # passing it here crashed for level>0 (wrong length, e.g. 256 instead of img_size**2).
-        label_tgt = np.asarray(label_fn(flat_raw, cfg, pixel_order, n_blocks, cfg.pq_chunks[level], cfg.code_vocab[level]))
+        label_tgt = label_fn(flat_raw, cfg, pixel_order, n_blocks,
+                             cfg.pq_chunks[level], cfg.code_vocab[level])
+        if fsdp_replicated is not None:
+            label_tgt = fsdp_to_host(label_tgt)
+        label_tgt = np.asarray(label_tgt)
         panels.append(to_grid(label_tgt))
         titles.append("target downsample")
         label_mse = float(np.mean((code_idx.astype(np.float64) - label_tgt.astype(np.float64)) ** 2))
     panels.append(pred_grid)
     titles.append("pred downsample")
 
+    if jax.process_index() != 0:
+        return util
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -4259,6 +4349,10 @@ def main():
                     help="training batch size -- a bare int applies uniformly to every phase; a "
                          "tuple gives one value per phase (length must equal n_phases)")
     p.add_argument("--n_devices", type=int, default=None)
+    p.add_argument("--fsdp", type=lambda x: x.lower() != "false", default=False,
+                   help="shard eligible parameter and optimizer-state arrays across all JAX devices "
+                        "with NamedSharding; batches are replicated across the shard mesh, so "
+                        "batch_size is the global batch")
     p.add_argument("--multihost", type=lambda x: x.lower() != "false", default=False,
                     help="jax.distributed.initialize() for a multi-host TPU slice: run the same command on every host; "
                          "batch_size stays per device, each host feeds its own slice of the global batch")
@@ -4705,6 +4799,19 @@ def main():
         jax.distributed.initialize()
     n_devices = args.n_devices or jax.local_device_count()
     print(f"jax devices ({n_devices} used of {jax.local_device_count()} local): {jax.devices()}")
+    fsdp_mesh = None
+    fsdp_replicated = None
+    fsdp_init_device = None
+    if args.fsdp:
+        if args.n_devices is not None and args.n_devices != jax.local_device_count():
+            raise ValueError("--fsdp uses every JAX device; do not set --n_devices to a subset")
+        fsdp_mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("fsdp",))
+        fsdp_replicated = jax.sharding.NamedSharding(
+            fsdp_mesh, jax.sharding.PartitionSpec())
+        fsdp_init_device = jax.local_devices()[0]
+        logger_device_count = fsdp_mesh.devices.size
+    else:
+        logger_device_count = n_devices
     cfg = Config(**{k: getattr(args, k) for k in CONFIG_FIELDS})
     label_fn = resolve_label_fn(label_fn_raw, cfg.modality)
     n_levels = len(cfg.strides)
@@ -4776,8 +4883,10 @@ def main():
     if args.val_subset_n:
         val_np = val_np[:args.val_subset_n]
 
-    rng = jax.random.PRNGKey(args.seed)
-    model = LagCodecModel(rng, cfg)
+    init_context = jax.default_device(fsdp_init_device) if args.fsdp else nullcontext()
+    with init_context:
+        rng = jax.random.PRNGKey(args.seed)
+        model = LagCodecModel(rng, cfg)
     n_params = count_params(model)
 
     run_dir = MODULE_DIR / "logs" / args.run_name
@@ -4786,27 +4895,39 @@ def main():
     (run_dir / f"config_{args.config.name}").write_text(args.config.read_text())
     logger(f"n_levels={n_levels} n_phases={n_phases} n_positions={n_positions} "
            f"params={n_params / 1e6:.2f}M")
+    if args.fsdp:
+        total_params, sharded_params, params_per_device = fsdp_parameter_stats(
+            model, logger_device_count)
+        logger(f"fsdp enabled: mesh_devices={logger_device_count} "
+               f"sharded_params={sharded_params / 1e6:.2f}/{total_params / 1e6:.2f}M "
+               f"estimated_params_per_device={params_per_device / 1e6:.2f}M")
+        if logger_device_count == 1:
+            warnings.warn("--fsdp has only one JAX device; it cannot reduce per-device parameter memory")
     resolved = {k: v for k, v in sorted(vars(args).items()) if k != "config"}
     logger(f"resolved_config:{_pretty_dict(_round_floats(resolved))}")
 
     resume_meta, resume_ckpt_dir = None, None
-    if args.resume:
-        resume_ckpt_dir = find_latest_checkpoint(run_dir)
-        if resume_ckpt_dir is not None:
-            resume_meta = json.loads((resume_ckpt_dir / "meta.json").read_text())
-            model = eqx.tree_deserialise_leaves(resume_ckpt_dir / "model.eqx", model)
-            logger(f"resuming from {resume_ckpt_dir}: phase={resume_meta['phase']} "
-                   f"phase_step={resume_meta['phase_step']} step={resume_meta['step']}")
-        else:
-            logger("--resume set but no checkpoint found under this run_dir -- starting fresh")
-    if args.load_encoder_checkpoint is not None:
+    init_context = jax.default_device(fsdp_init_device) if args.fsdp else nullcontext()
+    with init_context:
         if args.resume:
-            raise ValueError("--resume and --load_encoder_checkpoint cannot be used together")
-        ckpt_path = Path(args.load_encoder_checkpoint)
-        if not ckpt_path.exists():
-            raise FileNotFoundError(f"encoder checkpoint not found: {ckpt_path}")
-        model = load_encoder_only_checkpoint(model, ckpt_path)
-        logger(f"loaded CodeLM + Downsampler state from {ckpt_path}")
+            resume_ckpt_dir = find_latest_checkpoint(run_dir)
+            if resume_ckpt_dir is not None:
+                resume_meta = json.loads((resume_ckpt_dir / "meta.json").read_text())
+                model = eqx.tree_deserialise_leaves(resume_ckpt_dir / "model.eqx", model)
+                logger(f"resuming from {resume_ckpt_dir}: phase={resume_meta['phase']} "
+                       f"phase_step={resume_meta['phase_step']} step={resume_meta['step']}")
+            else:
+                logger("--resume set but no checkpoint found under this run_dir -- starting fresh")
+        if args.load_encoder_checkpoint is not None:
+            if args.resume:
+                raise ValueError("--resume and --load_encoder_checkpoint cannot be used together")
+            ckpt_path = Path(args.load_encoder_checkpoint)
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"encoder checkpoint not found: {ckpt_path}")
+            model = load_encoder_only_checkpoint(model, ckpt_path)
+            logger(f"loaded CodeLM + Downsampler state from {ckpt_path}")
+    if args.fsdp:
+        model = fsdp_put_tree(model, fsdp_mesh)
     if cfg.freeze_encoder and args.load_encoder_checkpoint is None and resume_meta is None:
         warnings.warn("--freeze_encoder is active without --load_encoder_checkpoint or a resumed "
                       "checkpoint; the randomly initialized CodeLM/downsampler will remain frozen. "
@@ -4828,18 +4949,27 @@ def main():
         tag = tag + ("_sample" if sample else "")
         g_kw = dict(greedy=not sample, temperature=cfg.gen_temperature, seed=1 if sample else 0)
         m = cast_pytree(eval_model, compute_dtype)
+        if args.fsdp:
+            flat_prompt = fsdp_put_array(flat_prompt, fsdp_replicated)
         codelm0 = m.codelm_for(0)
         tok0 = rgb_byte_pq_fn(flat_prompt, codelm0.pq_chunks, codelm0.code_vocab)
         raw, target = tok0, tok0
+        tag_seed = zlib.crc32(tag.encode()) if args.fsdp else hash(tag) % (2**31)
         codes, codes_soft = [], []
         # gen_eval_encode_mode="generate" always needs real randomness (it's actual sampling, not a
         # quantize_mode dispatch choice) -- independent of gumbel_at_inference, which only governs
         # the teacher_force path's quantize_dispatch rng.
-        if cfg.gen_eval_encode_mode == "generate":
-            eval_rngs = list(jax.random.split(jax.random.fold_in(jax.random.PRNGKey(0), hash(tag) % (2**31)), top + 1))
-        else:
-            eval_rngs = ([None] * (top + 1) if not cfg.gumbel_at_inference
-                         else list(jax.random.split(jax.random.fold_in(jax.random.PRNGKey(0), hash(tag) % (2**31)), top + 1)))
+        rng_context = jax.default_device(fsdp_init_device) if args.fsdp else nullcontext()
+        with rng_context:
+            if cfg.gen_eval_encode_mode == "generate":
+                eval_rngs = list(jax.random.split(jax.random.fold_in(jax.random.PRNGKey(0), tag_seed), top + 1))
+            else:
+                eval_rngs = ([None] * (top + 1) if not cfg.gumbel_at_inference
+                             else list(jax.random.split(jax.random.fold_in(jax.random.PRNGKey(0), tag_seed), top + 1)))
+        if args.fsdp:
+            eval_rngs = [fsdp_put_array(np.asarray(jax.device_get(key)), fsdp_replicated)
+                         if key is not None else None
+                         for key in eval_rngs]
         for i in range(top + 1):
             codelm_i = m.codelm_for(i)
             if cfg.gen_eval_encode_mode == "generate":
@@ -4876,10 +5006,13 @@ def main():
         if not gen_jit_timed[0]:
             gen_compile_s = time.monotonic() - cascade_t0
             gen_jit_timed[0] = True
-        cascade_acc = float(jnp.mean(cascade_recon == flat_prompt))
-        cascade_img = positions_to_image(np.asarray(cascade_recon), cfg, pixel_order)
+        cascade_acc_value = jnp.mean(cascade_recon == flat_prompt)
+        cascade_acc = float(fsdp_to_host(cascade_acc_value) if args.fsdp else cascade_acc_value)
+        cascade_recon_host = fsdp_to_host(cascade_recon) if args.fsdp else cascade_recon
+        cascade_img = positions_to_image(np.asarray(cascade_recon_host), cfg, pixel_order)
         cascade_mse = pixel_mse(cascade_img, gt_img)
-        save_samples(cascade_img, gt_img, run_dir / f"samples_{tag}.png", cfg)
+        if jax.process_index() == 0:
+            save_samples(cascade_img, gt_img, run_dir / f"samples_{tag}.png", cfg)
 
         gen_levelwise_acc = None
         if cfg.log_levelwise_gen:
@@ -4889,7 +5022,9 @@ def main():
                 level_tgt = label_fn(flat_prompt, cfg, pixel_order, n_blocks_i,
                                     cfg.pq_chunks[i], cfg.code_vocab[i])
                 level_targets.append(level_tgt)
-            gen_levelwise_acc = [float(jnp.mean(codes[i] == level_targets[i])) for i in range(top + 1)]
+            level_accs = [jnp.mean(codes[i] == level_targets[i]) for i in range(top + 1)]
+            gen_levelwise_acc = [
+                float(fsdp_to_host(value) if args.fsdp else value) for value in level_accs]
 
         gen_time_s = time.monotonic() - gen_t0
         msg = f"[{tag}] top={top} CASCADE{' (sampled T=%g k=%d)' % (cfg.gen_temperature, cfg.gen_top_k) if sample else ''} gen_byte_acc={cascade_acc:.4f} gen_cascade_mse={cascade_mse:.2f}"
@@ -4917,20 +5052,114 @@ def main():
                 run_gen_eval(eval_model, top, f"{tag}_train", train_flat_prompt, train_gt_img, sample=True)
         return result
 
+    def token_preview(tokens: np.ndarray, level: int) -> np.ndarray:
+        if level == 0:
+            return positions_to_image(tokens, cfg, pixel_order)
+        count = tokens.shape[1]
+        side = math.isqrt(count)
+        if side * side != count or tokens.shape[-1] < 3:
+            raise ValueError(
+                f"level {level}: cannot render {count} positions with {tokens.shape[-1]} chunks")
+        vocab = cfg.code_vocab[level]
+        rgb_seq = (tokens[0, :, :3].astype(np.float32) *
+                   (255.0 / max(1, vocab - 1))).clip(0, 255).astype(np.uint8)
+        order = zorder_pixel_order(side) if cfg.traversal == "zorder" else np.arange(count)
+        raster = np.zeros_like(rgb_seq)
+        raster[order] = rgb_seq
+        grid = raster.reshape(side, side, 3)
+        rows = np.linspace(0, side - 1, cfg.img_size).round().astype(int)
+        cols = np.linspace(0, side - 1, cfg.img_size).round().astype(int)
+        return grid[rows[:, None], cols[None, :]][None]
+
+    def teacher_force_level0(m, tokens: jnp.ndarray) -> jnp.ndarray:
+        codelm = m.codelm_for(0)
+        hidden = pardec_context_hidden(
+            codelm, m.downsampler_for(0), tokens, cfg, m.codelm_bos_rate_id(0), None,
+            group_size=m.K(0) * cfg.downsampler_ncodes[0])
+        logits = codelm_ntp_logits_tf(codelm, hidden[:, :-1], tokens[:, 1:])
+        predicted = jnp.argmax(logits, axis=-1).astype(tokens.dtype)
+        return tokens.at[:, 1:].set(predicted)
+
+    def run_qual_eval(eval_model, phase: int, tag: str) -> None:
+        if cfg.modality != "image":
+            logger(f"[{tag}] QUAL skipped: image token previews require modality='image'")
+            return
+        m = cast_pytree(eval_model, compute_dtype)
+        for source_name, images in (("train", train_np[:1]), ("val", val_np[:1])):
+            gt_image = images.astype(np.uint8)
+            flat_host = images_to_positions(images, cfg, pixel_order)
+            flat = fsdp_put_array(flat_host, fsdp_replicated) if args.fsdp else jnp.asarray(flat_host)
+            raw = rgb_byte_pq_fn(flat, m.codelm_for(0).pq_chunks, m.codelm_for(0).code_vocab)
+            level_tokens = []
+            for level in range(phase):
+                key = jax.random.PRNGKey(args.seed + level * 1009 +
+                                         (0 if source_name == "val" else 1))
+                if args.fsdp:
+                    key = fsdp_put_array(np.asarray(jax.device_get(key)), fsdp_replicated)
+                out = encode_pardec_downsampler_generate(
+                    m.codelm_for(level), m.downsampler_for(level), raw, m.K(level), cfg,
+                    rate_id=m.bos_rate_id(level),
+                    codelm_rate_id=m.codelm_bos_rate_id(level),
+                    rng=key, greedy=True, temperature=1.0, top_k=0,
+                    downsampler_ncodes=cfg.downsampler_ncodes[level])
+                raw = out["code_idx"]
+                level_tokens.append(raw)
+
+            for level, tokens in enumerate(level_tokens):
+                host_tokens = fsdp_to_host(tokens) if args.fsdp else np.asarray(tokens)
+                preview_gt = token_preview(np.asarray(host_tokens), level)
+                for requested_prefix in (1, 128):
+                    prefix = min(requested_prefix, tokens.shape[1])
+                    key = jax.random.PRNGKey(args.seed + level * 101 + prefix)
+                    if args.fsdp:
+                        key = fsdp_put_array(np.asarray(jax.device_get(key)), fsdp_replicated)
+                    generated = encoder_free_run(
+                        m.codelm_for(level), tokens[:, :prefix], tokens.shape[1], m.K(level), key,
+                        greedy=True, temperature=1.0, top_k=0,
+                        rate_id=m.codelm_bos_rate_id(level))
+                    if args.fsdp:
+                        generated = fsdp_to_host(generated)
+                    preview_gen = token_preview(np.asarray(generated), level)
+                    sample_path = run_dir / (
+                        f"samples_{tag}_{source_name}_level{level}_prompt{prefix}.png")
+                    if jax.process_index() == 0:
+                        save_samples(preview_gen, preview_gt, sample_path, cfg)
+                    logger(f"[{tag}] QUAL source={source_name} level={level} "
+                           f"prompt_positions={prefix}/{tokens.shape[1]} kv_cache=true "
+                           f"saved={sample_path.name}")
+
+                if level == 0:
+                    tf_tokens = teacher_force_level0(m, tokens)
+                    if args.fsdp:
+                        tf_tokens = fsdp_to_host(tf_tokens)
+                    tf_image = positions_to_image(np.asarray(tf_tokens), cfg, pixel_order)
+                    mse = pixel_mse(tf_image, gt_image)
+                    if jax.process_index() == 0:
+                        save_samples(
+                            tf_image, gt_image,
+                            run_dir / f"samples_{tag}_{source_name}_level0_teacher_force.png", cfg)
+                    logger(f"[{tag}] TF_SANITY source={source_name} level=0 mse={mse:.3f}",
+                           tag=tag, source=source_name, tf_sanity_mse=float(mse))
+
     def run_gen_eval_teacher_force_sanity(eval_model, top: int, tag: str, flat_prompt, gt_img) -> float:
         # SAME cross-level ctx cascade as training (level_gt_drop honored as-is -- see
         # Config.gen_eval_teacher_force_sanity), but every digit-level AR step forced teacher-forced.
         m = cast_pytree(eval_model, compute_dtype)
+        if args.fsdp:
+            flat_prompt = fsdp_put_array(flat_prompt, fsdp_replicated)
         phase = top + 1
         _, aux = val_eval_jit(m, flat_prompt, phase, rng=None,
                                level_gt_drop=args.level_gt_drop[phase - 1],
                                encode_temperature=args.encode_temperature[phase - 1],
                                label_reg_weight=0.0, label_fn=label_fn, pixel_order=pixel_order,
                                digit_teacher_force=True, return_recon=True)
+        if args.fsdp:
+            aux = fsdp_to_host(aux)
         pred_bytes = aux[-1]
         recon_img = positions_to_image(np.asarray(pred_bytes), cfg, pixel_order)
         mse = pixel_mse(recon_img, gt_img)
-        save_samples(recon_img, gt_img, run_dir / f"samples_{tag}_tfsanity.png", cfg)
+        if jax.process_index() == 0:
+            save_samples(recon_img, gt_img, run_dir / f"samples_{tag}_tfsanity.png", cfg)
         logger(f"[{tag}] top={top} TF_SANITY tf_sanity_mse={mse:.2f}", tag=tag, tf_sanity_mse=float(mse))
         return mse
 
@@ -4958,13 +5187,19 @@ def main():
         for start in range(0, n, bs):
             batch_imgs = val_np[start:start + bs]
             bn = len(batch_imgs)
-            batch_flat = jnp.array(images_to_positions(batch_imgs, cfg, pixel_order))
+            batch_positions = images_to_positions(batch_imgs, cfg, pixel_order)
+            if args.fsdp:
+                batch_flat = fsdp_put_array(batch_positions, fsdp_replicated)
+            else:
+                batch_flat = jnp.array(batch_positions)
             batch_t0 = time.monotonic()
             loss_b, aux_b = val_eval_jit(m, batch_flat, phase, rng=None,
                                           encode_temperature=args.encode_temperature[phase - 1],
                                           label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
                                           pixel_order=pixel_order,
                                           return_levelwise=cfg.log_levelwise_eval or cfg.log_levelwise_metrics)
+            if args.fsdp:
+                loss_b, aux_b = fsdp_to_host((loss_b, aux_b))
             if not val_jit_timed[0]:
                 val_compile_s = time.monotonic() - batch_t0
                 val_jit_timed[0] = True
@@ -5036,7 +5271,9 @@ def main():
     step = resume_meta["step"] if resume_meta else 0
     all_phases = [n_phases] if args.no_curriculum else list(range(1, n_phases + 1))
     total_all_steps = sum(
-        _phase_total_steps(p - 1, len(train_np) // (args.batch_size[p - 1] * n_devices * jax.process_count()))
+        _phase_total_steps(p - 1, len(BatchIterator(
+            train_np, train_labels[:len(train_np)], args.batch_size[p - 1], n_devices,
+            shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp)))
         for p in all_phases)
     step_w = len(str(total_all_steps))
     global_pbar = tqdm(total=total_all_steps, initial=step, desc="total", dynamic_ncols=True, position=1, leave=True)
@@ -5046,7 +5283,7 @@ def main():
         resume_phase = resume_meta["phase"]
         steps_per_epoch_resume = len(BatchIterator(
             train_np, train_labels[:len(train_np)], args.batch_size[resume_phase - 1], n_devices,
-            shuffle=True, seed=args.seed, cfg=cfg))
+            shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp))
         phase_steps_resume = _phase_total_steps(resume_phase - 1, steps_per_epoch_resume)
         phase_complete = resume_meta["phase_step"] >= phase_steps_resume
         phase_iter = [p for p in phase_iter if p > resume_phase] if phase_complete \
@@ -5069,13 +5306,17 @@ def main():
             logger(f"level{phase - 1}: level_epochs=0, skipping phase entirely")
             continue
         train_iter = BatchIterator(train_np, train_labels[:len(train_np)], args.batch_size[phase - 1],
-                                    n_devices, shuffle=True, seed=args.seed, cfg=cfg)
+                                    n_devices, shuffle=True, seed=args.seed, cfg=cfg, fsdp=args.fsdp)
         recon_prompt = val_np[:args.val_batch_size[phase - 1]]
-        flat_prompt = jnp.array(images_to_positions(recon_prompt, cfg, pixel_order))
+        flat_prompt_np = images_to_positions(recon_prompt, cfg, pixel_order)
+        flat_prompt = fsdp_put_array(flat_prompt_np, fsdp_replicated) if args.fsdp \
+            else jnp.array(flat_prompt_np)
         gt_img = recon_prompt.astype(np.uint8)
         if args.eval_gen_train:
             train_recon_prompt = train_np[:args.val_batch_size[phase - 1]]
-            train_flat_prompt = jnp.array(images_to_positions(train_recon_prompt, cfg, pixel_order))
+            train_flat_prompt_np = images_to_positions(train_recon_prompt, cfg, pixel_order)
+            train_flat_prompt = fsdp_put_array(train_flat_prompt_np, fsdp_replicated) if args.fsdp \
+                else jnp.array(train_flat_prompt_np)
             train_gt_img = train_recon_prompt.astype(np.uint8)
 
         filter_spec = phase_trainable_filter(model, phase)
@@ -5129,14 +5370,15 @@ def main():
             optimizer = optax.chain(optax.clip_by_global_norm(args.grad_clip), optimizer)
         opt_state = optimizer.init(diff_model)
 
-        def train_step(diff_model, opt_state, rng, flat_bytes, static_model=static_model):
+        def train_step_impl(diff_model, opt_state, rng, flat_bytes, static_model):
             rng, level_rng, cascade_rng = jax.random.split(rng, 3)
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
                 diff_model, static_model, flat_bytes, level_rng, cascade_rng)
             grads = tie_shared_grads(grads, cfg)
-            grads = jax.lax.pmean(grads, axis_name="d")
-            loss = jax.lax.pmean(loss, axis_name="d")
-            aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
+            if not args.fsdp:
+                grads = jax.lax.pmean(grads, axis_name="d")
+                loss = jax.lax.pmean(loss, axis_name="d")
+                aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
             # no gradient tying needed: with cfg.share_across_levels=True (default), codelm_for/
             # downsampler_for/upsampler_for all resolve to the SAME singleton instance regardless of
             # level index -- level_forward calling it at several different level indices within this
@@ -5150,8 +5392,29 @@ def main():
             diff_model = eqx.apply_updates(diff_model, updates)
             return diff_model, opt_state, rng, loss, aux
 
-        # donate model/opt_state/rng: replaced by the outputs every step (frees the old copies in the update)
-        train_step = jax.pmap(train_step, axis_name="d", donate_argnums=(0, 1, 2))
+        if args.fsdp:
+            diff_model = fsdp_put_tree(diff_model, fsdp_mesh)
+            # Frozen leaves must also stay sharded; passing them dynamically avoids replicated constants.
+            static_model = fsdp_put_tree(static_model, fsdp_mesh)
+            opt_state = fsdp_put_tree(opt_state, fsdp_mesh)
+            diff_shardings = fsdp_shardings(diff_model, fsdp_mesh)
+            opt_shardings = fsdp_shardings(opt_state, fsdp_mesh)
+            static_shardings = fsdp_shardings(static_model, fsdp_mesh)
+
+            def train_step(diff_model, opt_state, rng, flat_bytes, static_model):
+                return train_step_impl(diff_model, opt_state, rng, flat_bytes, static_model)
+
+            train_step = jax.jit(
+                train_step,
+                in_shardings=(diff_shardings, opt_shardings, fsdp_replicated,
+                              fsdp_replicated, static_shardings),
+                out_shardings=(diff_shardings, opt_shardings, fsdp_replicated, None, None),
+                donate_argnums=(0, 1, 2))
+        else:
+            train_step = jax.pmap(
+                lambda diff_model, opt_state, rng, flat_bytes:
+                    train_step_impl(diff_model, opt_state, rng, flat_bytes, static_model),
+                axis_name="d", donate_argnums=(0, 1, 2))
 
         # --level_select_prob: any-level training (see sample_level_range/level_forward_multires).
         # (entry_level, depth) must be static per trace (same constraint `phase` already has), so
@@ -5172,34 +5435,57 @@ def main():
                                                label_reg_weight=cfg.label_reg_weight, label_fn=label_fn,
                                                pixel_order=pixel_order, entry_gt_drop=entry_gt_drop_sd)
 
-            def train_step_sd(diff_model, opt_state, rng, flat_bytes, static_model=static_model):
+            def train_step_sd_impl(diff_model, opt_state, rng, flat_bytes, static_model):
                 rng, level_rng, cascade_rng = jax.random.split(rng, 3)
                 (loss, aux), grads = jax.value_and_grad(loss_fn_sd, has_aux=True)(
                     diff_model, static_model, flat_bytes, level_rng, cascade_rng)
                 grads = tie_shared_grads(grads, cfg)
-                grads = jax.lax.pmean(grads, axis_name="d")
-                loss = jax.lax.pmean(loss, axis_name="d")
-                aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
+                if not args.fsdp:
+                    grads = jax.lax.pmean(grads, axis_name="d")
+                    loss = jax.lax.pmean(loss, axis_name="d")
+                    aux = jax.tree_util.tree_map(lambda a: jax.lax.pmean(a, axis_name="d"), aux)
                 grad_norm = optax.global_norm(grads)
                 aux = aux + (grad_norm,)
                 updates, opt_state = optimizer.update(grads, opt_state, diff_model)
                 diff_model = eqx.apply_updates(diff_model, updates)
                 return diff_model, opt_state, rng, loss, aux
 
-            return jax.pmap(train_step_sd, axis_name="d", donate_argnums=(0, 1, 2))
+            if args.fsdp:
+                def train_step_sd(diff_model, opt_state, rng, flat_bytes, static_model):
+                    return train_step_sd_impl(diff_model, opt_state, rng, flat_bytes, static_model)
 
-        p_diff_model = replicate(diff_model, n_devices)
-        p_opt_state = replicate(opt_state, n_devices)
-        p_rng_key = jax.random.fold_in(jax.random.PRNGKey(args.seed), phase)
-        if jax.process_count() > 1:
+                return jax.jit(
+                    train_step_sd,
+                    in_shardings=(diff_shardings, opt_shardings, fsdp_replicated,
+                                  fsdp_replicated, static_shardings),
+                    out_shardings=(diff_shardings, opt_shardings, fsdp_replicated, None, None),
+                    donate_argnums=(0, 1, 2))
+            return jax.pmap(
+                lambda diff_model, opt_state, rng, flat_bytes:
+                    train_step_sd_impl(diff_model, opt_state, rng, flat_bytes, static_model),
+                axis_name="d", donate_argnums=(0, 1, 2))
+
+        p_diff_model = diff_model if args.fsdp else replicate(diff_model, n_devices)
+        p_opt_state = opt_state if args.fsdp else replicate(opt_state, n_devices)
+        rng_context = jax.default_device(fsdp_init_device) if args.fsdp else nullcontext()
+        with rng_context:
+            p_rng_key = jax.random.fold_in(jax.random.PRNGKey(args.seed), phase)
+        if jax.process_count() > 1 and not args.fsdp:
             p_rng_key = jax.random.fold_in(p_rng_key, jax.process_index())
-        p_rng = jax.random.split(p_rng_key, n_devices)
+        p_rng = fsdp_put_array(np.asarray(jax.device_get(p_rng_key)), fsdp_replicated) if args.fsdp \
+            else jax.random.split(p_rng_key, n_devices)
 
         start_phase_step = 0
         if resume_meta is not None and phase == resume_meta["phase"]:
-            p_opt_state = replicate(
-                eqx.tree_deserialise_leaves(resume_ckpt_dir / "opt_state.eqx", opt_state), n_devices)
-            p_rng = eqx.tree_deserialise_leaves(resume_ckpt_dir / "p_rng.eqx", p_rng)
+            restore_context = jax.default_device(fsdp_init_device) if args.fsdp else nullcontext()
+            with restore_context:
+                restored_opt_state = eqx.tree_deserialise_leaves(
+                    resume_ckpt_dir / "opt_state.eqx", opt_state)
+                restored_rng = eqx.tree_deserialise_leaves(resume_ckpt_dir / "p_rng.eqx", p_rng)
+            p_opt_state = fsdp_put_tree(restored_opt_state, fsdp_mesh) if args.fsdp \
+                else replicate(restored_opt_state, n_devices)
+            p_rng = fsdp_put_array(np.asarray(jax.device_get(restored_rng)), fsdp_replicated) \
+                if args.fsdp else restored_rng
             dl_state = json.loads((resume_ckpt_dir / "dataloader_state.json").read_text())
             train_iter.epoch_rng.bit_generator.state = dl_state["epoch_rng_state"]
             train_iter.epoch_seed = dl_state["epoch_seed"]
@@ -5226,6 +5512,7 @@ def main():
         pbar = tqdm(total=phase_total_steps, initial=start_phase_step, desc=active_desc, dynamic_ncols=True, position=0)
         jit_timed = False
         phase_step = start_phase_step
+        last_checkpoint_step = step if resuming_this_phase and start_phase_step == phase_total_steps else None
         epoch_num = start_phase_step // steps_per_epoch
         while phase_step < phase_total_steps:
             epoch_num += 1
@@ -5236,7 +5523,8 @@ def main():
             for flat in train_iter:
                 if phase_step >= phase_total_steps:
                     break
-                flat = jnp.array(flat)
+                flat = fsdp_put_array(np.asarray(flat[0]), fsdp_replicated) if args.fsdp \
+                    else jnp.array(flat)
                 if not jit_timed:
                     jit_t0 = time.monotonic()
                 if multires_active:
@@ -5245,13 +5533,25 @@ def main():
                     if step_fn is None:
                         step_fn = _build_multires_step(s_lvl, d_lvl)
                         multires_step_cache[(s_lvl, d_lvl)] = step_fn
-                    p_diff_model, p_opt_state, p_rng, loss, aux = step_fn(p_diff_model, p_opt_state, p_rng, flat)
+                    if args.fsdp:
+                        p_diff_model, p_opt_state, p_rng, loss, aux = step_fn(
+                            p_diff_model, p_opt_state, p_rng, flat, static_model)
+                    else:
+                        p_diff_model, p_opt_state, p_rng, loss, aux = step_fn(
+                            p_diff_model, p_opt_state, p_rng, flat)
                 else:
-                    p_diff_model, p_opt_state, p_rng, loss, aux = train_step(p_diff_model, p_opt_state, p_rng, flat)
+                    if args.fsdp:
+                        p_diff_model, p_opt_state, p_rng, loss, aux = train_step(
+                            p_diff_model, p_opt_state, p_rng, flat, static_model)
+                    else:
+                        p_diff_model, p_opt_state, p_rng, loss, aux = train_step(
+                            p_diff_model, p_opt_state, p_rng, flat)
+                if args.fsdp:
+                    loss, aux = fsdp_to_host((loss, aux))
                 step += 1
                 phase_step += 1
                 pbar.update(1)
-                loss0 = float(local_array(loss)[0])
+                loss0 = scalar_float(loss)
                 if not jit_timed:
                     logger(f"{active_desc}: first train_step (incl. jit compile) took "
                            f"{time.monotonic() - jit_t0:.1f}s")
@@ -5260,7 +5560,8 @@ def main():
                     scalar_aux = [scalar_float(a) for a in aux[:9]]
                     dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse = scalar_aux
                     enc_level_losses, enc_level_accs, dec_level_losses, dec_level_accs = [
-                        np.asarray(device_mean_array(a), dtype=np.float64) for a in aux[9:13]
+                        np.asarray(a if args.fsdp else device_mean_array(a), dtype=np.float64)
+                        for a in aux[9:13]
                     ]
                     grad_norm = scalar_float(aux[13])
                 else:
@@ -5300,9 +5601,11 @@ def main():
                            **log_kwargs)
 
                 if step % gen_eval_every_steps == 0:
-                    snapshot = eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
+                    snapshot = eqx.combine(p_diff_model, static_model) if args.fsdp else \
+                        eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
                     st = f"{step:0{step_w}d}"  # zero-padded so file browsers sort samples numerically
                     run_val_eval(snapshot, phase, tag=f"level{phase - 1}_step{st}")
+                    run_qual_eval(snapshot, phase, tag=f"step{st}")
                     if cfg.gen_eval_all_levels:
                         for lvl in range(phase - 1, -1, -1):
                             run_gen_eval_both(snapshot, top=lvl, tag=f"level{lvl}_step{st}")
@@ -5316,46 +5619,72 @@ def main():
                         assert cfg.modality == "image", "codegrid is image-only"
                         plot_encoder_outs(snapshot, cfg, val_np[:args.val_batch_size[phase - 1]], pixel_order,
                                        run_dir / f"samples_level{phase - 1}_step{st}_codegrid.png",
-                                       level=phase - 1, label_fn=label_fn)
+                                       level=phase - 1, label_fn=label_fn,
+                                       fsdp_replicated=fsdp_replicated if args.fsdp else None)
                     except Exception as e:
                         print(e)
 
                 if step % ckpt_every_steps == 0:
-                    ckpt_model = eqx.combine(to_host(unreplicate(p_diff_model)), static_model)
-                    ckpt_opt_state = to_host(unreplicate(p_opt_state))
+                    if args.fsdp:
+                        ckpt_model = fsdp_to_host(eqx.combine(p_diff_model, static_model))
+                        ckpt_opt_state = fsdp_to_host(p_opt_state)
+                        ckpt_rng = fsdp_to_host(p_rng)
+                    else:
+                        ckpt_model = eqx.combine(to_host(unreplicate(p_diff_model)), static_model)
+                        ckpt_opt_state = to_host(unreplicate(p_opt_state))
+                        ckpt_rng = to_host(p_rng)
                     ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_step{step}"
-                    save_checkpoint(ckpt_dir, ckpt_model, ckpt_opt_state, to_host(p_rng), train_iter,
-                                     phase=phase, phase_step=phase_step, step=step, seed=args.seed,
-                                     schedule_meta=schedule_meta)
-                    prune_checkpoints(run_dir, args.ckpt_keep)
+                    if jax.process_index() == 0:
+                        if args.ckpt_keep is not None:
+                            prune_checkpoints(run_dir, max(0, args.ckpt_keep - 1))
+                        save_checkpoint(ckpt_dir, ckpt_model, ckpt_opt_state, ckpt_rng, train_iter,
+                                         phase=phase, phase_step=phase_step, step=step, seed=args.seed,
+                                         schedule_meta=schedule_meta)
+                        prune_checkpoints(run_dir, args.ckpt_keep)
+                    last_checkpoint_step = step
                     logger(f"checkpoint saved: {ckpt_dir}")
 
                 if args.wa_mode != "none" and step % wa_every_steps == 0:
-                    cur_diff_model = to_host(unreplicate(p_diff_model))
+                    cur_diff_model = fsdp_to_host(p_diff_model) if args.fsdp \
+                        else to_host(unreplicate(p_diff_model))
                     wa_dir.mkdir(parents=True, exist_ok=True)
                     if args.wa_mode == "ema":
                         wa_ema = cur_diff_model if wa_ema is None else \
                             ema_update(wa_ema, cur_diff_model, args.wa_ema_decay)
-                        eqx.tree_serialise_leaves(wa_dir / "ema_latest.eqx", wa_ema)
-                        if args.wa_verbose:
+                        if jax.process_index() == 0:
+                            eqx.tree_serialise_leaves(wa_dir / "ema_latest.eqx", wa_ema)
+                        if args.wa_verbose and jax.process_index() == 0:
                             logger(f"wa (ema) snapshot saved at step {step}")
                     else:
                         wa_stack.append(cur_diff_model)
                         if len(wa_stack) == args.wa_stack_size:
                             avg = stack_average(list(wa_stack), weights=args.wa_wma_weights)
-                            eqx.tree_serialise_leaves(wa_dir / "wma_latest.eqx", avg)
-                            if args.wa_verbose:
+                            if jax.process_index() == 0:
+                                eqx.tree_serialise_leaves(wa_dir / "wma_latest.eqx", avg)
+                            if args.wa_verbose and jax.process_index() == 0:
                                 logger(f"wa (wma, n={len(wa_stack)}) average saved at step {step}")
 
-        diff_model = to_host(unreplicate(p_diff_model))
-        model = eqx.combine(diff_model, static_model)
         freeze_msg = "no freeze (no_freeze mode)" if cfg.curriculum_mode == "no_freeze" else f"freezing level {phase - 1}"
         logger(f"=== {active_desc} done, {freeze_msg} ===")
         ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_step{step}"
-        save_checkpoint(ckpt_dir, model, to_host(unreplicate(p_opt_state)), to_host(p_rng), train_iter,
-                         phase=phase, phase_step=phase_total_steps, step=step, seed=args.seed,
-                         schedule_meta=schedule_meta)
-        prune_checkpoints(run_dir, args.ckpt_keep)
+        model = eqx.combine(p_diff_model, static_model) if args.fsdp else \
+            eqx.combine(to_host(unreplicate(p_diff_model)), static_model)
+        if last_checkpoint_step != step:
+            if args.fsdp:
+                ckpt_model = fsdp_to_host(model)
+                ckpt_opt_state = fsdp_to_host(p_opt_state)
+                ckpt_rng = fsdp_to_host(p_rng)
+            else:
+                ckpt_model = model
+                ckpt_opt_state = to_host(unreplicate(p_opt_state))
+                ckpt_rng = to_host(p_rng)
+            if jax.process_index() == 0:
+                if args.ckpt_keep is not None:
+                    prune_checkpoints(run_dir, max(0, args.ckpt_keep - 1))
+                save_checkpoint(ckpt_dir, ckpt_model, ckpt_opt_state, ckpt_rng, train_iter,
+                                 phase=phase, phase_step=phase_total_steps, step=step, seed=args.seed,
+                                 schedule_meta=schedule_meta)
+                prune_checkpoints(run_dir, args.ckpt_keep)
         if args.final_eval:
             run_val_eval(model, phase, tag=f"level{phase - 1}_final")
             if cfg.gen_eval_all_levels:
@@ -5372,6 +5701,7 @@ def main():
     global_pbar.close()
     logger("=== all phases done, running final top-down cascade eval ===")
     run_val_eval(model, n_phases, tag="final")
+    run_qual_eval(model, n_phases, tag="final")
     for top in range(n_phases - 1, -1, -1):
         run_gen_eval_both(model, top=top, tag=f"final_top{top}")
         if cfg.gen_eval_teacher_force_sanity:

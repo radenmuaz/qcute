@@ -107,8 +107,8 @@ pardec_token_head = "ar"    # alternative: autoregressive digits
 token_dim = 128
 token_n_heads = 2
 # --- training ---
-batch_size = 4      # per DEVICE; tpu34 = 2 hosts x 4 devices -> global batch 64 (16 OOMs: 20.4G program vs 16G free)
-val_batch_size = 4
+batch_size = 8      # per DEVICE; tpu34 = 2 hosts x 4 devices -> global batch 64 (16 OOMs: 20.4G program vs 16G free)
+val_batch_size = 8
 # level_epochs = (1, 1, 5)
 # Approximate step equivalents (tpu34 v4-16: batch_size 8 x 4 local devices x 2 hosts = global batch 64;
 # ImageNet64 train = 1,281,167 imgs -> 1 epoch = 1,281,167 / 64 = 20,018 steps):
@@ -135,9 +135,10 @@ lr_min = 1e-5
 # lr_min_step = int(200e3)
 warmup_steps = 1000
 optimizer = "adamw"
-optimizer_kwargs = dict(weight_decay=0)
+optimizer_kwargs = dict(weight_decay=1e-5)
 
 # --- logging ---
 log_every = 100
 ckpt_every_step = 10_000
-ckpt_keep = 2
+# ckpt_every_step = 10
+ckpt_keep = 1
