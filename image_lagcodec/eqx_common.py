@@ -110,6 +110,17 @@ def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: boo
                 q_p * sm_scale, k_p, v_p)
         else:
             y = jax.vmap(kernel)(q_p * sm_scale, k_p, v_p)
+    # elif (jax.process_count() == 1 or "dp" in mesh.axis_names):
+    # elif (jax.process_count() == 1):
+    #     # Single-host FSDP and hybrid FSDP/DP fast-path experiment: use the original
+    #     # direct Splash call, without the extra replicated shard_map. Set `and True`
+    #     # to `and False` to force the established shard_map path below. The hybrid
+    #     # case is opt-in because direct Splash previously had multihost issues.
+    #     if sink is not None:
+    #         y = jax.vmap(lambda qq, kk, vv: kernel(qq, kk, vv, sinks=sink))(
+    #             q_p * sm_scale, k_p, v_p)
+    #     else:
+    #         y = jax.vmap(kernel)(q_p * sm_scale, k_p, v_p)
     else:
         def run_local(qq, kk, vv, ss):
             if ss is not None:

@@ -24,6 +24,7 @@ dependencies = [
     "tpu-info>=0.14.2",
     "pillow>=12.3.0",
     "equinox>=0.13.8",
+    "imagecodecs"
 ]
 
 [tool.uv]

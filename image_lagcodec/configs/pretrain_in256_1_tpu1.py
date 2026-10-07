@@ -1,13 +1,13 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/pretrain_in64_1_one.py
+uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/pretrain_in64_1_tpu1.py
 """
 # --- data ---
-img_size = 64
-dataset = "imagenet64"
-data_root = "/dev/shm/imagenet64"
-multihost = True
+img_size = 256
+dataset = "imagenet256_jxl"
+data_root = "/dev/shm/imagenet256_jxl"
+multihost = False
 fsdp = True
-fsdp_mode = "intra_node_fsdp_inter_node_dp"
+# fsdp_mode = "intra_node_fsdp_inter_node_dp"
 
 traversal = "zorder"
 eval_gen_train = True
@@ -17,14 +17,8 @@ gen_eval_prompt = 2048
 # remat_level = True
 share_across_levels = False
 
-# codelm_d_model = 1024
-# codelm_n_layers = 16
-# codelm_n_heads = 8
-# codelm_n_kv_heads = 8
-# mlp_mult = 4
-
 codelm_d_model = 2048
-codelm_n_layers = 32
+codelm_n_layers = 16
 codelm_n_heads = 16
 codelm_n_kv_heads = 16
 mlp_mult = 2
@@ -32,7 +26,6 @@ mlp_mult = 2
 code_vocab = 256
 pq_chunks = 3
 pq_dim = 128
-# pq_dim = 64
 rope_base = 10000.0
 
 ntp_weight = 1.0
@@ -64,11 +57,10 @@ use_sink = True
 precision = "bf16"
 
 byte_group = 3
-token_head_type = "ar"
-codelm_token_head = "ar"
+token_head_type = "ar_flat"
+codelm_token_head = "ar_flat"
 pardec_token_head = "ar"
 token_dim = 128
-# token_dim = 64
 token_n_heads = 2
 traversal = "zorder"
 eval_gen_train = True
@@ -77,10 +69,10 @@ gen_eval_teacher_force_sanity = True
 gen_eval_prompt = 512
 
 # --- training ---
-batch_size = 8
-val_batch_size = 8
+batch_size = 4
+val_batch_size = 4
 # level_steps = (20_000, 20_000, 20_000, 100_000)
-level_steps = (int(1e5),)
+level_steps = (int(2e5),)
 seed = 0
 train_subset_n = None
 val_subset_n = None
@@ -100,7 +92,7 @@ optimizer_kwargs = dict(weight_decay=1e-2)
 wa_verbose = False
 
 # --- logging ---
-log_every = 1000
+log_every = 100
 ckpt_every_step = 10_000
 # ckpt_every_step = int(2e5)
 ckpt_keep = 1

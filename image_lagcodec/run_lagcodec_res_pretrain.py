@@ -193,15 +193,15 @@ class Config:
     # next token in parallel/independently. "ar": a small autoregressive digit head (same design as
     # the PardecLM AR head, token_dim/token_n_heads) -- digit m conditioned on digits <m of the SAME
     # token (teacher-forced real digits in the NTP loss, own sampled digits in free-run generation).
-    # The AR head's params are only allocated in "ar" mode. Prefill (KV-cache build over the prompt)
-    # is head-independent; only the per-step next-token sampling changes.
+    # "ar_flat": factorized linear heads of widths token_dim, 2*token_dim, 3*token_dim (requires
+    # pq_chunks=3). AR modes use token_mask_prob during teacher-forced NTP. Prefill is head-independent.
     downsampler_rollout: bool = False  # False (default, current behavior): the downsampler is
     # TEACHER-FORCED on label_fn(image) digits inside pardec_score, and the code it emits is
     # quantized from those teacher-forced logits (train/gen mismatch; a ground-truth leak into a
     # latent when label_reg_weight=0). True: the downsampler instead SELF-FEEDS -- digits are
     # sampled (straight-through gumbel / hard, per quantize_mode) and fed back through the AR head,
     # exactly as at inference; label_fn is then only used for the optional label_reg aux loss.
-    # Needs downsampler_decode_past/future==0, pardec_token_head="ar". downsampler_ncodes>1: the row is rolled
+    # Needs downsampler_decode_past/future==0, pardec_token_head="ar" or "ar_flat". downsampler_ncodes>1: the row is rolled
     # out too, one pass per row code (exact); downsampler_pss_passes>1 caps the passes (approximate).
     # Warns when False while label_reg_weight==0.
     downsampler_rollout_prob: float = 1.0  # probability (per train step, one draw per level) of
@@ -214,7 +214,7 @@ class Config:
     # sequential) is then never exercised during training at all. True: digits are self-fed
     # (token_ar_rollout, straight-through per quantize_mode) while the loss still scores against the
     # real target -- training the digit head the way it's actually used at generation time. Needs
-    # upsampler_decode_past/future==0, pardec_token_head="ar". Row TOKENS stay teacher-forced (any
+    # upsampler_decode_past/future==0, pardec_token_head="ar" or "ar_flat". Row TOKENS stay teacher-forced (any
     # upsampler_ncodes); upsampler_pss_passes self-feeds those.
     upsampler_rollout_prob: float = 1.0  # probability (per decode step, one draw per level) of using
     # the rollout path instead of teacher-forced when upsampler_rollout=True. Eval (rng=None) always
@@ -605,13 +605,18 @@ class Config:
                         f"(one shared module for the whole model, not one per level), got {vals}"
         assert len(self.token_head_type) == n
         assert len(self.pq_dim) == n
-        assert all(t in ("linears", "ar") for t in self.token_head_type)
+        assert all(t in ("linears", "ar", "ar_flat") for t in self.token_head_type)
         for i in range(n):
             if self.token_head_type[i] == "ar":
                 assert i < len(self.token_dim) and i < len(self.token_n_heads), \
                     f"level {i} uses token_head_type={self.token_head_type[i]!r} but token_dim/" \
                     f"token_n_heads only has {len(self.token_dim)} entries -- set one per level"
                 assert self.token_dim[i] % self.token_n_heads[i] == 0
+            elif self.token_head_type[i] == "ar_flat":
+                assert i < len(self.token_dim), \
+                    f"level {i} uses token_head_type='ar_flat' but token_dim only has {len(self.token_dim)} entries"
+                assert self.modality == "image" and self.byte_group == 3 and self.pq_chunks[i] == 3, \
+                    f"level {i} uses token_head_type='ar_flat', which requires RGB byte_group=3 and pq_chunks=3"
         assert self.modality in MODALITIES, self.modality
         if self.modality == "image":
             assert self.byte_group in (1, 3), "byte_group must be 1 (per-byte) or 3 (per-pixel RGB)"
@@ -626,11 +631,22 @@ class Config:
         assert self.traversal in ("raster", "zorder")
         assert self.bos_rate_mode in ("relative", "absolute")
         assert self.context_source in ("codelm", "codelm_upper", "own_embed", "shared_embed")
-        assert self.pardec_token_head in ("ar", "linear"), self.pardec_token_head
-        assert self.codelm_token_head in ("ar", "linear"), self.codelm_token_head
+        assert self.pardec_token_head in ("ar", "ar_flat", "linear"), self.pardec_token_head
+        assert self.codelm_token_head in ("ar", "ar_flat", "linear"), self.codelm_token_head
+        if self.codelm_token_head == "ar_flat" and not (
+                self.modality == "image" and self.byte_group == 3 and all(c == 3 for c in self.pq_chunks)):
+            raise ValueError("codelm_token_head='ar_flat' requires RGB image tokens with byte_group=3 "
+                             "and pq_chunks=3 at every level")
+        if self.codelm_token_head == "ar_flat":
+            assert len(self.token_dim) == n, "codelm_token_head='ar_flat' needs token_dim for all levels"
+        assert 0.0 <= self.token_mask_prob <= 1.0, self.token_mask_prob
+        if self.pardec_token_head == "ar_flat":
+            assert self.modality == "image" and self.byte_group == 3 and all(c == 3 for c in self.pq_chunks), \
+                "pardec_token_head='ar_flat' requires RGB image tokens with byte_group=3 and pq_chunks=3 at every level"
+            assert len(self.token_dim) == n, "pardec_token_head='ar_flat' needs token_dim for all levels"
         assert 0.0 <= self.downsampler_rollout_prob <= 1.0, self.downsampler_rollout_prob
         if self.downsampler_rollout:
-            if self.pardec_token_head != "ar":
+            if self.pardec_token_head not in ("ar", "ar_flat"):
                 raise ValueError("downsampler_rollout is incompatible with pardec_token_head='linear' "
                                  "(the rollout self-feeds digits through the AR token head)")
             assert all(p == 0 for p in self.downsampler_decode_past) \
@@ -638,13 +654,13 @@ class Config:
                 "downsampler_rollout needs downsampler_decode_past/future==0 (they embed real label tokens)"
         assert 0.0 <= self.upsampler_rollout_prob <= 1.0, self.upsampler_rollout_prob
         if self.upsampler_rollout:
-            if self.pardec_token_head != "ar":
+            if self.pardec_token_head not in ("ar", "ar_flat"):
                 raise ValueError("upsampler_rollout is incompatible with pardec_token_head='linear' "
                                  "(the rollout self-feeds digits through the AR token head)")
             assert all(p == 0 for p in self.upsampler_decode_past) \
                 and all(f == 0 for f in self.upsampler_decode_future), \
                 "upsampler_rollout needs upsampler_decode_past/future==0 (they embed real target tokens)"
-        _ds_leak = (self.pardec_token_head == "ar" or any(g > 1 for g in self.downsampler_ncodes)
+        _ds_leak = (self.pardec_token_head in ("ar", "ar_flat") or any(g > 1 for g in self.downsampler_ncodes)
                     or any(pst > 0 for pst in self.downsampler_decode_past))
         if self.label_reg_weight == 0 and _ds_leak:
             if not self.downsampler_rollout:
@@ -1989,7 +2005,8 @@ def block_step(blk, x_new: jnp.ndarray, cache, pos, T_max: int, extra_valid: jnp
 
 
 def token_ar_teacher_forced(in_proj, member_embed, norm1, attn, ln_f, out_head, dim, in_code_vocab,
-                             h: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+                             h: jnp.ndarray, target: jnp.ndarray, mask_embed=None,
+                             token_mask_prob: float = 0.0, rng=None) -> jnp.ndarray:
     lead = h.shape[:-1]
     D = h.shape[-1]
     chunks = target.shape[-1]
@@ -1998,10 +2015,33 @@ def token_ar_teacher_forced(in_proj, member_embed, norm1, attn, ln_f, out_head, 
     tgt_flat = target.reshape(N, chunks)
     member_embeds = member_embed[tgt_flat[:, :chunks - 1]] if chunks > 1 else \
         jnp.zeros((N, 0, dim), dtype=ctx.dtype)
+    if rng is not None and mask_embed is not None and token_mask_prob > 0.0 and chunks > 1:
+        drop = jax.random.bernoulli(rng, p=token_mask_prob, shape=(N, 1, 1))
+        member_embeds = jnp.where(drop, mask_embed.astype(member_embeds.dtype), member_embeds)
     seq_in = jnp.concatenate([ctx, member_embeds], axis=1)
     h1 = seq_in + dense_self_attention(attn, norm1(seq_in), causal=True)
     logits = ln_f(h1) @ out_head
     return logits.reshape(*lead, chunks, in_code_vocab)
+
+
+def token_ar_flat_teacher_forced(ctx_proj, member_embed, mask_embed, out_heads, vocab,
+                                 h: jnp.ndarray, target: jnp.ndarray,
+                                 token_mask_prob: float = 0.0, rng=None) -> jnp.ndarray:
+    """Linear RGB factorization: p(r|h), p(g|h,r), p(b|h,r,g)."""
+    lead = h.shape[:-1]
+    D = h.shape[-1]
+    N = int(np.prod(lead)) if lead else 1
+    ctx = h.reshape(N, D) @ ctx_proj
+    target = target.reshape(N, 3)
+    red, green = member_embed[target[:, 0]], member_embed[target[:, 1]]
+    if rng is not None and token_mask_prob > 0.0:
+        drop = jax.random.bernoulli(rng, p=token_mask_prob, shape=(N, 1))
+        mask = mask_embed.astype(red.dtype)[None, :]
+        red, green = jnp.where(drop, mask, red), jnp.where(drop, mask, green)
+    logits = (ctx @ out_heads[0],
+              jnp.concatenate([ctx, red], axis=-1) @ out_heads[1],
+              jnp.concatenate([ctx, red, green], axis=-1) @ out_heads[2])
+    return jnp.stack(logits, axis=1).reshape(*lead, 3, vocab)
 
 
 def token_ar_generate(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks: int,
@@ -2023,6 +2063,23 @@ def token_ar_generate(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks
             collected.append(member_embed[val_m][:, None, :])
     idx = jnp.stack(vals, axis=1).reshape(*lead, chunks)
     return idx, rng
+
+
+def token_ar_flat_generate(ctx_proj, member_embed, out_heads, h: jnp.ndarray, rng,
+                            greedy: bool, temperature: float, top_k: int = 0,
+                            top_p: float = 1.0) -> tuple:
+    lead = h.shape[:-1]
+    D = h.shape[-1]
+    N = int(np.prod(lead)) if lead else 1
+    ctx = h.reshape(N, D) @ ctx_proj
+    red, rng = sample_idx(ctx @ out_heads[0], rng, greedy, temperature, top_k, top_p)
+    red_embed = member_embed[red]
+    green, rng = sample_idx(jnp.concatenate([ctx, red_embed], axis=-1) @ out_heads[1],
+                            rng, greedy, temperature, top_k, top_p)
+    green_embed = member_embed[green]
+    blue, rng = sample_idx(jnp.concatenate([ctx, red_embed, green_embed], axis=-1) @ out_heads[2],
+                           rng, greedy, temperature, top_k, top_p)
+    return jnp.stack([red, green, blue], axis=-1).reshape(*lead, 3), rng
 
 
 def token_ar_rollout(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks: int,
@@ -2052,6 +2109,27 @@ def token_ar_rollout(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks:
             jnp.stack(lgs, axis=1).reshape(*lead, chunks, V))
 
 
+def token_ar_flat_rollout(ctx_proj, member_embed, out_heads, h: jnp.ndarray, rng, quant_fn) -> tuple:
+    """Differentiable straight-through rollout through the factorized linear RGB heads."""
+    lead = h.shape[:-1]
+    D = h.shape[-1]
+    N = int(np.prod(lead)) if lead else 1
+    ctx = h.reshape(N, D) @ ctx_proj
+    softs, idxs, logits, previous = [], [], [], []
+    for channel in range(3):
+        rng, key = jax.random.split(rng)
+        x = ctx if channel == 0 else jnp.concatenate([ctx] + previous, axis=-1)
+        lg = x @ out_heads[channel]
+        soft, idx = quant_fn(lg, key)
+        logits.append(lg); softs.append(soft); idxs.append(idx)
+        if channel < 2:
+            previous.append(soft.astype(member_embed.dtype) @ member_embed)
+    vocab = logits[0].shape[-1]
+    return (jnp.stack(softs, axis=1).reshape(*lead, 3, vocab),
+            jnp.stack(idxs, axis=1).reshape(*lead, 3),
+            jnp.stack(logits, axis=1).reshape(*lead, 3, vocab))
+
+
 class PardecLM(eqx.Module):
     # Shared pardec LM: downsampler and upsampler are both instances of this, independent weights,
     # differing only in output_expansion/vocab. Context = CodeLM's cached hidden states (via
@@ -2070,6 +2148,8 @@ class PardecLM(eqx.Module):
     # token_head_type="ar" elsewhere in this file (token_ar_teacher_forced/token_ar_generate).
     token_in_proj: jnp.ndarray
     token_member_embed: jnp.ndarray
+    token_flat_out_heads: list
+    token_mask_embed: jnp.ndarray
     token_norm1: RMSNorm
     token_attn: Attention
     token_ln_f: RMSNorm
@@ -2109,7 +2189,8 @@ class PardecLM(eqx.Module):
     # (see pardec_score) -- 0 = off
     remat: bool = eqx.field(static=True)
     remat_chunks: int = eqx.field(static=True)  # see Config.upsampler_remat_chunks
-    token_head: str = eqx.field(static=True)  # "ar" | "linear", see Config.pardec_token_head
+    token_head: str = eqx.field(static=True)  # "ar" | "ar_flat" | "linear"
+    token_mask_prob: float = eqx.field(static=True)
 
     def __init__(self, key, context_hidden_dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int,
                  n_layers: int, mlp_mult: int, rope_base: float, output_expansion: int,
@@ -2121,7 +2202,7 @@ class PardecLM(eqx.Module):
                  ctx_vocab: int = None, ctx_pq_chunks: int = None, ctx_pq_dim: int = None,
                  shared_ctx_embed: jnp.ndarray = None, shared_ctx_proj: jnp.ndarray = None,
                  token_head: str = "ar", backbone: str = "transformer", state_dim: int = 16,
-                 cycle_slots: int = 0, remat_chunks: int = 1):
+                 cycle_slots: int = 0, remat_chunks: int = 1, token_mask_prob: float = 0.15):
         # shared_blocks/shared_ln_f (both None by default): when given, REUSE these instead of
         # building a fresh transformer stack -- the LM weight-sharing option (see
         # cfg.share_downsampler_upsampler_lm): downsampler and upsampler can share the SAME
@@ -2147,11 +2228,20 @@ class PardecLM(eqx.Module):
         self.target_proj = init_matrix(keys[4], (output_chunks * pq_dim, hidden_dim), init_scheme)
         self.token_in_proj = init_matrix(keys[5], (hidden_dim, token_dim), init_scheme)
         self.token_member_embed = init_matrix(keys[6], (output_vocab, token_dim), init_scheme)
-        self.token_norm1 = RMSNorm(token_dim)
-        self.token_attn = Attention(keys[7], token_dim, token_n_heads, token_n_heads, rope_base, n_layers=1,
-                                     init_scheme=init_scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
-        self.token_ln_f = RMSNorm(token_dim)
-        self.token_out_head = init_matrix(jax.random.fold_in(key, 0), (token_dim, output_vocab), init_scheme)
+        if token_head == "ar_flat":
+            self.token_norm1 = self.token_attn = self.token_ln_f = self.token_out_head = None
+            self.token_flat_out_heads = [
+                init_matrix(jax.random.fold_in(key, 10 + i), (token_dim * width, output_vocab), init_scheme)
+                for i, width in enumerate((1, 2, 3))]
+        else:
+            self.token_norm1 = RMSNorm(token_dim)
+            self.token_attn = Attention(keys[7], token_dim, token_n_heads, token_n_heads, rope_base, n_layers=1,
+                                         init_scheme=init_scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
+            self.token_ln_f = RMSNorm(token_dim)
+            self.token_out_head = init_matrix(jax.random.fold_in(key, 0), (token_dim, output_vocab), init_scheme)
+            self.token_flat_out_heads = None
+        self.token_mask_embed = (init_vector(jax.random.fold_in(key, 13), token_dim, init_scheme)
+                                 if token_head in ("ar", "ar_flat") else None)
         self.output_head_linear = init_matrix(jax.random.fold_in(key, 1),
                                                (hidden_dim, output_chunks * output_vocab), init_scheme)
         self.draft_mask_embed = init_vector(jax.random.fold_in(key, 3), hidden_dim, init_scheme)
@@ -2169,6 +2259,7 @@ class PardecLM(eqx.Module):
         self.remat = remat
         self.remat_chunks = remat_chunks
         self.token_head = token_head
+        self.token_mask_prob = token_mask_prob
         if shared_ctx_embed is not None:
             self.own_ctx_embed, self.own_ctx_proj = shared_ctx_embed, shared_ctx_proj
         else:
@@ -2226,7 +2317,7 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
                   context_group_size: int, output_group_size: int, rate_id: int = 0,
                   output_expansion: int = None, return_hidden: bool = False,
                   draft_seq: jnp.ndarray = None, draft_len: int = 0, draft_fill: str = "zero",
-                  cycle_ctx: list = None, input_seq: jnp.ndarray = None) -> tuple:
+                  cycle_ctx: list = None, input_seq: jnp.ndarray = None, rng=None) -> tuple:
     # input_seq (pss): tokens embedded as the row's own inputs instead of target_seq, which stays the
     # loss / digit-head target. Same shape as target_seq.
     # cycle_ctx (level_cycle_mode="stack"): per slot a (batch, n_context_positions, context_hidden)
@@ -2360,10 +2451,16 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
         return predicted_hidden
     if pardec.token_head == "linear":
         logits = reshape_pq(predicted_hidden @ pardec.output_head_linear, pardec.output_chunks, pardec.output_vocab)
+    elif pardec.token_head == "ar_flat":
+        logits = token_ar_flat_teacher_forced(pardec.token_in_proj, pardec.token_member_embed,
+                                               pardec.token_mask_embed, pardec.token_flat_out_heads,
+                                               pardec.output_vocab, predicted_hidden, target_out,
+                                               pardec.token_mask_prob, rng)
     else:
         logits = token_ar_teacher_forced(pardec.token_in_proj, pardec.token_member_embed, pardec.token_norm1,
                                           pardec.token_attn, pardec.token_ln_f, pardec.token_out_head,
-                                          pardec.token_dim, pardec.output_vocab, predicted_hidden, target_out)
+                                          pardec.token_dim, pardec.output_vocab, predicted_hidden, target_out,
+                                          pardec.token_mask_embed, pardec.token_mask_prob, rng)
 
     # decode_future aux NTP loss: standard shifted next-token prediction OVER the widened lookahead
     # span itself (predict future token k from the hidden state produced by processing future token
@@ -2389,11 +2486,19 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
         if pardec.token_head == "linear":
             aux_logits = reshape_pq(aux_predicted_hidden @ pardec.output_head_linear,
                                     pardec.output_chunks, pardec.output_vocab)
+        elif pardec.token_head == "ar_flat":
+            aux_rng = jax.random.fold_in(rng, 0x5eed) if rng is not None else None
+            aux_logits = token_ar_flat_teacher_forced(pardec.token_in_proj, pardec.token_member_embed,
+                                                       pardec.token_mask_embed, pardec.token_flat_out_heads,
+                                                       pardec.output_vocab, aux_predicted_hidden, aux_target,
+                                                       pardec.token_mask_prob, aux_rng)
         else:
+            aux_rng = jax.random.fold_in(rng, 0x5eed) if rng is not None else None
             aux_logits = token_ar_teacher_forced(pardec.token_in_proj, pardec.token_member_embed,
                                                   pardec.token_norm1, pardec.token_attn, pardec.token_ln_f,
                                                   pardec.token_out_head, pardec.token_dim, pardec.output_vocab,
-                                                  aux_predicted_hidden, aux_target)
+                                                  aux_predicted_hidden, aux_target, pardec.token_mask_embed,
+                                                  pardec.token_mask_prob, aux_rng)
         logp_aux = jax.nn.log_softmax(aux_logits, axis=-1)
         nll_aux = -jnp.take_along_axis(logp_aux, aux_target[..., None], axis=-1)[..., 0]
         denom = jnp.maximum(jnp.sum(aux_valid), 1.0)
@@ -2500,6 +2605,10 @@ def pardec_generate(pardec: PardecLM, context_h: jnp.ndarray, context_group_size
         if pardec.token_head == "linear":
             val, rng = sample_idx(reshape_pq(hidden @ pardec.output_head_linear, pardec.output_chunks,
                                              pardec.output_vocab), rng, greedy, temperature, top_k)
+        elif pardec.token_head == "ar_flat":
+            val, rng = token_ar_flat_generate(pardec.token_in_proj, pardec.token_member_embed,
+                                               pardec.token_flat_out_heads, hidden, rng,
+                                               greedy, temperature, top_k)
         else:
             val, rng = token_ar_generate(pardec.token_in_proj, pardec.token_member_embed, pardec.token_norm1,
                                           pardec.token_attn, pardec.token_ln_f, pardec.token_out_head,
@@ -2642,10 +2751,13 @@ class CodeLM(eqx.Module):
     codelm_bos_prob: float = eqx.field(static=True)
     n_heads: int = eqx.field(static=True)  # needed for KV-cache sizing in _encoder_free_run
     n_kv_heads: int = eqx.field(static=True)
-    token_head: str = eqx.field(static=True)  # "linear" | "ar", see Config.codelm_token_head
+    token_head: str = eqx.field(static=True)  # "linear" | "ar" | "ar_flat"
     token_dim: int = eqx.field(static=True)
+    token_mask_prob: float = eqx.field(static=True)
     tok_in_proj: jnp.ndarray = None  # AR digit head params, None unless token_head=="ar"
     tok_member_embed: jnp.ndarray = None
+    tok_flat_out_heads: list = None
+    tok_mask_embed: jnp.ndarray = None
     tok_norm1: RMSNorm = None
     tok_attn: Attention = None
     tok_ln_f: RMSNorm = None
@@ -2707,6 +2819,7 @@ class CodeLM(eqx.Module):
         self.bos_embed = jnp.stack([init_vector(k, D_enc, scheme) for k in bos_keys], axis=0)
         self.token_head = cfg.codelm_token_head
         self.token_dim = cfg.token_dim[level_idx]
+        self.token_mask_prob = cfg.token_mask_prob
         if self.token_head == "ar":
             tk = jax.random.split(jax.random.fold_in(key, 5), 4)
             td, tnh = cfg.token_dim[level_idx], cfg.token_n_heads[level_idx]
@@ -2717,6 +2830,17 @@ class CodeLM(eqx.Module):
                                        init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
             self.tok_ln_f = RMSNorm(td)
             self.tok_out_head = init_matrix(tk[3], (td, self.code_vocab), scheme)
+            self.tok_flat_out_heads = None
+            self.tok_mask_embed = init_vector(jax.random.fold_in(key, 56), td, scheme)
+        elif self.token_head == "ar_flat":
+            td = cfg.token_dim[level_idx]
+            self.tok_in_proj = init_matrix(jax.random.fold_in(key, 50), (D_enc, td), scheme)
+            self.tok_member_embed = init_matrix(jax.random.fold_in(key, 51), (self.code_vocab, td), scheme)
+            self.tok_flat_out_heads = [
+                init_matrix(jax.random.fold_in(key, 52 + i), (td * width, self.code_vocab), scheme)
+                for i, width in enumerate((1, 2, 3))]
+            self.tok_mask_embed = init_vector(jax.random.fold_in(key, 56), td, scheme)
+            self.tok_norm1 = self.tok_attn = self.tok_ln_f = self.tok_out_head = None
 
     def encode(self, x: jnp.ndarray, target_idx: jnp.ndarray, K: int, rng=None, encode_temperature: float = 1.0,
                layer_drop_prob=None, rate_id: int = 0, force_bos: bool = False) -> dict:
@@ -2762,7 +2886,8 @@ class CodeLM(eqx.Module):
         ntp_shift = 1 + self.attn_lookahead
         if L > ntp_shift:
             tgt = target_idx[:, ntp_shift:]
-            ntp_logits = codelm_ntp_logits_tf(self, h[:, :-ntp_shift, :], tgt)
+            ntp_logits = codelm_ntp_logits_tf(self, h[:, :-ntp_shift, :], tgt,
+                                               rng=None if quant_rng is None else jax.random.fold_in(quant_rng, 71))
             logp = jax.nn.log_softmax(ntp_logits, axis=-1)
             ntp_loss = -jnp.mean(jnp.take_along_axis(logp, tgt[..., None], axis=-1))
             ntp_acc = jnp.mean(jnp.argmax(ntp_logits, -1) == tgt)
@@ -2900,7 +3025,8 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
         # teacher-forced on label_fn(image) digits (default path; see Config.downsampler_rollout)
         label_tgt = label_fn(flat_bytes, cfg, pixel_order, n_blocks, codelm.pq_chunks, codelm.code_vocab)
         score = lambda **kw: pardec_score(downsampler, label_tgt, h, context_group_size=K * downsampler_ncodes,
-                                          output_group_size=downsampler_ncodes, rate_id=rate_id, **kw)[0]
+                                          output_group_size=downsampler_ncodes, rate_id=rate_id,
+                                          rng=rng, **kw)[0]
         lg = score()
         for _ in range(1, pss_n_passes(pss_passes, downsampler_ncodes, downsampler.decode_past)):
             lg = score(input_seq=pss_inputs(lg, label_tgt, cfg, rng, cfg.downsampler_pss_prob))
@@ -2920,10 +3046,16 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
             hid = pardec_score(downsampler, dummy, h, context_group_size=K * downsampler_ncodes,
                                output_group_size=downsampler_ncodes, rate_id=rate_id, return_hidden=True,
                                input_seq=None if ci is None else jax.lax.stop_gradient(ci))
-            cs, ci, lg = token_ar_rollout(downsampler.token_in_proj, downsampler.token_member_embed,
-                                           downsampler.token_norm1, downsampler.token_attn, downsampler.token_ln_f,
-                                           downsampler.token_out_head, downsampler.output_chunks, hid,
-                                           rng if rng is not None else jax.random.PRNGKey(0), qfn)
+            rollout_rng = rng if rng is not None else jax.random.PRNGKey(0)
+            if downsampler.token_head == "ar_flat":
+                cs, ci, lg = token_ar_flat_rollout(downsampler.token_in_proj,
+                                                    downsampler.token_member_embed,
+                                                    downsampler.token_flat_out_heads, hid, rollout_rng, qfn)
+            else:
+                cs, ci, lg = token_ar_rollout(downsampler.token_in_proj, downsampler.token_member_embed,
+                                               downsampler.token_norm1, downsampler.token_attn,
+                                               downsampler.token_ln_f, downsampler.token_out_head,
+                                               downsampler.output_chunks, hid, rollout_rng, qfn)
         return lg, cs, ci
 
     if not cfg.downsampler_rollout:
@@ -2945,7 +3077,8 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
     ntp_shift = 1 + codelm.attn_lookahead
     if L > ntp_shift:
         tgt = target_idx[:, ntp_shift:]
-        ntp_logits = codelm_ntp_logits_tf(codelm, h[:, :-ntp_shift, :], tgt)
+        ntp_logits = codelm_ntp_logits_tf(codelm, h[:, :-ntp_shift, :], tgt,
+                                           rng=None if rng is None else jax.random.fold_in(rng, 71))
         logp = jax.nn.log_softmax(ntp_logits, axis=-1)
         ntp_loss = -jnp.mean(jnp.take_along_axis(logp, tgt[..., None], axis=-1))
         ntp_acc = jnp.mean(jnp.argmax(ntp_logits, -1) == tgt)
@@ -2958,7 +3091,7 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
 
 
 def codelm_ntp_loss(codelm: CodeLM, raw: jnp.ndarray, target: jnp.ndarray, cfg: "Config",
-                    prefix: jnp.ndarray = None) -> tuple:
+                    prefix: jnp.ndarray = None, rng=None) -> tuple:
     # next-token loss/acc of `codelm` over its own input sequence (codelm_upper: the CodeLM one level up
     # over the top code -- the decoderless level's only objective)
     h = codelm_hidden_from_raw(codelm, raw, prefix)
@@ -2972,14 +3105,14 @@ def codelm_ntp_loss(codelm: CodeLM, raw: jnp.ndarray, target: jnp.ndarray, cfg: 
         # subsequent token states predict the following target. The target tensor is never fed at
         # its own position when producing its logits, so this alignment has no target leakage.
         h = h[:, p - 1:p + n - 1, :]
-        logits = codelm_ntp_logits_tf(codelm, h, target)
+        logits = codelm_ntp_logits_tf(codelm, h, target, rng=rng)
         logp = jax.nn.log_softmax(logits, axis=-1)
         loss = -jnp.mean(jnp.take_along_axis(logp, target[..., None], axis=-1))
         return loss, jnp.mean(jnp.argmax(logits, axis=-1) == target)
     if h.shape[1] <= shift:
         return jnp.array(0.0, dtype=h.dtype), jnp.array(0.0, dtype=h.dtype)
     tgt = target[:, shift:]
-    logits = codelm_ntp_logits_tf(codelm, h[:, :-shift, :], tgt)
+    logits = codelm_ntp_logits_tf(codelm, h[:, :-shift, :], tgt, rng=rng)
     loss = -jnp.mean(jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), tgt[..., None], axis=-1))
     return loss, jnp.mean(jnp.argmax(logits, -1) == tgt)
 
@@ -3035,7 +3168,8 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
 
     def _teacher_forced(**dkw):
         return pardec_score(upsampler, target_seq, h_ctx, context_group_size=upsampler_ncodes,
-                             output_group_size=upsampler_ncodes, rate_id=rate_id, output_expansion=oe, **dkw)
+                             output_group_size=upsampler_ncodes, rate_id=rate_id, output_expansion=oe,
+                             rng=rng, **dkw)
 
     def _rollout(**dkw):
         # upsampler_rollout: like downsampler_rollout, but for the upsampler's own digit-AR head --
@@ -3053,10 +3187,15 @@ def decode_logits_and_target_multipass(model: "LagCodecModel", level_idx: int, t
         qfn = lambda lg_m, k_: quantize_dispatch(cfg.quantize_mode, lg_m,
                                                   k_ if rng is not None else None,
                                                   encode_temperature, cfg.quantize_drop)
-        _, _, lg = token_ar_rollout(upsampler.token_in_proj, upsampler.token_member_embed,
-                                     upsampler.token_norm1, upsampler.token_attn, upsampler.token_ln_f,
-                                     upsampler.token_out_head, upsampler.output_chunks, hid,
-                                     rng if rng is not None else jax.random.PRNGKey(0), qfn)
+        rollout_rng = rng if rng is not None else jax.random.PRNGKey(0)
+        if upsampler.token_head == "ar_flat":
+            _, _, lg = token_ar_flat_rollout(upsampler.token_in_proj, upsampler.token_member_embed,
+                                              upsampler.token_flat_out_heads, hid, rollout_rng, qfn)
+        else:
+            _, _, lg = token_ar_rollout(upsampler.token_in_proj, upsampler.token_member_embed,
+                                         upsampler.token_norm1, upsampler.token_attn,
+                                         upsampler.token_ln_f, upsampler.token_out_head,
+                                         upsampler.output_chunks, hid, rollout_rng, qfn)
         aux_loss = jnp.array(0.0, dtype=lg.dtype)
         aux_acc = jnp.array(0.0, dtype=lg.dtype)
         return lg, t_out, aux_loss, aux_acc
@@ -3165,6 +3304,11 @@ def cycle_reencode(model: "LagCodecModel", level_idx: int, tokens: jnp.ndarray, 
         return qfn(reshape_pq(hid @ ds.output_head_linear, ds.output_chunks, ds.output_vocab), rng)
     if rng is None:
         qfn = lambda lg, k_: quantize_dispatch(cfg.quantize_mode, lg, None, encode_temperature, cfg.quantize_drop)
+    if ds.token_head == "ar_flat":
+        cs, ci, _ = token_ar_flat_rollout(ds.token_in_proj, ds.token_member_embed,
+                                           ds.token_flat_out_heads, hid,
+                                           jax.random.PRNGKey(0) if rng is None else rng, qfn)
+        return cs, ci
     cs, ci, _ = token_ar_rollout(ds.token_in_proj, ds.token_member_embed, ds.token_norm1, ds.token_attn,
                                  ds.token_ln_f, ds.token_out_head, ds.output_chunks, hid,
                                  jax.random.PRNGKey(0) if rng is None else rng, qfn)
@@ -3276,14 +3420,19 @@ def encoder_ntp_logits(codelm: CodeLM, h: jnp.ndarray) -> jnp.ndarray:
     return reshape_pq(h @ codelm.ntp_head, codelm.pq_chunks, codelm.code_vocab)
 
 
-def codelm_ntp_logits_tf(codelm: CodeLM, h: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+def codelm_ntp_logits_tf(codelm: CodeLM, h: jnp.ndarray, target: jnp.ndarray, rng=None) -> jnp.ndarray:
     # Teacher-forced NTP logits (..., chunks, V): h (..., D) predicts `target` (..., chunks), the
     # NEXT token. Linear: parallel head. AR: digit m conditioned on the real digits <m of `target`.
     if codelm.token_head == "linear":
         return reshape_pq(h @ codelm.ntp_head, codelm.pq_chunks, codelm.code_vocab)
+    if codelm.token_head == "ar_flat":
+        return token_ar_flat_teacher_forced(codelm.tok_in_proj, codelm.tok_member_embed,
+                                             codelm.tok_mask_embed, codelm.tok_flat_out_heads,
+                                             codelm.code_vocab, h, target, codelm.token_mask_prob, rng)
     return token_ar_teacher_forced(codelm.tok_in_proj, codelm.tok_member_embed, codelm.tok_norm1,
                                     codelm.tok_attn, codelm.tok_ln_f, codelm.tok_out_head,
-                                    codelm.token_dim, codelm.code_vocab, h, target)
+                                    codelm.token_dim, codelm.code_vocab, h, target,
+                                    codelm.tok_mask_embed, codelm.token_mask_prob, rng)
 
 
 def codelm_sample_next(codelm: CodeLM, h_prev: jnp.ndarray, rng, greedy: bool, temperature,
@@ -3292,6 +3441,11 @@ def codelm_sample_next(codelm: CodeLM, h_prev: jnp.ndarray, rng, greedy: bool, t
     if codelm.token_head == "linear":
         return _sample_tokens(reshape_pq(h_prev @ codelm.ntp_head, codelm.pq_chunks, codelm.code_vocab),
                               rng, greedy, temperature, top_k, top_p)
+    if codelm.token_head == "ar_flat":
+        idx, _ = token_ar_flat_generate(codelm.tok_in_proj, codelm.tok_member_embed,
+                                         codelm.tok_flat_out_heads, h_prev, rng,
+                                         greedy, temperature, top_k, top_p)
+        return idx
     idx, _ = token_ar_generate(codelm.tok_in_proj, codelm.tok_member_embed, codelm.tok_norm1,
                                 codelm.tok_attn, codelm.tok_ln_f, codelm.tok_out_head,
                                 codelm.pq_chunks, h_prev, rng, greedy, temperature, top_k, top_p)
@@ -3575,6 +3729,7 @@ class LagCodecModel(eqx.Module):
                 n_rates=n_rates, init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, remat=downsampler_remat,
                 remat_chunks=cfg.downsampler_remat_chunks[level_idx],
                 ctx_vocab=code_vocab, ctx_pq_chunks=pq_chunks, ctx_pq_dim=pq_dim, token_head=cfg.pardec_token_head,
+                token_mask_prob=cfg.token_mask_prob,
                 backbone=cfg.downsampler_backbone[level_idx], state_dim=cfg.ssm_state_dim)
             downsamplers.append(downsampler)
 
@@ -3734,7 +3889,7 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
         if class_labels is None and model.cfg.class_conditional:
             raise ValueError("class_conditional simple NTP needs class_labels for each image")
         prefix = class_condition_prefix(model, 0, class_labels, tok0.shape[0], rng)
-        ntp_loss, ntp_acc = codelm_ntp_loss(codelm0, tok0, tok0, model.cfg, prefix=prefix)
+        ntp_loss, ntp_acc = codelm_ntp_loss(codelm0, tok0, tok0, model.cfg, prefix=prefix, rng=rng)
         zero = jnp.array(0.0, dtype=ntp_loss.dtype)
         util = codebook_utilization(tok0, codelm0.code_vocab)
         loss = model.cfg.ntp_weight * ntp_loss
@@ -3783,7 +3938,7 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
             label_mse_losses.append(jnp.mean((pred_label_soft - label_tgt.astype(jnp.float32)) ** 2))
         if model.cfg.class_conditional:
             class_ntp_loss_i, class_ntp_acc_i = codelm_ntp_loss(codelm, raw, target, model.cfg,
-                                                                 prefix=class_prefix)
+                                                                 prefix=class_prefix, rng=level_rngs[i])
             class_ntp_losses.append(class_ntp_loss_i)
             class_ntp_accs.append(class_ntp_acc_i)
         if i < phase - 1:
@@ -3807,7 +3962,9 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
                 raw = jnp.where(choose_gt[:, None, None, None], gt_soft, out["code_soft"])
                 target = jnp.where(choose_gt[:, None, None], gt_codes, out["code_idx"])
     if model.cfg.context_source == "codelm_upper":
-        ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(phase), codes_soft[phase - 1], codes[phase - 1], model.cfg)
+        ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(phase), codes_soft[phase - 1],
+                                         codes[phase - 1], model.cfg,
+                                         rng=None if rng is None else jax.random.fold_in(rng, 198))
         enc_losses.append(ntp_up)
         enc_accs.append(acc_up)
 
@@ -3983,7 +4140,8 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
                 pred_label_soft = jnp.sum(label_probs_i * label_values_i, axis=-1)
                 label_mse_losses.append(jnp.mean((pred_label_soft - label_tgt.astype(jnp.float32)) ** 2))
             if model.cfg.class_conditional:
-                ntp_i, acc_i = codelm_ntp_loss(codelm, raw, target, model.cfg, prefix=class_prefix)
+                ntp_i, acc_i = codelm_ntp_loss(codelm, raw, target, model.cfg, prefix=class_prefix,
+                                                rng=level_rngs[d])
                 class_ntp_losses.append(ntp_i)
                 class_ntp_accs.append(acc_i)
             if d < depth - 1:
@@ -4008,7 +4166,8 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
                     target = jnp.where(choose_gt[:, None, None], gt_codes, out["code_idx"])
         if model.cfg.context_source == "codelm_upper":
             ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(entry_level + depth), codes_soft[depth - 1],
-                                             codes[depth - 1], model.cfg)
+                                             codes[depth - 1], model.cfg,
+                                             rng=None if rng is None else jax.random.fold_in(rng, 198 + depth))
             enc_losses.append(ntp_up)
             enc_accs.append(acc_up)
         encoder_levels = list(range(entry_level, entry_level + depth))
@@ -4738,12 +4897,14 @@ def main():
                          "per-position embedding table, no self-attention, own table per module. "
                          "'shared_embed': same, but downsampler and upsampler share one table. 'codelm_upper': "
                          "upsampler i's context from CodeLM i+1 (+ a CodeLM-only top level when not shared).")
-    p.add_argument("--pardec_token_head", type=str, default=Config.pardec_token_head, choices=("ar", "linear"),
-                    help="'ar' (default): AR digit head. 'linear': one parallel linear head for all digits "
-                         "(incompatible with --downsampler_rollout).")
-    p.add_argument("--codelm_token_head", type=str, default=Config.codelm_token_head, choices=("linear", "ar"),
-                    help="CodeLM's own NTP/free-run head: 'linear' (default, parallel digits) or 'ar' "
-                         "(small autoregressive digit head).")
+    p.add_argument("--pardec_token_head", type=str, default=Config.pardec_token_head,
+                    choices=("ar", "ar_flat", "linear"),
+                    help="'ar' (default): tiny causal attention over digits; 'ar_flat': three linear "
+                         "RGB heads with factorized sampling; 'linear': parallel independent digit heads.")
+    p.add_argument("--codelm_token_head", type=str, default=Config.codelm_token_head,
+                    choices=("linear", "ar", "ar_flat"),
+                    help="CodeLM's own NTP/free-run head: 'linear', 'ar' (causal attention), or "
+                         "'ar_flat' (three factorized linear heads; requires pq_chunks=3).")
     p.add_argument("--downsampler_rollout", type=lambda x: x.lower() != "false",
                     default=Config.downsampler_rollout,
                     help="True: downsampler self-feeds its own (straight-through) digits instead of being "
@@ -4945,7 +5106,9 @@ def main():
     p.add_argument("--token_dim", type=_tuple_arg, default=Config.token_dim)
     p.add_argument("--token_n_heads", type=_tuple_arg, default=Config.token_n_heads)
     p.add_argument("--pq_dim", type=_tuple_arg, default=Config.pq_dim)
-    p.add_argument("--token_mask_prob", type=float, default=Config.token_mask_prob)
+    p.add_argument("--token_mask_prob", type=float, default=Config.token_mask_prob,
+                    help="AR/ar_flat teacher-forcing drop probability: replace all prior digit embeddings "
+                         "with a learned mask embedding for each dropped token; eval/generation never drop")
     p.add_argument("--entropy_weight", type=float, default=Config.entropy_weight)
     p.add_argument("--mse_weight", type=float, default=Config.mse_weight)
     p.add_argument("--mse_softmax_tau", type=float, default=Config.mse_softmax_tau)

@@ -102,11 +102,11 @@ class Config:
     remat_level: bool = False
 
     byte_group: int = 1
-    token_head_type: tuple = "linears"
+    token_head_type: tuple = "linears"  # linears | ar | ar_flat (RGB-only) | diffusion
     token_dim: tuple = 64
     token_n_heads: tuple = 4
     pq_dim: tuple = None
-    token_mask_prob: float = 0.15
+    token_mask_prob: float = 0.15  # per-token training drop for AR/AR-flat; diffusion mask rate
 
     mtp_horizon: tuple = 1
     mtp_mode: tuple = "parallel"
@@ -401,16 +401,25 @@ class Config:
                                   f"weight_sharing[{i}]=False first")
         assert len(self.token_head_type) == n
         assert len(self.pq_dim) == n
-        assert all(t in ("linears", "ar", "diffusion") for t in self.token_head_type)
+        assert all(t in ("linears", "ar", "ar_flat", "diffusion") for t in self.token_head_type)
+        assert 0.0 <= self.token_mask_prob <= 1.0, self.token_mask_prob
         assert len(self.mtp_horizon) == n and len(self.mtp_mode) == n
         assert len(self.mtp_ar_chunk) == n and len(self.mtp_ar_remat) == n
         assert all(m in ("parallel", "ar") for m in self.mtp_mode)
         for i in range(n):
-            if self.token_head_type[i] in ("ar", "diffusion"):
-                assert i < len(self.token_dim) and i < len(self.token_n_heads), \
-                    f"level {i} uses token_head_type={self.token_head_type[i]!r} but token_dim/" \
-                    f"token_n_heads only has {len(self.token_dim)} entries -- set one per level"
-                assert self.token_dim[i] % self.token_n_heads[i] == 0
+            if self.token_head_type[i] in ("ar", "ar_flat", "diffusion"):
+                assert i < len(self.token_dim), \
+                    f"level {i} uses token_head_type={self.token_head_type[i]!r} but token_dim " \
+                    f"only has {len(self.token_dim)} entries -- set one per level"
+                if self.token_head_type[i] != "ar_flat":
+                    assert i < len(self.token_n_heads), \
+                        f"level {i} uses token_head_type={self.token_head_type[i]!r} but token_n_heads " \
+                        f"only has {len(self.token_n_heads)} entries -- set one per level"
+                    assert self.token_dim[i] % self.token_n_heads[i] == 0
+            if self.token_head_type[i] == "ar_flat":
+                input_chunks = self.byte_group if i == 0 else self.pq_chunks[i - 1]
+                assert input_chunks == 3, \
+                    f"level {i}: token_head_type='ar_flat' requires exactly 3 target channels (RGB)"
             if self.mtp_horizon[i] > 1:
                 combo_ok = (self.token_head_type[i] in ("linears", "ar") and self.mtp_mode[i] == "parallel") \
                     or (self.token_head_type[i] == "ar" and self.mtp_mode[i] == "ar")
@@ -418,7 +427,8 @@ class Config:
                     raise NotImplementedError(
                         f"level {i}: token_head_type={self.token_head_type[i]!r} x "
                         f"mtp_mode={self.mtp_mode[i]!r} with mtp_horizon>1 is not implemented -- "
-                        "only (linears,parallel), (ar,parallel), and (ar,ar) are supported")
+                        "only (linears,parallel), (ar,parallel), and (ar,ar) are supported; "
+                        "ar_flat currently requires mtp_horizon=1")
             stride_i = self.strides[i]
             if stride_i != -1:
                 assert self.mtp_horizon[i] >= 1
@@ -1044,7 +1054,8 @@ def run_block_interleave_future(blk: Block, x: jnp.ndarray, per_group_len: int, 
 
 
 def token_ar_teacher_forced(in_proj, member_embed, norm1, attn, ln_f, out_head, dim, in_code_vocab,
-                             h: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+                             h: jnp.ndarray, target: jnp.ndarray, mask_embed=None,
+                             token_mask_prob: float = 0.0, rng=None) -> jnp.ndarray:
     lead = h.shape[:-1]
     D = h.shape[-1]
     chunks = target.shape[-1]
@@ -1053,10 +1064,43 @@ def token_ar_teacher_forced(in_proj, member_embed, norm1, attn, ln_f, out_head, 
     tgt_flat = target.reshape(N, chunks)
     member_embeds = member_embed[tgt_flat[:, :chunks - 1]] if chunks > 1 else \
         jnp.zeros((N, 0, dim), dtype=ctx.dtype)
+    if rng is not None and mask_embed is not None and token_mask_prob > 0.0 and chunks > 1:
+        # One independent decision per token position. A dropped token loses ALL real
+        # within-token context, so later channel predictions train in the independent
+        # (hidden-state-only) regime; inference remains fully autoregressive.
+        drop = jax.random.bernoulli(rng, p=token_mask_prob, shape=(N, 1, 1))
+        member_embeds = jnp.where(drop, mask_embed.astype(member_embeds.dtype), member_embeds)
     seq_in = jnp.concatenate([ctx, member_embeds], axis=1)
     h1 = seq_in + dense_self_attention(attn, norm1(seq_in), causal=True)
     logits = ln_f(h1) @ out_head
     return logits.reshape(*lead, chunks, in_code_vocab)
+
+
+def token_ar_flat_teacher_forced(ctx_proj, member_embed, mask_embed, out_heads, vocab,
+                                 h: jnp.ndarray, target: jnp.ndarray,
+                                 token_mask_prob: float = 0.0, rng=None) -> jnp.ndarray:
+    """Three linear conditional heads for RGB: p(r|h), p(g|h,r), p(b|h,r,g).
+
+    With probability token_mask_prob per token position, both prior RGB embeddings
+    are replaced by the learned mask embedding, making all three predictions
+    independent of the ground-truth RGB values for that token during training.
+    """
+    lead = h.shape[:-1]
+    D = h.shape[-1]
+    N = int(np.prod(lead)) if lead else 1
+    ctx = h.reshape(N, D) @ ctx_proj
+    target = target.reshape(N, 3)
+    red = member_embed[target[:, 0]]
+    green = member_embed[target[:, 1]]
+    if rng is not None and token_mask_prob > 0.0:
+        drop = jax.random.bernoulli(rng, p=token_mask_prob, shape=(N, 1))
+        mask = mask_embed.astype(red.dtype)[None, :]
+        red = jnp.where(drop, mask, red)
+        green = jnp.where(drop, mask, green)
+    logits_r = ctx @ out_heads[0]
+    logits_g = jnp.concatenate([ctx, red], axis=-1) @ out_heads[1]
+    logits_b = jnp.concatenate([ctx, red, green], axis=-1) @ out_heads[2]
+    return jnp.stack([logits_r, logits_g, logits_b], axis=1).reshape(*lead, 3, vocab)
 
 
 def token_ar_generate(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks: int,
@@ -1079,6 +1123,23 @@ def token_ar_generate(in_proj, member_embed, norm1, attn, ln_f, out_head, chunks
     return idx, rng
 
 
+def token_ar_flat_generate(ctx_proj, member_embed, out_heads, h: jnp.ndarray, rng,
+                            greedy: bool, temperature: float, top_k: int = 0) -> tuple:
+    """Sequentially sample the three RGB channels using the factorized linear heads."""
+    lead = h.shape[:-1]
+    D = h.shape[-1]
+    N = int(np.prod(lead)) if lead else 1
+    ctx = h.reshape(N, D) @ ctx_proj
+    red, rng = sample_idx(ctx @ out_heads[0], rng, greedy, temperature, top_k)
+    red_embed = member_embed[red]
+    green, rng = sample_idx(jnp.concatenate([ctx, red_embed], axis=-1) @ out_heads[1],
+                            rng, greedy, temperature, top_k)
+    green_embed = member_embed[green]
+    blue, rng = sample_idx(jnp.concatenate([ctx, red_embed, green_embed], axis=-1) @ out_heads[2],
+                           rng, greedy, temperature, top_k)
+    return jnp.stack([red, green, blue], axis=-1).reshape(*lead, 3), rng
+
+
 class EncDecLevel(eqx.Module):
     blocks: list
     ln_f: RMSNorm
@@ -1096,6 +1157,7 @@ class EncDecLevel(eqx.Module):
     dec_head: jnp.ndarray
     token_in_proj: jnp.ndarray
     token_member_embed: jnp.ndarray
+    token_flat_out_heads: list
     token_mask_embed: jnp.ndarray
     token_channel_embed: jnp.ndarray
     token_norm1: RMSNorm
@@ -1274,24 +1336,38 @@ class EncDecLevel(eqx.Module):
         else:
             self.dec_blocks, self.dec_ln_f, self.dec_target_embed, self.dec_target_proj, self.dec_head = None, None, None, None, None
 
-        if has_decoder and self.token_head_type in ("ar", "diffusion"):
-            tdim, theads = cfg.token_dim[level], cfg.token_n_heads[level]
+        if has_decoder and self.token_head_type in ("ar", "ar_flat", "diffusion"):
+            tdim = cfg.token_dim[level]
             self.token_in_proj = init_matrix(keys[9], (D_dec, tdim), scheme)
             self.token_member_embed = init_matrix(keys[10], (self.in_code_vocab, tdim), scheme)
-            self.token_norm1 = RMSNorm(tdim)
-            self.token_attn = Attention(keys[11], tdim, theads, theads, cfg.rope_base[level], n_layers=1,
-                                         init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
-            self.token_ln_f = RMSNorm(tdim)
-            self.token_out_head = init_matrix(keys[12], (tdim, self.in_code_vocab), scheme)
+            if self.token_head_type in ("ar", "diffusion"):
+                theads = cfg.token_n_heads[level]
+                self.token_norm1 = RMSNorm(tdim)
+                self.token_attn = Attention(keys[11], tdim, theads, theads, cfg.rope_base[level], n_layers=1,
+                                             init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm)
+                self.token_ln_f = RMSNorm(tdim)
+                self.token_out_head = init_matrix(keys[12], (tdim, self.in_code_vocab), scheme)
+            else:
+                self.token_norm1, self.token_attn, self.token_ln_f, self.token_out_head = (None,) * 4
+            if self.token_head_type == "ar_flat":
+                self.token_flat_out_heads = [
+                    init_matrix(k, (tdim * width, self.in_code_vocab), scheme)
+                    for k, width in zip(keys[11:14], (1, 2, 3))
+                ]
+            else:
+                self.token_flat_out_heads = None
             if self.token_head_type == "diffusion":
                 self.token_mask_embed = init_vector(keys[14], tdim, scheme)
                 self.token_channel_embed = init_matrix(keys[15], (self.in_pq_chunks, tdim), scheme)
+            elif self.token_head_type in ("ar", "ar_flat"):
+                self.token_mask_embed = init_vector(keys[14], tdim, scheme)
+                self.token_channel_embed = None
             else:
                 self.token_mask_embed, self.token_channel_embed = None, None
         else:
-            (self.token_in_proj, self.token_member_embed, self.token_mask_embed,
+            (self.token_in_proj, self.token_member_embed, self.token_flat_out_heads, self.token_mask_embed,
              self.token_channel_embed, self.token_norm1, self.token_attn, self.token_ln_f,
-             self.token_out_head) = (None,) * 8
+             self.token_out_head) = (None,) * 9
 
         (self.mtp_heads_in_proj, self.mtp_heads_member_embed, self.mtp_heads_norm1,
          self.mtp_heads_attn, self.mtp_heads_ln_f, self.mtp_heads_out_head) = (None,) * 6
@@ -1450,15 +1526,28 @@ class EncDecLevel(eqx.Module):
         logits = h @ self._dec_head_w()
         return reshape_pq(logits, self.in_pq_chunks, self.in_code_vocab)
 
-    def _token_teacher_forced_ar(self, h: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+    def _token_teacher_forced_ar(self, h: jnp.ndarray, target: jnp.ndarray, rng=None) -> jnp.ndarray:
         return token_ar_teacher_forced(self.token_in_proj, self.token_member_embed, self.token_norm1,
                                         self.token_attn, self.token_ln_f, self.token_out_head,
-                                        self.token_dim, self.in_code_vocab, h, target)
+                                        self.token_dim, self.in_code_vocab, h, target,
+                                        mask_embed=self.token_mask_embed,
+                                        token_mask_prob=self.token_mask_prob, rng=rng)
+
+    def _token_teacher_forced_ar_flat(self, h: jnp.ndarray, target: jnp.ndarray, rng=None) -> jnp.ndarray:
+        return token_ar_flat_teacher_forced(self.token_in_proj, self.token_member_embed,
+                                             self.token_mask_embed, self.token_flat_out_heads,
+                                             self.in_code_vocab, h, target,
+                                             token_mask_prob=self.token_mask_prob, rng=rng)
 
     def _token_generate_ar(self, h: jnp.ndarray, rng, greedy: bool, temperature: float) -> tuple:
         return token_ar_generate(self.token_in_proj, self.token_member_embed, self.token_norm1,
                                   self.token_attn, self.token_ln_f, self.token_out_head,
                                   self.in_pq_chunks, h, rng, greedy, temperature, self.gen_top_k)
+
+    def _token_generate_ar_flat(self, h: jnp.ndarray, rng, greedy: bool, temperature: float) -> tuple:
+        return token_ar_flat_generate(self.token_in_proj, self.token_member_embed,
+                                       self.token_flat_out_heads, h, rng, greedy, temperature,
+                                       self.gen_top_k)
 
     def _token_teacher_forced_diffusion(self, h: jnp.ndarray, target: jnp.ndarray, rng) -> tuple:
         lead = h.shape[:-1]
@@ -1618,7 +1707,9 @@ class EncDecLevel(eqx.Module):
         if self.token_head_type == "linears":
             logits, mask = self._token_logits_linears(h_t), None
         elif self.token_head_type == "ar":
-            logits, mask = self._token_teacher_forced_ar(h_t, target), None
+            logits, mask = self._token_teacher_forced_ar(h_t, target, rng), None
+        elif self.token_head_type == "ar_flat":
+            logits, mask = self._token_teacher_forced_ar_flat(h_t, target, rng), None
         else:
             assert rng is not None, "diffusion token head needs an rng even at eval (masking is inherent)"
             logits, mask = self._token_teacher_forced_diffusion(h_t, target, rng)
@@ -1743,7 +1834,9 @@ class EncDecLevel(eqx.Module):
         if self.token_head_type == "linears":
             logits, mask = self._token_logits_linears(h_t), None
         elif self.token_head_type == "ar":
-            logits, mask = self._token_teacher_forced_ar(h_t, target_out), None
+            logits, mask = self._token_teacher_forced_ar(h_t, target_out, rng), None
+        elif self.token_head_type == "ar_flat":
+            logits, mask = self._token_teacher_forced_ar_flat(h_t, target_out, rng), None
         else:
             assert rng is not None, "diffusion token head needs an rng even at eval (masking is inherent)"
             logits, mask = self._token_teacher_forced_diffusion(h_t, target_out, rng)
@@ -1788,7 +1881,9 @@ class EncDecLevel(eqx.Module):
         if self.token_head_type == "linears":
             logits_extra, mask_extra = self._token_logits_linears(h_extra), None
         elif self.token_head_type == "ar":
-            logits_extra, mask_extra = self._token_teacher_forced_ar(h_extra, target_extra), None
+            logits_extra, mask_extra = self._token_teacher_forced_ar(h_extra, target_extra, rng), None
+        elif self.token_head_type == "ar_flat":
+            logits_extra, mask_extra = self._token_teacher_forced_ar_flat(h_extra, target_extra, rng), None
         else:
             aux_rng = jax.random.fold_in(rng, 0x5eed) if rng is not None else None
             assert aux_rng is not None, "diffusion token head needs an rng even at eval (masking is inherent)"
@@ -1889,7 +1984,9 @@ class EncDecLevel(eqx.Module):
         if self.token_head_type == "linears":
             logits, mask = self._token_logits_linears(h_t), None
         elif self.token_head_type == "ar":
-            logits, mask = self._token_teacher_forced_ar(h_t, target), None
+            logits, mask = self._token_teacher_forced_ar(h_t, target, rng), None
+        elif self.token_head_type == "ar_flat":
+            logits, mask = self._token_teacher_forced_ar_flat(h_t, target, rng), None
         else:
             assert rng is not None, "diffusion token head needs an rng even at eval (masking is inherent)"
             logits, mask = self._token_teacher_forced_diffusion(h_t, target, rng)
@@ -1938,6 +2035,8 @@ class EncDecLevel(eqx.Module):
                 return sample_idx(logits, rng, greedy, temperature, self.gen_top_k)
             elif self.token_head_type == "ar":
                 return self._token_generate_ar(h_pos, rng, greedy, temperature)
+            elif self.token_head_type == "ar_flat":
+                return self._token_generate_ar_flat(h_pos, rng, greedy, temperature)
             else:
                 return self._token_generate_diffusion(h_pos, rng, greedy, temperature)
 
@@ -2054,6 +2153,8 @@ class EncDecLevel(eqx.Module):
                 return sample_idx(logits, rng, greedy, temperature, self.gen_top_k)
             elif self.token_head_type == "ar":
                 return self._token_generate_ar(h_pos, rng, greedy, temperature)
+            elif self.token_head_type == "ar_flat":
+                return self._token_generate_ar_flat(h_pos, rng, greedy, temperature)
             else:
                 return self._token_generate_diffusion(h_pos, rng, greedy, temperature)
 
@@ -2270,6 +2371,8 @@ class EncDecLevel(eqx.Module):
                 return sample_idx(logits, rng, greedy, temperature, self.gen_top_k)
             elif self.token_head_type == "ar":
                 return self._token_generate_ar(h_pos, rng, greedy, temperature)
+            elif self.token_head_type == "ar_flat":
+                return self._token_generate_ar_flat(h_pos, rng, greedy, temperature)
             else:
                 return self._token_generate_diffusion(h_pos, rng, greedy, temperature)
 
@@ -2620,6 +2723,8 @@ def token_predict_standalone(level: EncDecLevel, h_pos, rng, greedy, temperature
         return sample_idx(logits, rng, greedy, temperature, level.gen_top_k)
     elif level.token_head_type == "ar":
         return level._token_generate_ar(h_pos, rng, greedy, temperature)
+    elif level.token_head_type == "ar_flat":
+        return level._token_generate_ar_flat(h_pos, rng, greedy, temperature)
     else:
         return level._token_generate_diffusion(h_pos, rng, greedy, temperature)
 
@@ -3446,11 +3551,14 @@ def main():
                          "positions ahead (splash LocalMask's native right-side window)")
     p.add_argument("--use_sink", type=lambda x: x.lower() != "false", default=Config.use_sink)
     p.add_argument("--byte_group", type=int, default=Config.byte_group)
-    p.add_argument("--token_head_type", type=str, default=Config.token_head_type)
+    p.add_argument("--token_head_type", type=str, default=Config.token_head_type,
+                    help="per-level output head: linears, ar, ar_flat (three-channel RGB only), or diffusion")
     p.add_argument("--token_dim", type=_tuple_arg, default=Config.token_dim)
     p.add_argument("--token_n_heads", type=_tuple_arg, default=Config.token_n_heads)
     p.add_argument("--pq_dim", type=_tuple_arg, default=Config.pq_dim)
-    p.add_argument("--token_mask_prob", type=float, default=Config.token_mask_prob)
+    p.add_argument("--token_mask_prob", type=float, default=Config.token_mask_prob,
+                    help="AR/AR-flat: per-token training probability of replacing all prior member "
+                         "embeddings with the learned mask embedding; diffusion: mask rate")
     p.add_argument("--mtp_horizon", type=_tuple_arg, default=Config.mtp_horizon)
     p.add_argument("--mtp_mode", type=str, default=Config.mtp_mode)
     p.add_argument("--mtp_ar_chunk", type=_tuple_arg, default=Config.mtp_ar_chunk,
