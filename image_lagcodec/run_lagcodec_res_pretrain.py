@@ -403,6 +403,10 @@ class Config:
         if isinstance(self.gen_eval_prompt, int):
             if self.gen_eval_prompt <= 0:
                 raise ValueError("integer gen_eval_prompt byte count must be positive")
+            # Prompts are sliced in whole token positions. An RGB pixel is the smallest image
+            # prefix this byte-count option can express, so 1-2 requested bytes become 3.
+            min_prompt_bytes = 3 if self.modality == "image" else self.byte_group
+            self.gen_eval_prompt = max(self.gen_eval_prompt, min_prompt_bytes)
         elif not 0.0 < self.gen_eval_prompt < 1.0:
             raise ValueError("float gen_eval_prompt fraction must be strictly between 0 and 1")
         if self.remat and self.remat_level:
@@ -3822,13 +3826,23 @@ def codelm_hidden_from_raw(codelm: CodeLM, raw: jnp.ndarray, prefix: jnp.ndarray
     x = code_embed_proj(raw, codelm.own_input_embed, codelm.own_input_proj)
     if prefix is not None:
         x = jnp.concatenate((prefix.astype(x.dtype), x), axis=1)
+    logical_len = x.shape[1]
+    # With a virtual BOS prefix, a power-of-two image sequence can become one token off
+    # the Splash block boundary (e.g. 65,536 + 1 = 65,537). Under FSDP, the padded Splash
+    # output sliced inside its custom shard_map can produce an invalid transpose bitcast.
+    # For causal attention with no lookahead, trailing zero inputs are future keys and cannot
+    # affect any real position. Run the stack at a block-aligned length, then drop those rows.
+    if codelm.attn_lookahead == 0:
+        padded_len = (logical_len + 127) // 128 * 128
+        if padded_len > logical_len:
+            x = jnp.pad(x, ((0, 0), (0, padded_len - logical_len), (0, 0)))
     h = x
     def _enc_stack(h):
         for blk in codelm.blocks:
             h = run_block(blk, h, codelm.remat and not codelm.remat_level)
         return h
     h = jax.checkpoint(_enc_stack)(h) if codelm.remat_level else _enc_stack(h)
-    return codelm.ln_f(h)
+    return codelm.ln_f(h[:, :logical_len, :])
 
 
 def dec_loss_acc(logits: jnp.ndarray, target: jnp.ndarray, mask: jnp.ndarray = None) -> tuple:
@@ -4954,7 +4968,8 @@ def main():
                     help="skip the sampled (temperature/top_k) half of gen-eval, greedy decode only")
     p.add_argument("--gen_eval_prompt", type=_int_or_float_arg, default=Config.gen_eval_prompt,
                     help="long qualitative prompt: float fraction (default 0.5 of each level's sequence) "
-                         "or positive integer byte count (e.g. 2048; rounded up to whole token positions)")
+                         "or positive integer byte count (rounded up to a whole token, i.e. a multiple "
+                         "of pq_chunks; minimum 3 bytes for images so the prompt includes a complete pixel)")
     p.add_argument("--gen_eval_all_levels", type=lambda x: x.lower() != "false", default=Config.gen_eval_all_levels,
                     help="mid-phase/end-of-phase gen-eval also loops top=0..phase-2 (not just phase-1)")
     p.add_argument("--gen_eval_teacher_force_sanity", type=lambda x: x.lower() != "false",
@@ -5401,10 +5416,13 @@ def main():
                 level_side = math.isqrt(tokens.shape[1])
                 chunks_per_token = tokens.shape[-1]
                 if isinstance(cfg.gen_eval_prompt, int):
-                    requested_positions = math.ceil(cfg.gen_eval_prompt / chunks_per_token)
-                    prompt_label = f"bytes{cfg.gen_eval_prompt}"
+                    min_prompt_bytes = 3 if cfg.modality == "image" else cfg.byte_group
+                    prompt_positions = max(1, math.ceil(max(cfg.gen_eval_prompt, min_prompt_bytes) /
+                                                         chunks_per_token))
+                    aligned_prompt_bytes = prompt_positions * chunks_per_token
+                    prompt_label = f"bytes{aligned_prompt_bytes}"
                     prompt_request = prompt_label
-                    long_prefix = min(tokens.shape[1], max(1, requested_positions))
+                    long_prefix = min(tokens.shape[1], prompt_positions)
                 else:
                     prompt_label = None
                     prompt_request = f"{cfg.gen_eval_prompt:.3g}fraction"

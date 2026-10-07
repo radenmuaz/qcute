@@ -135,6 +135,16 @@ def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: boo
             return out[:, :, :T, :]
 
         replicated = jax.sharding.PartitionSpec()
+        # Splash itself is single-device. When the batch can be split over the
+        # manually mapped mesh axes, give each device only its local examples
+        # instead of running the same attention for the full batch everywhere.
+        # Keep the sequence and heads whole: Splash still computes each example's
+        # complete attention locally. For batch sizes smaller than the mesh, fall
+        # back to replication (the common batch_size=1 FSDP case).
+        batch_axes = tuple(sorted(_SPLASH_SHARD_MAP_AXIS_NAMES))
+        batch_shards = math.prod(mesh.shape[axis] for axis in batch_axes) if batch_axes else 1
+        batch_spec = (jax.sharding.PartitionSpec(batch_axes, None, None, None)
+                      if batch_shards > 1 and B % batch_shards == 0 else replicated)
         # Hybrid intra-node FSDP/inter-node DP nests this Splash shard_map inside
         # an outer shard_map where "dp" is already Manual and "fsdp" is Auto.
         # The captured concrete mesh is all-Auto, so JAX rejects it as a nested
@@ -151,9 +161,9 @@ def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: boo
         y = jax.shard_map(
             run_local,
             mesh=mesh,
-            in_specs=(replicated, replicated, replicated,
+            in_specs=(batch_spec, batch_spec, batch_spec,
                       None if sink is None else replicated),
-            out_specs=replicated,
+            out_specs=batch_spec,
             axis_names=_SPLASH_SHARD_MAP_AXIS_NAMES,
             check_vma=False,
         )(q_p, k_p, v_p, sink)
@@ -693,7 +703,7 @@ def _is_sinkhorn_param(path, leaf) -> bool:
     return getattr(leaf, "ndim", 0) == 2 and not any(k in name for k in excluded)
 
 
-def sinkgd(learning_rate, linear_lr_scale: float = 0.05, sinkhorn_iters: int = 2,
+def sinkgd(learning_rate, linear_lr_scale: float = 0.05, sinkhorn_iters: int = 5,
            b1: float = 0.9, b2: float = 0.999, eps: float = 1e-8, weight_decay: float = 0.0):
     """SinkGD: sr_sinkhorn + scaled SGD-style update for 2D linear weights (stateless), plain
     optax.adamw for everything else. `learning_rate` may be a float or an optax schedule

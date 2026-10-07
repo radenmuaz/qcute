@@ -6,22 +6,22 @@ img_size = 256
 dataset = "imagenet256_jxl"
 data_root = "/dev/shm/imagenet256_jxl"
 multihost = False
-fsdp = True
+# fsdp = True
 # fsdp_mode = "intra_node_fsdp_inter_node_dp"
 
 traversal = "zorder"
 eval_gen_train = True
 gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
-gen_eval_prompt = 2048
-# remat_level = True
+gen_eval_prompt = 2048*3
+remat = True
 share_across_levels = False
-
-codelm_d_model = 2048
+codelm_d_model = 1024
 codelm_n_layers = 16
-codelm_n_heads = 16
-codelm_n_kv_heads = 16
-mlp_mult = 2
+codelm_n_heads = 8
+codelm_n_kv_heads = 2
+mlp_mult = 4
+layer_drop_prob = 0.2
 
 code_vocab = 256
 pq_chunks = 3
@@ -57,22 +57,25 @@ use_sink = True
 precision = "bf16"
 
 byte_group = 3
+# token_head_type = "ar"
+# codelm_token_head = "ar"
 token_head_type = "ar_flat"
 codelm_token_head = "ar_flat"
-pardec_token_head = "ar"
+codelm_token_head = "ar_flat"
+token_mask_prob = 0.2
 token_dim = 128
 token_n_heads = 2
 traversal = "zorder"
 eval_gen_train = True
 gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
-gen_eval_prompt = 512
 
 # --- training ---
-batch_size = 4
-val_batch_size = 4
+batch_size = 1
+val_batch_size = 1
 # level_steps = (20_000, 20_000, 20_000, 100_000)
-level_steps = (int(2e5),)
+# level_steps = (int(4e5),)
+level_steps = (int(4e5)//batch_size,)
 seed = 0
 train_subset_n = None
 val_subset_n = None
@@ -80,19 +83,35 @@ val_subset_n = None
 gen_eval_every_step = 10000
 epoch_verbose = False
 
+# grad_clip = 1.0
+# lr = 5e-4
+# lr_schedule = "cosine"
+# lr_min = 1e-5
+# lr_min_step = level_steps[0]*3 // 4
+# warmup_steps = 10_000
+# optimizer = "adamw"
+# optimizer_kwargs = dict(weight_decay=1e-2)
+
 grad_clip = 1.0
-lr = 5e-4
+lr = 0.02
 lr_schedule = "cosine"
 lr_min = 1e-5
-lr_min_step = level_steps[0] // 2
-warmup_steps = 10_000
-optimizer = "adamw"
-optimizer_kwargs = dict(weight_decay=1e-2)
+lr_min_step = level_steps[0]*3 // 4
+warmup_steps = level_steps[0] // 16
+optimizer = "sinkgd"
+optimizer_kwargs = dict(linear_lr_scale=0.05, weight_decay=0.0, sinkhorn_iters=5)
+
 
 wa_verbose = False
 
 # --- logging ---
 log_every = 100
-ckpt_every_step = 10_000
+ckpt_every_step = level_steps[0] // 4
 # ckpt_every_step = int(2e5)
-ckpt_keep = 1
+ckpt_keep = 4
+
+class_conditional = True
+class_num_classes = 1000
+class_drop_prob: float = 0.2
+class_bos_order = "level_then_class"
+# class_bos_order = "class_then_level"
