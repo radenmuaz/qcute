@@ -257,15 +257,12 @@ class Config:
     attn_lookahead: tuple = 0
     use_sink: bool = False
 
-    use_codelm_bos: bool = False  # False (default) = no BOS/anchor token for CodeLM's own free-run --
-    # position 0 is whatever a real image's leading content looks like (dataset-biased), same as
-    # before this option existed. True = CodeLM gets its own learned bos_embed table (one row per
-    # codelm_bos_rates, e.g. one anchor per target scale/zoom for genuinely unconditional free-run
-    # generation, see encoder_free_run's use_bos/rate_id) -- substituted at position 0 with
-    # probability codelm_bos_prob during training so it's learned, not untrained noise at inference.
+    use_codelm_bos: bool = False  # True = prepend a dedicated CodeLM start position (one learned
+    # bos_embed row per target level/rate). Image/code tokens remain at their original positions;
+    # BOS is never substituted for and never removes the first data token.
     # Purely additive (a new field/table) -- opt-in per training run, including fine-tuning an
     # already-trained (use_codelm_bos=False) checkpoint by turning it on and continuing training.
-    codelm_bos_prob: float = 0.1
+    codelm_bos_prob: float = 0.1  # training probability of using learned BOS vs zero/null prefix
     codelm_bos_rates: tuple = 1  # per-level n_rates for the bos_embed table; 1 (default) = single
     # generic anchor. No effect when use_codelm_bos=False.
     class_conditional: bool = False  # add trainable class/null BOS tokens to CodeLM inputs
@@ -745,6 +742,8 @@ class Config:
         assert all(c >= 1 for c in self.downsampler_remat_chunks + self.upsampler_remat_chunks), \
             (self.downsampler_remat_chunks, self.upsampler_remat_chunks)
         assert self.init_scheme in ("llama", "zero")
+        if not 0.0 <= self.codelm_bos_prob <= 1.0:
+            raise ValueError(f"codelm_bos_prob must be in [0,1], got {self.codelm_bos_prob}")
         if not 0.0 <= self.class_drop_prob <= 1.0:
             raise ValueError(f"class_drop_prob must be in [0,1], got {self.class_drop_prob}")
         if self.class_num_classes < 1:
@@ -2848,13 +2847,10 @@ class CodeLM(eqx.Module):
 
     def encode(self, x: jnp.ndarray, target_idx: jnp.ndarray, K: int, rng=None, encode_temperature: float = 1.0,
                layer_drop_prob=None, rate_id: int = 0, force_bos: bool = False) -> dict:
-        if force_bos:
-            x = x.at[:, 0, :].set(self.bos_embed[rate_id])
-        elif self.use_codelm_bos and rng is not None:
-            B = x.shape[0]
-            do_sub = jax.random.bernoulli(jax.random.fold_in(rng, 6), p=self.codelm_bos_prob, shape=(B,))
-            x0 = jnp.where(do_sub[:, None], self.bos_embed[rate_id], x[:, 0, :])
-            x = x.at[:, 0, :].set(x0)
+        prefix = codelm_bos_prefix(self, x.shape[0], rate_id, rng, x.dtype, force=force_bos)
+        prefix_len = 0 if prefix is None else prefix.shape[1]
+        if prefix is not None:
+            x = jnp.concatenate((prefix.astype(x.dtype), x), axis=1)
         h = x
         n_blk = len(self.blocks)
         if rng is not None:
@@ -2874,10 +2870,13 @@ class CodeLM(eqx.Module):
         h = jax.checkpoint(_enc_stack)(h) if self.remat_level else _enc_stack(h)
         h = self.ln_f(h)
         M, L, D = h.shape
-        n_blocks = L // K
+        # BOS is context only. Pool complete groups from the original data-token stream.
+        data_h = h[:, prefix_len:, :]
+        data_len = data_h.shape[1]
+        n_blocks = data_len // K
         # TODO: CodePoolAttention removed (superseded by the PardecLM-based downsampler, not yet
         # wired in) -- naive position-(K-1) pick only, for now.
-        h_blocks = h[:, :n_blocks * K, :].reshape(M, n_blocks, K, D)
+        h_blocks = data_h[:, :n_blocks * K, :].reshape(M, n_blocks, K, D)
         pooled = h_blocks[:, :, K - 1, :]
         logits = reshape_pq(pooled @ self.code_head, self.pq_chunks, self.code_vocab)
         code_soft, code_idx = quantize_dispatch(self.quantize_mode, logits, quant_rng, encode_temperature,
@@ -2888,9 +2887,20 @@ class CodeLM(eqx.Module):
         entropy_loss = jnp.mean(jnp.sum(p_avg * jnp.log(jnp.maximum(p_avg, 1e-9)), axis=-1))
 
         ntp_shift = 1 + self.attn_lookahead
-        if L > ntp_shift:
+        if prefix is not None and data_len > self.attn_lookahead:
+            # The prefix state precedes data position zero, so with no lookahead it predicts
+            # target zero. A-token lookahead makes targets before index A visible and omits them.
+            prefix_target_start = self.attn_lookahead
+            tgt = target_idx[:, prefix_target_start:]
+            ntp_h = h[:, prefix_len - 1:prefix_len - 1 + tgt.shape[1], :]
+            ntp_logits = codelm_ntp_logits_tf(self, ntp_h, tgt,
+                                               rng=None if quant_rng is None else jax.random.fold_in(quant_rng, 71))
+            logp = jax.nn.log_softmax(ntp_logits, axis=-1)
+            ntp_loss = -jnp.mean(jnp.take_along_axis(logp, tgt[..., None], axis=-1))
+            ntp_acc = jnp.mean(jnp.argmax(ntp_logits, -1) == tgt)
+        elif prefix is None and data_len > ntp_shift:
             tgt = target_idx[:, ntp_shift:]
-            ntp_logits = codelm_ntp_logits_tf(self, h[:, :-ntp_shift, :], tgt,
+            ntp_logits = codelm_ntp_logits_tf(self, data_h[:, :-ntp_shift, :], tgt,
                                                rng=None if quant_rng is None else jax.random.fold_in(quant_rng, 71))
             logp = jax.nn.log_softmax(ntp_logits, axis=-1)
             ntp_loss = -jnp.mean(jnp.take_along_axis(logp, tgt[..., None], axis=-1))
@@ -2905,40 +2915,31 @@ class CodeLM(eqx.Module):
 
 
 
-def codelm_bos_substitute(codelm: CodeLM, x: jnp.ndarray, rate_id: int, rng, group_size: int) -> jnp.ndarray:
-    # Single source of truth for CodeLM's own bos substitution -- factored out 2026-09-27 after
-    # finding it missing from THREE separate call sites in a row (encode_pardec_downsampler,
-    # encode_pardec_downsampler_generate, and the upsampler's context builders
-    # decode_logits_and_target_multipass/_decode_generate_pardec_call all build a CodeLM forward
-    # pass over their own input x, and each one needs this same substitution applied to ITS OWN x
-    # before running it through CodeLM's blocks -- easy to forget per call site, so every caller
-    # should route through here instead of reimplementing it inline.
-    #
-    # REPEAT-PER-GROUP mode (tried 2026-09-27, testing the weight-sharing hypothesis for "train mse
-    # low but gen bad": with a SHARED CodeLM across all levels, a group only knew which level it
-    # belonged to via PardecLM's own per-group bos_embed[rate_id] row -- CodeLM's OWN context
-    # representation h never got a matching per-group anchor, only a global one at absolute sequence
-    # position 0). REVERTED same day: user confirmed via real training run (cifar_res_full2) this did
-    # NOT fix the bad-generation symptom, and separately confirmed use_codelm_bos=False entirely
-    # (run_lagcodec_res_v1.py, pre-bos-substitution code) DID work -- so bos substitution itself (in
-    # either form) is implicated, not just its once-vs-per-group granularity. Kept as a comment, not
-    # deleted, in case it's revisited:
-    # if codelm.use_codelm_bos and rng is not None:
-    #     B, T = x.shape[0], x.shape[1]
-    #     do_sub = jax.random.bernoulli(jax.random.fold_in(rng, 6), p=codelm.codelm_bos_prob, shape=(B,))
-    #     bos_row = codelm.bos_embed[rate_id]
-    #     for s in range(0, T, group_size):
-    #         xs = jnp.where(do_sub[:, None], bos_row, x[:, s, :])
-    #         x = x.at[:, s, :].set(xs)
-    # return x
-    #
-    # ACTIVE (bos-once at position 0 -- original pre-repeat-per-group behavior, restored):
-    if codelm.use_codelm_bos and rng is not None:
-        B = x.shape[0]
-        do_sub = jax.random.bernoulli(jax.random.fold_in(rng, 7), p=codelm.codelm_bos_prob, shape=(B,))
-        x0 = jnp.where(do_sub[:, None], codelm.bos_embed[rate_id], x[:, 0, :])
-        x = x.at[:, 0, :].set(x0)
-    return x
+def codelm_bos_prefix(codelm: CodeLM, batch_size: int, rate_id: int, rng,
+                      dtype, force: bool = False) -> jnp.ndarray | None:
+    """Build a fixed-length BOS/null prefix without replacing any data token.
+
+    During training, codelm_bos_prob selects the learned BOS per example; dropped BOS
+    examples receive a zero prefix. Keeping the prefix position in both cases preserves
+    sequence and target alignment. Without an RNG, use the learned BOS whenever its
+    training probability is nonzero; force=True always selects it.
+    """
+    if not codelm.use_codelm_bos:
+        return None
+    bos = jnp.broadcast_to(codelm.bos_embed[rate_id], (batch_size, codelm.bos_embed.shape[-1]))
+    if force:
+        value = bos
+    elif rng is None:
+        value = bos if codelm.codelm_bos_prob > 0.0 else jnp.zeros_like(bos)
+    elif codelm.codelm_bos_prob >= 1.0:
+        value = bos
+    elif codelm.codelm_bos_prob <= 0.0:
+        value = jnp.zeros_like(bos)
+    else:
+        selected = jax.random.bernoulli(jax.random.fold_in(rng, 7),
+                                        p=codelm.codelm_bos_prob, shape=(batch_size,))
+        value = jnp.where(selected[:, None], bos, jnp.zeros_like(bos))
+    return value.astype(dtype)[:, None, :]
 
 
 def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cfg: "Config",
@@ -2953,6 +2954,8 @@ def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cf
     # "own_embed"/"shared_embed" modes can bypass CodeLM's own embedding table entirely too.
     source = cfg.context_source if context_source is None else context_source
     if source in ("codelm", "codelm_upper"):  # which CodeLM is the caller's choice
+        if prefix is None:
+            prefix = codelm_bos_prefix(codelm, raw.shape[0], rate_id, rng, codelm.bos_embed.dtype)
         h = codelm_hidden_from_raw(codelm, raw, prefix)
         return h if prefix is None else h[:, prefix.shape[1]:]
         # "own_embed"/"shared_embed": plain per-position embedding, NO self-attention/contextualization
@@ -3101,14 +3104,15 @@ def codelm_ntp_loss(codelm: CodeLM, raw: jnp.ndarray, target: jnp.ndarray, cfg: 
     h = codelm_hidden_from_raw(codelm, raw, prefix)
     shift = 1 + codelm.attn_lookahead
     if prefix is not None:
-        if codelm.attn_lookahead != 0:
-            raise ValueError("prefixed CodeLM NTP requires attn_lookahead=0")
-        n = target.shape[1]
+        target_start = codelm.attn_lookahead
+        n = target.shape[1] - target_start
+        if n <= 0:
+            return jnp.array(0.0, dtype=h.dtype), jnp.array(0.0, dtype=h.dtype)
         p = prefix.shape[1]
-        # Prefix positions are context only. The last prefix state predicts target position 0;
-        # subsequent token states predict the following target. The target tensor is never fed at
-        # its own position when producing its logits, so this alignment has no target leakage.
-        h = h[:, p - 1:p + n - 1, :]
+        # The last prefix state predicts target 0 with zero lookahead. With lookahead A,
+        # the first A targets are visible to earlier states and are omitted from the objective.
+        h = h[:, p - 1:p - 1 + n, :]
+        target = target[:, target_start:]
         logits = codelm_ntp_logits_tf(codelm, h, target, rng=rng)
         logp = jax.nn.log_softmax(logits, axis=-1)
         loss = -jnp.mean(jnp.take_along_axis(logp, target[..., None], axis=-1))
@@ -3134,8 +3138,8 @@ def encode_pardec_downsampler_generate(codelm: CodeLM, downsampler: PardecLM, ra
     # path here, which use_pardec_downsampler=True training never touches/trains at all -- that's
     # what made cascade generation garbage despite good training loss (loss trains the downsampler
     # via encode_pardec_downsampler; generation was reading a permanently-untrained code_head).
-    # Same bos substitution as encode_pardec_downsampler/CodeLM.encode() -- keeps generation-time
-    # distribution consistent with whatever codelm_bos_prob training actually used. codelm_rate_id:
+    # Same BOS/null prefix as encode_pardec_downsampler/CodeLM.encode() -- keeps generation-time
+    # sequence alignment consistent with training. codelm_rate_id:
     # see encode_pardec_downsampler's own docstring -- CodeLM's bos is always absolute, independent
     # of `rate_id` (the downsampler's own bos, which follows cfg.bos_rate_mode).
     codelm_rate_id = rate_id if codelm_rate_id is None else codelm_rate_id
@@ -3515,16 +3519,13 @@ def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, tempe
     B, token_len, C = tokens.shape
     total_len = token_len
     x = code_embed_proj(tokens, codelm.own_input_embed, codelm.own_input_proj)
+    if use_bos:
+        bos_prefix = codelm_bos_prefix(codelm, B, rate_id, None, x.dtype)
+        prefix = bos_prefix if prefix is None else jnp.concatenate((bos_prefix, prefix), axis=1)
     prefix_len = 0 if prefix is None else prefix.shape[1]
     if prefix is not None:
         x = jnp.concatenate((prefix.astype(x.dtype), x), axis=1)
         total_len += prefix_len
-    if use_bos:
-        # position 0's discrete `tokens[:,0]` value is meaningless once its embedding is replaced --
-        # only the embedding matters for this level's own free-run (P=1, everything after is genuinely
-        # free-sampled with zero real content: a true unconditional/free rollout, not just a small
-        # real prompt). Downstream re-encoding of the returned tokens is the caller's concern.
-        x = x.at[:, 0, :].set(codelm.bos_embed[rate_id])
     # recurrent blocks can't overwrite a placeholder: their prefill only consumes the prompt (pos < P)
     prompt_len = prefix_len + P
     prompt_valid = jnp.broadcast_to((jnp.arange(total_len) < prompt_len)[None], (B, total_len))
@@ -3605,16 +3606,15 @@ def encoder_free_run(codelm: CodeLM, prompt_tokens: jnp.ndarray, total_len: int,
     """Free-run the SHARED CodeLM as a language model over its own input tokens (its NTP head), at
     whichever level's granularity K (a runtime grouping argument, not baked into any weight):
     keep the prompt tokens, then sample the rest. greedy=True is argmax; otherwise temperature/top_k
-    sampling. use_bos=True (needs cfg.use_codelm_bos): replace position 0's embedding with
-    codelm.bos_embed[rate_id] regardless of prompt_tokens -- a true free rollout (P should be 1),
-    not a real-byte-prompted completion."""
+    sampling. use_bos=True (needs cfg.use_codelm_bos) prepends a start position before the prompt;
+    it never overwrites a prompt token. P=0 is permitted for generation from BOS alone."""
     assert codelm.attn_lookahead == 0, \
         f"encoder free-run needs attn_lookahead=0 (got {codelm.attn_lookahead}): a lookahead shifts the NTP target"
     assert not use_bos or codelm.use_codelm_bos, \
         "use_bos=True needs cfg.use_codelm_bos=True (bos_embed was never trained)"
     B, P, C = prompt_tokens.shape
-    assert (0 if prefix is not None else 1) <= P <= total_len, \
-        f"prompt length {P} must be in [{0 if prefix is not None else 1}, {total_len}]"
+    assert (0 if (prefix is not None or use_bos) else 1) <= P <= total_len, \
+        f"prompt length {P} must be in [{0 if (prefix is not None or use_bos) else 1}, {total_len}]"
     tokens = jnp.zeros((B, total_len, C), prompt_tokens.dtype).at[:, :P].set(prompt_tokens)
     return _encoder_free_run_jit(codelm, tokens, jnp.asarray(P, jnp.int32), K, rng,
                                  jnp.asarray(temperature, jnp.float32), greedy, top_k, use_bos, rate_id,
@@ -3654,14 +3654,9 @@ def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.
     ds = 1
     for i in range(sample_level):
         ds *= model.K(i)
-    # use_bos: matches training's own position-0 substitution -- with codelm_bos_prob=1.0, training
-    # NEVER saw real content at position 0 for ANY level (including sample_level), so generation
-    # must substitute bos here too or it's off-distribution exactly where it matters most (caught
-    # 2026-09-27: this call previously always fed the real prompt token at position 0 regardless of
-    # codelm_bos_prob). For 0<codelm_bos_prob<1, neither True nor False matches training's actual
-    # random mix exactly; False (real content) is kept as the closer default since that's what an
-    # actual prompted continuation naturally has.
-    use_bos = cfg.use_codelm_bos and cfg.codelm_bos_prob >= 1.0
+    # Preserve the learned/zero start-context position used in training. Prompt tokens remain
+    # untouched after that prefix.
+    use_bos = cfg.use_codelm_bos
     codelm_L = model.codelm_for(sample_level)
     tokens_L = encoder_free_run(codelm_L, tok, total_positions // ds, model.K(sample_level), rng, greedy,
                                  temperature, top_k, use_bos=use_bos,
@@ -3794,11 +3789,8 @@ def class_condition_prefix(model: LagCodecModel, level_idx: int, class_labels, b
     cfg = model.cfg
     codelm = model.codelm_for(level_idx)
     if not cfg.class_conditional:
-        if cfg.simple_ntp and cfg.use_codelm_bos:
-            level_token = jnp.broadcast_to(codelm.bos_embed[model.codelm_bos_rate_id(level_idx)],
-                                           (batch_size, codelm.bos_embed.shape[-1]))
-            return level_token[:, None, :]
-        return None
+        return codelm_bos_prefix(codelm, batch_size, model.codelm_bos_rate_id(level_idx),
+                                 rng, codelm.bos_embed.dtype)
     class_table = model.class_bos_for(level_idx)
     null_id = cfg.class_num_classes
     if class_labels is None:
@@ -3814,8 +3806,8 @@ def class_condition_prefix(model: LagCodecModel, level_idx: int, class_labels, b
                 ids = jnp.where(drop, null_id, ids)
     class_token = class_table[ids]
     if cfg.use_codelm_bos:
-        level_token = jnp.broadcast_to(codelm.bos_embed[model.codelm_bos_rate_id(level_idx)],
-                                       class_token.shape)
+        level_token = codelm_bos_prefix(codelm, batch_size, model.codelm_bos_rate_id(level_idx),
+                                        rng, class_token.dtype)[:, 0, :]
         ordered = (level_token, class_token) if cfg.class_bos_order == "level_then_class" \
             else (class_token, level_token)
         return jnp.stack(ordered, axis=1)
@@ -3976,8 +3968,10 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
                 raw = jnp.where(choose_gt[:, None, None, None], gt_soft, out["code_soft"])
                 target = jnp.where(choose_gt[:, None, None], gt_codes, out["code_idx"])
     if model.cfg.context_source == "codelm_upper":
+        upper_prefix = class_condition_prefix(model, phase, class_labels, codes_soft[phase - 1].shape[0],
+                                              None if rng is None else jax.random.fold_in(rng, 197))
         ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(phase), codes_soft[phase - 1],
-                                         codes[phase - 1], model.cfg,
+                                         codes[phase - 1], model.cfg, prefix=upper_prefix,
                                          rng=None if rng is None else jax.random.fold_in(rng, 198))
         enc_losses.append(ntp_up)
         enc_accs.append(acc_up)
@@ -4179,8 +4173,13 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
                     raw = jnp.where(choose_gt[:, None, None, None], gt_soft, out["code_soft"])
                     target = jnp.where(choose_gt[:, None, None], gt_codes, out["code_idx"])
         if model.cfg.context_source == "codelm_upper":
+            upper_level = entry_level + depth
+            upper_prefix = class_condition_prefix(
+                model, upper_level, class_labels, codes_soft[depth - 1].shape[0],
+                None if rng is None else jax.random.fold_in(rng, 197 + depth))
             ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(entry_level + depth), codes_soft[depth - 1],
                                              codes[depth - 1], model.cfg,
+                                             prefix=upper_prefix,
                                              rng=None if rng is None else jax.random.fold_in(rng, 198 + depth))
             enc_losses.append(ntp_up)
             enc_accs.append(acc_up)
@@ -5089,15 +5088,15 @@ def main():
                          "positions ahead (splash LocalMask's native right-side window)")
     p.add_argument("--use_sink", type=lambda x: x.lower() != "false", default=Config.use_sink)
     p.add_argument("--use_codelm_bos", type=lambda x: x.lower() != "false", default=Config.use_codelm_bos,
-                    help="False (default): no BOS/anchor for CodeLM's own free-run, position 0 stays "
-                         "dataset-biased. True: CodeLM gets its own learned bos_embed table (one row "
-                         "per --codelm_bos_rates, e.g. one anchor per target scale), substituted at "
-                         "position 0 with probability --codelm_bos_prob during training. The bos_embed "
+                    help="False (default): no BOS prefix. True: prepend a dedicated CodeLM start "
+                         "position before the unchanged data-token sequence. During training, this "
+                         "position contains learned BOS with probability --codelm_bos_prob and zero "
+                         "otherwise. The bos_embed "
                          "param always exists (harmless/inert when this is False) so toggling this "
                          "flag alone never breaks checkpoint structure")
     p.add_argument("--codelm_bos_prob", type=float, default=Config.codelm_bos_prob,
-                    help="probability an example's position 0 is substituted with bos_embed[rate_id] "
-                         "during training (only when --use_codelm_bos=True)")
+                    help="probability per example of using learned BOS at the prepended start position; "
+                         "dropped BOS uses a zero vector while keeping sequence length fixed")
     p.add_argument("--codelm_bos_rates", type=_tuple_arg, default=Config.codelm_bos_rates,
                     help="per-level n_rates for the bos_embed table (1 default = single generic "
                          "anchor). No effect when --use_codelm_bos=False")

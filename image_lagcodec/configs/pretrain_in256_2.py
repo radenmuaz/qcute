@@ -1,5 +1,5 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/pretrain_in64_1_tpu1.py
+uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/pretrain_in256_2.py
 """
 # --- data ---
 img_size = 256
@@ -42,15 +42,15 @@ label_reg_weight = 1.0
 label_fn = "rgb_label_fn_jax"
 # bos_rate_mode = "relative"
 bos_rate_mode = "absolute"
-strides = (4, 4, 4)
+strides = None
 # attn_window = 4096
 attn_window = -1
 attn_lookahead = 0
 # remat = True
 # context_source = "own_embed"
-# use_codelm_bos = False
-use_codelm_bos = True
-codelm_bos_prob = 0.8
+use_codelm_bos = False
+# use_codelm_bos = True
+# codelm_bos_prob = 0.8
 curriculum_mode = "no_freeze"
 quantize_mode = "zgr"
 encode_temperature = 1.0
@@ -77,21 +77,12 @@ eval_gen_train = True
 gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
 
-downsampler_d_model = 128
-downsampler_n_layers = 1
-downsampler_n_heads = 1
-downsampler_n_kv_heads = 1
-downsampler_window = 1
-downsampler_rollout = True
-downsampler_rollout_prob = 0.2
-level_gt_input_prob = 0.8
-
 # --- training ---
 batch_size = 1
 val_batch_size = 1
 # level_steps = (20_000, 20_000, 20_000, 100_000)
 # level_steps = (int(4e5),)
-level_steps = (0,0,int(4e5)//batch_size,)
+level_steps = (int(4e5)//batch_size,)
 # level_steps = (int(4e5)//batch_size,)
 seed = 0
 train_subset_n = None

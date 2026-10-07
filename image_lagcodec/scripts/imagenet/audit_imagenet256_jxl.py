@@ -12,6 +12,7 @@ Example:
 
 The HF split is streamed from its beginning through the largest sampled index. No full source
 split is downloaded or cached as an Arrow dataset. JXL comparisons are exact pixel equality.
+Pass --full to check every common raw/JXL index instead of sampling.
 """
 from __future__ import annotations
 
@@ -147,6 +148,8 @@ def main() -> int:
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num_samples", type=int, default=1000)
+    parser.add_argument("--full", action="store_true",
+                        help="check every common raw/JXL sample; ignore --num_samples and --seed")
     parser.add_argument("--hf_dataset", type=str, default="ILSVRC/imagenet-1k")
     args = parser.parse_args()
     if args.resolution < 1 or args.num_samples < 1:
@@ -157,25 +160,41 @@ def main() -> int:
     common_count = min(int(raw.ends[-1]), jxl.count)
     if common_count == 0:
         raise ValueError("raw and JXL datasets have no common samples")
-    if int(raw.ends[-1]) != jxl.count:
+    count_mismatch = int(raw.ends[-1]) != jxl.count
+    if count_mismatch:
         print(f"WARNING: raw count={int(raw.ends[-1])}, JXL count={jxl.count}; "
-              f"sampling common prefix of {common_count}")
+              f"checking common prefix of {common_count}")
 
-    n = min(args.num_samples, common_count)
-    rng = np.random.default_rng(args.seed)
-    selected = np.sort(rng.choice(common_count, size=n, replace=False))
+    n = common_count if args.full else min(args.num_samples, common_count)
+    if args.full:
+        selected = np.arange(common_count, dtype=np.int64)
+    else:
+        rng = np.random.default_rng(args.seed)
+        selected = np.sort(rng.choice(common_count, size=n, replace=False))
     errors = []
+    error_count = 0
 
-    # First compare the two local datasets for the selected deterministic indices.
-    for index in selected:
-        index = int(index)
-        raw_image, raw_label = raw.get(index)
-        jxl_image, jxl_label = jxl.get(index, args.resolution)
-        ok, detail = compare_images(raw_image, jxl_image)
-        if not ok:
-            errors.append(f"index {index}: raw vs JXL: {detail}")
-        if raw_label != jxl_label:
-            errors.append(f"index {index}: raw/JXL labels differ: {raw_label} != {jxl_label}")
+    def record_error(message: str) -> None:
+        nonlocal error_count
+        error_count += 1
+        if len(errors) < 50:
+            errors.append(message)
+
+    if args.full and count_mismatch:
+        record_error(f"full check requires equal counts: raw={int(raw.ends[-1])}, JXL={jxl.count}")
+
+    # In full mode the HF pass below checks both local datasets directly, avoiding a second
+    # full decode pass over all JXL images.
+    if not args.full:
+        for index in selected:
+            index = int(index)
+            raw_image, raw_label = raw.get(index)
+            jxl_image, jxl_label = jxl.get(index, args.resolution)
+            ok, detail = compare_images(raw_image, jxl_image)
+            if not ok:
+                record_error(f"index {index}: raw vs JXL: {detail}")
+            if raw_label != jxl_label:
+                record_error(f"index {index}: raw/JXL labels differ: {raw_label} != {jxl_label}")
 
     ds = load_dataset(args.hf_dataset, split=args.split, streaming=True)
     if "label" not in ds.features:
@@ -202,32 +221,34 @@ def main() -> int:
             ok_raw, detail_raw = compare_images(source_image, raw_image)
             ok_jxl, detail_jxl = compare_images(source_image, jxl_image)
             if not ok_raw:
-                errors.append(f"index {valid_index} (HF row {source_row}): HF vs raw: {detail_raw}")
+                record_error(f"index {valid_index} (HF row {source_row}): HF vs raw: {detail_raw}")
             if not ok_jxl:
-                errors.append(f"index {valid_index} (HF row {source_row}): HF vs JXL: {detail_jxl}")
+                record_error(f"index {valid_index} (HF row {source_row}): HF vs JXL: {detail_jxl}")
             if source_label != raw_label or source_label != jxl_label:
-                errors.append(f"index {valid_index} (HF row {source_row}): labels HF/raw/JXL="
-                              f"{source_label}/{raw_label}/{jxl_label}")
+                record_error(f"index {valid_index} (HF row {source_row}): labels HF/raw/JXL="
+                             f"{source_label}/{raw_label}/{jxl_label}")
             target_pos += 1
-            pbar.set_postfix(checked=target_pos, selected=n)
+            if target_pos == n or target_pos % 1000 == 0:
+                pbar.set_postfix(checked=target_pos, selected=n)
         valid_index += 1
 
     if target_pos < n:
-        errors.append(f"HF stream ended after matching {target_pos}/{n} selected samples; "
-                      f"processed {valid_index} valid images and skipped {failed_preprocess} rows")
+        record_error(f"HF stream ended after matching {target_pos}/{n} selected samples; "
+                     f"processed {valid_index} valid images and skipped {failed_preprocess} rows")
 
-    print(f"split={args.split} seed={args.seed} checked={target_pos}/{n} "
+    mode = "full" if args.full else f"sampled seed={args.seed}"
+    print(f"split={args.split} mode={mode} checked={target_pos}/{n} "
           f"raw_count={int(raw.ends[-1])} jxl_count={jxl.count} "
           f"hf_preprocess_failures={failed_preprocess}")
-    if errors:
-        print(f"FAIL: {len(errors)} mismatch/error(s)")
+    if error_count:
+        print(f"FAIL: {error_count} mismatch/error(s)")
         for error in errors[:50]:
             print(f"  {error}")
-        if len(errors) > 50:
-            print(f"  ... {len(errors) - 50} more")
+        if error_count > len(errors):
+            print(f"  ... {error_count - len(errors)} more")
         return 1
 
-    print("PASS: every sampled decoded JXL image exactly matches both the raw shard and HF source.")
+    print("PASS: every checked decoded JXL image exactly matches both the raw shard and HF source.")
     return 0
 
 
