@@ -48,7 +48,43 @@ def _splash_pad(x: jnp.ndarray, block: int) -> jnp.ndarray:
     return x
 
 
-def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool, window: int = None, lookahead: int = 0):
+class PrefixCausalLocalMask(splash_mask_lib._ComputableMask):
+    """Causal sliding window attention where prefix positions [0, prefix_len)
+    (e.g. CodeLM BOS and class conditional tokens) remain always attendable by all queries."""
+    window: int
+    lookahead: int
+    prefix_len: int
+    offset: int
+
+    def __init__(self, shape: tuple[int, int], window: int, lookahead: int = 0,
+                 prefix_len: int = 0, offset: int = 0, shard_count: int = 1):
+        self.window = window
+        self.lookahead = lookahead
+        self.prefix_len = prefix_len
+        self.offset = offset
+
+        def fn(q_ids, kv_ids):
+            q = q_ids + offset if offset != 0 else q_ids
+            causal = kv_ids <= (q + lookahead)
+            in_window = (kv_ids >= q - window) & causal
+            in_prefix = (kv_ids < prefix_len) & (kv_ids <= q)
+            return in_window | in_prefix
+
+        super().__init__(shape=shape, mask_function=fn, shard_count=shard_count)
+
+    def __eq__(self, other):
+        if not isinstance(other, type(self)):
+            return NotImplemented
+        return (self.shape == other.shape and self.window == other.window
+                and self.lookahead == other.lookahead and self.prefix_len == other.prefix_len
+                and self.offset == other.offset)
+
+    def __hash__(self):
+        return hash((type(self), self.shape, self.window, self.lookahead, self.prefix_len, self.offset))
+
+
+def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool, window: int = None,
+                        lookahead: int = 0, prefix_len: int = 0):
     """Not cached: caching a SplashAttentionKernel (holds jnp.array-converted MaskInfo, created
     during whichever trace first calls this) across separate jax traces (train vs eval, or a
     retrace) leaks a tracer from the first, now-closed trace -- confirmed 2026-09-08, all 4 TPU
@@ -62,16 +98,27 @@ def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool, window: int =
     256x256 -> 65536-position sequences at level0) where full O(T^2) unbounded attention becomes
     prohibitive.
 
+    prefix_len (chat 2026-10-07): number of leading prefix positions (e.g. CodeLM BOS and/or class
+    conditional token) that remain always attendable by every query, even when the query is further
+    away than `window`. Uses PrefixCausalLocalMask when window is set.
+
     lookahead (chat 2026-09-16): 0 (default) -- plain causal, unchanged. int>0 -- shifted
     triangular mask: query i may additionally see keys up to i+lookahead (LocalMask's native
     right-side window_size, window_size=(window, lookahead) -- same kernel, still genuinely
     block-sparse). Only meaningful when causal=True; ignored when causal=False (already fully
     unbounded both ways -- ordinary full attention, ordinary per-query output)."""
     if window is not None or lookahead > 0:
-        mask = splash_mask_lib.MultiHeadMask(
-            [splash_mask_lib.LocalMask((padded_T, padded_T), window_size=(window, lookahead), offset=0)
-             for _ in range(n_heads)]
-        )
+        if prefix_len > 0:
+            mask = splash_mask_lib.MultiHeadMask(
+                [PrefixCausalLocalMask((padded_T, padded_T), window=window, lookahead=lookahead,
+                                       prefix_len=prefix_len, offset=0)
+                 for _ in range(n_heads)]
+            )
+        else:
+            mask = splash_mask_lib.MultiHeadMask(
+                [splash_mask_lib.LocalMask((padded_T, padded_T), window_size=(window, lookahead), offset=0)
+                 for _ in range(n_heads)]
+            )
     else:
         mask_cls = splash_mask_lib.CausalMask if causal else splash_mask_lib.FullMask
         mask = splash_mask_lib.MultiHeadMask(
@@ -87,16 +134,18 @@ def _splash_attn_kernel(n_heads: int, padded_T: int, causal: bool, window: int =
 
 
 def splash_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray, causal: bool, sm_scale: float,
-                      window: int = None, lookahead: int = 0, sink: jnp.ndarray = None) -> jnp.ndarray:
+                      window: int = None, lookahead: int = 0, sink: jnp.ndarray = None,
+                      prefix_len: int = 0) -> jnp.ndarray:
     """q:(B,Hq,T,hd), k/v:(B,Hkv,T,hd), Hq%Hkv==0 (native GQA -- splash groups kv heads internally,
     no repeat_kv needed unlike Pallas flash_attention). Returns (B,Hq,T,hd). window/lookahead: see
     _splash_attn_kernel's docstring -- None/0 (default) is unchanged/unbounded-causal behavior.
+    prefix_len: number of always-attendable leading prefix tokens (e.g. CodeLM BOS and class tokens).
     sink (chat 2026-09-15): optional (Hq,) per-head attention-sink logit, splash_attention's
     NATIVE `sinks` kernel arg -- NOT batched (shared across B), so vmap must close over it rather
     than map it like q/k/v."""
     B, Hq, T, hd = q.shape
     q_p, k_p, v_p = _splash_pad(q, _SPLASH_BLOCK), _splash_pad(k, _SPLASH_BLOCK), _splash_pad(v, _SPLASH_BLOCK)
-    kernel = _splash_attn_kernel(Hq, q_p.shape[-2], causal, window, lookahead)
+    kernel = _splash_attn_kernel(Hq, q_p.shape[-2], causal, window, lookahead, prefix_len=prefix_len)
 
     # Splash's Mosaic custom call is a single-device kernel. Under a global FSDP
     # mesh, GSPMD cannot partition that call automatically. Replicate the attention
@@ -445,11 +494,12 @@ class Attention(eqx.Module):
     use_qknorm: bool = eqx.field(static=True)
     window: int = eqx.field(static=True)
     lookahead: int = eqx.field(static=True)
+    prefix_len: int = eqx.field(static=True)
     sink: jnp.ndarray
 
     def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, rope_base: float, n_layers: int = None,
                  init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True, window: int = None,
-                 lookahead: int = 0, use_sink: bool = False):
+                 lookahead: int = 0, use_sink: bool = False, prefix_len: int = 0):
         """See SwiGLU.__init__ for the init_scheme rationale -- applies identically here, with
         `out` as the residual-output projection. use_xsa: see apply_xsa() above (arXiv:2603.09078)
         -- applied right after the attention call, before the out-projection; default off, opt-in.
@@ -485,9 +535,10 @@ class Attention(eqx.Module):
         self.use_qknorm = use_qknorm
         self.window = window
         self.lookahead = lookahead
+        self.prefix_len = prefix_len
         self.sink = jnp.zeros((n_heads,)) if use_sink else None
 
-    def __call__(self, x: jnp.ndarray, causal: bool = True) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, causal: bool = True, prefix_len: int = None) -> jnp.ndarray:
         """Batched training-time forward: x is (B,T,D). causal=False is full bidirectional
         attention (discrete-diffusion-style masked head). Uses the Pallas TPU splash_attention
         kernel (block-sparse, genuine O(T) memory, native GQA -- see splash_attention() above)."""
@@ -512,8 +563,9 @@ class Attention(eqx.Module):
         # consistent dtype at the call site avoids relying on whatever internal promotion rule
         # splash_attention's `sinks` kernel arg applies.
         sink = self.sink.astype(q.dtype) if self.sink is not None else None
+        plen = self.prefix_len if prefix_len is None else prefix_len
         y = splash_attention(q, k, v, causal=causal, sm_scale=scale, window=self.window,
-                             lookahead=self.lookahead, sink=sink)  # (B,H,T,hd)
+                             lookahead=self.lookahead, sink=sink, prefix_len=plen)  # (B,H,T,hd)
         if self.use_xsa:
             n_rep = self.n_heads // self.n_kv_heads
             v_self = jnp.repeat(v, n_rep, axis=1) if n_rep > 1 else v
@@ -522,7 +574,7 @@ class Attention(eqx.Module):
         return y @ self.out
 
     def step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray, pos, T_max: int,
-              extra_valid: jnp.ndarray = None) -> tuple:
+              extra_valid: jnp.ndarray = None, prefix_len: int = None) -> tuple:
         """Single-step KV-cached form: x_new is (Bc,D), cache_k/v are (Bc,n_kv_heads,T_max,hd).
         extra_valid (Bc,T_max) bool, optional: ANDed into the causal mask -- for cache slots that
         are within the causal window (idx<=pos) but hold non-existent content (e.g. zero-padded
@@ -546,8 +598,9 @@ class Attention(eqx.Module):
         logits = jnp.einsum("bhd,bhtd->bht", q, k_full) * scale
         idx = jnp.arange(T_max)
         valid = idx <= pos
+        plen = self.prefix_len if prefix_len is None else prefix_len
         if self.window is not None:
-            valid = valid & (idx >= pos - self.window)
+            valid = valid & ((idx >= pos - self.window) | (idx < plen))
         valid = jnp.broadcast_to(valid[None, None, :], (Bc, 1, T_max))
         if extra_valid is not None:
             valid = valid & extra_valid[:, None, :]
@@ -568,7 +621,7 @@ class Attention(eqx.Module):
         return y @ self.out, cache_k, cache_v
 
     def chunk_step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray,
-                    pos_start, T_max: int) -> tuple:
+                    pos_start, T_max: int, prefix_len: int = None) -> tuple:
         """Parallel-prefill form: x_new is (Bc,T,D), T new KNOWN positions [pos_start,
         pos_start+T) written into the cache in ONE batched forward pass (causal within the chunk,
         full attention back into cache[:pos_start] from earlier chunks/groups) -- for content
@@ -597,8 +650,9 @@ class Attention(eqx.Module):
         logits = jnp.einsum("bhtd,bhsd->bhts", q, k_full) * scale  # (Bc,H,T,T_max)
         idx = jnp.arange(T_max)[None, :]
         valid = idx <= pos_ids[:, None]  # (T,T_max)
+        plen = self.prefix_len if prefix_len is None else prefix_len
         if self.window is not None:
-            valid = valid & (idx >= pos_ids[:, None] - self.window)
+            valid = valid & ((idx >= pos_ids[:, None] - self.window) | (idx < plen))
         logits = jnp.where(valid[None, None], logits, -1e9)
         attn = jax.nn.softmax(logits, axis=-1)
         y = jnp.einsum("bhts,bhsd->bhtd", attn, v_full)  # (Bc,H,T,hd)
@@ -617,30 +671,32 @@ class Block(eqx.Module):
 
     def __init__(self, key, d_model: int, n_heads: int, n_kv_heads: int, mlp_mult: int, rope_base: float,
                  n_layers: int = None, init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True,
-                 window: int = None, lookahead: int = 0, use_sink: bool = False):
+                 window: int = None, lookahead: int = 0, use_sink: bool = False, prefix_len: int = 0):
         k1, k2 = jax.random.split(key, 2)
         self.norm1 = RMSNorm(d_model)
         self.attn = Attention(k1, d_model, n_heads, n_kv_heads, rope_base, n_layers=n_layers,
                                init_scheme=init_scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, window=window,
-                               lookahead=lookahead, use_sink=use_sink)
+                               lookahead=lookahead, use_sink=use_sink, prefix_len=prefix_len)
         self.norm2 = RMSNorm(d_model)
         self.mlp = SwiGLU(k2, d_model, mlp_mult, n_layers=n_layers, init_scheme=init_scheme)
 
-    def __call__(self, x: jnp.ndarray, causal: bool = True) -> jnp.ndarray:
-        x = x + self.attn(self.norm1(x), causal=causal)
+    def __call__(self, x: jnp.ndarray, causal: bool = True, prefix_len: int = None) -> jnp.ndarray:
+        x = x + self.attn(self.norm1(x), causal=causal, prefix_len=prefix_len)
         x = x + self.mlp(self.norm2(x))
         return x
 
     def step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray, pos, T_max: int,
-              extra_valid: jnp.ndarray = None) -> tuple:
-        attn_out, ck, cv = self.attn.step(self.norm1(x_new), cache_k, cache_v, pos, T_max, extra_valid)
+              extra_valid: jnp.ndarray = None, prefix_len: int = None) -> tuple:
+        attn_out, ck, cv = self.attn.step(self.norm1(x_new), cache_k, cache_v, pos, T_max, extra_valid,
+                                           prefix_len=prefix_len)
         x = x_new + attn_out
         x = x + self.mlp(self.norm2(x))
         return x, ck, cv
 
     def chunk_step(self, x_new: jnp.ndarray, cache_k: jnp.ndarray, cache_v: jnp.ndarray,
-                    pos_start, T_max: int) -> tuple:
-        attn_out, ck, cv = self.attn.chunk_step(self.norm1(x_new), cache_k, cache_v, pos_start, T_max)
+                    pos_start, T_max: int, prefix_len: int = None) -> tuple:
+        attn_out, ck, cv = self.attn.chunk_step(self.norm1(x_new), cache_k, cache_v, pos_start, T_max,
+                                                 prefix_len=prefix_len)
         x = x_new + attn_out
         x = x + self.mlp(self.norm2(x))
         return x, ck, cv

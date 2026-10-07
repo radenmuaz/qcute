@@ -11,7 +11,7 @@ data_root = "/dev/shm/imagenet256_jxl"
 # data_root = "/dev/shm/imagenet64"
 
 multihost = False
-# fsdp = True
+fsdp = True
 # fsdp_mode = "intra_node_fsdp_inter_node_dp"
 
 traversal = "zorder"
@@ -78,11 +78,11 @@ gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
 
 # --- training ---
-batch_size = 1
-val_batch_size = 1
+batch_size = 8
+val_batch_size = 8
 # level_steps = (20_000, 20_000, 20_000, 100_000)
-# level_steps = (int(4e5),)
-level_steps = (int(4e5)//batch_size,)
+level_steps = (int(4e5),)
+# level_steps = (int(4e5)//batch_size,)
 # level_steps = (int(4e5)//batch_size,)
 seed = 0
 train_subset_n = None
@@ -111,10 +111,10 @@ optimizer_kwargs = dict(linear_lr_scale=0.05, weight_decay=0.0, sinkhorn_iters=2
 
 wa_verbose = False
 
-wa_mode = "wma"
-wa_every_step = 10_000
-wa_stack_size = 3
-wa_wma_weights = (1.0, 1.0, 1.0)
+# wa_mode = "wma"
+# wa_every_step = 10_000
+# wa_stack_size = 3
+# wa_wma_weights = (1.0, 1.0, 1.0)
 
 # --- logging ---
 log_every = 1000

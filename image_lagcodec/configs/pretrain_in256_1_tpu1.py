@@ -10,8 +10,8 @@ data_root = "/dev/shm/imagenet256_jxl"
 # dataset = "imagenet64"
 # data_root = "/dev/shm/imagenet64"
 
-multihost = False
-# fsdp = True
+# multihost = False
+fsdp = True
 # fsdp_mode = "intra_node_fsdp_inter_node_dp"
 
 traversal = "zorder"
@@ -87,11 +87,12 @@ downsampler_rollout_prob = 0.2
 level_gt_input_prob = 0.8
 
 # --- training ---
-batch_size = 1
-val_batch_size = 1
+batch_size = 8
+val_batch_size = 8
 # level_steps = (20_000, 20_000, 20_000, 100_000)
 # level_steps = (int(4e5),)
-level_steps = (0,0,int(4e5)//batch_size,)
+level_steps = (0,0,int(4e5)//2,)
+# level_steps = (0,0,int(4e5)//batch_size,)
 # level_steps = (int(4e5)//batch_size,)
 seed = 0
 train_subset_n = None
