@@ -17,8 +17,9 @@ Non-RGB images (CMYK/L/RGBA) are resized in their native mode then converted to 
 step, exactly matching the reference's order (see center_crop_resize's docstring). Images that
 fail to decode are skipped and counted, not silently dropped without a trace.
 
-    uv run python image_lagcodec/scripts/imagenet/download_imagenet256.py --split train --out_dir /dev/shm/imagenet256
-    uv run python image_lagcodec/scripts/imagenet/download_imagenet256.py --split validation --out_dir /dev/shm/imagenet256
+sudo mount -o remount,size=300G /dev/shm
+uv run python image_lagcodec/scripts/imagenet/download_imagenet256.py --split train --out_dir /dev/shm/imagenet256
+uv run python image_lagcodec/scripts/imagenet/download_imagenet256.py --split validation --out_dir /dev/shm/imagenet256
 """
 from __future__ import annotations
 

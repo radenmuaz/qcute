@@ -184,12 +184,12 @@ class Config:
     pardec_token_head: str = "ar"  # how a PardecLM (downsampler AND upsampler) predicts the
     # pq_chunks digits of one code. "ar" (default, current behavior): small autoregressive head,
     # digit m conditioned on digits <m (teacher-forced digits in pardec_score, own digits in
-    # pardec_generate). "linears": ONE parallel linear head (output_head_linear) predicts all digits
+    # pardec_generate). "linear": ONE parallel linear head (output_head_linear) predicts all digits
     # independently from the hidden state, like the original lagcodec code_head -- no digit-level
     # dependence at all, so no digit-level teacher forcing/leak either. Incompatible with
     # downsampler_rollout (the rollout self-feeds digits through the AR head).
-    codelm_token_head: str = "linears"  # CodeLM's own NTP head (its aux NTP loss AND encoder_free_run
-    # sampling). "linears" (default, current behavior): ntp_head predicts all pq_chunks digits of the
+    codelm_token_head: str = "linear"  # CodeLM's own NTP head (its aux NTP loss AND encoder_free_run
+    # sampling). "linear" (default, current behavior): ntp_head predicts all pq_chunks digits of the
     # next token in parallel/independently. "ar": a small autoregressive digit head (same design as
     # the PardecLM AR head, token_dim/token_n_heads) -- digit m conditioned on digits <m of the SAME
     # token (teacher-forced real digits in the NTP loss, own sampled digits in free-run generation).
@@ -632,8 +632,8 @@ class Config:
         assert self.traversal in ("raster", "zorder")
         assert self.bos_rate_mode in ("relative", "absolute")
         assert self.context_source in ("codelm", "codelm_upper", "own_embed", "shared_embed")
-        assert self.pardec_token_head in ("ar", "ar_flat", "linears"), self.pardec_token_head
-        assert self.codelm_token_head in ("ar", "ar_flat", "linears"), self.codelm_token_head
+        assert self.pardec_token_head in ("ar", "ar_flat", "linear"), self.pardec_token_head
+        assert self.codelm_token_head in ("ar", "ar_flat", "linear"), self.codelm_token_head
         if self.codelm_token_head == "ar_flat" and not (
                 self.modality == "image" and self.byte_group == 3 and all(c == 3 for c in self.pq_chunks)):
             raise ValueError("codelm_token_head='ar_flat' requires RGB image tokens with byte_group=3 "
@@ -917,116 +917,6 @@ class ImageNetJXLByteDataset:
         return np.stack(images, axis=0) if images else np.empty((0, *self.shape[1:]), dtype=np.uint8)
 
 
-class ImageNetMmapDataset:
-    """Array-like random access to memory-mapped ImageNet .npy shards without in-memory concatenation.
-
-    Integer indexing returns one uint8 HWC image. Slice or integer-array indexing
-    returns a batch with shape (N, H, W, 3), matching the ndarray API used by train_np.
-    Shards stay memory-mapped on disk; only requested images are loaded into memory.
-    """
-
-    def __init__(self, shards: list, resolution: int, labels: np.ndarray = None):
-        self.resolution = int(resolution)
-        self.shards = []
-        counts = []
-        for s in shards:
-            arr = np.load(s, mmap_mode="r") if isinstance(s, (str, Path)) else s
-            arr = arr.reshape(-1, self.resolution, self.resolution, 3)
-            self.shards.append(arr)
-            counts.append(len(arr))
-        self.counts = np.asarray(counts, dtype=np.int64)
-        self.ends = np.cumsum(self.counts)
-        self._length = int(self.ends[-1]) if len(self.ends) else 0
-        self.labels = labels
-
-    def __len__(self):
-        return self._length
-
-    @property
-    def shape(self):
-        return (len(self), self.resolution, self.resolution, 3)
-
-    @property
-    def dtype(self):
-        return np.uint8
-
-    @property
-    def ndim(self):
-        return 4
-
-    def _get_one(self, index: int) -> np.ndarray:
-        if index < 0:
-            index += len(self)
-        if index < 0 or index >= len(self):
-            raise IndexError(f"index {index} out of bounds for dataset of length {len(self)}")
-        shard_idx = int(np.searchsorted(self.ends, index, side="right"))
-        shard_start = 0 if shard_idx == 0 else int(self.ends[shard_idx - 1])
-        local_idx = index - shard_start
-        return np.asarray(self.shards[shard_idx][local_idx])
-
-    def _get_slice(self, s: slice) -> np.ndarray:
-        start, stop, step = s.indices(len(self))
-        if (step > 0 and start >= stop) or (step < 0 and start <= stop):
-            return np.empty((0, *self.shape[1:]), dtype=np.uint8)
-        if step == 1:
-            first_shard = int(np.searchsorted(self.ends, start, side="right"))
-            last_shard = int(np.searchsorted(self.ends, stop - 1, side="right"))
-            if first_shard == last_shard:
-                shard_start = 0 if first_shard == 0 else int(self.ends[first_shard - 1])
-                return np.asarray(self.shards[first_shard][start - shard_start : stop - shard_start])
-            chunks = []
-            cur = start
-            for shard_idx in range(first_shard, last_shard + 1):
-                shard_start = 0 if shard_idx == 0 else int(self.ends[shard_idx - 1])
-                shard_end = int(self.ends[shard_idx])
-                chunk_start = cur - shard_start
-                chunk_end = min(stop, shard_end) - shard_start
-                if chunk_end > chunk_start:
-                    chunks.append(np.asarray(self.shards[shard_idx][chunk_start:chunk_end]))
-                cur = shard_end
-            return np.concatenate(chunks, axis=0) if chunks else np.empty((0, *self.shape[1:]), dtype=np.uint8)
-        indices = np.arange(start, stop, step)
-        return self._get_indices(indices)
-
-    def _get_indices(self, indices) -> np.ndarray:
-        indices = np.asarray(indices)
-        if indices.dtype == np.bool_:
-            if indices.ndim != 1 or len(indices) != len(self):
-                raise IndexError("boolean index must match dataset length")
-            indices = np.flatnonzero(indices)
-        elif indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
-            raise IndexError("dataset indices must be integers, slices, or 1D integer arrays")
-        if len(indices) == 0:
-            return np.empty((0, *self.shape[1:]), dtype=np.uint8)
-        indices = np.asarray(indices, dtype=np.int64)
-        neg = indices < 0
-        if np.any(neg):
-            indices = np.where(neg, indices + len(self), indices)
-        if np.any((indices < 0) | (indices >= len(self))):
-            raise IndexError("index out of bounds for dataset")
-        shard_indices = np.searchsorted(self.ends, indices, side="right")
-        shard_starts = np.where(shard_indices == 0, 0, self.ends[shard_indices - 1])
-        local_indices = indices - shard_starts
-        out = np.empty((len(indices), *self.shape[1:]), dtype=np.uint8)
-        unique_shards = np.unique(shard_indices)
-        for s_idx in unique_shards:
-            mask = (shard_indices == s_idx)
-            locs = local_indices[mask]
-            out[mask] = self.shards[s_idx][locs]
-        return out
-
-    def __getitem__(self, index):
-        if isinstance(index, (int, np.integer)):
-            return self._get_one(int(index))
-        if isinstance(index, slice):
-            return self._get_slice(index)
-        return self._get_indices(index)
-
-
-# Alias for compatibility
-ImageNetNpyDataset = ImageNetMmapDataset
-
-
 def load_imagenet_jxl(data_root: Path, resolution: int, split: str, shard_limit=None):
     manifest_path = data_root / f"imagenet{resolution}_{split}_manifest.json"
     if not manifest_path.is_file():
@@ -1045,7 +935,7 @@ def load_imagenet_jxl(data_root: Path, resolution: int, split: str, shard_limit=
 
 
 def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = None,
-                  require_labels: bool = False, concat: bool = False) -> tuple:
+                  require_labels: bool = False) -> tuple:
     def load_split(split: str, limit=None) -> tuple:
         shards = sorted(data_root.glob(f"imagenet{resolution}_{split}_*.npy"))
         if not shards and (data_root / f"imagenet{resolution}_{split}_manifest.json").is_file():
@@ -1059,11 +949,8 @@ def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = Non
             raise FileNotFoundError(
                 f"class_conditional=True but ImageNet label shards are missing (e.g. {missing[0]}). "
                 f"Re-run download_imagenet{resolution}.py to create aligned labels/ shards.")
-        if concat:
-            image_parts = [np.load(s, mmap_mode="r") for s in shards]
-            images = np.concatenate(image_parts, axis=0).reshape(-1, resolution, resolution, 3)
-        else:
-            images = ImageNetMmapDataset(shards, resolution)
+        image_parts = [np.load(s, mmap_mode="r") for s in shards]
+        images = np.concatenate(image_parts, axis=0).reshape(-1, resolution, resolution, 3)
         if not missing:
             labels = np.concatenate([np.load(p, mmap_mode="r") for p in label_paths]).astype(np.int32)
         elif require_labels:
@@ -1079,13 +966,12 @@ def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = Non
     return (train, train_labels), (val, val_labels)
 
 
-def load_imagenet64(data_root: Path, resolution: int = 64, require_labels: bool = False,
-                    concat: bool = False) -> tuple:
-    return load_imagenet(data_root, resolution, require_labels=require_labels, concat=concat)
+def load_imagenet64(data_root: Path, resolution: int = 64, require_labels: bool = False) -> tuple:
+    return load_imagenet(data_root, resolution, require_labels=require_labels)
 
 
 def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards: int = None,
-                 cfg=None, require_labels: bool = False, concat: bool = False) -> tuple:
+                 cfg=None, require_labels: bool = False) -> tuple:
     # train_shards: only load the first N imagenet train shards (off-training scripts need a few images, not 15GB)
     if name == "folder":
         if require_labels:
@@ -1106,12 +992,12 @@ def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards:
         train = load_imagenet_jxl(data_root, res, "train", train_shards)
         val = load_imagenet_jxl(data_root, res, "validation")
         return train, val
-    return load_imagenet(data_root, res, train_shards, require_labels=require_labels, concat=concat)
+    return load_imagenet(data_root, res, train_shards, require_labels=require_labels)
 
 
-def dataset_from_config(cv: dict, repo_root: Path, train_shards: int = 1, concat: bool = False) -> tuple:
+def dataset_from_config(cv: dict, repo_root: Path, train_shards: int = 1) -> tuple:
     root = Path(cv.get("data_root") or repo_root / "datasets")
-    return load_dataset(cv.get("dataset", "cifar"), root, cv.get("img_size"), train_shards, concat=concat)
+    return load_dataset(cv.get("dataset", "cifar"), root, cv.get("img_size"), train_shards)
 
 
 def images_to_positions(images: np.ndarray, cfg: Config, pixel_order: np.ndarray) -> np.ndarray:
@@ -2319,7 +2205,7 @@ class PardecLM(eqx.Module):
     # (see pardec_score) -- 0 = off
     remat: bool = eqx.field(static=True)
     remat_chunks: int = eqx.field(static=True)  # see Config.upsampler_remat_chunks
-    token_head: str = eqx.field(static=True)  # "ar" | "ar_flat" | "linears"
+    token_head: str = eqx.field(static=True)  # "ar" | "ar_flat" | "linear"
     token_mask_prob: float = eqx.field(static=True)
 
     def __init__(self, key, context_hidden_dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int,
@@ -2579,7 +2465,7 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
     target_out = target_seq[:, :valid_len]
     if return_hidden:
         return predicted_hidden
-    if pardec.token_head == "linears":
+    if pardec.token_head == "linear":
         logits = reshape_pq(predicted_hidden @ pardec.output_head_linear, pardec.output_chunks, pardec.output_vocab)
     elif pardec.token_head == "ar_flat":
         logits = token_ar_flat_teacher_forced(pardec.token_in_proj, pardec.token_member_embed,
@@ -2613,7 +2499,7 @@ def pardec_score(pardec: PardecLM, target_seq: jnp.ndarray, context_h: jnp.ndarr
                              for g in range(n_groups)])
         aux_valid = jnp.asarray(abs_idx < valid_len).reshape(1, n_groups * decode_future, 1)
         aux_valid = jnp.broadcast_to(aux_valid, aux_target.shape).astype(jnp.float32)
-        if pardec.token_head == "linears":
+        if pardec.token_head == "linear":
             aux_logits = reshape_pq(aux_predicted_hidden @ pardec.output_head_linear,
                                     pardec.output_chunks, pardec.output_vocab)
         elif pardec.token_head == "ar_flat":
@@ -2732,7 +2618,7 @@ def pardec_generate(pardec: PardecLM, context_h: jnp.ndarray, context_group_size
 
     def gen_step(carry, _):
         caches, pos, rng, x_input, hidden = carry
-        if pardec.token_head == "linears":
+        if pardec.token_head == "linear":
             val, rng = sample_idx(reshape_pq(hidden @ pardec.output_head_linear, pardec.output_chunks,
                                              pardec.output_vocab), rng, greedy, temperature, top_k)
         elif pardec.token_head == "ar_flat":
@@ -2882,7 +2768,7 @@ class CodeLM(eqx.Module):
     codelm_bos_prob: float = eqx.field(static=True)
     n_heads: int = eqx.field(static=True)  # needed for KV-cache sizing in _encoder_free_run
     n_kv_heads: int = eqx.field(static=True)
-    token_head: str = eqx.field(static=True)  # "linears" | "ar" | "ar_flat"
+    token_head: str = eqx.field(static=True)  # "linear" | "ar" | "ar_flat"
     token_dim: int = eqx.field(static=True)
     token_mask_prob: float = eqx.field(static=True)
     tok_in_proj: jnp.ndarray = None  # AR digit head params, None unless token_head=="ar"
@@ -3442,7 +3328,7 @@ def cycle_reencode(model: "LagCodecModel", level_idx: int, tokens: jnp.ndarray, 
                        context_group_size=K, output_group_size=1, rate_id=model.bos_rate_id(level_idx),
                        return_hidden=True)
     qfn = lambda lg, k_: quantize_dispatch(cfg.quantize_mode, lg, k_, encode_temperature, cfg.quantize_drop)
-    if ds.token_head == "linears":
+    if ds.token_head == "linear":
         return qfn(reshape_pq(hid @ ds.output_head_linear, ds.output_chunks, ds.output_vocab), rng)
     if rng is None:
         qfn = lambda lg, k_: quantize_dispatch(cfg.quantize_mode, lg, None, encode_temperature, cfg.quantize_drop)
@@ -3558,14 +3444,14 @@ def encoder_hidden(codelm: CodeLM, x: jnp.ndarray) -> jnp.ndarray:
 def encoder_ntp_logits(codelm: CodeLM, h: jnp.ndarray) -> jnp.ndarray:
     # linear head only: an AR head needs the token's earlier digits, use codelm_ntp_logits_tf /
     # codelm_sample_next for that.
-    assert codelm.token_head == "linears", "encoder_ntp_logits is linear-head only"
+    assert codelm.token_head == "linear", "encoder_ntp_logits is linear-head only"
     return reshape_pq(h @ codelm.ntp_head, codelm.pq_chunks, codelm.code_vocab)
 
 
 def codelm_ntp_logits_tf(codelm: CodeLM, h: jnp.ndarray, target: jnp.ndarray, rng=None) -> jnp.ndarray:
     # Teacher-forced NTP logits (..., chunks, V): h (..., D) predicts `target` (..., chunks), the
     # NEXT token. Linear: parallel head. AR: digit m conditioned on the real digits <m of `target`.
-    if codelm.token_head == "linears":
+    if codelm.token_head == "linear":
         return reshape_pq(h @ codelm.ntp_head, codelm.pq_chunks, codelm.code_vocab)
     if codelm.token_head == "ar_flat":
         return token_ar_flat_teacher_forced(codelm.tok_in_proj, codelm.tok_member_embed,
@@ -3580,7 +3466,7 @@ def codelm_ntp_logits_tf(codelm: CodeLM, h: jnp.ndarray, target: jnp.ndarray, rn
 def codelm_sample_next(codelm: CodeLM, h_prev: jnp.ndarray, rng, greedy: bool, temperature,
                        top_k: int = 0, top_p: float = 1.0) -> jnp.ndarray:
     # Sample the next token (B, chunks) from the last hidden state h_prev (B, D).
-    if codelm.token_head == "linears":
+    if codelm.token_head == "linear":
         return _sample_tokens(reshape_pq(h_prev @ codelm.ntp_head, codelm.pq_chunks, codelm.code_vocab),
                               rng, greedy, temperature, top_k, top_p)
     if codelm.token_head == "ar_flat":
@@ -4423,7 +4309,6 @@ def fsdp_to_host(tree):
 
 def local_array(x):
     # this process's addressable slice of a pmap output (multi-host arrays are not fully addressable)
-    return x
     if getattr(x, "is_fully_addressable", True):
         return x
     return np.concatenate([np.asarray(s.data).reshape((-1,) + x.shape[1:]) for s in x.addressable_shards])
@@ -4835,8 +4720,6 @@ def main():
                          "defaults} -- see load_text/load_audio/bpe_label_fn/resample_label_fn stubs "
                          "below rgb_label_fn_jax (not wired in yet).")
     p.add_argument("--data_root", type=str, default=str(REPO_ROOT / "datasets"))
-    p.add_argument("--dataset_concat", action="store_true", default=False,
-                   help="concatenate ImageNet shards into one in-memory array (legacy behavior; consumes high RAM)")
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--batch_size", type=_tuple_arg, default=(16,),
                     help="training batch size -- a bare int applies uniformly to every phase; a "
@@ -5049,11 +4932,11 @@ def main():
                          "'shared_embed': same, but downsampler and upsampler share one table. 'codelm_upper': "
                          "upsampler i's context from CodeLM i+1 (+ a CodeLM-only top level when not shared).")
     p.add_argument("--pardec_token_head", type=str, default=Config.pardec_token_head,
-                    choices=("ar", "ar_flat", "linears"),
+                    choices=("ar", "ar_flat", "linear"),
                     help="'ar' (default): tiny causal attention over digits; 'ar_flat': three linear "
                          "RGB heads with factorized sampling; 'linear': parallel independent digit heads.")
     p.add_argument("--codelm_token_head", type=str, default=Config.codelm_token_head,
-                    choices=("linears", "ar", "ar_flat"),
+                    choices=("linear", "ar", "ar_flat"),
                     help="CodeLM's own NTP/free-run head: 'linear', 'ar' (causal attention), or "
                          "'ar_flat' (three factorized linear heads; requires pq_chunks=3).")
     p.add_argument("--downsampler_rollout", type=lambda x: x.lower() != "false",
@@ -5430,12 +5313,10 @@ def main():
         if any(g > 0 for g in args.level_gt_drop):
             warnings.warn(f"curriculum_mode='freeze' with level_gt_drop={args.level_gt_drop}: frozen lower "
                           f"decoders get predicted ctx from the new level and can't adapt to it")
-    print("loading dataset")
+
     (train_np, train_labels), (val_np, val_labels) = load_dataset(
         args.dataset, Path(args.data_root), cfg.img_size if cfg.modality == "image" else None,
-        cfg=cfg, require_labels=cfg.class_conditional, concat=args.dataset_concat)
-    print("dataset loaded", train_np.shape)
-    
+        cfg=cfg, require_labels=cfg.class_conditional)
     if cfg.class_conditional:
         if (np.any(train_labels < 0) or np.any(train_labels >= cfg.class_num_classes)
                 or np.any(val_labels < 0) or np.any(val_labels >= cfg.class_num_classes)):
@@ -6090,11 +5971,11 @@ def main():
                 step += 1
                 phase_step += 1
                 pbar.update(1)
+                loss0 = scalar_float(loss)
                 if not jit_timed:
                     logger(f"{active_desc}: first train_step (incl. jit compile) took "
                            f"{time.monotonic() - jit_t0:.1f}s")
                     jit_timed = True
-                loss0 = scalar_float(loss)
                 if cfg.log_levelwise_metrics:
                     scalar_aux = [scalar_float(a) for a in aux[:9]]
                     dec_loss, dec_acc, enc_loss, enc_acc, util, train_mse, _aux_ntp_bpb, aux_ntp_acc, label_mse = scalar_aux

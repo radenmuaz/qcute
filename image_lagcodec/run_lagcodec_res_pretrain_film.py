@@ -1,4 +1,36 @@
 """
+run_lagcodec_res_pretrain_film: fork of run_lagcodec_res_pretrain.py (2026-10-08).
+
+Class conditioning changed from "class conditional token attention" to FiLM/adaLN:
+  - REMOVED: the class condition used to be a trainable class/null BOS *token* prepended to
+    CodeLM's input sequence, i.e. an extra attention position every query attended to, with
+    class_bos_order deciding which prefix token predicted target zero. That token path, the
+    learned null-class row and class_bos_order are pruned.
+  - REMOVED: the CodeLM BOS token's special masking (PrefixCausalLocalMask-style
+    prefix_len=prefix_len on every attention call / block step / dense reference). The BOS
+    (when use_codelm_bos) is now just the first input token under plain causal masking: BOS
+    position 0 sees only BOS, data position i sees BOS + data[..i]. Surviving `prefix_len`
+    locals are pure sequence-offset bookkeeping (how many rows were prepended) for slicing
+    data_h and NTP alignment, never a mask input.
+  - ADDED: FiLM adaLN-style conditioning. Per example, CodeLM's block stack is modulated before
+    each block as h * (1 + scale) + shift, where (scale, shift) = class_embedding @ film_mod[layer]
+    (film_mod is zero-initialised -> adaLN-Zero, identity at init). The class never occupies a
+    sequence position, so prefix_len is now purely use_codelm_bos.
+  - Classifier-free drop reuses cfg.class_drop_prob with its old per-example bernoulli draw
+    (training only, fold_in(rng, 701)): a dropped example (or a missing label at generation time)
+    gets IDENTITY modulation (all-zero scale/shift) instead of a learned null token -- i.e. the
+    class FiLM is either applied or an exact no-op.
+  - Qual eval covers both modes: TF conditional (real image labels) and TF unconditional (same
+    tokens, identity FiLM); prompt-based conditional generation (existing) plus BOS-anchored
+    (use_codelm_bos) or uniform-first-token-seeded (bos-free) free-run generation for the
+    exemplar "cat"/"dog" classes (--class_eval_labels) and for the unconditional (identity FiLM),
+    all sharing one anchor so only the conditioning differs.
+
+Everything else (datasets, losses, schedules, checkpoints, generation) is bit-identical to
+run_lagcodec_res_pretrain.py.
+
+--- original run_lagcodec_res_denoise docstring follows ---
+
 run_lagcodec_res_denoise: fork of run_lagcodec_res.py (2026-10-03). Defaults are bit-identical to it.
 1. Same-level decode cycles (run_lagcodec's cycle_refine_passes, per level instead of across levels):
    decode level-i tokens from code c(t), re-encode them with downsampler i (quantize_mode) into c(t+1),
@@ -265,10 +297,13 @@ class Config:
     codelm_bos_prob: float = 0.1  # training probability of using learned BOS vs zero/null prefix
     codelm_bos_rates: tuple = 1  # per-level n_rates for the bos_embed table; 1 (default) = single
     # generic anchor. No effect when use_codelm_bos=False.
-    class_conditional: bool = False  # add trainable class/null BOS tokens to CodeLM inputs
+    class_conditional: bool = False  # FiLM/adaLN class conditioning on CodeLM: per block,
+    # h * (1 + scale) + shift from a learned class embedding (zero-init modulation weights ->
+    # identity at init). Replaces the old class/null BOS prefix token: the class is never an
+    # attention input position anymore.
     class_num_classes: int = 1000
-    class_drop_prob: float = 0.1  # classifier-free dropout to the learned null-class token
-    class_bos_order: str = "level_then_class"  # last prefix token predicts the first target
+    class_drop_prob: float = 0.1  # classifier-free dropout: per example in training, apply
+    # IDENTITY (unmodulated) instead of the class FiLM with this probability
     class_ntp_weight: float = 1.0  # direct CodeLM NTP objective, enabled only for class_conditional
     level_gt_input_prob: tuple = 0.0  # per level: use label_fn(image) codes instead of lower model codes
 
@@ -748,8 +783,6 @@ class Config:
             raise ValueError(f"class_drop_prob must be in [0,1], got {self.class_drop_prob}")
         if self.class_num_classes < 1:
             raise ValueError("class_num_classes must be positive")
-        if self.class_bos_order not in ("level_then_class", "class_then_level"):
-            raise ValueError("class_bos_order must be 'level_then_class' or 'class_then_level'")
         if self.class_ntp_weight < 0:
             raise ValueError("class_ntp_weight must be nonnegative")
         if any(not 0.0 <= p <= 1.0 for p in self.level_gt_input_prob):
@@ -800,6 +833,25 @@ def pixel_order_for(cfg: Config) -> np.ndarray:
     if cfg.traversal == "raster":
         return np.arange(cfg.img_size * cfg.img_size)
     return zorder_pixel_order(cfg.img_size)
+
+
+# Exemplar "cat"/"dog" classes whose class-conditional generations the qual eval samples:
+# dataset -> ({class_id: name}, default ids). --class_eval_labels overrides the ids (names then
+# fall back to "class<id>" unless the id is in the dataset's exemplar table).
+CLASS_EVAL_EXEMPLARS = {
+    "cifar": ({3: "cat", 5: "dog"}, (3, 5)),                    # CIFAR-10
+    "imagenet64": ({281: "cat", 207: "dog"}, (281, 207)),       # ILSVRC: tabby, golden retriever
+    "imagenet256": ({281: "cat", 207: "dog"}, (281, 207)),
+    "imagenet256_jxl": ({281: "cat", 207: "dog"}, (281, 207)),
+    "folder": ({3: "cat", 5: "dog"}, (3, 5)),
+}
+
+
+def class_eval_classes(dataset: str, labels=None) -> list:
+    """(class id, name) pairs for the qual eval's class-conditional generation samples."""
+    names, default_ids = CLASS_EVAL_EXEMPLARS.get(dataset, ({}, (3, 5)))
+    ids = tuple(default_ids if labels is None else labels)
+    return [(int(i), names.get(int(i), f"class{int(i)}")) for i in ids]
 
 
 CIFAR10_URL = "https://cave.cs.toronto.edu/kriz/cifar-10-python.tar.gz"
@@ -1780,21 +1832,37 @@ def sample_idx(logits: jnp.ndarray, rng, greedy: bool, temperature: float, top_k
     return safe_argmax(lg + jax.random.gumbel(k_, lg.shape)), rng
 
 
-def run_block(blk: Block, x: jnp.ndarray, remat: bool, rng=None, drop_prob: float = 0.0,
-              prefix_len: int = None) -> jnp.ndarray:
-    if isinstance(blk, Block) and prefix_len is not None:
-        call_blk = lambda b, val: b(val, prefix_len=prefix_len)
-        out = eqx.filter_checkpoint(call_blk)(blk, x) if remat else blk(x, prefix_len=prefix_len)
-    else:
-        out = eqx.filter_checkpoint(blk)(x) if remat else blk(x)
+def run_block(blk: Block, x: jnp.ndarray, remat: bool, rng=None, drop_prob: float = 0.0) -> jnp.ndarray:
+    # No prefix_len/mask override: the CodeLM BOS (when use_codelm_bos) is an ordinary input
+    # token at position 0 under plain causal masking, so blocks always run with their
+    # construction-time attention defaults.
+    out = eqx.filter_checkpoint(blk)(x) if remat else blk(x)
     if rng is not None and drop_prob > 0.0:
         keep = jax.random.bernoulli(rng, p=1.0 - drop_prob)
         out = jnp.where(keep, out, x)
     return out
 
 
-def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False,
-                         prefix_len: int = None) -> jnp.ndarray:
+
+def film_modulate(h: jnp.ndarray, film: jnp.ndarray, layer: int) -> jnp.ndarray:
+    """FiLM/adaLN modulation of one block's input: h * (1 + scale) + shift.
+
+    `film` is the per-example modulation tensor (B, n_layers, 2*D); the first D columns are the
+    scale and the last D the shift of this `layer`. An all-zero row (class dropped via
+    cfg.class_drop_prob, or no label at generation time) reduces to exact identity, and
+    film=None skips modulation entirely -- so conditioning is either applied or a no-op.
+    Accepts (B, D) single-position states (KV-cache stepping) and (B, L, D) sequences.
+    """
+    if film is None:
+        return h
+    D = h.shape[-1]
+    lead = (h.shape[0],) + (1,) * (h.ndim - 2) + (D,)
+    scale = film[:, layer, :D].astype(h.dtype).reshape(lead)
+    shift = film[:, layer, D:].astype(h.dtype).reshape(lead)
+    return h * (1.0 + scale) + shift
+
+
+def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False) -> jnp.ndarray:
     B, T, D = x.shape
     hd = D // attn.n_heads
     qkv = x @ attn.qkv
@@ -1810,7 +1878,7 @@ def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False,
     k, v = jnp.repeat(k, rep, axis=1), jnp.repeat(v, rep, axis=1)
     scale = 1.0 / math.sqrt(hd)
     scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale
-    plen = attn.prefix_len if prefix_len is None else prefix_len
+    plen = attn.prefix_len  # construction-time only; CodeLM paths no longer override it
     if causal:
         idx_q = jnp.arange(T)[:, None]
         idx_k = jnp.arange(T)[None, :]
@@ -2107,12 +2175,11 @@ class RecurrentBlock(eqx.Module):
 
 def make_block(key, backbone: str, d_model: int, n_heads: int, n_kv_heads: int, mlp_mult: int, rope_base: float,
                n_layers: int = None, init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True,
-               window: int = None, lookahead: int = 0, use_sink: bool = False, state_dim: int = 16,
-               prefix_len: int = 0):
+               window: int = None, lookahead: int = 0, use_sink: bool = False, state_dim: int = 16):
     if backbone == "transformer":
         return Block(key, d_model, n_heads, n_kv_heads, mlp_mult, rope_base, n_layers=n_layers,
                      init_scheme=init_scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, window=window,
-                     lookahead=lookahead, use_sink=use_sink, prefix_len=prefix_len)
+                     lookahead=lookahead, use_sink=use_sink)
     return RecurrentBlock(key, d_model, backbone, mlp_mult, state_dim, n_layers=n_layers, init_scheme=init_scheme)
 
 
@@ -2125,12 +2192,11 @@ def block_cache_init(blk, batch: int, T_max: int):
     return z, jnp.zeros_like(z)
 
 
-def block_step(blk, x_new: jnp.ndarray, cache, pos, T_max: int, extra_valid: jnp.ndarray = None,
-               prefix_len: int = None) -> tuple:
+def block_step(blk, x_new: jnp.ndarray, cache, pos, T_max: int, extra_valid: jnp.ndarray = None) -> tuple:
     if isinstance(blk, RecurrentBlock):
         valid = None if extra_valid is None else jax.lax.dynamic_index_in_dim(extra_valid, pos, axis=1, keepdims=False)
         return blk.step(x_new, cache, valid)
-    x, ck, cv = blk.step(x_new, cache[0], cache[1], pos, T_max, extra_valid, prefix_len=prefix_len)
+    x, ck, cv = blk.step(x_new, cache[0], cache[1], pos, T_max, extra_valid)
     return x, (ck, cv)
 
 
@@ -2925,12 +2991,13 @@ class CodeLM(eqx.Module):
         enc_window_val = (cfg.encoder_attn_window[level_idx] if cfg.encoder_attn_window[level_idx] is not None
                            else cfg.attn_window[level_idx])
         enc_window = None if enc_window_val == -1 else enc_window_val
-        prefix_len = int(cfg.class_conditional) + int(cfg.use_codelm_bos)
+        # No BOS/class special masking: the CodeLM BOS (when use_codelm_bos) is just the
+        # first input token under plain causal masking, so blocks use construction-time
+        # attention defaults (prefix_len=0 in eqx_common).
         self.blocks = [make_block(k, cfg.codelm_backbone[level_idx], D_enc, n_heads_enc, n_kv_heads_enc,
                                   cfg.mlp_mult[level_idx], cfg.rope_base[level_idx], n_layers=n_layers_enc,
                                   init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, window=enc_window,
-                                  lookahead=self.attn_lookahead, use_sink=cfg.use_sink, state_dim=cfg.ssm_state_dim,
-                                  prefix_len=prefix_len)
+                                  lookahead=self.attn_lookahead, use_sink=cfg.use_sink, state_dim=cfg.ssm_state_dim)
                        for k in block_keys]
         self.ln_f = RMSNorm(D_enc)
         self.code_head = init_matrix(keys[2], (D_enc, self.pq_chunks * self.code_vocab), scheme)
@@ -2997,7 +3064,7 @@ class CodeLM(eqx.Module):
         def _enc_stack(h):
             for i, blk in enumerate(self.blocks):
                 h = run_block(blk, h, self.remat and not self.remat_level, rng=layer_rngs[i],
-                              drop_prob=layer_drop_prob[i], prefix_len=prefix_len)
+                              drop_prob=layer_drop_prob[i])
             return h
         h = jax.checkpoint(_enc_stack)(h) if self.remat_level else _enc_stack(h)
         h = self.ln_f(h)
@@ -3078,7 +3145,8 @@ def codelm_bos_prefix(codelm: CodeLM, batch_size: int, rate_id: int, rng,
 
 def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cfg: "Config",
                            rate_id: int, rng, group_size: int,
-                           context_source: str = None, prefix: jnp.ndarray = None) -> jnp.ndarray:
+                           context_source: str = None, prefix: jnp.ndarray = None,
+                           film: jnp.ndarray = None) -> jnp.ndarray:
     # Single source of truth for how a PardecLM gets its CONTEXT. `context_source` defaults to the
     # configured upsampler source; downsampler callsites explicitly pass "codelm". `raw` is the
     # pre-embedding representation of
@@ -3090,7 +3158,7 @@ def pardec_context_hidden(codelm: CodeLM, pardec: PardecLM, raw: jnp.ndarray, cf
     if source in ("codelm", "codelm_upper"):  # which CodeLM is the caller's choice
         if prefix is None:
             prefix = codelm_bos_prefix(codelm, raw.shape[0], rate_id, rng, codelm.bos_embed.dtype)
-        h = codelm_hidden_from_raw(codelm, raw, prefix)
+        h = codelm_hidden_from_raw(codelm, raw, prefix, film=film)
         return h if prefix is None else h[:, prefix.shape[1]:]
         # "own_embed"/"shared_embed": plain per-position embedding, NO self-attention/contextualization
     # at all -- CodeLM's own block stack is skipped entirely (codelm_bos is therefore also moot here,
@@ -3128,7 +3196,8 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
                                flat_bytes: jnp.ndarray, cfg: "Config", pixel_order, label_fn,
                                K: int, rate_id: int = 0, rng=None, downsampler_ncodes: int = 1,
                                encode_temperature: float = 1.0, codelm_rate_id: int = None,
-                               pss_passes: int = 1, class_prefix: jnp.ndarray = None) -> dict:
+                               pss_passes: int = 1, prefix: jnp.ndarray = None,
+                               class_film: jnp.ndarray = None) -> dict:
     # CodeLM forward (same as CodeLM.encode()'s first half), then the SHARED downsampler PardecLM
     # teacher-forced against label_fn's real downsampled-image target (context_group_size=K,
     # output_group_size=1 -- one code per K-block, genuinely autoregressive over context).
@@ -3152,7 +3221,7 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
     codelm_rate_id = rate_id if codelm_rate_id is None else codelm_rate_id
     h = pardec_context_hidden(codelm, downsampler, raw, cfg, codelm_rate_id, rng,
                               group_size=K * downsampler_ncodes, context_source="codelm",
-                              prefix=class_prefix)
+                              prefix=prefix, film=class_film)
     M, L, D = h.shape
     n_blocks = L // K
     # context_group_size=K*downsampler_ncodes, output_group_size=downsampler_ncodes, rate_id=this
@@ -3232,10 +3301,10 @@ def encode_pardec_downsampler(codelm: CodeLM, downsampler: PardecLM, raw: jnp.nd
 
 
 def codelm_ntp_loss(codelm: CodeLM, raw: jnp.ndarray, target: jnp.ndarray, cfg: "Config",
-                    prefix: jnp.ndarray = None, rng=None) -> tuple:
+                    prefix: jnp.ndarray = None, rng=None, film: jnp.ndarray = None) -> tuple:
     # next-token loss/acc of `codelm` over its own input sequence (codelm_upper: the CodeLM one level up
     # over the top code -- the decoderless level's only objective)
-    h = codelm_hidden_from_raw(codelm, raw, prefix)
+    h = codelm_hidden_from_raw(codelm, raw, prefix, film=film)
     shift = 1 + codelm.attn_lookahead
     if prefix is not None:
         target_start = codelm.attn_lookahead
@@ -3615,7 +3684,8 @@ def _sample_tokens(logits: jnp.ndarray, rng, greedy: bool, temperature, top_k: i
     return safe_argmax(lg + jax.random.gumbel(rng, lg.shape))
 
 
-def _encoder_hidden_cached(codelm: CodeLM, tokens: jnp.ndarray, prefix: jnp.ndarray = None) -> jnp.ndarray:
+def _encoder_hidden_cached(codelm: CodeLM, tokens: jnp.ndarray, prefix: jnp.ndarray = None,
+                           film: jnp.ndarray = None) -> jnp.ndarray:
     """Compute causal CodeLM states via incremental attention/recurrent caches, without Splash."""
     B, total_len, _ = tokens.shape
     x = code_embed_proj(tokens, codelm.own_input_embed, codelm.own_input_proj)
@@ -3629,8 +3699,9 @@ def _encoder_hidden_cached(codelm: CodeLM, tokens: jnp.ndarray, prefix: jnp.ndar
         x_t, pos = x_and_pos
         h = x_t
         new_caches = []
-        for blk, cache in zip(codelm.blocks, caches):
-            h, cache = block_step(blk, h, cache, pos, total_len, prefix_len=prefix_len)
+        for i, (blk, cache) in enumerate(zip(codelm.blocks, caches)):
+            h = film_modulate(h, film, i)
+            h, cache = block_step(blk, h, cache, pos, total_len)
             new_caches.append(cache)
         return new_caches, codelm.ln_f(h)
 
@@ -3641,7 +3712,8 @@ def _encoder_hidden_cached(codelm: CodeLM, tokens: jnp.ndarray, prefix: jnp.ndar
 
 def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, temperature, greedy: bool,
                       top_k: int, use_bos: bool = False, rate_id: int = 0,
-                      prefix: jnp.ndarray = None, top_p: float = 1.0) -> jnp.ndarray:
+                      prefix: jnp.ndarray = None, top_p: float = 1.0,
+                      film: jnp.ndarray = None) -> jnp.ndarray:
     # tokens (B,total_len,C) holds the prompt in [:P] (P may be traced); the rest is overwritten.
     # Real incremental KV cache (was: full-buffer recompute every step, O(T^2)) -- same blk.step
     # pattern as pardec_generate. Prefill scans the WHOLE fixed-length buffer once (positions >= P
@@ -3667,9 +3739,10 @@ def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, tempe
     def self_step(x_new, caches, pos, prefill=False):
         new_caches = []
         h = x_new
-        for blk, c in zip(codelm.blocks, caches):
+        for i, (blk, c) in enumerate(zip(codelm.blocks, caches)):
+            h = film_modulate(h, film, i)
             valid = prompt_valid if prefill and isinstance(blk, RecurrentBlock) else None
-            h, c = block_step(blk, h, c, pos, total_len, valid, prefix_len=prefix_len)
+            h, c = block_step(blk, h, c, pos, total_len, valid)
             new_caches.append(c)
         return codelm.ln_f(h), new_caches
 
@@ -3701,7 +3774,7 @@ _encoder_free_run_jit = eqx.filter_jit(_encoder_free_run)
 
 
 def _encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1,
-                           prefix: jnp.ndarray = None) -> jnp.ndarray:
+                           prefix: jnp.ndarray = None, film: jnp.ndarray = None) -> jnp.ndarray:
     """Teacher-force CodeLM over its own tokens using incremental block caches.
 
     Stepping position by position avoids the full-sequence TPU SplashAttention call, which cannot
@@ -3711,7 +3784,7 @@ def _encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1,
     if tokens.shape[1] == 0:
         return tokens
     prefix_len = 0 if prefix is None else prefix.shape[1]
-    h_all = _encoder_hidden_cached(codelm, tokens, prefix)
+    h_all = _encoder_hidden_cached(codelm, tokens, prefix, film=film)
     if prefix is not None:
         logits = codelm_ntp_logits_tf(codelm, h_all[:, prefix_len - 1:prefix_len + tokens.shape[1] - 1], tokens)
         predicted = jnp.argmax(logits, axis=-1).astype(tokens.dtype)
@@ -3727,16 +3800,17 @@ _encoder_teacher_force_jit = eqx.filter_jit(_encoder_teacher_force)
 
 
 def encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1,
-                          prefix: jnp.ndarray = None) -> jnp.ndarray:
+                          prefix: jnp.ndarray = None, film: jnp.ndarray = None) -> jnp.ndarray:
     """Return NTP predictions; with a prefix, every position including zero is predicted."""
     assert codelm.attn_lookahead == 0, \
         f"encoder teacher-forcing needs attn_lookahead=0 (got {codelm.attn_lookahead})"
-    return _encoder_teacher_force_jit(codelm, tokens, K, prefix)
+    return _encoder_teacher_force_jit(codelm, tokens, K, prefix, film)
 
 
 def encoder_free_run(codelm: CodeLM, prompt_tokens: jnp.ndarray, total_len: int, K: int, rng, greedy: bool = False,
                      temperature: float = 1.0, top_k: int = 0, use_bos: bool = False, rate_id: int = 0,
-                     prefix: jnp.ndarray = None, top_p: float = 1.0) -> jnp.ndarray:
+                     prefix: jnp.ndarray = None, top_p: float = 1.0,
+                     film: jnp.ndarray = None) -> jnp.ndarray:
     """Free-run the SHARED CodeLM as a language model over its own input tokens (its NTP head), at
     whichever level's granularity K (a runtime grouping argument, not baked into any weight):
     keep the prompt tokens, then sample the rest. greedy=True is argmax; otherwise temperature/top_k
@@ -3752,7 +3826,16 @@ def encoder_free_run(codelm: CodeLM, prompt_tokens: jnp.ndarray, total_len: int,
     tokens = jnp.zeros((B, total_len, C), prompt_tokens.dtype).at[:, :P].set(prompt_tokens)
     return _encoder_free_run_jit(codelm, tokens, jnp.asarray(P, jnp.int32), K, rng,
                                  jnp.asarray(temperature, jnp.float32), greedy, top_k, use_bos, rate_id,
-                                 prefix, top_p)
+                                 prefix, top_p, film)
+
+
+def uniform_seed_prompt(tmpl: jnp.ndarray, vocab: int, rng) -> jnp.ndarray:
+    """Position-0 seed for BOS-free generation: the first token is drawn uniformly over the
+    codebook (p(x0) = uniform), so the roll-out then models p(x1 | x0) p(x2 | x0, x1) ... When
+    use_codelm_bos is on, callers keep a zero-length prompt instead -- there the learned BOS row
+    IS the first-token distribution p(x | bos), which is a strictly better anchor than uniform."""
+    B, _, C = tmpl.shape
+    return jax.random.randint(rng, (B, 1, C), 0, vocab).astype(tmpl.dtype)
 
 
 def generate_from_prompt(model: "LagCodecModel", cfg: Config, prompt_bytes: jnp.ndarray, total_positions: int,
@@ -3827,7 +3910,8 @@ class LagCodecModel(eqx.Module):
     # Shared mode stores one CodeLM/Downsampler; unshared mode stores one per level.
     codelms: tuple
     downsamplers: tuple
-    class_bos_embeds: tuple  # per CodeLM: (class_num_classes + null_class, D_enc)
+    class_film_embeds: tuple  # per CodeLM: (class_num_classes, D_enc) learned class embeddings
+    class_film_mods: tuple  # per CodeLM: (n_layers, D_enc, 2*D_enc) adaLN-Zero scale/shift weights
     cfg: Config = eqx.field(static=True)
 
     def __init__(self, key, cfg: Config):
@@ -3872,12 +3956,21 @@ class LagCodecModel(eqx.Module):
         self.codelms = tuple(codelms)
         self.downsamplers = tuple(downsamplers)
         if cfg.class_conditional:
-            self.class_bos_embeds = tuple(
+            # FiLM/adaLN conditioning: class embedding -> per-block (scale, shift). The modulation
+            # weights are zero-initialised (adaLN-Zero), so every block starts as an exact identity
+            # and conditioning is learned from there. No null-class row: a dropped/missing class is
+            # an all-zero embedding -> exact identity modulation (see class_condition).
+            self.class_film_embeds = tuple(
                 init_matrix(jax.random.fold_in(key, 2000 + i),
-                            (cfg.class_num_classes + 1, codelm.own_input_proj.shape[-1]), cfg.init_scheme)
+                            (cfg.class_num_classes, codelm.own_input_proj.shape[-1]), cfg.init_scheme)
                 for i, codelm in enumerate(codelms))
+            self.class_film_mods = tuple(
+                jnp.zeros((len(codelm.blocks), codelm.own_input_proj.shape[-1],
+                           2 * codelm.own_input_proj.shape[-1]))
+                for codelm in codelms)
         else:
-            self.class_bos_embeds = ()
+            self.class_film_embeds = ()
+            self.class_film_mods = ()
 
     def codelm_for(self, level_idx: int) -> CodeLM:
         return self.codelms[0] if self.cfg.share_across_levels else self.codelms[level_idx]
@@ -3885,11 +3978,12 @@ class LagCodecModel(eqx.Module):
     def downsampler_for(self, level_idx: int) -> "PardecLM":
         return self.downsamplers[0] if self.cfg.share_across_levels else self.downsamplers[level_idx]
 
-    def class_bos_for(self, level_idx: int) -> jnp.ndarray:
+    def class_film_for(self, level_idx: int) -> tuple:
+        """(class embedding table, per-block modulation weights) for one level's CodeLM."""
         if not self.cfg.class_conditional:
-            raise ValueError("class BOS requested while class_conditional=False")
+            raise ValueError("class FiLM requested while class_conditional=False")
         model_idx = 0 if self.cfg.share_across_levels else level_idx
-        return self.class_bos_embeds[model_idx]
+        return self.class_film_embeds[model_idx], self.class_film_mods[model_idx]
 
     def bos_rate_id(self, level_idx: int) -> int:
         # Downsampler's own BOS identifies its contraction rate.
@@ -3912,43 +4006,45 @@ class LagCodecModel(eqx.Module):
         return self.cfg.strides[level] if self.cfg.strides[level] != -1 else 1
 
 
-def class_condition_prefix(model: LagCodecModel, level_idx: int, class_labels, batch_size: int,
-                           rng=None) -> jnp.ndarray | None:
-    """Return virtual BOS embeddings in the exact order used by train/eval/generation.
+def class_condition(model: LagCodecModel, level_idx: int, class_labels, batch_size: int,
+                    rng=None) -> tuple:
+    """Return (prefix, film) for one level's CodeLM forward -- used by train/eval/generation alike.
 
-    A missing label selects the learned null-class row. During training, one class-dropout draw
-    per example replaces the real class with that same null row. If both BOS types are active,
-    class_bos_order controls which one is last and therefore predicts token zero.
+    prefix: the level/rate BOS prefix only (None unless use_codelm_bos). Class conditioning no
+    longer contributes an attention token, so it never adds a sequence position.
+    film: (B, n_layers, 2*D_enc) FiLM/adaLN modulation for that same CodeLM, None when
+    class_conditional=False. A missing label selects IDENTITY, and during training one
+    class-dropout draw per example (cfg.class_drop_prob, same bernoulli/fold-in seed as the old
+    class-token implementation) does the same: the modulation is applied or is an exact no-op,
+    never a learned null token.
     """
     cfg = model.cfg
     codelm = model.codelm_for(level_idx)
+    prefix = codelm_bos_prefix(codelm, batch_size, model.codelm_bos_rate_id(level_idx),
+                               rng, codelm.bos_embed.dtype)
     if not cfg.class_conditional:
-        return codelm_bos_prefix(codelm, batch_size, model.codelm_bos_rate_id(level_idx),
-                                 rng, codelm.bos_embed.dtype)
-    class_table = model.class_bos_for(level_idx)
-    null_id = cfg.class_num_classes
+        return prefix, None
+    class_table, mod_w = model.class_film_for(level_idx)  # (C, D), (n_layers, D, 2*D)
+    n_layers, _, two_d = mod_w.shape
     if class_labels is None:
-        ids = jnp.full((batch_size,), null_id, dtype=jnp.int32)
-    else:
-        ids = jnp.asarray(class_labels, dtype=jnp.int32).reshape((batch_size,))
-        if rng is not None and cfg.class_drop_prob > 0.0:
-            if cfg.class_drop_prob >= 1.0:
-                ids = jnp.full_like(ids, null_id)
-            else:
-                drop = jax.random.bernoulli(jax.random.fold_in(rng, 701),
-                                            p=cfg.class_drop_prob, shape=(batch_size,))
-                ids = jnp.where(drop, null_id, ids)
-    class_token = class_table[ids]
-    if cfg.use_codelm_bos:
-        level_token = codelm_bos_prefix(codelm, batch_size, model.codelm_bos_rate_id(level_idx),
-                                        rng, class_token.dtype)[:, 0, :]
-        ordered = (level_token, class_token) if cfg.class_bos_order == "level_then_class" \
-            else (class_token, level_token)
-        return jnp.stack(ordered, axis=1)
-    return class_token[:, None, :]
+        return prefix, jnp.zeros((batch_size, n_layers, two_d), dtype=mod_w.dtype)
+    ids = jnp.asarray(class_labels, dtype=jnp.int32).reshape((batch_size,))
+    keep = jnp.ones((batch_size,), dtype=mod_w.dtype)
+    if rng is not None and cfg.class_drop_prob > 0.0:
+        if cfg.class_drop_prob >= 1.0:
+            keep = jnp.zeros_like(keep)
+        else:
+            drop = jax.random.bernoulli(jax.random.fold_in(rng, 701),
+                                        p=cfg.class_drop_prob, shape=(batch_size,))
+            keep = jnp.where(drop, jnp.zeros_like(keep), keep)
+    # Dropped rows carry a zero embedding, and the modulation is bias-free linear in the
+    # embedding, so they modulate with exact (scale, shift) = (0, 0) = identity.
+    emb = class_table[ids] * keep[:, None]
+    return prefix, jnp.einsum("bd,ldo->blo", emb, mod_w)
 
 
-def codelm_hidden_from_raw(codelm: CodeLM, raw: jnp.ndarray, prefix: jnp.ndarray = None) -> jnp.ndarray:
+def codelm_hidden_from_raw(codelm: CodeLM, raw: jnp.ndarray, prefix: jnp.ndarray = None,
+                           film: jnp.ndarray = None) -> jnp.ndarray:
     x = code_embed_proj(raw, codelm.own_input_embed, codelm.own_input_proj)
     prefix_len = 0 if prefix is None else prefix.shape[1]
     if prefix is not None:
@@ -3965,8 +4061,9 @@ def codelm_hidden_from_raw(codelm: CodeLM, raw: jnp.ndarray, prefix: jnp.ndarray
             x = jnp.pad(x, ((0, 0), (0, padded_len - logical_len), (0, 0)))
     h = x
     def _enc_stack(h):
-        for blk in codelm.blocks:
-            h = run_block(blk, h, codelm.remat and not codelm.remat_level, prefix_len=prefix_len)
+        for i, blk in enumerate(codelm.blocks):
+            h = film_modulate(h, film, i)
+            h = run_block(blk, h, codelm.remat and not codelm.remat_level)
         return h
     h = jax.checkpoint(_enc_stack)(h) if codelm.remat_level else _enc_stack(h)
     return codelm.ln_f(h[:, :logical_len, :])
@@ -4029,8 +4126,9 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     if model.cfg.simple_ntp:
         if class_labels is None and model.cfg.class_conditional:
             raise ValueError("class_conditional simple NTP needs class_labels for each image")
-        prefix = class_condition_prefix(model, 0, class_labels, tok0.shape[0], rng)
-        ntp_loss, ntp_acc = codelm_ntp_loss(codelm0, tok0, tok0, model.cfg, prefix=prefix, rng=rng)
+        prefix, class_film = class_condition(model, 0, class_labels, tok0.shape[0], rng)
+        ntp_loss, ntp_acc = codelm_ntp_loss(codelm0, tok0, tok0, model.cfg, prefix=prefix,
+                                            rng=rng, film=class_film)
         zero = jnp.array(0.0, dtype=ntp_loss.dtype)
         util = codebook_utilization(tok0, codelm0.code_vocab)
         loss = model.cfg.ntp_weight * ntp_loss
@@ -4047,13 +4145,13 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     level_rngs = [None] * phase if rng is None else list(jax.random.split(rng, phase))
     for i in range(phase):
         codelm = model.codelm_for(i)
-        class_prefix = class_condition_prefix(model, i, class_labels, raw.shape[0], level_rngs[i])
+        class_prefix, class_film = class_condition(model, i, class_labels, raw.shape[0], level_rngs[i])
         out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, model.cfg,
                                          pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                          codelm_rate_id=model.codelm_bos_rate_id(i),
                                          rng=level_rngs[i], downsampler_ncodes=model.cfg.downsampler_ncodes[i],
                                         pss_passes=model.cfg.downsampler_pss_passes[i],
-                                        class_prefix=class_prefix)
+                                        prefix=class_prefix, class_film=class_film)
         codes.append(out["code_idx"])
         codes_soft.append(out["code_soft"])
         enc_losses.append(out["ntp_loss"])
@@ -4079,7 +4177,8 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
             label_mse_losses.append(jnp.mean((pred_label_soft - label_tgt.astype(jnp.float32)) ** 2))
         if model.cfg.class_conditional:
             class_ntp_loss_i, class_ntp_acc_i = codelm_ntp_loss(codelm, raw, target, model.cfg,
-                                                                 prefix=class_prefix, rng=level_rngs[i])
+                                                                 prefix=class_prefix, film=class_film,
+                                                                 rng=level_rngs[i])
             class_ntp_losses.append(class_ntp_loss_i)
             class_ntp_accs.append(class_ntp_acc_i)
         if i < phase - 1:
@@ -4103,11 +4202,13 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
                 raw = jnp.where(choose_gt[:, None, None, None], gt_soft, out["code_soft"])
                 target = jnp.where(choose_gt[:, None, None], gt_codes, out["code_idx"])
     if model.cfg.context_source == "codelm_upper":
-        upper_prefix = class_condition_prefix(model, phase, class_labels, codes_soft[phase - 1].shape[0],
-                                              None if rng is None else jax.random.fold_in(rng, 197))
+        upper_prefix, upper_film = class_condition(model, phase, class_labels,
+                                                   codes_soft[phase - 1].shape[0],
+                                                   None if rng is None else jax.random.fold_in(rng, 197))
         ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(phase), codes_soft[phase - 1],
                                          codes[phase - 1], model.cfg, prefix=upper_prefix,
-                                         rng=None if rng is None else jax.random.fold_in(rng, 198))
+                                         rng=None if rng is None else jax.random.fold_in(rng, 198),
+                                         film=upper_film)
         enc_losses.append(ntp_up)
         enc_accs.append(acc_up)
 
@@ -4189,13 +4290,13 @@ def _encode_chain_upto(model, flat_bytes, upto_level, cfg, label_fn, pixel_order
     code_idx = code_soft = None
     for i in range(upto_level):
         codelm = model.codelm_for(i)
-        class_prefix = class_condition_prefix(model, i, class_labels, raw.shape[0], level_rngs[i])
+        class_prefix, class_film = class_condition(model, i, class_labels, raw.shape[0], level_rngs[i])
         out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, cfg,
                                          pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                          codelm_rate_id=model.codelm_bos_rate_id(i), rng=level_rngs[i],
                                          downsampler_ncodes=cfg.downsampler_ncodes[i],
                                         pss_passes=cfg.downsampler_pss_passes[i],
-                                        class_prefix=class_prefix)
+                                        prefix=class_prefix, class_film=class_film)
         code_idx, code_soft = out["code_idx"], out["code_soft"]
         raw, target = code_soft, code_idx
     return code_idx, code_soft
@@ -4256,13 +4357,13 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
         for d in range(depth):
             i = entry_level + d
             codelm = model.codelm_for(i)
-            class_prefix = class_condition_prefix(model, i, class_labels, raw.shape[0], level_rngs[d])
+            class_prefix, class_film = class_condition(model, i, class_labels, raw.shape[0], level_rngs[d])
             out = encode_pardec_downsampler(codelm, model.downsampler_for(i), raw, target, flat_bytes, model.cfg,
                                              pixel_order, label_fn, model.K(i), rate_id=model.bos_rate_id(i),
                                              codelm_rate_id=model.codelm_bos_rate_id(i),
                                              rng=level_rngs[d], downsampler_ncodes=model.cfg.downsampler_ncodes[i],
                                             pss_passes=model.cfg.downsampler_pss_passes[i],
-                                            class_prefix=class_prefix)
+                                            prefix=class_prefix, class_film=class_film)
             codes.append(out["code_idx"])
             codes_soft.append(out["code_soft"])
             enc_losses.append(out["ntp_loss"])
@@ -4284,7 +4385,7 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
                 label_mse_losses.append(jnp.mean((pred_label_soft - label_tgt.astype(jnp.float32)) ** 2))
             if model.cfg.class_conditional:
                 ntp_i, acc_i = codelm_ntp_loss(codelm, raw, target, model.cfg, prefix=class_prefix,
-                                                rng=level_rngs[d])
+                                                film=class_film, rng=level_rngs[d])
                 class_ntp_losses.append(ntp_i)
                 class_ntp_accs.append(acc_i)
             if d < depth - 1:
@@ -4309,13 +4410,14 @@ def level_forward_multires(model: LagCodecModel, flat_bytes: jnp.ndarray, entry_
                     target = jnp.where(choose_gt[:, None, None], gt_codes, out["code_idx"])
         if model.cfg.context_source == "codelm_upper":
             upper_level = entry_level + depth
-            upper_prefix = class_condition_prefix(
+            upper_prefix, upper_film = class_condition(
                 model, upper_level, class_labels, codes_soft[depth - 1].shape[0],
                 None if rng is None else jax.random.fold_in(rng, 197 + depth))
             ntp_up, acc_up = codelm_ntp_loss(model.codelm_for(entry_level + depth), codes_soft[depth - 1],
                                              codes[depth - 1], model.cfg,
                                              prefix=upper_prefix,
-                                             rng=None if rng is None else jax.random.fold_in(rng, 198 + depth))
+                                             rng=None if rng is None else jax.random.fold_in(rng, 198 + depth),
+                                             film=upper_film)
             enc_losses.append(ntp_up)
             enc_accs.append(acc_up)
         encoder_levels = list(range(entry_level, entry_level + depth))
@@ -4516,9 +4618,9 @@ def load_encoder_only_checkpoint(model, ckpt_path: Path):
         root_field = getattr(path[0], "name", None) if path else None
         if root_field in ("codelms", "downsamplers"):
             return eqx.default_deserialise_filter_spec
-        if root_field == "class_bos_embeds":
-            # This leaf is deliberately initialized fresh when starting from an older unconditional
-            # checkpoint; it did not exist in that checkpoint's serialized tree.
+        if root_field in ("class_film_embeds", "class_film_mods"):
+            # These leaves are deliberately initialized fresh when starting from an older
+            # checkpoint; they did not exist in that checkpoint's serialized tree.
             return lambda file, template: template
 
         def skip_leaf(file, template):
@@ -4811,7 +4913,7 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
                   "use_qknorm", "remat", "remat_level", "attn_window", "attn_lookahead",
                   "encoder_attn_window", "decoder_attn_window", "use_sink",
                   "use_codelm_bos", "codelm_bos_prob", "codelm_bos_rates",
-                  "class_conditional", "class_num_classes", "class_drop_prob", "class_bos_order",
+                  "class_conditional", "class_num_classes", "class_drop_prob",
                   "class_ntp_weight", "level_gt_input_prob",
                   "byte_group", "token_head_type", "token_dim", "token_n_heads", "token_mask_prob", "pq_dim",
                   "entropy_weight", "mse_weight",
@@ -5107,6 +5209,10 @@ def main():
                     help="long qualitative prompt: float fraction (default 0.5 of each level's sequence) "
                          "or positive integer byte count (rounded up to a whole token, i.e. a multiple "
                          "of pq_chunks; minimum 3 bytes for images so the prompt includes a complete pixel)")
+    p.add_argument("--class_eval_labels", type=_tuple_arg, default=None,
+                   help="class ids whose class-conditional generations the qual eval samples, "
+                        "comma-separated (default: the dataset's cat/dog exemplars -- cifar 3,5; "
+                        "imagenet 281,207). Only used with --class_conditional")
     p.add_argument("--gen_eval_all_levels", type=lambda x: x.lower() != "false", default=Config.gen_eval_all_levels,
                     help="mid-phase/end-of-phase gen-eval also loops top=0..phase-2 (not just phase-1)")
     p.add_argument("--gen_eval_teacher_force_sanity", type=lambda x: x.lower() != "false",
@@ -5240,14 +5346,13 @@ def main():
                          "anchor). No effect when --use_codelm_bos=False")
     p.add_argument("--class_conditional", type=lambda x: x.lower() != "false",
                    default=Config.class_conditional,
-                   help="enable trainable class BOS conditioning, null-class dropout, and class-conditional NTP")
+                   help="enable FiLM/adaLN class conditioning on CodeLM's block stack "
+                        "(per-block h*(1+scale)+shift), null-class dropout, and class-conditional NTP")
     p.add_argument("--class_num_classes", type=int, default=Config.class_num_classes,
-                   help="number of class IDs; an extra learned null-class BOS row is allocated")
+                   help="number of class IDs; each row maps to a learned class embedding")
     p.add_argument("--class_drop_prob", type=float, default=Config.class_drop_prob,
-                   help="training probability of replacing the real class BOS with the learned null-class BOS")
-    p.add_argument("--class_bos_order", choices=("level_then_class", "class_then_level"),
-                   default=Config.class_bos_order,
-                   help="when both BOS types are enabled, which comes last and predicts byte/code position zero")
+                   help="training probability per example of using IDENTITY (unmodulated) instead "
+                        "of the class FiLM -- classifier-free guidance dropout")
     p.add_argument("--class_ntp_weight", type=float, default=Config.class_ntp_weight,
                    help="weight of direct CodeLM next-token loss; active only with --class_conditional")
     p.add_argument("--level_gt_input_prob", type=_tuple_arg, default=Config.level_gt_input_prob,
@@ -5321,6 +5426,8 @@ def main():
     _resolve_pair("wa_every_step", "wa_every_epoch")
     if args.wa_every_step is None and args.wa_every_epoch is None:
         args.wa_every_epoch = 10
+    # Exemplar (cat/dog) class ids + names for the qual eval's class-conditional generation.
+    args.class_eval_classes = class_eval_classes(args.dataset, args.class_eval_labels)
 
     if args.multihost:
         jax.distributed.initialize()
@@ -5484,7 +5591,7 @@ def main():
                 raise FileNotFoundError(f"encoder checkpoint not found: {ckpt_path}")
             model = load_encoder_only_checkpoint(model, ckpt_path)
             logger(f"loaded CodeLM + available Downsampler state from {ckpt_path}; "
-                   f"new class BOS embeddings remain freshly initialized")
+                   f"new class FiLM embeddings/modulation weights remain freshly initialized")
 
     if args.fsdp:
         model = fsdp_put_tree(model, fsdp_mesh)
@@ -5516,8 +5623,8 @@ def main():
         raster[:, order] = rgb_seq
         return raster.reshape(tokens.shape[0], side, side, 3)
 
-    def teacher_force_level(m, level: int, tokens: jnp.ndarray, prefix=None) -> jnp.ndarray:
-        return encoder_teacher_force(m.codelm_for(level), tokens, K=1, prefix=prefix)
+    def teacher_force_level(m, level: int, tokens: jnp.ndarray, prefix=None, film=None) -> jnp.ndarray:
+        return encoder_teacher_force(m.codelm_for(level), tokens, K=1, prefix=prefix, film=film)
 
     def run_qual_eval(eval_model, phase: int, tag: str) -> None:
         if cfg.modality != "image":
@@ -5546,9 +5653,19 @@ def main():
                     cfg.pq_chunks[prev], cfg.code_vocab[prev]))
 
             for level, tokens in enumerate(level_tokens):
-                cond_prefix = class_condition_prefix(m, level, class_ids, tokens.shape[0])
-                if args.fsdp and cond_prefix is not None:
-                    cond_prefix = fsdp_put_array(cond_prefix, fsdp_replicated)
+                cond_prefix, cond_film = class_condition(m, level, class_ids, tokens.shape[0])
+                # Identity-FiLM (no label) conditioning shared by the unconditional gen/TF evals.
+                null_prefix, null_film = (class_condition(m, level, None, tokens.shape[0])
+                                          if cfg.class_conditional else (None, None))
+                if args.fsdp:
+                    if cond_prefix is not None:
+                        cond_prefix = fsdp_put_array(cond_prefix, fsdp_replicated)
+                    if cond_film is not None:
+                        cond_film = fsdp_put_array(cond_film, fsdp_replicated)
+                    if null_prefix is not None:
+                        null_prefix = fsdp_put_array(null_prefix, fsdp_replicated)
+                    if null_film is not None:
+                        null_film = fsdp_put_array(null_film, fsdp_replicated)
                 host_tokens = fsdp_to_host(tokens) if args.fsdp else tokens
                 input_vocab = m.codelm_for(level).code_vocab
                 preview_gt = token_preview(np.asarray(host_tokens), level, input_vocab)
@@ -5578,7 +5695,8 @@ def main():
                         generated = encoder_free_run(
                             m.codelm_for(level), tokens[:, :prefix], tokens.shape[1], 1, gen_key,
                             greedy=greedy, temperature=cfg.gen_temperature, top_k=cfg.gen_top_k,
-                            rate_id=m.codelm_bos_rate_id(level), prefix=cond_prefix, top_p=cfg.gen_top_p)
+                            rate_id=m.codelm_bos_rate_id(level), prefix=cond_prefix, top_p=cfg.gen_top_p,
+                            film=cond_film)
                         if args.fsdp:
                             generated = fsdp_to_host(generated)
                         preview_gen = token_preview(np.asarray(generated), level, input_vocab)
@@ -5595,18 +5713,33 @@ def main():
                                f"saved={sample_path.name}")
 
                 if cfg.class_conditional:
-                    null_prefix = class_condition_prefix(m, level, None, tokens.shape[0])
-                    if args.fsdp and null_prefix is not None:
-                        null_prefix = fsdp_put_array(null_prefix, fsdp_replicated)
+                    # Generation anchor: with use_codelm_bos the learned BOS row IS the first-token
+                    # distribution p(x | bos), so keep a zero-length prompt. BOS-free runs instead
+                    # draw position 0 uniformly over the codebook (p(x0) = uniform) and then roll
+                    # out p(x1 | x0) p(x2 | x0, x1) ... The same anchor feeds both the unconditional
+                    # (identity FiLM) and the per-class conditional (class FiLM) generations below,
+                    # so only the conditioning differs between them.
+                    if null_prefix is not None:
+                        gen_prompt, anchor = tokens[:, :0], "bos"
+                    else:
+                        seed_key = jax.random.PRNGKey(args.seed + level * 4001 + 7)
+                        if args.fsdp:
+                            seed_key = fsdp_put_array(seed_key, fsdp_replicated)
+                        gen_prompt = uniform_seed_prompt(tokens, input_vocab, seed_key)
+                        if args.fsdp:
+                            gen_prompt = fsdp_put_array(gen_prompt, fsdp_replicated)
+                        anchor = "uniform_first_token"
+                    gen_prompt_n = gen_prompt.shape[1]
                     uncond_key = jax.random.PRNGKey(args.seed + level * 1009 + 17)
                     if args.fsdp:
                         uncond_key = fsdp_put_array(uncond_key, fsdp_replicated)
                     for mode, greedy in (("greedy", True), ("sample", False)):
                         mode_key = jax.random.fold_in(uncond_key, 0 if greedy else 7919)
                         uncond_tokens = encoder_free_run(
-                            m.codelm_for(level), tokens[:, :0], tokens.shape[1], 1, mode_key,
+                            m.codelm_for(level), gen_prompt, tokens.shape[1], 1, mode_key,
                             greedy=greedy, temperature=cfg.gen_temperature, top_k=cfg.gen_top_k,
-                            rate_id=m.codelm_bos_rate_id(level), prefix=null_prefix, top_p=cfg.gen_top_p)
+                            rate_id=m.codelm_bos_rate_id(level), prefix=null_prefix,
+                            top_p=cfg.gen_top_p, film=null_film)
                         if args.fsdp:
                             uncond_tokens = fsdp_to_host(uncond_tokens)
                         uncond_image = token_preview(np.asarray(uncond_tokens), level, input_vocab)
@@ -5616,10 +5749,49 @@ def main():
                             save_samples(uncond_image, preview_gt, uncond_path, cfg)
                         logger(f"[{tag}] QUAL source={source_name} level={level} class=unconditional mode={mode} "
                                f"temperature={cfg.gen_temperature:g} top_k={cfg.gen_top_k} top_p={cfg.gen_top_p:g} "
-                               f"prompt_positions=0/{tokens.shape[1]} batch={len(images)} "
-                               f"kv_cache=true saved={uncond_path.name}")
+                               f"prompt_positions={gen_prompt_n}/{tokens.shape[1]} anchor={anchor} "
+                               f"batch={len(images)} kv_cache=true saved={uncond_path.name}")
+                    # Class-conditional generations for the exemplar classes (cat / dog): same
+                    # anchor as the unconditional samples, FiLM set to the requested class.
+                    for cls_id, cls_name in args.class_eval_classes:
+                        if not 0 <= cls_id < cfg.class_num_classes:
+                            logger(f"[{tag}] QUAL source={source_name} level={level} "
+                                   f"class={cls_name}{cls_id} skipped: id outside [0,{cfg.class_num_classes})")
+                            continue
+                        cls_ids = jnp.full((tokens.shape[0],), cls_id, dtype=jnp.int32)
+                        _, cls_film = class_condition(m, level, cls_ids, tokens.shape[0])
+                        if args.fsdp and cls_film is not None:
+                            cls_film = fsdp_put_array(cls_film, fsdp_replicated)
+                        cls_key = jax.random.PRNGKey(args.seed + level * 20011 + cls_id)
+                        if args.fsdp:
+                            cls_key = fsdp_put_array(cls_key, fsdp_replicated)
+                        for mode, greedy in (("greedy", True), ("sample", False)):
+                            mode_key = jax.random.fold_in(cls_key, 0 if greedy else 7919)
+                            cls_tokens = encoder_free_run(
+                                m.codelm_for(level), gen_prompt, tokens.shape[1], 1, mode_key,
+                                greedy=greedy, temperature=cfg.gen_temperature,
+                                top_k=cfg.gen_top_k,
+                                rate_id=m.codelm_bos_rate_id(level), prefix=null_prefix,
+                                top_p=cfg.gen_top_p, film=cls_film)
+                            if args.fsdp:
+                                cls_tokens = fsdp_to_host(cls_tokens)
+                            cls_image = token_preview(np.asarray(cls_tokens), level, input_vocab)
+                            cls_path = run_dir / (
+                                f"samples_{tag}_{source_name}_level{level}_gencond_{cls_name}{cls_id}_{mode}.png")
+                            if jax.process_index() == 0:
+                                save_samples(cls_image, preview_gt, cls_path, cfg)
+                            logger(f"[{tag}] QUAL source={source_name} level={level} class={cls_name}{cls_id} "
+                                   f"mode={mode} temperature={cfg.gen_temperature:g} "
+                                   f"top_k={cfg.gen_top_k} top_p={cfg.gen_top_p:g} "
+                                   f"prompt_positions={gen_prompt_n}/{tokens.shape[1]} anchor={anchor} "
+                                   f"batch={len(images)} kv_cache=true saved={cls_path.name}",
+                                   tag=tag, source=source_name, level=level,
+                                   class_id=cls_id, class_name=cls_name)
 
-                tf_tokens = teacher_force_level(m, level, tokens, prefix=cond_prefix)
+                # Teacher-forced eval: conditional (real image labels) and, when
+                # class_conditional, unconditional (same tokens, identity FiLM) -- the mse gap
+                # isolates what the class conditioning contributes to NTP reconstruction.
+                tf_tokens = teacher_force_level(m, level, tokens, prefix=cond_prefix, film=cond_film)
                 if args.fsdp:
                     tf_tokens = fsdp_to_host(tf_tokens)
                 tf_image = token_preview(np.asarray(tf_tokens), level, input_vocab)
@@ -5631,11 +5803,27 @@ def main():
                     save_samples(
                         tf_image, preview_gt,
                         run_dir / f"samples_{tag}_{source_name}_level{level}{tf_class_suffix}_teacher_force.png", cfg)
-                logger(f"[{tag}] TF_SANITY source={source_name} level={level} "
+                logger(f"[{tag}] TF_SANITY source={source_name} level={level} cond=conditional "
                        f"mse={mse:.3f} grid={level_side}x{level_side} "
                        f"seq_len={tokens.shape[1]} downsampler=false",
-                       tag=tag, source=source_name, level=level,
+                       tag=tag, source=source_name, level=level, cond="conditional",
                        tf_sanity_mse=float(mse))
+                if cfg.class_conditional:
+                    tf_un_tokens = teacher_force_level(m, level, tokens, prefix=cond_prefix,
+                                                       film=null_film)
+                    if args.fsdp:
+                        tf_un_tokens = fsdp_to_host(tf_un_tokens)
+                    tf_un_image = token_preview(np.asarray(tf_un_tokens), level, input_vocab)
+                    mse_un = pixel_mse(tf_un_image, preview_gt)
+                    if jax.process_index() == 0:
+                        save_samples(
+                            tf_un_image, preview_gt,
+                            run_dir / f"samples_{tag}_{source_name}_level{level}_uncond_teacher_force.png", cfg)
+                    logger(f"[{tag}] TF_SANITY source={source_name} level={level} cond=unconditional "
+                           f"mse={mse_un:.3f} grid={level_side}x{level_side} "
+                           f"seq_len={tokens.shape[1]} downsampler=false",
+                           tag=tag, source=source_name, level=level, cond="unconditional",
+                           tf_sanity_mse_uncond=float(mse_un))
 
     val_eval_jit = eqx.filter_jit(level_forward)
     val_jit_timed = [False]
