@@ -10,7 +10,7 @@ img_size = 64
 dataset = "imagenet64"
 data_root = "/dev/shm/imagenet64"
 
-# multihost = True
+multihost = False
 # fsdp = True
 # fsdp_mode = "intra_node_fsdp_inter_node_dp"
 
@@ -22,13 +22,13 @@ gen_eval_prompt = 256*3
 # remat = True
 share_across_levels = False
 # share_across_levels = True
-codelm_d_model = 512
-codelm_n_layers = 16
+codelm_d_model = 1024
+codelm_n_layers = 8
 codelm_n_heads = 8
-codelm_n_kv_heads = 2
+codelm_n_kv_heads = 4
 mlp_mult = 4
 
-layer_drop_prob = 0.2
+layer_drop_prob = 0.1
 
 code_vocab = 256
 pq_chunks = 3
@@ -44,7 +44,6 @@ label_fn = "rgb_label_fn_jax"
 # bos_rate_mode = "relative"
 bos_rate_mode = "absolute"
 strides = None
-# attn_window = 1024
 attn_window = -1
 attn_lookahead = 0
 # remat = True
@@ -81,9 +80,8 @@ gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
 
 # --- training ---
-NODES = 1
-batch_size = 16 // NODES
-val_batch_size = 16 // NODES
+batch_size = 16
+val_batch_size = 16
 # level_steps = (20_000, 20_000, 20_000, 100_000)
 # level_steps = (int(4e5),)
 # level_steps = (int(4e5)//batch_size,)
@@ -93,9 +91,8 @@ train_subset_n = None
 val_subset_n = None
 # val_subset_n = 1000
 gen_eval_every_step = level_steps[-1]//10
-epoch_verbose = False
+epoch_verbose = True
 skip_gen = False
-# skip_gen = True
 
 # grad_clip = 1.0
 # lr = 1e-3
@@ -132,7 +129,7 @@ ckpt_keep = 10
 
 class_conditional = True
 class_num_classes = 1000
-class_drop_prob: float = 0.2
+class_drop_prob: float = 0.1
 # class_bos_order = "level_then_class"
 
 # class_bos_order = "class_then_level"

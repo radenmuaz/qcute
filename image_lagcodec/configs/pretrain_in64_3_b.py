@@ -1,10 +1,14 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/pretrain_in256_1.py
+uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain --config image_lagcodec/configs/pretrain_in256_1_single.py
 """
 # --- data ---
-img_size = 256
-dataset = "imagenet256"
-data_root = "/dev/shm/imagenet256"
+# img_size = 256
+# dataset = "imagenet256"
+# data_root = "/dev/shm/imagenet256"
+
+img_size = 64
+dataset = "imagenet64"
+data_root = "/dev/shm/imagenet64"
 
 multihost = True
 # fsdp = True
@@ -15,21 +19,15 @@ eval_gen_train = True
 gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
 gen_eval_prompt = 256*3
+# remat = True
 share_across_levels = False
-
-codelm_d_model = 512
-mlp_mult = 8
-codelm_n_layers = 16
-codelm_n_heads = 8
+# share_across_levels = True
+codelm_d_model = 256
+codelm_n_layers = 8
+codelm_n_heads = 4
 codelm_n_kv_heads = 2
+mlp_mult = 4
 layer_drop_prob = 0.2
-
-# codelm_d_model = 1024
-# codelm_n_layers = 16
-# codelm_n_heads = 8
-# codelm_n_kv_heads = 2
-# mlp_mult = 4
-# layer_drop_prob = 0.2
 
 code_vocab = 256
 pq_chunks = 3
@@ -41,11 +39,18 @@ mse_weight = 0.0
 entropy_weight = 0.0
 label_reg_weight = 1.0
 
+label_fn = "rgb_label_fn_jax"
+# bos_rate_mode = "relative"
+bos_rate_mode = "absolute"
 strides = None
-attn_window = 4096
-# attn_window = -1
+# attn_window = 4096
+attn_window = -1
 attn_lookahead = 0
+# remat = True
+# context_source = "own_embed"
 use_codelm_bos = False
+# use_codelm_bos = True
+# codelm_bos_prob = 0.8
 curriculum_mode = "no_freeze"
 quantize_mode = "zgr"
 encode_temperature = 1.0
@@ -63,7 +68,9 @@ byte_group = 3
 # codelm_token_head = "ar"
 token_head_type = "ar_flat"
 codelm_token_head = "ar_flat"
-codelm_token_head = "ar_flat"
+# token_head_type = "linears"
+# codelm_token_head = "linears"
+
 token_mask_prob = 0.2
 token_dim = 128
 token_n_heads = 2
@@ -73,16 +80,15 @@ gen_eval_all_levels = True
 gen_eval_teacher_force_sanity = True
 
 # --- training ---
-batch_size = 2
-val_batch_size = 2
+batch_size = 16
+val_batch_size = 16
 # level_steps = (20_000, 20_000, 20_000, 100_000)
-# level_steps = (int(2e5),)
-level_steps = (int(2e5)//batch_size,)
-# level_steps = (int(4e5)//batch_size,)
+# level_steps = (int(4e5),)
+level_steps = (int(4e5)//batch_size,)
 seed = 0
 train_subset_n = None
-val_subset_n = None
-# val_subset_n = 1000
+# val_subset_n = None
+val_subset_n = 1000
 gen_eval_every_step = level_steps[-1]
 epoch_verbose = False
 
@@ -90,7 +96,7 @@ grad_clip = 1.0
 lr = 1e-3
 lr_schedule = "cosine"
 lr_min = 1e-5
-lr_min_step = level_steps[-1]*3 // 4
+lr_min_step = level_steps[-1]*9 // 10
 warmup_steps = level_steps[-1] // 10
 optimizer = "adamw"
 optimizer_kwargs = dict(weight_decay=1e-5)
@@ -99,8 +105,8 @@ optimizer_kwargs = dict(weight_decay=1e-5)
 # lr = 0.02
 # lr_schedule = "cosine"
 # lr_min = 1e-5
-# lr_min_step = level_steps[-1]*3 // 4
-# warmup_steps = level_steps[-1] // 16
+# lr_min_step = level_steps[-1]*9 // 10
+# warmup_steps = level_steps[-1] // 10
 # optimizer = "sinkgd"
 # optimizer_kwargs = dict(linear_lr_scale=0.05, weight_decay=0.0, sinkhorn_iters=2)
 
@@ -114,6 +120,7 @@ wa_verbose = False
 # --- logging ---
 log_every = 1000
 ckpt_every_step = level_steps[-1] // 4
+# ckpt_every_step = int(2e5)
 ckpt_keep = 2
 
 # class_conditional = False
@@ -121,3 +128,6 @@ ckpt_keep = 2
 class_conditional = True
 class_num_classes = 1000
 class_drop_prob: float = 0.2
+# class_bos_order = "level_then_class"
+
+# class_bos_order = "class_then_level"

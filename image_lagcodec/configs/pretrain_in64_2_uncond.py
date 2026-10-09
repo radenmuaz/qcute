@@ -10,7 +10,7 @@ img_size = 64
 dataset = "imagenet64"
 data_root = "/dev/shm/imagenet64"
 
-# multihost = True
+multihost = True
 # fsdp = True
 # fsdp_mode = "intra_node_fsdp_inter_node_dp"
 
@@ -128,11 +128,11 @@ ckpt_every_step = level_steps[-1] // 10
 # ckpt_every_step = int(2e5)
 ckpt_keep = 10
 
-# class_conditional = False
+class_conditional = False
 
-class_conditional = True
-class_num_classes = 1000
-class_drop_prob: float = 0.2
+# class_conditional = True
+# class_num_classes = 1000
+# class_drop_prob: float = 0.2
 # class_bos_order = "level_then_class"
 
 # class_bos_order = "class_then_level"

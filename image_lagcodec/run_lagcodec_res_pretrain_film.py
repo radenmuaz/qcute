@@ -116,6 +116,7 @@ def n_blocks_for_level(cfg, j: int) -> int:
 
 @dataclass
 class Config:
+    skip_gen: bool = True
     simple_ntp: bool = False  # derived from strides=None/empty; one CodeLM, no downsampler
     img_size: int = 32
     # data: image (img_size^2 RGB pixels) | text | audio | binary (1D: seq_len positions of byte_group bytes,
@@ -4124,8 +4125,6 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     # which is what lets a single shared CodeLM process every level.
     tok0 = byte_pq_fn(flat_bytes, codelm0.pq_chunks, codelm0.code_vocab)
     if model.cfg.simple_ntp:
-        if class_labels is None and model.cfg.class_conditional:
-            raise ValueError("class_conditional simple NTP needs class_labels for each image")
         prefix, class_film = class_condition(model, 0, class_labels, tok0.shape[0], rng)
         ntp_loss, ntp_acc = codelm_ntp_loss(codelm0, tok0, tok0, model.cfg, prefix=prefix,
                                             rng=rng, film=class_film)
@@ -4920,7 +4919,7 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
                   "mse_softmax_tau", "traversal", "label_reg_weight", "label_mse_weight",
                   "encoder_level_loss_weights", "decoder_level_loss_weights",
                   "log_levelwise_metrics", "log_levelwise_eval", "log_levelwise_gen",
-                  "encoder_only_pretrain", "load_encoder_checkpoint")
+                  "encoder_only_pretrain", "load_encoder_checkpoint", "skip_gen")
 
 
 def main():
@@ -5385,6 +5384,7 @@ def main():
                          "still computed and logged (hard, argmax-based) whenever label_reg_weight>0, "
                          "just not backpropped")
     p.add_argument("--traversal", type=str, default=Config.traversal, choices=["raster", "zorder"])
+    p.add_argument("--skip_gen",  type=lambda x: x.lower() != "false", default=Config.skip_gen)
     pre_args, _ = p.parse_known_args()
     config_vars = load_config_module(pre_args.config)
     label_fn_raw = config_vars.pop("label_fn", None)
@@ -5828,7 +5828,7 @@ def main():
     val_eval_jit = eqx.filter_jit(level_forward)
     val_jit_timed = [False]
 
-    def run_val_eval(eval_model, phase: int, tag: str) -> tuple:
+    def run_val_eval(eval_model, phase: int, tag: str, force_uncond: bool=False) -> tuple:
         val_t0 = time.monotonic()
         m = cast_pytree(eval_model, compute_dtype)
         bs = args.val_batch_size[phase - 1]
@@ -5841,11 +5841,13 @@ def main():
         enc_level_accs_sum = None
         dec_level_losses_sum = None
         dec_level_accs_sum = None
-        for start in range(0, n, bs):
+        val_pbar = tqdm(range(0, n, bs), total=-(-n // bs), desc=f"val {tag}", dynamic_ncols=True,
+                        position=2, leave=False, disable=jax.process_index() != 0)
+        for start in val_pbar:
             batch_imgs = val_np[start:start + bs]
             bn = len(batch_imgs)
             batch_flat = jnp.array(images_to_positions(batch_imgs, cfg, pixel_order))
-            batch_class_labels = jnp.asarray(val_labels[start:start + bn], dtype=jnp.int32)
+            batch_class_labels = jnp.asarray(val_labels[start:start + bn], dtype=jnp.int32) if not force_uncond else None
             if args.fsdp:
                 batch_flat = fsdp_put_array(batch_flat, fsdp_replicated)
             batch_t0 = time.monotonic()
@@ -5879,6 +5881,9 @@ def main():
             sums += bn * np.array([float(a) for a in aux_b[:9]])
             total_loss += bn * float(loss_b)
             total_n += bn
+            val_pbar.set_postfix(loss=f"{total_loss / total_n:.3f}",
+                                 enc_acc=f"{sums[3] / total_n:.3f}", n=total_n)
+        val_pbar.close()
         dec_loss, dec_acc, enc_loss, enc_acc, util, val_mse, _aux_ntp_bpb, aux_ntp_acc, val_label_mse = \
             (sums / total_n).tolist()
         loss = total_loss / total_n
@@ -6329,7 +6334,10 @@ def main():
                         eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
                     st = f"{step:0{step_w}d}"
                     run_val_eval(snapshot, phase, tag=f"level{phase - 1}_step{st}")
-                    run_qual_eval(snapshot, phase, tag=f"step{st}")
+                    if cfg.class_conditional:
+                        run_val_eval(snapshot, phase, tag=f"uncond_level{phase - 1}_step{st}", force_uncond=True)
+                    if not cfg.skip_gen:
+                        run_qual_eval(snapshot, phase, tag=f"step{st}")
 
                 if step % ckpt_every_steps == 0:
                     ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_step{step}"
