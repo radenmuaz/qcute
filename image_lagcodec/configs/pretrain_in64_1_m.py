@@ -115,10 +115,10 @@ optimizer_kwargs = dict(linear_lr_scale=0.05, weight_decay=0.0, sinkhorn_iters=5
 
 wa_verbose = False
 
-wa_mode = "wma"
-wa_every_step = 10_000
-wa_stack_size = 3
-wa_wma_weights = (1.0, 1.0, 1.0)
+# wa_mode = "wma"
+# wa_every_step = 10_000
+# wa_stack_size = 3
+# wa_wma_weights = (1.0, 1.0, 1.0)
 
 # --- logging ---
 log_every = 1000

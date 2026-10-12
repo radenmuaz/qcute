@@ -839,10 +839,28 @@ def pixel_order_for(cfg: Config) -> np.ndarray:
 # Exemplar "cat"/"dog" classes whose class-conditional generations the qual eval samples:
 # dataset -> ({class_id: name}, default ids). --class_eval_labels overrides the ids (names then
 # fall back to "class<id>" unless the id is in the dataset's exemplar table).
+CAT_CLASSES = {
+    281: "tabby",
+    282: "tiger_cat",
+    283: "Persian_cat",
+    284: "Siamese_cat",
+    285: "Egyptian_cat",
+    286: "cougar",
+    287: "lynx",
+    288: "leopard",
+    289: "snow_leopard",
+    290: "jaguar",
+    291: "lion",
+    292: "tiger",
+    293: "cheetah",
+}
+
 CLASS_EVAL_EXEMPLARS = {
     "cifar": ({3: "cat", 5: "dog"}, (3, 5)),                    # CIFAR-10
     "imagenet64": ({281: "cat", 207: "dog"}, (281, 207)),       # ILSVRC: tabby, golden retriever
+    "imagenet64_cat": (CAT_CLASSES, list(CAT_CLASSES.keys())),       # ILSVRC: tabby, golden retriever
     "imagenet256": ({281: "cat", 207: "dog"}, (281, 207)),
+    "imagenet256_cat": (CAT_CLASSES, list(CAT_CLASSES.keys())),
     "imagenet256_jxl": ({281: "cat", 207: "dog"}, (281, 207)),
     "folder": ({3: "cat", 5: "dog"}, (3, 5)),
 }
@@ -1098,7 +1116,7 @@ def load_imagenet_jxl(data_root: Path, resolution: int, split: str, shard_limit=
 
 
 def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = None,
-                  require_labels: bool = False, concat: bool = False) -> tuple:
+                  require_labels: bool = False, concat: bool = False, cat=False) -> tuple:
     def load_split(split: str, limit=None) -> tuple:
         shards = sorted(data_root.glob(f"imagenet{resolution}_{split}_*.npy"))
         if not shards and (data_root / f"imagenet{resolution}_{split}_manifest.json").is_file():
@@ -1125,6 +1143,28 @@ def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = Non
             labels = np.zeros(len(images), dtype=np.int32)
         if len(labels) != len(images):
             raise ValueError(f"{split} image/label count mismatch: {len(images)} images, {len(labels)} labels")
+        if cat:
+            # {281: "cat", 207: "dog"}
+            cat_classes = {
+                281: "tabby",
+                282: "tiger_cat",
+                283: "Persian_cat",
+                284: "Siamese_cat",
+                285: "Egyptian_cat",
+                286: "cougar",
+                287: "lynx",
+                288: "leopard",
+                289: "snow_leopard",
+                290: "jaguar",
+                291: "lion",
+                292: "tiger",
+                293: "cheetah",
+            }
+            mask = np.isin(labels, list(cat_classes.keys()))
+            indices = np.where(mask)[0]
+            labels = labels[indices]
+            images = images[indices]
+            # filtered_names = np.array([mapping[label] for label in filtered_labels])
         return images, labels
 
     train, train_labels = load_split("train", train_shards)
@@ -1151,7 +1191,7 @@ def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards:
         res = 256
     else:
         assert name.startswith("imagenet"), f"unknown dataset {name!r}"
-        res = int(name[len("imagenet"):])
+        res = int(name[len("imagenet"):].split("_")[0])
     assert img_size is None or img_size == res, f"dataset {name} is {res}px but img_size={img_size}"
     if name == "cifar":
         return load_cifar10(data_root)
@@ -1159,7 +1199,7 @@ def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards:
         train = load_imagenet_jxl(data_root, res, "train", train_shards)
         val = load_imagenet_jxl(data_root, res, "validation")
         return train, val
-    return load_imagenet(data_root, res, train_shards, require_labels=require_labels, concat=concat)
+    return load_imagenet(data_root, res, train_shards, require_labels=require_labels, concat=concat, cat=("cat" in name))
 
 
 def dataset_from_config(cv: dict, repo_root: Path, train_shards: int = 1, concat: bool = False) -> tuple:
@@ -4028,7 +4068,10 @@ def class_condition(model: LagCodecModel, level_idx: int, class_labels, batch_si
     class_table, mod_w = model.class_film_for(level_idx)  # (C, D), (n_layers, D, 2*D)
     n_layers, _, two_d = mod_w.shape
     if class_labels is None:
+        print("\n\n\t-- confirmed uncond works for class conditional training\n")
         return prefix, jnp.zeros((batch_size, n_layers, two_d), dtype=mod_w.dtype)
+    else:
+        print("\n\n\t==== now class cond\n")
     ids = jnp.asarray(class_labels, dtype=jnp.int32).reshape((batch_size,))
     keep = jnp.ones((batch_size,), dtype=mod_w.dtype)
     if rng is not None and cfg.class_drop_prob > 0.0:
@@ -5751,42 +5794,71 @@ def main():
                                f"temperature={cfg.gen_temperature:g} top_k={cfg.gen_top_k} top_p={cfg.gen_top_p:g} "
                                f"prompt_positions={gen_prompt_n}/{tokens.shape[1]} anchor={anchor} "
                                f"batch={len(images)} kv_cache=true saved={uncond_path.name}")
-                    # Class-conditional generations for the exemplar classes (cat / dog): same
-                    # anchor as the unconditional samples, FiLM set to the requested class.
-                    for cls_id, cls_name in args.class_eval_classes:
-                        if not 0 <= cls_id < cfg.class_num_classes:
-                            logger(f"[{tag}] QUAL source={source_name} level={level} "
-                                   f"class={cls_name}{cls_id} skipped: id outside [0,{cfg.class_num_classes})")
-                            continue
-                        cls_ids = jnp.full((tokens.shape[0],), cls_id, dtype=jnp.int32)
-                        _, cls_film = class_condition(m, level, cls_ids, tokens.shape[0])
-                        if args.fsdp and cls_film is not None:
-                            cls_film = fsdp_put_array(cls_film, fsdp_replicated)
-                        cls_key = jax.random.PRNGKey(args.seed + level * 20011 + cls_id)
+                    # Batch-conditional free-run: condition on the batch's own train/val
+                    # labels (same anchor as the unconditional above), instead of repeating a
+                    # free-run per exemplar class id. Cheaper: 2 runs (greedy/sample) per level
+                    # per source, not 2 * len(class_eval_classes).
+                    # Note: the batch-conditioning (cond_film) was already computed above from
+                    # class_ids, so no extra class_condition call is needed here.
+                    batch_cls_tag = f"class{int(source_labels[0])}" if cfg.class_conditional and len(source_labels) else "uncond"
+                    for mode, greedy in (("greedy", True), ("sample", False)):
+                        mode_key = jax.random.fold_in(uncond_key, 0 if greedy else 7919)
+                        batch_tokens = encoder_free_run(
+                            m.codelm_for(level), gen_prompt, tokens.shape[1], 1, mode_key,
+                            greedy=greedy, temperature=cfg.gen_temperature,
+                            top_k=cfg.gen_top_k,
+                            rate_id=m.codelm_bos_rate_id(level), prefix=cond_prefix,
+                            top_p=cfg.gen_top_p, film=cond_film)
                         if args.fsdp:
-                            cls_key = fsdp_put_array(cls_key, fsdp_replicated)
-                        for mode, greedy in (("greedy", True), ("sample", False)):
-                            mode_key = jax.random.fold_in(cls_key, 0 if greedy else 7919)
-                            cls_tokens = encoder_free_run(
-                                m.codelm_for(level), gen_prompt, tokens.shape[1], 1, mode_key,
-                                greedy=greedy, temperature=cfg.gen_temperature,
-                                top_k=cfg.gen_top_k,
-                                rate_id=m.codelm_bos_rate_id(level), prefix=null_prefix,
-                                top_p=cfg.gen_top_p, film=cls_film)
-                            if args.fsdp:
-                                cls_tokens = fsdp_to_host(cls_tokens)
-                            cls_image = token_preview(np.asarray(cls_tokens), level, input_vocab)
-                            cls_path = run_dir / (
-                                f"samples_{tag}_{source_name}_level{level}_gencond_{cls_name}{cls_id}_{mode}.png")
-                            if jax.process_index() == 0:
-                                save_samples(cls_image, preview_gt, cls_path, cfg)
-                            logger(f"[{tag}] QUAL source={source_name} level={level} class={cls_name}{cls_id} "
-                                   f"mode={mode} temperature={cfg.gen_temperature:g} "
-                                   f"top_k={cfg.gen_top_k} top_p={cfg.gen_top_p:g} "
-                                   f"prompt_positions={gen_prompt_n}/{tokens.shape[1]} anchor={anchor} "
-                                   f"batch={len(images)} kv_cache=true saved={cls_path.name}",
-                                   tag=tag, source=source_name, level=level,
-                                   class_id=cls_id, class_name=cls_name)
+                            batch_tokens = fsdp_to_host(batch_tokens)
+                        batch_image = token_preview(np.asarray(batch_tokens), level, input_vocab)
+                        batch_path = run_dir / (
+                            f"samples_{tag}_{source_name}_level{level}_{batch_cls_tag}_{mode}.png")
+                        if jax.process_index() == 0:
+                            save_samples(batch_image, preview_gt, batch_path, cfg)
+                        logger(f"[{tag}] QUAL source={source_name} level={level} class={batch_cls_tag} "
+                               f"mode={mode} temperature={cfg.gen_temperature:g} "
+                               f"top_k={cfg.gen_top_k} top_p={cfg.gen_top_p:g} "
+                               f"prompt_positions={gen_prompt_n}/{tokens.shape[1]} anchor={anchor} "
+                               f"batch={len(images)} kv_cache=true saved={batch_path.name}")
+
+                    # # Per-exemplar-class conditional generations (DISABLED to save time: 2 runs per
+                    # # class id in args.class_eval_classes per level per source). Kept for reference;
+                    # # re-enable if per-class coverage beyond the batch's own labels is needed.
+                    # for cls_id, cls_name in args.class_eval_classes:
+                    #     if not 0 <= cls_id < cfg.class_num_classes:
+                    #         logger(f"[{tag}] QUAL source={source_name} level={level} "
+                    #                f"class={cls_name}{cls_id} skipped: id outside [0,{cfg.class_num_classes})")
+                    #         continue
+                    #     cls_ids = jnp.full((tokens.shape[0],), cls_id, dtype=jnp.int32)
+                    #     _, cls_film = class_condition(m, level, cls_ids, tokens.shape[0])
+                    #     if args.fsdp and cls_film is not None:
+                    #         cls_film = fsdp_put_array(cls_film, fsdp_replicated)
+                    #     cls_key = jax.random.PRNGKey(args.seed + level * 20011 + cls_id)
+                    #     if args.fsdp:
+                    #         cls_key = fsdp_put_array(cls_key, fsdp_replicated)
+                    #     for mode, greedy in (("greedy", True), ("sample", False)):
+                    #         mode_key = jax.random.fold_in(cls_key, 0 if greedy else 7919)
+                    #         cls_tokens = encoder_free_run(
+                    #             m.codelm_for(level), gen_prompt, tokens.shape[1], 1, mode_key,
+                    #             greedy=greedy, temperature=cfg.gen_temperature,
+                    #             top_k=cfg.gen_top_k,
+                    #             rate_id=m.codelm_bos_rate_id(level), prefix=null_prefix,
+                    #             top_p=cfg.gen_top_p, film=cls_film)
+                    #         if args.fsdp:
+                    #             cls_tokens = fsdp_to_host(cls_tokens)
+                    #         cls_image = token_preview(np.asarray(cls_tokens), level, input_vocab)
+                    #         cls_path = run_dir / (
+                    #             f"samples_{tag}_{source_name}_level{level}_gencond_{cls_name}{cls_id}_{mode}.png")
+                    #         if jax.process_index() == 0:
+                    #             save_samples(cls_image, preview_gt, cls_path, cfg)
+                    #         logger(f"[{tag}] QUAL source={source_name} level={level} class={cls_name}{cls_id} "
+                    #                f"mode={mode} temperature={cfg.gen_temperature:g} "
+                    #                f"top_k={cfg.gen_top_k} top_p={cfg.gen_top_p:g} "
+                    #                f"prompt_positions={gen_prompt_n}/{tokens.shape[1]} anchor={anchor} "
+                    #                f"batch={len(images)} kv_cache=true saved={cls_path.name}",
+                    #                tag=tag, source=source_name, level=level,
+                    #                class_id=cls_id, class_name=cls_name)
 
                 # Teacher-forced eval: conditional (real image labels) and, when
                 # class_conditional, unconditional (same tokens, identity FiLM) -- the mse gap

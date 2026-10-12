@@ -84,6 +84,7 @@ def n_blocks_for_level(cfg, j: int) -> int:
 
 @dataclass
 class Config:
+    skip_gen: bool = True
     simple_ntp: bool = False  # derived from strides=None/empty; one CodeLM, no downsampler
     img_size: int = 32
     # data: image (img_size^2 RGB pixels) | text | audio | binary (1D: seq_len positions of byte_group bytes,
@@ -805,6 +806,43 @@ def pixel_order_for(cfg: Config) -> np.ndarray:
 CIFAR10_URL = "https://cave.cs.toronto.edu/kriz/cifar-10-python.tar.gz"
 
 
+# Exemplar "cat"/"dog" classes whose class-conditional generations the qual eval samples:
+# dataset -> ({class_id: name}, default ids). --class_eval_labels overrides the ids (names then
+# fall back to "class<id>" unless the id is in the dataset's exemplar table).
+CAT_CLASSES = {
+    281: "tabby",
+    282: "tiger_cat",
+    283: "Persian_cat",
+    284: "Siamese_cat",
+    285: "Egyptian_cat",
+    286: "cougar",
+    287: "lynx",
+    288: "leopard",
+    289: "snow_leopard",
+    290: "jaguar",
+    291: "lion",
+    292: "tiger",
+    293: "cheetah",
+}
+
+CLASS_EVAL_EXEMPLARS = {
+    "cifar": ({3: "cat", 5: "dog"}, (3, 5)),                    # CIFAR-10
+    "imagenet64": ({281: "cat", 207: "dog"}, (281, 207)),       # ILSVRC: tabby, golden retriever
+    "imagenet64_cat": (CAT_CLASSES, list(CAT_CLASSES.keys())),       # ILSVRC: tabby, golden retriever
+    "imagenet256": ({281: "cat", 207: "dog"}, (281, 207)),
+    "imagenet256_cat": (CAT_CLASSES, list(CAT_CLASSES.keys())),
+    "imagenet256_jxl": ({281: "cat", 207: "dog"}, (281, 207)),
+    "folder": ({3: "cat", 5: "dog"}, (3, 5)),
+}
+
+
+def class_eval_classes(dataset: str, labels=None) -> list:
+    """(class id, name) pairs for the qual eval's class-conditional generation samples."""
+    names, default_ids = CLASS_EVAL_EXEMPLARS.get(dataset, ({}, (3, 5)))
+    ids = tuple(default_ids if labels is None else labels)
+    return [(int(i), names.get(int(i), f"class{int(i)}")) for i in ids]
+
+
 def load_cifar10(data_root: Path) -> tuple:
     data_root.mkdir(parents=True, exist_ok=True)
     tar_path = data_root / "cifar-10-python.tar.gz"
@@ -934,8 +972,118 @@ def load_imagenet_jxl(data_root: Path, resolution: int, split: str, shard_limit=
     return dataset, dataset.labels
 
 
+class ImageNetMmapDataset:
+    """Array-like random access to memory-mapped ImageNet .npy shards without in-memory concatenation.
+
+    Integer indexing returns one uint8 HWC image. Slice or integer-array indexing
+    returns a batch with shape (N, H, W, 3), matching the ndarray API used by train_np.
+    Shards stay memory-mapped on disk; only requested images are loaded into memory.
+    """
+
+    def __init__(self, shards: list, resolution: int, labels: np.ndarray = None):
+        self.resolution = int(resolution)
+        self.shards = []
+        counts = []
+        for s in shards:
+            arr = np.load(s, mmap_mode="r") if isinstance(s, (str, Path)) else s
+            arr = arr.reshape(-1, self.resolution, self.resolution, 3)
+            self.shards.append(arr)
+            counts.append(len(arr))
+        self.counts = np.asarray(counts, dtype=np.int64)
+        self.ends = np.cumsum(self.counts)
+        self._length = int(self.ends[-1]) if len(self.ends) else 0
+        self.labels = labels
+
+    def __len__(self):
+        return self._length
+
+    @property
+    def shape(self):
+        return (len(self), self.resolution, self.resolution, 3)
+
+    @property
+    def dtype(self):
+        return np.uint8
+
+    @property
+    def ndim(self):
+        return 4
+
+    def _get_one(self, index: int) -> np.ndarray:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(f"index {index} out of bounds for dataset of length {len(self)}")
+        shard_idx = int(np.searchsorted(self.ends, index, side="right"))
+        shard_start = 0 if shard_idx == 0 else int(self.ends[shard_idx - 1])
+        local_idx = index - shard_start
+        return np.asarray(self.shards[shard_idx][local_idx])
+
+    def _get_slice(self, s: slice) -> np.ndarray:
+        start, stop, step = s.indices(len(self))
+        if (step > 0 and start >= stop) or (step < 0 and start <= stop):
+            return np.empty((0, *self.shape[1:]), dtype=np.uint8)
+        if step == 1:
+            first_shard = int(np.searchsorted(self.ends, start, side="right"))
+            last_shard = int(np.searchsorted(self.ends, stop - 1, side="right"))
+            if first_shard == last_shard:
+                shard_start = 0 if first_shard == 0 else int(self.ends[first_shard - 1])
+                return np.asarray(self.shards[first_shard][start - shard_start : stop - shard_start])
+            chunks = []
+            cur = start
+            for shard_idx in range(first_shard, last_shard + 1):
+                shard_start = 0 if shard_idx == 0 else int(self.ends[shard_idx - 1])
+                shard_end = int(self.ends[shard_idx])
+                chunk_start = cur - shard_start
+                chunk_end = min(stop, shard_end) - shard_start
+                if chunk_end > chunk_start:
+                    chunks.append(np.asarray(self.shards[shard_idx][chunk_start:chunk_end]))
+                cur = shard_end
+            return np.concatenate(chunks, axis=0) if chunks else np.empty((0, *self.shape[1:]), dtype=np.uint8)
+        indices = np.arange(start, stop, step)
+        return self._get_indices(indices)
+
+    def _get_indices(self, indices) -> np.ndarray:
+        indices = np.asarray(indices)
+        if indices.dtype == np.bool_:
+            if indices.ndim != 1 or len(indices) != len(self):
+                raise IndexError("boolean index must match dataset length")
+            indices = np.flatnonzero(indices)
+        elif indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+            raise IndexError("dataset indices must be integers, slices, or 1D integer arrays")
+        if len(indices) == 0:
+            return np.empty((0, *self.shape[1:]), dtype=np.uint8)
+        indices = np.asarray(indices, dtype=np.int64)
+        neg = indices < 0
+        if np.any(neg):
+            indices = np.where(neg, indices + len(self), indices)
+        if np.any((indices < 0) | (indices >= len(self))):
+            raise IndexError("index out of bounds for dataset")
+        shard_indices = np.searchsorted(self.ends, indices, side="right")
+        shard_starts = np.where(shard_indices == 0, 0, self.ends[shard_indices - 1])
+        local_indices = indices - shard_starts
+        out = np.empty((len(indices), *self.shape[1:]), dtype=np.uint8)
+        unique_shards = np.unique(shard_indices)
+        for s_idx in unique_shards:
+            mask = (shard_indices == s_idx)
+            locs = local_indices[mask]
+            out[mask] = self.shards[s_idx][locs]
+        return out
+
+    def __getitem__(self, index):
+        if isinstance(index, (int, np.integer)):
+            return self._get_one(int(index))
+        if isinstance(index, slice):
+            return self._get_slice(index)
+        return self._get_indices(index)
+
+
+# Alias for compatibility
+ImageNetNpyDataset = ImageNetMmapDataset
+
+
 def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = None,
-                  require_labels: bool = False) -> tuple:
+                  require_labels: bool = False, concat: bool = False, cat=False) -> tuple:
     def load_split(split: str, limit=None) -> tuple:
         shards = sorted(data_root.glob(f"imagenet{resolution}_{split}_*.npy"))
         if not shards and (data_root / f"imagenet{resolution}_{split}_manifest.json").is_file():
@@ -949,8 +1097,11 @@ def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = Non
             raise FileNotFoundError(
                 f"class_conditional=True but ImageNet label shards are missing (e.g. {missing[0]}). "
                 f"Re-run download_imagenet{resolution}.py to create aligned labels/ shards.")
-        image_parts = [np.load(s, mmap_mode="r") for s in shards]
-        images = np.concatenate(image_parts, axis=0).reshape(-1, resolution, resolution, 3)
+        if concat:
+            image_parts = [np.load(s, mmap_mode="r") for s in shards]
+            images = np.concatenate(image_parts, axis=0).reshape(-1, resolution, resolution, 3)
+        else:
+            images = ImageNetMmapDataset(shards, resolution)
         if not missing:
             labels = np.concatenate([np.load(p, mmap_mode="r") for p in label_paths]).astype(np.int32)
         elif require_labels:
@@ -959,6 +1110,27 @@ def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = Non
             labels = np.zeros(len(images), dtype=np.int32)
         if len(labels) != len(images):
             raise ValueError(f"{split} image/label count mismatch: {len(images)} images, {len(labels)} labels")
+        if cat:
+                    # {281: "cat", 207: "dog"}
+                    cat_classes = {
+                        281: "tabby",
+                        282: "tiger_cat",
+                        283: "Persian_cat",
+                        284: "Siamese_cat",
+                        285: "Egyptian_cat",
+                        286: "cougar",
+                        287: "lynx",
+                        288: "leopard",
+                        289: "snow_leopard",
+                        290: "jaguar",
+                        291: "lion",
+                        292: "tiger",
+                        293: "cheetah",
+                    }
+                    mask = np.isin(labels, list(cat_classes.keys()))
+                    indices = np.where(mask)[0]
+                    labels = labels[indices]
+                    images = images[indices]
         return images, labels
 
     train, train_labels = load_split("train", train_shards)
@@ -966,12 +1138,13 @@ def load_imagenet(data_root: Path, resolution: int = 64, train_shards: int = Non
     return (train, train_labels), (val, val_labels)
 
 
-def load_imagenet64(data_root: Path, resolution: int = 64, require_labels: bool = False) -> tuple:
-    return load_imagenet(data_root, resolution, require_labels=require_labels)
+def load_imagenet64(data_root: Path, resolution: int = 64, require_labels: bool = False,
+                    concat: bool = False) -> tuple:
+    return load_imagenet(data_root, resolution, require_labels=require_labels, concat=concat)
 
 
 def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards: int = None,
-                 cfg=None, require_labels: bool = False) -> tuple:
+                 cfg=None, require_labels: bool = False, concat: bool = False) -> tuple:
     # train_shards: only load the first N imagenet train shards (off-training scripts need a few images, not 15GB)
     if name == "folder":
         if require_labels:
@@ -984,7 +1157,7 @@ def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards:
         res = 256
     else:
         assert name.startswith("imagenet"), f"unknown dataset {name!r}"
-        res = int(name[len("imagenet"):])
+        res = int(name[len("imagenet"):].split("_")[0])
     assert img_size is None or img_size == res, f"dataset {name} is {res}px but img_size={img_size}"
     if name == "cifar":
         return load_cifar10(data_root)
@@ -992,12 +1165,12 @@ def load_dataset(name: str, data_root: Path, img_size: int = None, train_shards:
         train = load_imagenet_jxl(data_root, res, "train", train_shards)
         val = load_imagenet_jxl(data_root, res, "validation")
         return train, val
-    return load_imagenet(data_root, res, train_shards, require_labels=require_labels)
+    return load_imagenet(data_root, res, train_shards, require_labels=require_labels, concat=concat, cat=("cat" in name))
 
 
-def dataset_from_config(cv: dict, repo_root: Path, train_shards: int = 1) -> tuple:
+def dataset_from_config(cv: dict, repo_root: Path, train_shards: int = 1, concat: bool = False) -> tuple:
     root = Path(cv.get("data_root") or repo_root / "datasets")
-    return load_dataset(cv.get("dataset", "cifar"), root, cv.get("img_size"), train_shards)
+    return load_dataset(cv.get("dataset", "cifar"), root, cv.get("img_size"), train_shards, concat=concat)
 
 
 def images_to_positions(images: np.ndarray, cfg: Config, pixel_order: np.ndarray) -> np.ndarray:
@@ -1666,21 +1839,18 @@ def sample_idx(logits: jnp.ndarray, rng, greedy: bool, temperature: float, top_k
     return safe_argmax(lg + jax.random.gumbel(k_, lg.shape)), rng
 
 
-def run_block(blk: Block, x: jnp.ndarray, remat: bool, rng=None, drop_prob: float = 0.0,
-              prefix_len: int = None) -> jnp.ndarray:
-    if isinstance(blk, Block) and prefix_len is not None:
-        call_blk = lambda b, val: b(val, prefix_len=prefix_len)
-        out = eqx.filter_checkpoint(call_blk)(blk, x) if remat else blk(x, prefix_len=prefix_len)
-    else:
-        out = eqx.filter_checkpoint(blk)(x) if remat else blk(x)
+def run_block(blk: Block, x: jnp.ndarray, remat: bool, rng=None, drop_prob: float = 0.0) -> jnp.ndarray:
+    # No prefix_len/mask override: BOS/class prefixes (when present) are ordinary leading
+    # input positions under plain causal/window masking, so blocks always run with their
+    # construction-time attention defaults (plain full or window attention, no custom mask).
+    out = eqx.filter_checkpoint(blk)(x) if remat else blk(x)
     if rng is not None and drop_prob > 0.0:
         keep = jax.random.bernoulli(rng, p=1.0 - drop_prob)
         out = jnp.where(keep, out, x)
     return out
 
 
-def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False,
-                         prefix_len: int = None) -> jnp.ndarray:
+def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False) -> jnp.ndarray:
     B, T, D = x.shape
     hd = D // attn.n_heads
     qkv = x @ attn.qkv
@@ -1696,7 +1866,7 @@ def dense_self_attention(attn: Attention, x: jnp.ndarray, causal: bool = False,
     k, v = jnp.repeat(k, rep, axis=1), jnp.repeat(v, rep, axis=1)
     scale = 1.0 / math.sqrt(hd)
     scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * scale
-    plen = attn.prefix_len if prefix_len is None else prefix_len
+    plen = attn.prefix_len  # construction-time only; CodeLM paths no longer override it
     if causal:
         idx_q = jnp.arange(T)[:, None]
         idx_k = jnp.arange(T)[None, :]
@@ -1993,12 +2163,11 @@ class RecurrentBlock(eqx.Module):
 
 def make_block(key, backbone: str, d_model: int, n_heads: int, n_kv_heads: int, mlp_mult: int, rope_base: float,
                n_layers: int = None, init_scheme: str = "llama", use_xsa: bool = False, use_qknorm: bool = True,
-               window: int = None, lookahead: int = 0, use_sink: bool = False, state_dim: int = 16,
-               prefix_len: int = 0):
+               window: int = None, lookahead: int = 0, use_sink: bool = False, state_dim: int = 16):
     if backbone == "transformer":
         return Block(key, d_model, n_heads, n_kv_heads, mlp_mult, rope_base, n_layers=n_layers,
                      init_scheme=init_scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, window=window,
-                     lookahead=lookahead, use_sink=use_sink, prefix_len=prefix_len)
+                     lookahead=lookahead, use_sink=use_sink)
     return RecurrentBlock(key, d_model, backbone, mlp_mult, state_dim, n_layers=n_layers, init_scheme=init_scheme)
 
 
@@ -2011,12 +2180,11 @@ def block_cache_init(blk, batch: int, T_max: int):
     return z, jnp.zeros_like(z)
 
 
-def block_step(blk, x_new: jnp.ndarray, cache, pos, T_max: int, extra_valid: jnp.ndarray = None,
-               prefix_len: int = None) -> tuple:
+def block_step(blk, x_new: jnp.ndarray, cache, pos, T_max: int, extra_valid: jnp.ndarray = None) -> tuple:
     if isinstance(blk, RecurrentBlock):
         valid = None if extra_valid is None else jax.lax.dynamic_index_in_dim(extra_valid, pos, axis=1, keepdims=False)
         return blk.step(x_new, cache, valid)
-    x, ck, cv = blk.step(x_new, cache[0], cache[1], pos, T_max, extra_valid, prefix_len=prefix_len)
+    x, ck, cv = blk.step(x_new, cache[0], cache[1], pos, T_max, extra_valid)
     return x, (ck, cv)
 
 
@@ -2811,12 +2979,13 @@ class CodeLM(eqx.Module):
         enc_window_val = (cfg.encoder_attn_window[level_idx] if cfg.encoder_attn_window[level_idx] is not None
                            else cfg.attn_window[level_idx])
         enc_window = None if enc_window_val == -1 else enc_window_val
-        prefix_len = int(cfg.class_conditional) + int(cfg.use_codelm_bos)
+        # No BOS/class special masking: BOS/class prefixes (when present) are ordinary leading
+        # input positions under plain causal/window masking, so blocks use construction-time
+        # attention defaults (prefix_len=0 in eqx_common).
         self.blocks = [make_block(k, cfg.codelm_backbone[level_idx], D_enc, n_heads_enc, n_kv_heads_enc,
                                   cfg.mlp_mult[level_idx], cfg.rope_base[level_idx], n_layers=n_layers_enc,
                                   init_scheme=scheme, use_xsa=use_xsa, use_qknorm=use_qknorm, window=enc_window,
-                                  lookahead=self.attn_lookahead, use_sink=cfg.use_sink, state_dim=cfg.ssm_state_dim,
-                                  prefix_len=prefix_len)
+                                  lookahead=self.attn_lookahead, use_sink=cfg.use_sink, state_dim=cfg.ssm_state_dim)
                        for k in block_keys]
         self.ln_f = RMSNorm(D_enc)
         self.code_head = init_matrix(keys[2], (D_enc, self.pq_chunks * self.code_vocab), scheme)
@@ -2883,7 +3052,7 @@ class CodeLM(eqx.Module):
         def _enc_stack(h):
             for i, blk in enumerate(self.blocks):
                 h = run_block(blk, h, self.remat and not self.remat_level, rng=layer_rngs[i],
-                              drop_prob=layer_drop_prob[i], prefix_len=prefix_len)
+                              drop_prob=layer_drop_prob[i])
             return h
         h = jax.checkpoint(_enc_stack)(h) if self.remat_level else _enc_stack(h)
         h = self.ln_f(h)
@@ -3516,7 +3685,7 @@ def _encoder_hidden_cached(codelm: CodeLM, tokens: jnp.ndarray, prefix: jnp.ndar
         h = x_t
         new_caches = []
         for blk, cache in zip(codelm.blocks, caches):
-            h, cache = block_step(blk, h, cache, pos, total_len, prefix_len=prefix_len)
+            h, cache = block_step(blk, h, cache, pos, total_len)
             new_caches.append(cache)
         return new_caches, codelm.ln_f(h)
 
@@ -3555,7 +3724,7 @@ def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, tempe
         h = x_new
         for blk, c in zip(codelm.blocks, caches):
             valid = prompt_valid if prefill and isinstance(blk, RecurrentBlock) else None
-            h, c = block_step(blk, h, c, pos, total_len, valid, prefix_len=prefix_len)
+            h, c = block_step(blk, h, c, pos, total_len, valid)
             new_caches.append(c)
         return codelm.ln_f(h), new_caches
 
@@ -3584,6 +3753,15 @@ def _encoder_free_run(codelm: CodeLM, tokens: jnp.ndarray, P, K: int, rng, tempe
 
 
 _encoder_free_run_jit = eqx.filter_jit(_encoder_free_run)
+
+
+def uniform_seed_prompt(tmpl: jnp.ndarray, vocab: int, rng) -> jnp.ndarray:
+    """Position-0 seed for BOS-free generation: the first token is drawn uniformly over the
+    codebook (p(x0) = uniform), so the roll-out then models p(x1 | x0) p(x2 | x0, x1) ... When
+    use_codelm_bos is on, callers keep a zero-length prompt instead -- there the learned BOS row
+    IS the first-token distribution p(x | bos), which is a strictly better anchor than uniform."""
+    B, _, C = tmpl.shape
+    return jax.random.randint(rng, (B, 1, C), 0, vocab).astype(tmpl.dtype)
 
 
 def _encoder_teacher_force(codelm: CodeLM, tokens: jnp.ndarray, K: int = 1,
@@ -3852,7 +4030,7 @@ def codelm_hidden_from_raw(codelm: CodeLM, raw: jnp.ndarray, prefix: jnp.ndarray
     h = x
     def _enc_stack(h):
         for blk in codelm.blocks:
-            h = run_block(blk, h, codelm.remat and not codelm.remat_level, prefix_len=prefix_len)
+            h = run_block(blk, h, codelm.remat and not codelm.remat_level)
         return h
     h = jax.checkpoint(_enc_stack)(h) if codelm.remat_level else _enc_stack(h)
     return codelm.ln_f(h[:, :logical_len, :])
@@ -3913,8 +4091,8 @@ def level_forward(model: LagCodecModel, flat_bytes: jnp.ndarray, phase: int, rng
     # which is what lets a single shared CodeLM process every level.
     tok0 = byte_pq_fn(flat_bytes, codelm0.pq_chunks, codelm0.code_vocab)
     if model.cfg.simple_ntp:
-        if class_labels is None and model.cfg.class_conditional:
-            raise ValueError("class_conditional simple NTP needs class_labels for each image")
+        # class_labels=None under class_conditional selects the learned null-class row
+        # (see class_condition_prefix) -- i.e. unconditional eval, not an error.
         prefix = class_condition_prefix(model, 0, class_labels, tok0.shape[0], rng)
         ntp_loss, ntp_acc = codelm_ntp_loss(codelm0, tok0, tok0, model.cfg, prefix=prefix, rng=rng)
         zero = jnp.array(0.0, dtype=ntp_loss.dtype)
@@ -4703,7 +4881,7 @@ CONFIG_FIELDS = ("img_size", "modality", "seq_len", "audio_sample_rate", "audio_
                   "mse_softmax_tau", "traversal", "label_reg_weight", "label_mse_weight",
                   "encoder_level_loss_weights", "decoder_level_loss_weights",
                   "log_levelwise_metrics", "log_levelwise_eval", "log_levelwise_gen",
-                  "encoder_only_pretrain", "load_encoder_checkpoint")
+                  "encoder_only_pretrain", "load_encoder_checkpoint", "skip_gen")
 
 
 def main():
@@ -4720,6 +4898,8 @@ def main():
                          "defaults} -- see load_text/load_audio/bpe_label_fn/resample_label_fn stubs "
                          "below rgb_label_fn_jax (not wired in yet).")
     p.add_argument("--data_root", type=str, default=str(REPO_ROOT / "datasets"))
+    p.add_argument("--dataset_concat", action="store_true", default=False,
+                   help="concatenate ImageNet shards into one in-memory array (legacy behavior; consumes high RAM)")
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--batch_size", type=_tuple_arg, default=(16,),
                     help="training batch size -- a bare int applies uniformly to every phase; a "
@@ -4990,6 +5170,10 @@ def main():
                     help="long qualitative prompt: float fraction (default 0.5 of each level's sequence) "
                          "or positive integer byte count (rounded up to a whole token, i.e. a multiple "
                          "of pq_chunks; minimum 3 bytes for images so the prompt includes a complete pixel)")
+    p.add_argument("--class_eval_labels", type=_tuple_arg, default=None,
+                   help="class ids whose class-conditional generations the qual eval samples, "
+                        "comma-separated (default: the dataset's cat/dog exemplars -- cifar 3,5; "
+                        "imagenet 281,207). Only used with --class_conditional")
     p.add_argument("--gen_eval_all_levels", type=lambda x: x.lower() != "false", default=Config.gen_eval_all_levels,
                     help="mid-phase/end-of-phase gen-eval also loops top=0..phase-2 (not just phase-1)")
     p.add_argument("--gen_eval_teacher_force_sanity", type=lambda x: x.lower() != "false",
@@ -5163,6 +5347,7 @@ def main():
                          "still computed and logged (hard, argmax-based) whenever label_reg_weight>0, "
                          "just not backpropped")
     p.add_argument("--traversal", type=str, default=Config.traversal, choices=["raster", "zorder"])
+    p.add_argument("--skip_gen",  type=lambda x: x.lower() != "false", default=Config.skip_gen)
     pre_args, _ = p.parse_known_args()
     config_vars = load_config_module(pre_args.config)
     label_fn_raw = config_vars.pop("label_fn", None)
@@ -5204,6 +5389,8 @@ def main():
     _resolve_pair("wa_every_step", "wa_every_epoch")
     if args.wa_every_step is None and args.wa_every_epoch is None:
         args.wa_every_epoch = 10
+    # Exemplar (cat/dog) class ids + names for the qual eval's class-conditional generation.
+    args.class_eval_classes = class_eval_classes(args.dataset, args.class_eval_labels)
 
     if args.multihost:
         jax.distributed.initialize()
@@ -5316,7 +5503,8 @@ def main():
 
     (train_np, train_labels), (val_np, val_labels) = load_dataset(
         args.dataset, Path(args.data_root), cfg.img_size if cfg.modality == "image" else None,
-        cfg=cfg, require_labels=cfg.class_conditional)
+        cfg=cfg, require_labels=cfg.class_conditional, concat=args.dataset_concat)
+    print("dataset loaded", train_np.shape)
     if cfg.class_conditional:
         if (np.any(train_labels < 0) or np.any(train_labels >= cfg.class_num_classes)
                 or np.any(val_labels < 0) or np.any(val_labels >= cfg.class_num_classes)):
@@ -5479,15 +5667,33 @@ def main():
                     null_prefix = class_condition_prefix(m, level, None, tokens.shape[0])
                     if args.fsdp and null_prefix is not None:
                         null_prefix = fsdp_put_array(null_prefix, fsdp_replicated)
+                    # Generation anchor: with use_codelm_bos the learned BOS row IS the first-token
+                    # distribution p(x | bos), so keep a zero-length prompt. BOS-free runs instead
+                    # draw position 0 uniformly over the codebook (p(x0) = uniform) and then roll
+                    # out p(x1 | x0) p(x2 | x0, x1) ... The same anchor feeds both the unconditional
+                    # (null-class BOS token) and the per-class conditional generations below,
+                    # so only the conditioning differs between them.
+                    if null_prefix is not None:
+                        gen_prompt, anchor = tokens[:, :0], "bos"
+                    else:
+                        seed_key = jax.random.PRNGKey(args.seed + level * 4001 + 7)
+                        if args.fsdp:
+                            seed_key = fsdp_put_array(seed_key, fsdp_replicated)
+                        gen_prompt = uniform_seed_prompt(tokens, input_vocab, seed_key)
+                        if args.fsdp:
+                            gen_prompt = fsdp_put_array(gen_prompt, fsdp_replicated)
+                        anchor = "uniform_first_token"
+                    gen_prompt_n = gen_prompt.shape[1]
                     uncond_key = jax.random.PRNGKey(args.seed + level * 1009 + 17)
                     if args.fsdp:
                         uncond_key = fsdp_put_array(uncond_key, fsdp_replicated)
                     for mode, greedy in (("greedy", True), ("sample", False)):
                         mode_key = jax.random.fold_in(uncond_key, 0 if greedy else 7919)
                         uncond_tokens = encoder_free_run(
-                            m.codelm_for(level), tokens[:, :0], tokens.shape[1], 1, mode_key,
+                            m.codelm_for(level), gen_prompt, tokens.shape[1], 1, mode_key,
                             greedy=greedy, temperature=cfg.gen_temperature, top_k=cfg.gen_top_k,
-                            rate_id=m.codelm_bos_rate_id(level), prefix=null_prefix, top_p=cfg.gen_top_p)
+                            rate_id=m.codelm_bos_rate_id(level), prefix=null_prefix,
+                            top_p=cfg.gen_top_p)
                         if args.fsdp:
                             uncond_tokens = fsdp_to_host(uncond_tokens)
                         uncond_image = token_preview(np.asarray(uncond_tokens), level, input_vocab)
@@ -5497,8 +5703,69 @@ def main():
                             save_samples(uncond_image, preview_gt, uncond_path, cfg)
                         logger(f"[{tag}] QUAL source={source_name} level={level} class=unconditional mode={mode} "
                                f"temperature={cfg.gen_temperature:g} top_k={cfg.gen_top_k} top_p={cfg.gen_top_p:g} "
-                               f"prompt_positions=0/{tokens.shape[1]} batch={len(images)} "
-                               f"kv_cache=true saved={uncond_path.name}")
+                               f"prompt_positions={gen_prompt_n}/{tokens.shape[1]} anchor={anchor} "
+                               f"batch={len(images)} kv_cache=true saved={uncond_path.name}")
+
+                    # Batch-conditional free-run: one generation conditioned on the batch's own
+                    # train/val labels (same anchor as the unconditional above), instead of
+                    # repeating a free-run per exemplar class id. Cheaper: 2 runs (greedy/sample)
+                    # per level per source, not 2 * len(class_eval_classes).
+                    batch_prefix = class_condition_prefix(m, level, class_ids, tokens.shape[0])
+                    if args.fsdp and batch_prefix is not None:
+                        batch_prefix = fsdp_put_array(batch_prefix, fsdp_replicated)
+                    batch_cls_tag = f"class{int(source_labels[0])}" if cfg.class_conditional and len(source_labels) else "uncond"
+                    for mode, greedy in (("greedy", True), ("sample", False)):
+                        mode_key = jax.random.fold_in(uncond_key, 0 if greedy else 7919)
+                        batch_tokens = encoder_free_run(
+                            m.codelm_for(level), gen_prompt, tokens.shape[1], 1, mode_key,
+                            greedy=greedy, temperature=cfg.gen_temperature, top_k=cfg.gen_top_k,
+                            rate_id=m.codelm_bos_rate_id(level), prefix=batch_prefix,
+                            top_p=cfg.gen_top_p)
+                        if args.fsdp:
+                            batch_tokens = fsdp_to_host(batch_tokens)
+                        batch_image = token_preview(np.asarray(batch_tokens), level, input_vocab)
+                        batch_path = run_dir / (
+                            f"samples_{tag}_{source_name}_level{level}_{batch_cls_tag}_{mode}.png")
+                        if jax.process_index() == 0:
+                            save_samples(batch_image, preview_gt, batch_path, cfg)
+                        logger(f"[{tag}] QUAL source={source_name} level={level} class={batch_cls_tag} "
+                               f"mode={mode} temperature={cfg.gen_temperature:g} top_k={cfg.gen_top_k} "
+                               f"top_p={cfg.gen_top_p:g} prompt_positions={gen_prompt_n}/"
+                               f"{tokens.shape[1]} anchor={anchor} batch={len(images)} "
+                               f"kv_cache=true saved={batch_path.name}")
+
+                    # # Per-exemplar-class conditional generations (DISABLED to save time: 2 runs per
+                    # # class id in args.class_eval_classes per level per source). Kept for reference;
+                    # # re-enable if per-class coverage beyond the batch's own labels is needed.
+                    # for cls_id, cls_name in args.class_eval_classes:
+                    #     if not 0 <= cls_id < cfg.class_num_classes:
+                    #         logger(f"[{tag}] QUAL source={source_name} level={level} "
+                    #                f"class={cls_id}_{cls_name} skipped (out of range "
+                    #                f"for class_num_classes={cfg.class_num_classes})")
+                    #         continue
+                    #     cls_labels = [cls_id] * tokens.shape[0]
+                    #     cls_prefix = class_condition_prefix(m, level, cls_labels, tokens.shape[0])
+                    #     if args.fsdp and cls_prefix is not None:
+                    #         cls_prefix = fsdp_put_array(cls_prefix, fsdp_replicated)
+                    #     for mode, greedy in (("greedy", True), ("sample", False)):
+                    #         mode_key = jax.random.fold_in(uncond_key, 0 if greedy else 7919)
+                    #         cls_tokens = encoder_free_run(
+                    #             m.codelm_for(level), gen_prompt, tokens.shape[1], 1, mode_key,
+                    #             greedy=greedy, temperature=cfg.gen_temperature, top_k=cfg.gen_top_k,
+                    #             rate_id=m.codelm_bos_rate_id(level), prefix=cls_prefix,
+                    #             top_p=cfg.gen_top_p)
+                    #         if args.fsdp:
+                    #             cls_tokens = fsdp_to_host(cls_tokens)
+                    #         cls_image = token_preview(np.asarray(cls_tokens), level, input_vocab)
+                    #         cls_path = run_dir / (
+                    #             f"samples_{tag}_{source_name}_level{level}_class{cls_id}_{cls_name}_{mode}.png")
+                    #         if jax.process_index() == 0:
+                    #             save_samples(cls_image, preview_gt, cls_path, cfg)
+                    #         logger(f"[{tag}] QUAL source={source_name} level={level} class={cls_id}_{cls_name} "
+                    #                f"mode={mode} temperature={cfg.gen_temperature:g} top_k={cfg.gen_top_k} "
+                    #                f"top_p={cfg.gen_top_p:g} prompt_positions={gen_prompt_n}/"
+                    #                f"{tokens.shape[1]} anchor={anchor} batch={len(images)} "
+                    #                f"kv_cache=true saved={cls_path.name}")
 
                 tf_tokens = teacher_force_level(m, level, tokens, prefix=cond_prefix)
                 if args.fsdp:
@@ -5512,16 +5779,33 @@ def main():
                     save_samples(
                         tf_image, preview_gt,
                         run_dir / f"samples_{tag}_{source_name}_level{level}{tf_class_suffix}_teacher_force.png", cfg)
-                logger(f"[{tag}] TF_SANITY source={source_name} level={level} "
+                logger(f"[{tag}] TF_SANITY source={source_name} level={level} cond=conditional "
                        f"mse={mse:.3f} grid={level_side}x{level_side} "
                        f"seq_len={tokens.shape[1]} downsampler=false",
-                       tag=tag, source=source_name, level=level,
+                       tag=tag, source=source_name, level=level, cond="conditional",
                        tf_sanity_mse=float(mse))
+                if cfg.class_conditional:
+                    # TF unconditional (same tokens, null-class BOS prefix) -- the mse gap
+                    # isolates what the class conditioning contributes to NTP reconstruction.
+                    tf_un_tokens = teacher_force_level(m, level, tokens, prefix=null_prefix)
+                    if args.fsdp:
+                        tf_un_tokens = fsdp_to_host(tf_un_tokens)
+                    tf_un_image = token_preview(np.asarray(tf_un_tokens), level, input_vocab)
+                    mse_un = pixel_mse(tf_un_image, preview_gt)
+                    if jax.process_index() == 0:
+                        save_samples(
+                            tf_un_image, preview_gt,
+                            run_dir / f"samples_{tag}_{source_name}_level{level}_uncond_teacher_force.png", cfg)
+                    logger(f"[{tag}] TF_SANITY source={source_name} level={level} cond=unconditional "
+                           f"mse={mse_un:.3f} grid={level_side}x{level_side} "
+                           f"seq_len={tokens.shape[1]} downsampler=false",
+                           tag=tag, source=source_name, level=level, cond="unconditional",
+                           tf_sanity_mse_uncond=float(mse_un))
 
     val_eval_jit = eqx.filter_jit(level_forward)
     val_jit_timed = [False]
 
-    def run_val_eval(eval_model, phase: int, tag: str) -> tuple:
+    def run_val_eval(eval_model, phase: int, tag: str, force_uncond: bool=False) -> tuple:
         val_t0 = time.monotonic()
         m = cast_pytree(eval_model, compute_dtype)
         bs = args.val_batch_size[phase - 1]
@@ -5538,7 +5822,7 @@ def main():
             batch_imgs = val_np[start:start + bs]
             bn = len(batch_imgs)
             batch_flat = jnp.array(images_to_positions(batch_imgs, cfg, pixel_order))
-            batch_class_labels = jnp.asarray(val_labels[start:start + bn], dtype=jnp.int32)
+            batch_class_labels = jnp.asarray(val_labels[start:start + bn], dtype=jnp.int32) if not force_uncond else None
             if args.fsdp:
                 batch_flat = fsdp_put_array(batch_flat, fsdp_replicated)
             batch_t0 = time.monotonic()
@@ -6022,7 +6306,10 @@ def main():
                         eqx.combine(to_single_device(unreplicate(p_diff_model)), static_model)
                     st = f"{step:0{step_w}d}"
                     run_val_eval(snapshot, phase, tag=f"level{phase - 1}_step{st}")
-                    run_qual_eval(snapshot, phase, tag=f"step{st}")
+                    if cfg.class_conditional:
+                        run_val_eval(snapshot, phase, tag=f"uncond_level{phase - 1}_step{st}", force_uncond=True)
+                    if not cfg.skip_gen:
+                        run_qual_eval(snapshot, phase, tag=f"step{st}")
 
                 if step % ckpt_every_steps == 0:
                     ckpt_dir = run_dir / "checkpoints" / f"phase_{phase}_step{step}"
