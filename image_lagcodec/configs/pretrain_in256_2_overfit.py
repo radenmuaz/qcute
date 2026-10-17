@@ -1,5 +1,5 @@
 """
-uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain_film --config image_lagcodec/configs/pretrain_in256_2_overfit.py
+uv run python3 -m image_lagcodec.run_lagcodec_res_pretrain_film --config image_lagcodec/configs/pretrain_in256_3_overfit.py
 """
 # --- data ---
 # img_size = 256

@@ -25,6 +25,11 @@ SEVERAL stride options (e.g. level0 in {4,16,32}, level1 in {4,16}) instead of o
      product.
   6. generate_from_prompt's cascade must record which K encoded each level and replay the SAME K
      on the matching decode step.
+
+python -m image_lagcodec.run_lagcodec_res_pretrain_window --config <same.py> \
+  --eval_only --eval_checkpoint image_lagcodec/logs/<run>/ \
+  --eval_split val --eval_num_batches 2 --eval_batch_index 0
+--gen_eval_prompt 2048
 """
 from __future__ import annotations
 
@@ -4900,6 +4905,20 @@ def main():
     p.add_argument("--data_root", type=str, default=str(REPO_ROOT / "datasets"))
     p.add_argument("--dataset_concat", action="store_true", default=False,
                    help="concatenate ImageNet shards into one in-memory array (legacy behavior; consumes high RAM)")
+    p.add_argument("--eval_only", action="store_true", default=False,
+                   help="skip training: build the model from the same Config, load --eval_checkpoint, "
+                        "run gen eval (same run_qual_eval), save outputs to --eval_out_dir, then exit")
+    p.add_argument("--eval_checkpoint", type=str, default=None,
+                   help="folder checkpoint for --eval_only: a run logs/<run>/ dir, a logs/<run>/checkpoints/ "
+                        "dir, a checkpoints/<step>/ dir holding model.eqx (+ meta.json), or a model.eqx file")
+    p.add_argument("--eval_split", type=str, default="val", choices=["train", "val"],
+                   help="which split feeds --eval_only gen eval")
+    p.add_argument("--eval_num_batches", type=int, default=1,
+                   help="how many consecutive gen_eval_batch_size batches --eval_only generates")
+    p.add_argument("--eval_batch_index", type=int, default=0,
+                   help="starting batch offset for --eval_only (batch i covers images[i*B:(i+1)*B])")
+    p.add_argument("--eval_out_dir", type=str, default=None,
+                   help="output dir for --eval_only PNGs + meta.json (default: logs/<run_name>/eval_only/)")
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--batch_size", type=_tuple_arg, default=(16,),
                     help="training batch size -- a bare int applies uniformly to every phase; a "
@@ -5569,6 +5588,47 @@ def main():
     cfg.encoder_only_pretrain = True
     cfg.load_encoder_checkpoint = str(args.load_encoder_checkpoint) if args.load_encoder_checkpoint is not None else None
 
+    def resolve_eval_checkpoint(path_str: str) -> Path:
+        """Resolve --eval_checkpoint to a model.eqx file.
+
+        Accepts a run logs/<run>/ dir, a logs/<run>/checkpoints/ dir, a
+        checkpoints/<step>/ dir holding model.eqx (+ meta.json), or a model.eqx file.
+        """
+        p = Path(path_str)
+        if not p.exists():
+            raise FileNotFoundError(f"--eval_checkpoint not found: {p}")
+        if p.is_file():
+            if p.name != "model.eqx":
+                raise ValueError(f"--eval_checkpoint file must be model.eqx, got {p}")
+            return p
+        step_dir = p
+        latest = find_latest_checkpoint(p)
+        if latest is not None:
+            step_dir = latest
+        model_file = step_dir / "model.eqx"
+        if not model_file.is_file():
+            raise FileNotFoundError(
+                f"--eval_checkpoint {p} has no model.eqx "
+                f"(looked in {step_dir}; pass a logs/<run>/ dir, a checkpoints/ dir, "
+                f"a checkpoints/<step>/ dir, or a model.eqx file)")
+        return model_file
+
+    if args.eval_only:
+        if args.eval_checkpoint is None:
+            raise ValueError("--eval_only requires --eval_checkpoint")
+        if args.eval_num_batches < 1:
+            raise ValueError(f"--eval_num_batches must be >=1, got {args.eval_num_batches}")
+        if args.eval_batch_index < 0:
+            raise ValueError(f"--eval_batch_index must be >=0, got {args.eval_batch_index}")
+        model_file = resolve_eval_checkpoint(args.eval_checkpoint)
+        with init_context:
+            model = eqx.tree_deserialise_leaves(model_file, model)
+        logger(f"--eval_only: loaded {model_file}")
+        eval_out = Path(args.eval_out_dir) if args.eval_out_dir else run_dir / "eval_only"
+        eval_out.mkdir(parents=True, exist_ok=True)
+        if args.fsdp:
+            model = fsdp_put_tree(model, fsdp_mesh)
+
     compute_dtype = jnp.bfloat16 if cfg.precision == "bf16" else jnp.float32
     if cfg.precision != "bf16":
         jax.config.update("jax_default_matmul_precision", "highest")
@@ -5588,14 +5648,36 @@ def main():
     def teacher_force_level(m, level: int, tokens: jnp.ndarray, prefix=None) -> jnp.ndarray:
         return encoder_teacher_force(m.codelm_for(level), tokens, K=1, prefix=prefix)
 
-    def run_qual_eval(eval_model, phase: int, tag: str) -> None:
+    def run_qual_eval(eval_model, phase: int, tag: str, save_dir: Path = None,
+                      eval_split: str = None, batch_index: int = 0, num_batches: int = 1) -> None:
         if cfg.modality != "image":
             logger(f"[{tag}] QUAL skipped: image token previews require modality='image'")
             return
+        out_dir = run_dir if save_dir is None else Path(save_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
         m = cast_pytree(eval_model, compute_dtype)
         gen_batch_size = cfg.gen_eval_batch_size or args.val_batch_size[phase - 1]
-        sources = [("train", train_np[:gen_batch_size], train_labels[:gen_batch_size]),
-                   ("val", val_np[:gen_batch_size], val_labels[:gen_batch_size])]
+        all_sources = [("train", train_np, train_labels),
+                       ("val", val_np, val_labels)]
+        if eval_split is not None:
+            all_sources = [s for s in all_sources if s[0] == eval_split]
+            if not all_sources:
+                raise ValueError(f"--eval_split={eval_split!r} has no data (train/val only)")
+        sources = []
+        for source_name, images_all, labels_all in all_sources:
+            for b in range(num_batches):
+                start = (batch_index + b) * gen_batch_size
+                if start >= len(images_all):
+                    logger(f"[{tag}] QUAL source={source_name} batch {batch_index + b} out of range "
+                           f"(split has {len(images_all)} images, batch size {gen_batch_size}) -- stopping")
+                    break
+                end = min(start + gen_batch_size, len(images_all))
+                sources.append((f"{source_name}_b{batch_index + b}",
+                                np.asarray(images_all[start:end]),
+                                np.asarray(labels_all[start:end])))
+        if not sources:
+            logger(f"[{tag}] QUAL skipped: no batches selected")
+            return
         for source_name, images, source_labels in sources:
             gt_image = images.astype(np.uint8)
             flat = jnp.asarray(images_to_positions(images, cfg, pixel_order))
@@ -5652,7 +5734,7 @@ def main():
                             generated = fsdp_to_host(generated)
                         preview_gen = token_preview(np.asarray(generated), level, input_vocab)
                         class_suffix = f"_conditional_b{len(images)}" if cfg.class_conditional else ""
-                        sample_path = run_dir / (
+                        sample_path = out_dir / (
                             f"samples_{tag}_{source_name}_level{level}{class_suffix}_{mode}_{prompt_suffix}.png")
                         if jax.process_index() == 0:
                             save_samples(preview_gen, preview_gt, sample_path, cfg)
@@ -5697,7 +5779,7 @@ def main():
                         if args.fsdp:
                             uncond_tokens = fsdp_to_host(uncond_tokens)
                         uncond_image = token_preview(np.asarray(uncond_tokens), level, input_vocab)
-                        uncond_path = run_dir / (
+                        uncond_path = out_dir / (
                             f"samples_{tag}_{source_name}_level{level}_uncond_{mode}.png")
                         if jax.process_index() == 0:
                             save_samples(uncond_image, preview_gt, uncond_path, cfg)
@@ -5724,7 +5806,7 @@ def main():
                         if args.fsdp:
                             batch_tokens = fsdp_to_host(batch_tokens)
                         batch_image = token_preview(np.asarray(batch_tokens), level, input_vocab)
-                        batch_path = run_dir / (
+                        batch_path = out_dir / (
                             f"samples_{tag}_{source_name}_level{level}_{batch_cls_tag}_{mode}.png")
                         if jax.process_index() == 0:
                             save_samples(batch_image, preview_gt, batch_path, cfg)
@@ -5778,7 +5860,7 @@ def main():
                 if jax.process_index() == 0:
                     save_samples(
                         tf_image, preview_gt,
-                        run_dir / f"samples_{tag}_{source_name}_level{level}{tf_class_suffix}_teacher_force.png", cfg)
+                        out_dir / f"samples_{tag}_{source_name}_level{level}{tf_class_suffix}_teacher_force.png", cfg)
                 logger(f"[{tag}] TF_SANITY source={source_name} level={level} cond=conditional "
                        f"mse={mse:.3f} grid={level_side}x{level_side} "
                        f"seq_len={tokens.shape[1]} downsampler=false",
@@ -5795,12 +5877,28 @@ def main():
                     if jax.process_index() == 0:
                         save_samples(
                             tf_un_image, preview_gt,
-                            run_dir / f"samples_{tag}_{source_name}_level{level}_uncond_teacher_force.png", cfg)
+                            out_dir / f"samples_{tag}_{source_name}_level{level}_uncond_teacher_force.png", cfg)
                     logger(f"[{tag}] TF_SANITY source={source_name} level={level} cond=unconditional "
                            f"mse={mse_un:.3f} grid={level_side}x{level_side} "
                            f"seq_len={tokens.shape[1]} downsampler=false",
                            tag=tag, source=source_name, level=level, cond="unconditional",
                            tf_sanity_mse_uncond=float(mse_un))
+
+    if args.eval_only:
+        # Same run_qual_eval as training (prompt cond gen, uncond free-run, batch-cond
+        # run, TF sanity + uncond), but on the requested split/batch slice of an already
+        # trained checkpoint, with outputs under eval_out instead of run_dir. Phase is the
+        # full model (n_phases) so every level generates.
+        run_qual_eval(model, n_phases, tag="evalonly", save_dir=eval_out,
+                      eval_split=args.eval_split, batch_index=args.eval_batch_index,
+                      num_batches=args.eval_num_batches)
+        meta = dict(checkpoint=str(model_file), split=args.eval_split,
+                    batch_index=args.eval_batch_index, num_batches=args.eval_num_batches,
+                    gen_eval_batch_size=cfg.gen_eval_batch_size,
+                    val_batch_size=list(args.val_batch_size), n_phases=n_phases)
+        (eval_out / "meta.json").write_text(json.dumps(meta, indent=2))
+        logger(f"--eval_only done: outputs in {eval_out}")
+        return
 
     val_eval_jit = eqx.filter_jit(level_forward)
     val_jit_timed = [False]
